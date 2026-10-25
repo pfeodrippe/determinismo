@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Starts Redis, drives it with the reference workload, prints what the workload saw.
+set -e
+redis-server --daemonize yes --save "" --appendonly no --bind 127.0.0.1 --port 6379 \
+  --logfile /tmp/redis.log
+until redis-cli -p 6379 ping >/dev/null 2>&1; do sleep 0.01; done
+det-workload-redis --ops 5000
+echo "[redis] keys=$(redis-cli dbsize) counter=$(redis-cli get counter) log_len=$(redis-cli llen log)"
+redis-cli shutdown nosave >/dev/null 2>&1 || true

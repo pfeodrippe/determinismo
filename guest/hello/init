@@ -1,0 +1,9 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: MIT
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "determinismo: hello from the guest, kernel $(uname -r), uptime $(cut -d' ' -f1 /proc/uptime)s"
+echo "determinismo: random=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' ')"
+reboot -f

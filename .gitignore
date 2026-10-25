@@ -1,0 +1,15 @@
+# Zig
+zig-out/
+.zig-cache/
+# Kernel module build outputs
+guest/module/*.ko
+guest/module/*.o
+guest/module/*.mod
+guest/module/*.mod.c
+guest/module/.*.cmd
+guest/module/Module.symvers
+guest/module/modules.order
+guest/module/.module-common.o
+# Claude Code local settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

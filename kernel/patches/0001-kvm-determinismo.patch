@@ -1,0 +1,414 @@
+SPDX-License-Identifier: GPL-2.0-only
+determinismo: deterministic execution for single-vCPU KVM guests (see ARCHITECTURE.md §4).
+Branch-count clock, in-kernel RDTSC, exact-count stops (PMU overflow + MTF), HLT to userspace.
+
+diff -ruN a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
+--- a/arch/x86/include/asm/kvm-x86-ops.h	2026-10-24 18:52:24
++++ b/arch/x86/include/asm/kvm-x86-ops.h	2026-10-24 18:54:45
+@@ -139,6 +139,7 @@
+ KVM_X86_OP_OPTIONAL_RET0(gmem_prepare)
+ KVM_X86_OP_OPTIONAL_RET0(private_max_mapping_level)
+ KVM_X86_OP_OPTIONAL(gmem_invalidate)
++KVM_X86_OP_OPTIONAL(det_ioctl)
+ 
+ #undef KVM_X86_OP
+ #undef KVM_X86_OP_OPTIONAL
+diff -ruN a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h	2026-10-24 18:52:22
++++ b/arch/x86/include/asm/kvm_host.h	2026-10-24 18:54:45
+@@ -1034,6 +1034,9 @@
+ 	/* Protected Guests */
+ 	bool guest_state_protected;
+ 
++	/* determinismo: HLT exits to userspace, which owns guest idle time. */
++	bool det_enabled;
++
+ 	/*
+ 	 * Set when PDPTS were loaded directly by the userspace without
+ 	 * reading the guest memory
+@@ -1848,6 +1851,7 @@
+ 	void *(*alloc_apic_backing_page)(struct kvm_vcpu *vcpu);
+ 	int (*gmem_prepare)(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
+ 	void (*gmem_invalidate)(kvm_pfn_t start, kvm_pfn_t end);
++	long (*det_ioctl)(struct kvm_vcpu *vcpu, unsigned int ioctl, void __user *argp);
+ 	int (*private_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn);
+ };
+ 
+diff -ruN a/arch/x86/kvm/vmx/main.c b/arch/x86/kvm/vmx/main.c
+--- a/arch/x86/kvm/vmx/main.c	2026-10-24 18:52:36
++++ b/arch/x86/kvm/vmx/main.c	2026-10-24 18:54:45
+@@ -159,6 +159,7 @@
+ 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
+ 
+ 	.get_untagged_addr = vmx_get_untagged_addr,
++	.det_ioctl = vmx_det_ioctl,
+ };
+ 
+ struct kvm_x86_init_ops vt_init_ops __initdata = {
+diff -ruN a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+--- a/arch/x86/kvm/vmx/vmx.c	2026-10-24 18:52:33
++++ b/arch/x86/kvm/vmx/vmx.c	2026-10-24 18:54:45
+@@ -73,6 +73,7 @@
+ #include "smm.h"
+ #include "vmx_onhyperv.h"
+ #include "posted_intr.h"
++#include <linux/perf_event.h>
+ 
+ MODULE_AUTHOR("Qumranet");
+ MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
+@@ -5924,11 +5925,206 @@
+ 	return kvm_skip_emulated_instruction(vcpu);
+ }
+ 
++/*
++ * determinismo: deterministic execution for single-vCPU VMs.
++ *
++ * A pinned, guest-only PMU counter of retired conditional branches is the clock. RDTSC returns
++ * tsc_base + branches * tsc_per_branch. KVM_DET_SET_TARGET makes the vCPU exit to userspace
++ * exactly when the count reaches the target: the counter overflows `margin` branches early
++ * (PMIs skid), then the Monitor Trap Flag single-steps to the exact count.
++ */
++static u64 vmx_det_branches(struct vcpu_vmx *vmx)
++{
++	u64 enabled, running;
++
++	return perf_event_read_value(vmx->det.counter, &enabled, &running);
++}
++
++static u64 vmx_det_tsc(struct vcpu_vmx *vmx, u64 branches)
++{
++	return vmx->det.tsc_base + branches * vmx->det.tsc_per_branch;
++}
++
++static void vmx_det_overflow(struct perf_event *event, struct perf_sample_data *data,
++			     struct pt_regs *regs)
++{
++	struct vcpu_vmx *vmx = event->overflow_handler_context;
++
++	WRITE_ONCE(vmx->det.overflowed, true);
++	vmx->det.overflows++;
++}
++
++static void vmx_det_set_stepping(struct vcpu_vmx *vmx, bool on)
++{
++	preempt_disable();
++	if (on)
++		exec_controls_setbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
++	else
++		exec_controls_clearbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
++	preempt_enable();
++	vmx->det.stepping = on;
++}
++
++/* Disarms the target; returns 0 so the caller exits to userspace. */
++static int vmx_det_reached(struct kvm_vcpu *vcpu, u64 now)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	if (now > vmx->det.target)
++		vmx->det.overshoots++;
++	vmx->det.reached = now;
++	vmx->det.target = 0;
++	vmx_det_set_stepping(vmx, false);
++	perf_event_period(vmx->det.counter, 1ULL << 62);
++	vcpu->run->exit_reason = KVM_EXIT_DET_TARGET;
++	return 0;
++}
++
++static int vmx_det_arm(struct kvm_vcpu *vcpu, u64 target)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 now = vmx_det_branches(vmx);
++
++	if (!target) {
++		vmx->det.target = 0;
++		vmx_det_set_stepping(vmx, false);
++		return perf_event_period(vmx->det.counter, 1ULL << 62);
++	}
++	if (target <= now)
++		return -ERANGE;
++	vmx->det.target = target;
++	WRITE_ONCE(vmx->det.overflowed, false);
++	if (target - now <= vmx->det.margin) {
++		vmx_det_set_stepping(vmx, true);
++		return 0;
++	}
++	vmx_det_set_stepping(vmx, false);
++	return perf_event_period(vmx->det.counter, target - now - vmx->det.margin);
++}
++
++/* Runs after every exit, preemptible: turns a counter overflow into single-stepping. */
++static int vmx_det_after_exit(struct kvm_vcpu *vcpu, int ret)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 now;
++
++	if (!vmx->det.target || vmx->det.stepping || !READ_ONCE(vmx->det.overflowed))
++		return ret;
++	WRITE_ONCE(vmx->det.overflowed, false);
++	now = vmx_det_branches(vmx);
++	if (now >= vmx->det.target)
++		return ret > 0 ? vmx_det_reached(vcpu, now) : ret;
++	vmx_det_set_stepping(vmx, true);
++	return ret;
++}
++
+ static int handle_monitor_trap(struct kvm_vcpu *vcpu)
+ {
+-	return 1;
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 now;
++
++	if (!vmx->det.stepping)
++		return 1;
++	vmx->det.mtf_steps++;
++	now = vmx_det_branches(vmx);
++	if (now < vmx->det.target)
++		return 1;
++	return vmx_det_reached(vcpu, now);
+ }
+ 
++static int handle_rdtsc(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 tsc;
++
++	if (!vmx->det.counter)
++		return kvm_handle_invalid_op(vcpu);
++	vmx->det.rdtsc_exits++;
++	tsc = vmx_det_tsc(vmx, vmx_det_branches(vmx));
++	kvm_rax_write(vcpu, (u32)tsc);
++	kvm_rdx_write(vcpu, tsc >> 32);
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int vmx_det_enable(struct kvm_vcpu *vcpu, struct kvm_det_config *cfg)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	struct perf_event_attr attr = {
++		.type = PERF_TYPE_RAW,
++		.size = sizeof(attr),
++		.config = cfg->event,
++		.pinned = 1,
++		.exclude_host = 1,
++		.sample_period = 1ULL << 62,
++	};
++	struct perf_event *counter;
++
++	if (vmx->det.counter || !cfg->tsc_per_branch || !cfg->margin || cfg->flags)
++		return -EINVAL;
++	counter = perf_event_create_kernel_counter(&attr, -1, current, vmx_det_overflow, vmx);
++	if (IS_ERR(counter))
++		return PTR_ERR(counter);
++	vmx->det.counter = counter;
++	vmx->det.tsc_base = cfg->tsc_base;
++	vmx->det.tsc_per_branch = cfg->tsc_per_branch;
++	vmx->det.margin = cfg->margin;
++	preempt_disable();
++	exec_controls_setbit(vmx, CPU_BASED_RDTSC_EXITING);
++	preempt_enable();
++	vcpu->arch.det_enabled = true;
++	return 0;
++}
++
++long vmx_det_ioctl(struct kvm_vcpu *vcpu, unsigned int ioctl, void __user *argp)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	switch (ioctl) {
++	case KVM_DET_ENABLE: {
++		struct kvm_det_config cfg;
++
++		if (copy_from_user(&cfg, argp, sizeof(cfg)))
++			return -EFAULT;
++		return vmx_det_enable(vcpu, &cfg);
++	}
++	case KVM_DET_SET_TARGET: {
++		u64 target;
++
++		if (!vmx->det.counter)
++			return -EINVAL;
++		if (copy_from_user(&target, argp, sizeof(target)))
++			return -EFAULT;
++		return vmx_det_arm(vcpu, target);
++	}
++	case KVM_DET_GET_STATE: {
++		struct kvm_det_state st = {};
++
++		if (!vmx->det.counter)
++			return -EINVAL;
++		st.branches = vmx_det_branches(vmx);
++		st.tsc = vmx_det_tsc(vmx, st.branches);
++		st.target = vmx->det.target;
++		st.reached = vmx->det.reached;
++		st.rdtsc_exits = vmx->det.rdtsc_exits;
++		st.mtf_steps = vmx->det.mtf_steps;
++		st.overflows = vmx->det.overflows;
++		st.overshoots = vmx->det.overshoots;
++		return copy_to_user(argp, &st, sizeof(st)) ? -EFAULT : 0;
++	}
++	case KVM_DET_ADD_TSC: {
++		u64 delta;
++
++		if (!vmx->det.counter)
++			return -EINVAL;
++		if (copy_from_user(&delta, argp, sizeof(delta)))
++			return -EFAULT;
++		vmx->det.tsc_base += delta;
++		return 0;
++	}
++	}
++	return -ENOTTY;
++}
++
+ static int handle_invpcid(struct kvm_vcpu *vcpu)
+ {
+ 	u32 vmx_instruction_info;
+@@ -6109,6 +6305,7 @@
+ 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
+ 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
+ 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
++	[EXIT_REASON_RDTSC]                   = handle_rdtsc,
+ 	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+ 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
+@@ -6620,6 +6817,9 @@
+ {
+ 	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
+ 
++	if (to_vmx(vcpu)->det.counter)
++		ret = vmx_det_after_exit(vcpu, ret);
++
+ 	/*
+ 	 * Exit to user space when bus lock detected to inform that there is
+ 	 * a bus lock in guest.
+@@ -7503,6 +7703,8 @@
+ 	nested_vmx_free_vcpu(vcpu);
+ 	free_loaded_vmcs(vmx->loaded_vmcs);
+ 	free_page((unsigned long)vmx->ve_info);
++	if (vmx->det.counter)
++		perf_event_release_kernel(vmx->det.counter);
+ }
+ 
+ int vmx_vcpu_create(struct kvm_vcpu *vcpu)
+diff -ruN a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+--- a/arch/x86/kvm/vmx/vmx.h	2026-10-24 18:52:30
++++ b/arch/x86/kvm/vmx/vmx.h	2026-10-24 18:54:45
+@@ -363,6 +363,22 @@
+ 
+ 	/* ve_info must be page aligned. */
+ 	struct vmx_ve_information *ve_info;
++
++	/* determinismo, see KVM_DET_* in uapi/linux/kvm.h. */
++	struct {
++		struct perf_event *counter;
++		u64 tsc_base;
++		u32 tsc_per_branch;
++		u32 margin;
++		u64 target;
++		u64 reached;
++		bool stepping;
++		bool overflowed;
++		u64 rdtsc_exits;
++		u64 mtf_steps;
++		u64 overflows;
++		u64 overshoots;
++	} det;
+ };
+ 
+ struct kvm_vmx {
+diff -ruN a/arch/x86/kvm/vmx/x86_ops.h b/arch/x86/kvm/vmx/x86_ops.h
+--- a/arch/x86/kvm/vmx/x86_ops.h	2026-10-24 18:52:39
++++ b/arch/x86/kvm/vmx/x86_ops.h	2026-10-24 18:54:45
+@@ -27,6 +27,7 @@
+ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu);
+ void vmx_vcpu_put(struct kvm_vcpu *vcpu);
+ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath);
++long vmx_det_ioctl(struct kvm_vcpu *vcpu, unsigned int ioctl, void __user *argp);
+ void vmx_handle_exit_irqoff(struct kvm_vcpu *vcpu);
+ int vmx_skip_emulated_instruction(struct kvm_vcpu *vcpu);
+ void vmx_update_emulated_instruction(struct kvm_vcpu *vcpu);
+diff -ruN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	2026-10-24 18:52:28
++++ b/arch/x86/kvm/x86.c	2026-10-24 18:54:45
+@@ -5708,6 +5708,14 @@
+ 		r = kvm_vcpu_ioctl_x86_set_xcrs(vcpu, u.xcrs);
+ 		break;
+ 	}
++	case KVM_DET_ENABLE:
++	case KVM_DET_SET_TARGET:
++	case KVM_DET_GET_STATE:
++	case KVM_DET_ADD_TSC:
++		r = -ENOTTY;
++		if (kvm_x86_ops.det_ioctl)
++			r = kvm_x86_call(det_ioctl)(vcpu, ioctl, argp);
++		break;
+ 	case KVM_SET_TSC_KHZ: {
+ 		u32 user_tsc_khz;
+ 
+@@ -10944,10 +10952,14 @@
+ 	 */
+ 	++vcpu->stat.halt_exits;
+ 	if (lapic_in_kernel(vcpu)) {
+-		if (kvm_vcpu_has_events(vcpu))
++		if (kvm_vcpu_has_events(vcpu)) {
+ 			vcpu->arch.pv.pv_unhalted = false;
+-		else
++		} else if (vcpu->arch.det_enabled) {
++			vcpu->run->exit_reason = reason;
++			return 0;
++		} else {
+ 			vcpu->arch.mp_state = state;
++		}
+ 		return 1;
+ 	} else {
+ 		vcpu->run->exit_reason = reason;
+diff -ruN a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+--- a/include/uapi/linux/kvm.h	2026-10-24 18:52:19
++++ b/include/uapi/linux/kvm.h	2026-10-24 18:54:45
+@@ -183,6 +183,8 @@
+ #define KVM_EXIT_NOTIFY           37
+ #define KVM_EXIT_LOONGARCH_IOCSR  38
+ #define KVM_EXIT_MEMORY_FAULT     39
++/* determinismo: the branch-count target set with KVM_DET_SET_TARGET was reached. */
++#define KVM_EXIT_DET_TARGET       1000
+ 
+ /* For KVM_EXIT_INTERNAL_ERROR */
+ /* Emulate instruction failed. */
+@@ -1574,6 +1576,36 @@
+ };
+ 
+ #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
++
++/*
++ * determinismo: deterministic execution for single-vCPU VMs.
++ * Guest time is a function of retired guest branches: tsc = tsc_base + branches * tsc_per_branch.
++ */
++struct kvm_det_config {
++	__u64 event;		/* raw PMU event counting retired conditional branches */
++	__u64 tsc_base;
++	__u32 tsc_per_branch;
++	__u32 margin;		/* branches before a target where single-stepping starts */
++	__u64 flags;
++	__u64 reserved[4];
++};
++
++struct kvm_det_state {
++	__u64 branches;
++	__u64 tsc;
++	__u64 target;
++	__u64 reached;		/* branch count at the last KVM_EXIT_DET_TARGET */
++	__u64 rdtsc_exits;
++	__u64 mtf_steps;
++	__u64 overflows;
++	__u64 overshoots;
++	__u64 reserved[8];
++};
++
++#define KVM_DET_ENABLE		_IOW(KVMIO, 0xf0, struct kvm_det_config)
++#define KVM_DET_SET_TARGET	_IOW(KVMIO, 0xf1, __u64)	/* 0 cancels */
++#define KVM_DET_GET_STATE	_IOR(KVMIO, 0xf2, struct kvm_det_state)
++#define KVM_DET_ADD_TSC		_IOW(KVMIO, 0xf3, __u64)	/* e.g. idle time skipped */
+ 
+ struct kvm_pre_fault_memory {
+ 	__u64 gpa;

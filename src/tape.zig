@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MIT
+//! Tapes (docs/PLUGINS.md): the decisions a strategy overrode in one branch, written as JSON lines
+//! so the branch replays without the strategy. Replays load overrides into a fixed table.
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const Strategy = @import("strategy.zig");
+
+pub const override_count_max = 1 << 16;
+const tape_version = 1;
+
+pub const Header = struct { exploration_seed: u64, branch: u32, branch_seed: u64 };
+
+pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
+
+/// Overrides of one branch, ordered by pull. A replay consumes them in order.
+pub const Overrides = struct {
+    entries: [override_count_max]Override,
+    count: u32,
+    cursor: u32,
+
+    /// Replaces `value` if pull `pull` was overridden. Pulls arrive in increasing order.
+    pub fn apply(overrides: *Overrides, pull: u64, value: []u8) !bool {
+        assert(overrides.cursor <= overrides.count);
+        if (overrides.cursor == overrides.count) return false;
+        const entry = &overrides.entries[overrides.cursor];
+        if (entry.pull < pull) return error.TapeOutOfOrder; // The replay diverged from the tape.
+        if (entry.pull > pull) return false;
+        if (entry.size != value.len) return error.TapeSizeMismatch;
+        @memcpy(value, entry.bytes[0..entry.size]);
+        overrides.cursor += 1;
+        return true;
+    }
+};
+
+pub fn write_header(fd: linux.fd_t, header: Header) void {
+    assert(fd >= 0);
+    var buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{{\"tape\":{d},\"exploration_seed\":\"{x:0>16}\"," ++
+        "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"}}\n", .{
+        tape_version, header.exploration_seed, header.branch, header.branch_seed,
+    }) catch unreachable; // 160 bytes fit the keys and two 16-digit seeds.
+    write_all(fd, line);
+}
+
+pub fn write_override(fd: linux.fd_t, pull: u64, value: []const u8) void {
+    assert(fd >= 0);
+    assert(value.len <= Strategy.override_size_max);
+    var buffer: [64 + 2 * Strategy.override_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("{{\"pull\":{d},\"hex\":\"", .{pull}) catch unreachable;
+    for (value) |byte| writer.print("{x:0>2}", .{byte}) catch unreachable;
+    writer.writeAll("\"}\n") catch unreachable;
+    write_all(fd, writer.buffered());
+}
+
+/// Parses a tape file's contents into its header and `overrides`.
+pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
+    assert(scratch.len > 0);
+    overrides.count = 0;
+    overrides.cursor = 0;
+    var lines = std.mem.tokenizeScalar(u8, source, '\n');
+    const header_line = lines.next() orelse return error.EmptyTape;
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    const Value = std.json.Value;
+    const header = try std.json.parseFromSliceLeaky(Value, fba.allocator(), header_line, .{});
+    if (header != .object) return error.BadTape;
+    if ((header.object.get("tape") orelse return error.BadTape).integer != tape_version) {
+        return error.UnsupportedTape;
+    }
+    const result = Header{
+        .exploration_seed = try hex_field(header.object, "exploration_seed"),
+        .branch = @intCast((header.object.get("branch") orelse return error.BadTape).integer),
+        .branch_seed = try hex_field(header.object, "branch_seed"),
+    };
+    while (lines.next()) |line| {
+        fba.reset();
+        const value = try std.json.parseFromSliceLeaky(Value, fba.allocator(), line, .{});
+        if (overrides.count == override_count_max) return error.TapeTooLong;
+        const entry = &overrides.entries[overrides.count];
+        entry.pull = @intCast((value.object.get("pull") orelse return error.BadTape).integer);
+        const hex = (value.object.get("hex") orelse return error.BadTape).string;
+        if (hex.len > 2 * Strategy.override_size_max) return error.BadTape;
+        entry.size = @intCast((try std.fmt.hexToBytes(&entry.bytes, hex)).len);
+        if (overrides.count > 0) {
+            if (overrides.entries[overrides.count - 1].pull >= entry.pull) return error.BadTape;
+        }
+        overrides.count += 1;
+    }
+    return result;
+}
+
+fn hex_field(object: std.json.ObjectMap, key: []const u8) !u64 {
+    assert(key.len > 0);
+    const value = object.get(key) orelse return error.BadTape;
+    if (value != .string) return error.BadTape;
+    return std.fmt.parseInt(u64, value.string, 16);
+}
+
+fn write_all(fd: linux.fd_t, bytes: []const u8) void {
+    var written: u64 = 0;
+    while (written < bytes.len) {
+        const result = linux.write(fd, bytes[written..].ptr, bytes.len - written);
+        if (linux.errno(result) != .SUCCESS) return; // Reported when the tape fails to replay.
+        written += result;
+    }
+    assert(written == bytes.len);
+}
+
+test "a written tape parses back" {
+    const allocator = std.testing.allocator;
+    const overrides = try allocator.create(Overrides);
+    defer allocator.destroy(overrides);
+    const scratch = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(scratch);
+    const source = "{\"tape\":1,\"exploration_seed\":\"0000000000000007\",\"branch\":3," ++
+        "\"branch_seed\":\"00000000000000ff\"}\n" ++
+        "{\"pull\":10,\"hex\":\"0102\"}\n" ++
+        "{\"pull\":12,\"hex\":\"ff\"}\n";
+    const header = try parse(source, scratch, overrides);
+    try std.testing.expectEqual(@as(u64, 7), header.exploration_seed);
+    try std.testing.expectEqual(@as(u32, 3), header.branch);
+    try std.testing.expectEqual(@as(u32, 2), overrides.count);
+    var value: [2]u8 = .{ 0, 0 };
+    try std.testing.expect(!try overrides.apply(9, &value));
+    try std.testing.expect(try overrides.apply(10, &value));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &value);
+}

@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The bank example: Redis plus the bank test template, scheduled by the composer, with faults.
+set -e
+redis-server --daemonize yes --save "" --appendonly no --bind 127.0.0.1 --port 6379 \
+  --logfile /tmp/redis.log --pidfile /tmp/redis.pid
+until redis-cli -p 6379 ping >/dev/null 2>&1; do sleep 0.01; done
+/opt/determinismo/test/bank/setup
+# Faults the injector may use during the driver phase (guest/runtime/faults.zig).
+cat > /opt/determinismo/test/bank/faults.conf <<CONF
+pause /tmp/redis.pid
+clock_skip
+CONF
+det-composer /opt/determinismo/test/bank/*
+redis-cli shutdown nosave >/dev/null 2>&1 || true
