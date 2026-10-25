@@ -172,6 +172,51 @@ fn emit_raw(message: []const u8) void {
     }
 }
 
+/// Code coverage for strategies: build the program with `sanitize_coverage_trace_pc_guard` set
+/// on its compile step, and reference this (`comptime { _ = sdk.coverage; }`). Each edge then
+/// emits a "coverage" event the first time a process runs it, which strategies such as
+/// det-strategy-mutate use to keep timelines that reach new code. Same events as the C SDK's.
+pub const coverage = struct {
+    var next: u32 = 1;
+    /// Edges the SDK runs while reporting one are reported later, when they run again.
+    var busy = false;
+    // Zig's instrumentation also tracks stack depth (unused here) in a thread-local the program
+    // must define. In assembly: defined in Zig, LLVM's pass would not bind to it.
+    comptime {
+        asm (
+            \\.section .tbss,"awT",@nobits
+            \\.globl __sancov_lowest_stack
+            \\.type __sancov_lowest_stack,@object
+            \\.p2align 3
+            \\__sancov_lowest_stack:
+            \\.zero 8
+            \\.size __sancov_lowest_stack, 8
+            \\.text
+        );
+    }
+
+    export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void {
+        @disableInstrumentation();
+        const count = (@intFromPtr(stop) - @intFromPtr(start)) / @sizeOf(u32);
+        if (count == 0 or start[0] != 0) return; // Already numbered.
+        for (start[0..count]) |*guard| {
+            guard.* = next;
+            next += 1;
+        }
+    }
+
+    export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
+        @disableInstrumentation();
+        if (guard.* == 0 or busy) return;
+        busy = true;
+        defer busy = false;
+        var name_buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "edge {d}", .{guard.*}) catch unreachable;
+        guard.* = 0;
+        event("coverage", .{ .name = name });
+    }
+};
+
 fn device_get() Device {
     if (device == .unopened) {
         const result = linux.open(device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);

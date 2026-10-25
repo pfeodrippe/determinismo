@@ -111,6 +111,19 @@ pub fn build(b: *std.Build) void {
     });
     maze.root_module.addIncludePath(b.path("sdk/c"));
     b.installArtifact(maze);
+    // The same maze in Zig, through the Zig SDK's coverage hooks.
+    const maze_zig = b.addExecutable(.{
+        .name = "det-maze-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/selftest/maze.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "determinismo", .module = sdk }},
+        }),
+    });
+    maze_zig.sanitize_coverage_trace_pc_guard = true;
+    maze_zig.use_llvm = true; // Coverage instrumentation is an LLVM pass.
+    b.installArtifact(maze_zig);
 
     // The guest's base initramfs, built on the host from the guest runtime above.
     const initramfs = b.addExecutable(.{

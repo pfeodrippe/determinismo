@@ -18,7 +18,13 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
 
-const Nodes = struct { echo: ?sdk.Node, csdk: ?sdk.Node, controller: ?sdk.Node, maze: ?sdk.Node };
+const Nodes = struct {
+    echo: ?sdk.Node,
+    csdk: ?sdk.Node,
+    controller: ?sdk.Node,
+    maze: ?sdk.Node,
+    zigmaze: ?sdk.Node,
+};
 pub const System = sdk.System(Nodes);
 const port = 7000;
 /// No faults: these nodes check the platform, not resilience.
@@ -71,6 +77,13 @@ fn describe(d: *System.Describe) !void {
     maze_profile.node(.maze, .{
         .binary = "zig-out/bin/det-maze",
         .command = &.{ "/bin/det-maze", "idle" },
+        .faults = quiet,
+    });
+    // The same maze in Zig: coverage through the Zig SDK.
+    const maze_zig = try d.profile("maze-zig");
+    maze_zig.node(.zigmaze, .{
+        .binary = "zig-out/bin/det-maze-zig",
+        .command = &.{ "/bin/det-maze-zig", "idle" },
         .faults = quiet,
     });
     const controller = try d.profile("controller");
@@ -176,15 +189,15 @@ fn forks(_: *System.Context) !void {
     }
 }
 
-/// One attempt at the maze per timeline (profile "maze"), inside the maze node: by chance 1 in
-/// 10000 timelines solves it.
+/// One attempt at the maze per timeline (profile "maze", or "maze-zig"), inside the maze node:
+/// by chance 1 in 10000 timelines solves it.
 fn maze(s: *System.Scenario) void {
     s.singleton_driver("attempt", maze_attempt);
 }
 
 fn maze_attempt(context: *System.Context) !void {
-    const node = context.nodes.maze orelse return error.NoMazeNode;
-    _ = try node.exec(&.{ "/bin/det-maze", "solve" });
+    if (context.nodes.maze) |node| _ = try node.exec(&.{ "/bin/det-maze", "solve" });
+    if (context.nodes.zigmaze) |node| _ = try node.exec(&.{ "/bin/det-maze-zig", "solve" });
 }
 
 fn ping(context: *System.Context) !void {

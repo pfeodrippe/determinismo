@@ -155,12 +155,22 @@ fn check_tapes(context: *Context) !void {
 }
 
 /// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance) within 300
-/// branches, and its solving branch replays from its tape.
+/// branches, with coverage from the C SDK and from the Zig SDK, and the solving branch replays
+/// from its tape.
 fn check_coverage(context: *Context) !void {
+    for ([_][]const u8{ "maze", "maze-zig" }) |profile| {
+        try check_coverage_profile(context, profile);
+    }
+}
+
+fn check_coverage_profile(context: *Context, profile: []const u8) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const strategy = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
-    const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "maze-tapes" });
-    const common = [_][]const u8{ "--program", program, "--profile", "maze", "--scenario", "maze" };
+    const tapes_name = try std.fmt.allocPrint(context.arena, "{s}-tapes", .{profile});
+    const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, tapes_name });
+    const common = [_][]const u8{
+        "--program", program, "--profile", profile, "--scenario", "maze",
+    };
     const report = try explore(context, &(common ++ [_][]const u8{
         "--seed", "1", "--branches", "300", "--jobs", "1", "--strategy", strategy,
         "--tape-dir", tapes,
@@ -170,7 +180,9 @@ fn check_coverage(context: *Context) !void {
     const solved = for (branches[0..count]) |branch| {
         if (branch.failing) break branch;
     } else null;
-    expect(context, solved != null, "coverage: guided exploration solves the maze", .{});
+    expect(context, solved != null, "coverage ({s}): guided exploration solves the maze", .{
+        profile,
+    });
     const branch = solved orelse return;
     const tape_name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{branch.index});
     const tape = try std.fs.path.join(context.arena, &.{ tapes, tape_name });
@@ -178,8 +190,8 @@ fn check_coverage(context: *Context) !void {
     var replayed: [1]Branch = undefined;
     const same = parse_branches(replay, &replayed) == 1 and replayed[0].failing and
         std.mem.eql(u8, replayed[0].events_hash, branch.events_hash);
-    expect(context, same, "coverage: the solving branch {d} replays from its tape", .{
-        branch.index,
+    expect(context, same, "coverage ({s}): the solving branch {d} replays from its tape", .{
+        profile, branch.index,
     });
 }
 
