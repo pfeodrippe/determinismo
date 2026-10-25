@@ -90,6 +90,17 @@ determinismo explore ... --program zig-out/bin/bank-test --seed 7 --from-branch 
   --from-vtime-ms 1200 --branches 32
 ```
 
+Results as JSON lines (`--record results.jsonl`). An HTTP API keeps runs, results and tapes, and
+replays branches; an MCP server gives agents the same powers:
+
+```
+determinismo serve --listen 127.0.0.1:7878 --data ~/runs --kernel ... --initrd ... --cache ~/cache
+curl -X POST localhost:7878/runs -d '{"program":"zig-out/bin/bank-test","scenario":"bank","branches":40}'
+curl localhost:7878/runs/1                       # state, branches, properties
+curl -X POST localhost:7878/runs/1/replay -d '{"branch":3}'
+determinismo mcp --kernel ... --initrd ... --cache ~/cache   # tools: describe, explore, replay, fork
+```
+
 Multiverse debugging: stop a branch at a moment and run a command there (output streams back,
 and is identical every time):
 

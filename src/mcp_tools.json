@@ -1,0 +1,115 @@
+[
+  {
+    "name": "describe",
+    "description": "Show a test program's profiles (nodes, sources, faults) and scenarios (test commands).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string",
+          "description": "Path to the test program"
+        }
+      },
+      "required": [
+        "program"
+      ]
+    }
+  },
+  {
+    "name": "explore",
+    "description": "Explore a scenario: snapshot after setup, run many branches (each a different interleaving, faults and inputs), and report which properties failed and in which branches.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "branches": {
+          "type": "integer",
+          "description": "How many timelines (default 16)"
+        }
+      },
+      "required": [
+        "program"
+      ]
+    }
+  },
+  {
+    "name": "replay",
+    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "at_vtime_ms": {
+          "type": "integer"
+        },
+        "exec": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "program",
+        "branch"
+      ]
+    }
+  },
+  {
+    "name": "fork",
+    "description": "Replay a branch to a virtual time, snapshot it there, and explore new branches from that moment.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "from_branch": {
+          "type": "integer"
+        },
+        "from_vtime_ms": {
+          "type": "integer"
+        },
+        "branches": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "program",
+        "from_branch",
+        "from_vtime_ms"
+      ]
+    }
+  }
+]

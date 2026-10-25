@@ -15,10 +15,12 @@ const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
 const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
+const mcp = @import("mcp.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
     \\       determinismo serve   [--listen <address:port>] [--data <dir>] <machine options>
+    \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
@@ -91,6 +93,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
     var arguments = parse_arguments(arena, argv) catch {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
@@ -172,6 +175,21 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .data_directory = data,
         .machine = machine.items,
         .self = self_buffer[0..self_size],
+    });
+}
+
+/// `determinismo mcp <machine options>`: an MCP server on stdio (mcp.zig).
+fn command_mcp(init: std.process.Init, argv: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    const machine = try arena.alloc([]const u8, argv.len);
+    for (argv, machine) |argument, *target| target.* = argument;
+    var self_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const self_size = linux.readlink("/proc/self/exe", &self_buffer, self_buffer.len);
+    if (linux.errno(self_size) != .SUCCESS) return error.SelfPath;
+    try mcp.serve(arena, init.io, .{
+        .machine = machine,
+        .self = self_buffer[0..self_size],
+        .scratch_directory = "/tmp/determinismo-mcp",
     });
 }
 
@@ -858,4 +876,5 @@ test {
     _ = @import("virtio_block.zig");
     _ = @import("prepare.zig");
     _ = @import("serve.zig");
+    _ = @import("mcp.zig");
 }
