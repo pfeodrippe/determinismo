@@ -743,122 +743,190 @@ async function mapDraw() {
   }
   const rows = [];
   const place = (branch, parentRow) => {
-    const row = { branch, depth: parentRow == null ? 0 : 1, parentRow, parent: parentOf(branch) };
-    rows.push(row);
+    rows.push({ branch, parentRow, parent: parentOf(branch) });
     const at = rows.length - 1;
     for (const kid of (kids.get(branch.index) || []).sort((a, b) => a.index - b.index)) place(kid, at);
     for (const child of children.filter((c) => c.run.from_branch === branch.index)) {
       for (const sub of child.branches.slice().sort((a, b) => a.index - b.index)) {
-        rows.push({ branch: sub, depth: 1, child, parentRow: at });
+        rows.push({ branch: sub, child, parentRow: at });
       }
     }
   };
   for (const b of (kids.get("root") || []).sort((a, b) => a.index - b.index)) place(b, null);
-  const depthMax = Math.max(0, ...branches.map((b) => (b.path || []).length));
   const snapshotNs = run.snapshot ? run.snapshot.vtime_ns
     : Math.min(...failures.concat(faults).map((e) => e.vtime_ns), ...branches.map((b) => b.vtime_ns)) * 0.98;
   const rootNs = forkedHere ? info.from_vtime_ms * 1e6 : snapshotNs;
-  // A few much longer timelines would squash the rest: the scale ends past most of them, and
-  // the longer ones are cut at the edge (›), their end in their tooltip.
+  // A few much longer timelines would squash the rest: the scale ends past most of them (the
+  // longer ones are cut at the edge, ›); zooming and panning reach the rest.
   const ends = rows.map((r) => r.branch.vtime_ns).sort((a, b) => a - b);
   const longest = ends[ends.length - 1], typical = ends[Math.floor(0.95 * (ends.length - 1))];
   const endNs = longest - rootNs > 1.6 * (typical - rootNs) ? rootNs + 1.15 * (typical - rootNs) : longest;
-  const width = Math.max(720, body.clientWidth - 4);
-  const rowHeight = Math.max(3, Math.min(14, 760 / rows.length));
-  const top = 34, height = top + rows.length * rowHeight + 34;
-  const trunkStart = 16, snapshotX = 150, fan = Math.min(70, 8 + rows.length * 1.5);
-  const rootX = forkedHere ? snapshotX + 110 : snapshotX;
-  const x0 = rootX + fan, x1 = width - 46;
-  const x = (ns) => Math.min(x1, x0 + (x1 - x0) * (ns - rootNs) / Math.max(1, endNs - rootNs));
-  const cut = rows.map((row, i) => row.branch.vtime_ns > endNs
-    ? `<text x="${x1 + 1}" y="${y(i) + 3.5}" fill="#9a9eab" font-size="11">›</text>` : "").join("");
-  const y = (i) => top + i * rowHeight + rowHeight / 2;
-  const rootY = y((rows.length - 1) / 2);
   const rowOf = new Map(rows.filter((r) => !r.child).map((r) => [r.branch.index, rows.indexOf(r)]));
-  const pathText = (b) => (b.path || []).map((s) => `#${s.branch}@${(s.vtime_ns / 1e9).toFixed(2)}s`).concat(`#${b.index}`).join(" / ");
-  const color = (branch) => branch.failing.length ? "#f0506e" : "#3fbf7f";
-  const tip = (branch, run) => tipAttr(timelineTip(branch, run));
-  const stroke = Math.max(1, Math.min(1.6, rowHeight / 5));
-  const lines = rows.map((row, i) => {
-    const b = row.branch, yy = y(i);
-    if (!row.child && row.parentRow != null) {
-      // Left its parent's line at the moment it diverged: everything before is shared.
-      const fx = x(row.parent.vtime_ns), fy = y(row.parentRow);
-      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip(b)}>
-        <path d="M${fx},${fy} C${fx + 18},${fy} ${fx + 10},${yy} ${fx + 30},${yy} L${Math.max(fx + 30, x(b.vtime_ns))},${yy}"
-          fill="none" stroke="${color(b)}" stroke-opacity=".7" stroke-width="${stroke}"/>
-        <line x1="${fx}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${rowHeight}"/></g>`;
-    }
-    if (!row.child) {
-      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip(b)}>
-        <path d="M${rootX},${rootY} C${rootX + fan * 0.6},${rootY} ${rootX + fan * 0.4},${yy} ${x0},${yy} L${Math.max(x0, x(b.vtime_ns))},${yy}"
-          fill="none" stroke="${color(b)}" stroke-opacity=".6" stroke-width="${stroke}"/>
-        <line x1="${x0}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${rowHeight}"/></g>`;
-    }
-    const fx = x(row.child.run.from_vtime_ms * 1e6), fy = y(row.parentRow);
-    return `<g class="timeline" data-run="${row.child.id}" style="cursor:pointer" ${tip(b, row.child.id)}>
-      <path d="M${fx},${fy} C${fx + 24},${fy} ${fx + 16},${yy} ${fx + 40},${yy} L${Math.max(fx + 40, x(b.vtime_ns))},${yy}"
-        fill="none" stroke="#8f7cf7" stroke-opacity=".75" stroke-width="${stroke}"/></g>`;
-  }).join("");
+  const firstFailures = new Map();
+  for (const e of failures) if (!firstFailures.has(e.branch) || firstFailures.get(e.branch).vtime_ns > e.vtime_ns) firstFailures.set(e.branch, e);
   const points = new Map();
   for (const row of rows) if (!row.child && row.parentRow != null) {
     const key = `${row.parentRow}:${row.parent.vtime_ns}`;
-    if (!points.has(key)) points.set(key, { row: row.parentRow, vtime: row.parent.vtime_ns, count: 0, from: rows[row.parentRow].branch.index });
-    points.get(key).count += 1;
+    if (!points.has(key)) points.set(key, { row: row.parentRow, vtime: row.parent.vtime_ns, count: 0, from: rows[row.parentRow].branch.index, why: "" });
+    const point = points.get(key);
+    point.count += 1;
+    if (row.branch.why) point.why = row.branch.why;
   }
-  const whyAt = new Map();
-  for (const row of rows) if (!row.child && row.parentRow != null && row.branch.why) whyAt.set(`${row.parentRow}:${row.parent.vtime_ns}`, row.branch.why);
-  const branchPoints = [...points.entries()].map(([key, point]) => `<circle cx="${x(point.vtime)}" cy="${y(point.row)}" r="${Math.max(3, Math.min(5.5, rowHeight / 2))}"
-      fill="#15161a" stroke="#e6e7eb" stroke-width="1.5" ${tipAttr(branchPointTip(point, whyAt.get(key)))}></circle>`).join("");
-  const forkPoints = children.map((child) => {
-    const fx = x(child.run.from_vtime_ms * 1e6), fy = y(rowOf.get(child.run.from_branch) ?? 0);
-    const forkTip = `<div class="t-title"><span class="t-dot" style="background:var(--accent)"></span>Fork · run ${child.id}</div>
-      <div>${child.branches.length} timelines from #${child.run.from_branch} at ${child.run.from_vtime_ms} ms, explored as their own run.</div>
-      <div class="t-why"><b>Why here</b><br>Someone forked this moment (from the logs, the API or MCP).</div><div class="t-foot">Click to open the run</div>`;
-    return `<g class="fork" data-run="${child.id}" style="cursor:pointer" ${tipAttr(forkTip)}>
-      <circle cx="${fx}" cy="${fy}" r="5" fill="#8f7cf7"/>
-      <text x="${fx - 8}" y="${fy - 7}" fill="#8f7cf7" font-size="10.5" text-anchor="end">run ${child.id} · #${child.run.from_branch} at ${(child.run.from_vtime_ms / 1000).toFixed(2)}s</text></g>`;
-  }).join("");
-  const mark = (e, kind) => {
-    if (!rowOf.has(e.branch)) return "";
-    const xx = x(e.vtime_ns), yy = y(rowOf.get(e.branch)), size = Math.max(3, rowHeight * 0.75);
-    const html = kind === "fault" ? faultTip(e, decisionFor(e)) : failureTip(e);
-    return kind === "fault"
-      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(html)}></rect>`
-      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2, size / 2)}" fill="#f0506e" style="cursor:pointer" ${tipAttr(html)}></circle>`;
-  };
-  const firstFailures = new Map();
-  for (const e of failures) if (!firstFailures.has(e.branch) || firstFailures.get(e.branch).vtime_ns > e.vtime_ns) firstFailures.set(e.branch, e);
-  const labelEvery = Math.ceil(12 / rowHeight);
-  const labels = rows.map((row, i) => !row.child && i % labelEvery === 0
-    ? `<text x="${x1 + 10}" y="${y(i) + 3.5}" fill="#9a9eab" font-size="10" font-family="var(--mono)">#${row.branch.index}</text>` : "").join("");
-  const ticks = Array.from({ length: 6 }, (_, i) => rootNs + (endNs - rootNs) * i / 5).map((ns) =>
-    `<text x="${x(ns)}" y="${height - 8}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(ns / 1e9).toFixed(2)}s</text>`).join("");
-  const trunk = `<line x1="${trunkStart}" y1="${rootY}" x2="${snapshotX}" y2="${rootY}" stroke="#9a9eab" stroke-width="3"/>
-    <text x="${trunkStart}" y="${rootY - 9}" fill="#9a9eab" font-size="10.5">boot · 0s</text>
-    ${forkedHere ? `<line x1="${snapshotX}" y1="${rootY}" x2="${rootX}" y2="${rootY}" stroke="#8f7cf7" stroke-width="3"/>
-      <text x="${(snapshotX + rootX) / 2}" y="${rootY - 9}" fill="#8f7cf7" font-size="10.5" text-anchor="middle">#${info.from_branch}</text>
-      <circle cx="${rootX}" cy="${rootY}" r="6" fill="#8f7cf7"/>
-      <text x="${rootX}" y="${rootY + 22}" fill="#8f7cf7" font-size="11" text-anchor="middle">fork · ${(info.from_vtime_ms / 1000).toFixed(2)}s</text>` : ""}
-    <circle cx="${snapshotX}" cy="${rootY}" r="7" fill="#15161a" stroke="#e6e7eb" stroke-width="2.5" ${tipAttr(`<div class="t-title">The setup snapshot</div>The system booted and is ready (setup_complete) at ${(snapshotNs / 1e9).toFixed(3)}s. Every timeline starts here, or from a moment of one that did.`)}></circle>
-    <text x="${snapshotX}" y="${rootY + (forkedHere ? -14 : 24)}" fill="#e6e7eb" font-size="11" text-anchor="middle">setup snapshot</text>
-    ${forkedHere ? "" : `<text x="${snapshotX}" y="${rootY + 38}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(snapshotNs / 1e9).toFixed(2)}s</text>`}`;
-  body.innerHTML = `<div class="muted" style="margin-bottom:6px">${depthMax
-      ? `Branched up to ${depthMax} deep: ${rows.filter((r) => !r.child && r.parentRow != null).length} timelines continue another from a moment (◯), sharing everything before it.`
+  const model = { rows, rowOf, faults, firstFailures: [...firstFailures.values()], points: [...points.values()], children,
+    decisionFor, forkedHere, info, snapshotNs, rootNs, endNs, longest, depthMax: Math.max(0, ...branches.map((b) => (b.path || []).length)) };
+  const full = { t0: rootNs, t1: endNs, r0: 0, r1: rows.length };
+  const branched = rows.filter((r) => !r.child && r.parentRow != null).length;
+  body.innerHTML = `<div class="muted" style="margin-bottom:6px">${model.depthMax
+      ? `Branched up to ${model.depthMax} deep: ${branched} timelines continue another from a moment (◯), sharing everything before it.`
       : "Every timeline starts from the setup snapshot (flat branching)."}</div>
     <div class="legend"><span><i style="background:#9a9eab"></i>boot to snapshot</span>
       <span><i style="background:#3fbf7f"></i>passing timeline</span><span><i style="background:#f0506e"></i>failing timeline</span>
       <span><i style="background:#f0a650"></i>fault</span><span><i style="background:#f0506e;border-radius:50%"></i>failed assertion</span>
-      <span><i style="background:#8f7cf7"></i>fork (a subtree: another run)</span></div>
-    <div class="map tree"><svg width="${width}" height="${height}">${trunk}${lines}
-      ${faults.map((e) => mark(e, "fault")).join("")}${[...firstFailures.values()].map((e) => mark(e, "failure")).join("")}
-      ${branchPoints}${forkPoints}${cut}${labels}${ticks}</svg></div>
-    <div class="muted">Hover a timeline for its outcome; click it (or a mark) for its logs at that moment. Fork a timeline from the logs' moment tools to grow a subtree.</div>`;
-  body.querySelectorAll(".timeline, .mark, .fork").forEach((element) => element.addEventListener("click", (event) => {
-    event.stopPropagation();
-    if (element.dataset.run) { runOpen(Number(element.dataset.run)); return; }
-    logsOpen(Number(element.dataset.branch), Number(element.dataset.vtime));
-  }));
+      <span><i style="background:#e6e7eb;border-radius:50%"></i>branch point</span><span><i style="background:#8f7cf7"></i>fork (a subtree: another run)</span></div>
+    <div class="map tree" style="cursor:grab;touch-action:none"></div>
+    <div class="muted">Hover for details and why; click a timeline (or a mark) for its logs at that moment. Scroll to zoom (time and timelines), drag to pan, double-click to see it all.</div>`;
+  const container = body.querySelector(".tree");
+  let view = { ...full };
+  const draw = () => {
+    container.innerHTML = treeSvg(model, view, Math.max(720, body.clientWidth - 4));
+    container.querySelectorAll(".timeline, .mark, .fork").forEach((element) => element.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (element.dataset.run) { runOpen(Number(element.dataset.run)); return; }
+      logsOpen(Number(element.dataset.branch), Number(element.dataset.vtime));
+    }));
+  };
+  draw();
+  // Zoom and pan change the window of time and timelines shown; the tree is drawn again at
+  // its size (not magnified). A drag past a few pixels is not a click.
+  const layout = () => treeLayout(model, view, Math.max(720, body.clientWidth - 4));
+  let frame = null;
+  const redraw = () => { if (!frame) frame = requestAnimationFrame(() => { frame = null; draw(); }); };
+  container.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const { x0, x1, top, rowHeight } = layout();
+    const box = container.getBoundingClientRect();
+    const factor = Math.exp(event.deltaY * 0.0015);
+    const px = Math.min(1, Math.max(0, (event.clientX - box.left - x0) / (x1 - x0)));
+    const at = view.t0 + (view.t1 - view.t0) * px;
+    const span = Math.min(full.t1 - full.t0, Math.max(1e6, (view.t1 - view.t0) * factor));
+    view.t0 = Math.max(full.t0 - span * 0.05, at - span * px);
+    view.t1 = view.t0 + span;
+    const rowAt = view.r0 + (event.clientY - box.top - top) / rowHeight;
+    const rows = Math.min(full.r1, Math.max(6, (view.r1 - view.r0) * factor));
+    const py = Math.min(1, Math.max(0, (rowAt - view.r0) / (view.r1 - view.r0)));
+    view.r0 = Math.min(Math.max(0, rowAt - rows * py), full.r1 - rows);
+    view.r1 = view.r0 + rows;
+    redraw();
+  }, { passive: false });
+  let drag = null;
+  container.addEventListener("pointerdown", (event) => { drag = { x: event.clientX, y: event.clientY, view: { ...view }, moved: false }; });
+  container.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+    if (!drag.moved) { container.setPointerCapture(event.pointerId); container.style.cursor = "grabbing"; drag.moved = true; }
+    const { x0, x1, rowHeight } = layout();
+    const dt = -dx * (drag.view.t1 - drag.view.t0) / (x1 - x0);
+    const dr = Math.min(Math.max(-drag.view.r0, -dy / rowHeight), full.r1 - drag.view.r1);
+    view = { t0: drag.view.t0 + dt, t1: drag.view.t1 + dt, r0: drag.view.r0 + dr, r1: drag.view.r1 + dr };
+    redraw();
+  });
+  const release = () => { if (drag && drag.moved) container.dataset.dragged = "1"; drag = null; container.style.cursor = "grab"; };
+  container.addEventListener("pointerup", release);
+  container.addEventListener("pointercancel", release);
+  container.addEventListener("click", (event) => {
+    if (container.dataset.dragged) { delete container.dataset.dragged; event.stopPropagation(); event.preventDefault(); }
+  }, true);
+  container.addEventListener("dblclick", () => { view = { ...full }; redraw(); });
+}
+
+// Where things go for a window of the tree: time t0..t1 across, timelines r0..r1 down.
+function treeLayout(model, view, width) {
+  // The plot keeps the height it has with every timeline shown: zooming spreads fewer rows over it.
+  const visible = view.r1 - view.r0;
+  const plot = Math.max(3, Math.min(14, 760 / model.rows.length)) * model.rows.length;
+  const rowHeight = Math.max(plot, 160) / visible;
+  const top = 34, height = top + Math.max(plot, 160) + 34;
+  const snapshotX = 150, fan = Math.min(70, 8 + visible * 1.5);
+  const rootX = model.forkedHere ? snapshotX + 110 : snapshotX;
+  const x0 = rootX + fan, x1 = width - 46;
+  return { rowHeight, top, height, snapshotX, rootX, fan, x0, x1, width };
+}
+
+function treeSvg(model, view, width) {
+  const { rows, rowOf, info, forkedHere, snapshotNs, rootNs } = model;
+  const { rowHeight, top, height, snapshotX, rootX, fan, x0, x1 } = treeLayout(model, view, width);
+  const x = (ns) => x0 + (x1 - x0) * (ns - view.t0) / Math.max(1, view.t1 - view.t0);
+  const y = (i) => top + (i - view.r0) * rowHeight + rowHeight / 2;
+  const shown = (i) => i >= view.r0 - 1 && i <= view.r1;
+  const inTime = (ns) => ns >= view.t0 && ns <= view.t1;
+  const whole = view.r0 === 0 && view.r1 === rows.length && view.t0 <= rootNs;
+  // The snapshot (the fan's root): at its place in time, or at the left edge when out of view.
+  const rootPoint = { x: whole ? rootX : Math.max(x0 - fan, Math.min(x(rootNs), x1)), y: y((rows.length - 1) / 2) };
+  const color = (branch) => branch.failing.length ? "#f0506e" : "#3fbf7f";
+  const stroke = Math.max(1, Math.min(1.8, rowHeight / 5));
+  const lines = rows.map((row, i) => {
+    if (!shown(i) && !(row.parentRow != null && shown(row.parentRow))) return "";
+    const b = row.branch, yy = y(i), end = Math.min(x1, x(b.vtime_ns));
+    const tip = tipAttr(timelineTip(b, row.child && row.child.id));
+    const hit = `<line x1="${x0 - fan}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${Math.max(rowHeight, 4)}"/>`;
+    if (row.child) {
+      const fx = x(row.child.run.from_vtime_ms * 1e6), fy = y(row.parentRow);
+      return `<g class="timeline" data-run="${row.child.id}" style="cursor:pointer" ${tip}>
+        <path d="M${fx},${fy} C${fx + 24},${fy} ${fx + 16},${yy} ${fx + 40},${yy} L${Math.max(fx + 40, end)},${yy}" fill="none" stroke="#8f7cf7" stroke-opacity=".75" stroke-width="${stroke}"/>${hit}</g>`;
+    }
+    if (row.parentRow != null) {
+      // Left its parent's line at the moment it diverged: everything before is shared.
+      const fx = x(row.parent.vtime_ns), fy = y(row.parentRow);
+      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip}>
+        <path d="M${fx},${fy} C${fx + 18},${fy} ${fx + 10},${yy} ${fx + 30},${yy} L${Math.max(fx + 30, end)},${yy}" fill="none" stroke="${color(b)}" stroke-opacity=".75" stroke-width="${stroke}"/>${hit}</g>`;
+    }
+    const start = whole ? x0 : Math.max(x0, x(rootNs) + fan);
+    return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip}>
+      <path d="M${rootPoint.x},${rootPoint.y} C${rootPoint.x + fan * 0.6},${rootPoint.y} ${start - fan * 0.4},${yy} ${start},${yy} L${Math.max(start, end)},${yy}" fill="none" stroke="${color(b)}" stroke-opacity=".65" stroke-width="${stroke}"/>${hit}</g>`;
+  }).join("");
+  const size = Math.max(3, Math.min(10, rowHeight * 0.75));
+  const mark = (e, kind) => {
+    const row = rowOf.get(e.branch);
+    if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) return "";
+    const xx = x(e.vtime_ns), yy = y(row);
+    const html = kind === "fault" ? faultTip(e, model.decisionFor(e)) : failureTip(e);
+    return kind === "fault"
+      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(html)}></rect>`
+      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2.5, size / 2)}" fill="#f0506e" style="cursor:pointer" ${tipAttr(html)}></circle>`;
+  };
+  const branchPoints = model.points.filter((p) => shown(p.row) && inTime(p.vtime)).map((point) =>
+    `<circle cx="${x(point.vtime)}" cy="${y(point.row)}" r="${Math.max(3, Math.min(6, rowHeight / 2))}" fill="#15161a" stroke="#e6e7eb" stroke-width="1.5" ${tipAttr(branchPointTip(point, point.why))}></circle>`).join("");
+  const forkPoints = model.children.map((child) => {
+    const row = rowOf.get(child.run.from_branch) ?? 0, at = child.run.from_vtime_ms * 1e6;
+    if (!shown(row) || !inTime(at)) return "";
+    const fx = x(at), fy = y(row);
+    const forkTip = `<div class="t-title"><span class="t-dot" style="background:var(--accent)"></span>Fork · run ${child.id}</div>
+      <div>${child.branches.length} timelines from #${child.run.from_branch} at ${child.run.from_vtime_ms} ms, explored as their own run.</div>
+      <div class="t-why"><b>Why here</b><br>Someone forked this moment (from the logs, the API or MCP).</div><div class="t-foot">Click to open the run</div>`;
+    return `<g class="fork" data-run="${child.id}" style="cursor:pointer" ${tipAttr(forkTip)}><circle cx="${fx}" cy="${fy}" r="5" fill="#8f7cf7"/>
+      <text x="${fx - 8}" y="${fy - 7}" fill="#8f7cf7" font-size="10.5" text-anchor="end">run ${child.id} · #${child.run.from_branch} at ${(at / 1e9).toFixed(2)}s</text></g>`;
+  }).join("");
+  const cut = rows.map((row, i) => shown(i) && row.branch.vtime_ns > view.t1 && x(row.branch.vtime_ns) > x1
+    ? `<text x="${x1 + 1}" y="${y(i) + 3.5}" fill="#9a9eab" font-size="11">›</text>` : "").join("");
+  const labelEvery = Math.ceil(12 / rowHeight);
+  const labels = rows.map((row, i) => !row.child && shown(i) && i % labelEvery === 0
+    ? `<text x="${x1 + 10}" y="${y(i) + 3.5}" fill="#9a9eab" font-size="10" font-family="var(--mono)">#${row.branch.index}</text>` : "").join("");
+  const ticks = Array.from({ length: 6 }, (_, i) => view.t0 + (view.t1 - view.t0) * i / 5).map((ns) =>
+    `<text x="${x(ns)}" y="${height - 8}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(ns / 1e9).toFixed(view.t1 - view.t0 < 1e9 ? 3 : 2)}s</text>`).join("");
+  const trunk = !whole ? "" : `<line x1="16" y1="${rootPoint.y}" x2="${snapshotX}" y2="${rootPoint.y}" stroke="#9a9eab" stroke-width="3"/>
+    <text x="16" y="${rootPoint.y - 9}" fill="#9a9eab" font-size="10.5">boot · 0s</text>
+    ${forkedHere ? `<line x1="${snapshotX}" y1="${rootPoint.y}" x2="${rootX}" y2="${rootPoint.y}" stroke="#8f7cf7" stroke-width="3"/>
+      <text x="${(snapshotX + rootX) / 2}" y="${rootPoint.y - 9}" fill="#8f7cf7" font-size="10.5" text-anchor="middle">#${info.from_branch}</text>
+      <circle cx="${rootX}" cy="${rootPoint.y}" r="6" fill="#8f7cf7"/>
+      <text x="${rootX}" y="${rootPoint.y + 22}" fill="#8f7cf7" font-size="11" text-anchor="middle">fork · ${(info.from_vtime_ms / 1000).toFixed(2)}s</text>` : ""}
+    <circle cx="${snapshotX}" cy="${rootPoint.y}" r="7" fill="#15161a" stroke="#e6e7eb" stroke-width="2.5" ${tipAttr(`<div class="t-title">The setup snapshot</div>The system booted and is ready (setup_complete) at ${(snapshotNs / 1e9).toFixed(3)}s. Every timeline starts here, or from a moment of one that did.`)}></circle>
+    <text x="${snapshotX}" y="${rootPoint.y + (forkedHere ? -14 : 24)}" fill="#e6e7eb" font-size="11" text-anchor="middle">setup snapshot</text>
+    ${forkedHere ? "" : `<text x="${snapshotX}" y="${rootPoint.y + 38}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(snapshotNs / 1e9).toFixed(2)}s</text>`}`;
+  const zoomed = whole ? "" : `<text x="${x0 - fan}" y="16" fill="#9a9eab" font-size="10.5">zoomed: ${(view.t0 / 1e9).toFixed(3)}s to ${(view.t1 / 1e9).toFixed(3)}s · timelines ${Math.round(view.r0) + 1} to ${Math.round(view.r1)} of ${rows.length}</text>`;
+  return `<svg width="${width}" height="${height}"><defs><clipPath id="tree-clip"><rect x="${x0 - fan}" y="0" width="${x1 - x0 + fan + 2}" height="${height}"/></clipPath></defs>
+    ${trunk}${zoomed}<g clip-path="url(#tree-clip)">${lines}${model.faults.map((e) => mark(e, "fault")).join("")}
+    ${model.firstFailures.map((e) => mark(e, "failure")).join("")}${branchPoints}${forkPoints}</g>${cut}${labels}${ticks}</svg>`;
 }
 
 // Search: conditions and temporal conditions over every timeline (src/query.zig).

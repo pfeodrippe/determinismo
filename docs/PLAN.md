@@ -19,8 +19,12 @@ build e2e` tests it.
    - Behaviors from code coverage too (edges and lines, where the SDK instruments), and rarity
      weighting (Go-Explore's cell selection), and a budget split between depth and fresh starts
      learned from what found new behaviors.
-   - Strategies choose the moments to return to (`{"return": [moment, ...]}`), so mutate and
-     the LLM steer the tree, not only the decisions within a timeline.
+   - Strategies in the tree: today a node replays its parent with its seed alone, so a
+     strategy's overrides (in the parent's tape) would be lost and the tree refuses one. Replay
+     each ancestor with its tape's overrides (the tape directory becomes required), then let
+     strategies both decide within timelines and choose the moments to return to
+     (`{"method":"returns","candidates":[...]}` after each generation, answered with moments
+     and reasons), so mutate and the LLM steer the tree.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons

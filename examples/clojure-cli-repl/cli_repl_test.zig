@@ -69,6 +69,15 @@ fn edit(context: *System.Context) !void {
     terminal.open(nodes.cli.address, port) catch |err| return unavailable(err);
     defer terminal.close();
     _ = terminal.send(&.{.{ "op", "watch" }}) catch |err| return unavailable(err);
+    // `watch` never answers: the terminal knows it is watching once it sees an evaluation
+    // through. Until then one may reach it in part (its end without its code), so that first
+    // one is not judged.
+    const warm_up = [_][2][]const u8{
+        .{ "op", "eval" }, .{ "code", ":watching" }, .{ "file", editor_file },
+    };
+    const warm_up_id = editor.send(&warm_up) catch |err| return unavailable(err);
+    _ = editor.collect(warm_up_id) catch |err| return unavailable(err);
+    terminal_sees_end(&terminal, warm_up_id) catch |err| return unavailable(err);
     var reference = Client.init();
     reference.open(nodes.plain.address, port) catch |err| return unavailable(err);
     defer reference.close();
@@ -86,6 +95,15 @@ fn edit(context: *System.Context) !void {
         compare(code, answer, expected);
         seen_by_terminal(&terminal, id, answer) catch |err| return unavailable(err);
     }
+}
+
+fn terminal_sees_end(terminal: *Client, id: []const u8) !void {
+    for (0..4096) |_| {
+        const message = try terminal.read();
+        const for_eval = message.string("eval-id") orelse continue;
+        if (std.mem.eql(u8, for_eval, id) and message.status_has("eval-done")) return;
+    }
+    return error.NoDone;
 }
 
 /// The terminal's stream for this evaluation: its code echoed, its output, then its end.
