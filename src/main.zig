@@ -20,7 +20,8 @@ const merge = @import("merge.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
-    \\       determinismo serve   [--listen <address:port>] [--data <dir>] <machine options>
+    \\       determinismo serve   [--listen <address:port>] [--data <dir>] [--archive "<cmd>"]
+    \\                            <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
@@ -211,6 +212,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var listen: []const u8 = "127.0.0.1:7878";
     var data: []const u8 = ".determinismo-data";
     var explorer: ?[]const u8 = null;
+    var archive: ?[]const u8 = null;
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
@@ -221,6 +223,9 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             index += 1;
         } else if (std.mem.eql(u8, flag, "--data")) {
             data = value;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--archive")) {
+            archive = value;
             index += 1;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
@@ -237,6 +242,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .data_directory = data,
         .machine = machine.items,
         .self = explorer orelse self_buffer[0..self_size],
+        .archive = archive,
     });
 }
 
@@ -373,7 +379,9 @@ fn command_explore(
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
     }
     exploration.inputs = inputs_hash(options, arguments);
-    std.debug.print("[determinismo] inputs {x:0>16}\n", .{exploration.inputs});
+    const signature = host_cpu_signature()[3];
+    std.debug.print("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature " ++
+        "{x:0>8})\n", .{ exploration.inputs, VM.determinism_abi, signature });
     if (arguments.record_path) |path| {
         if (report.record_fd == null) {
             report.record_fd = try open_for_appending(context.arena, path);
@@ -775,7 +783,34 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     for (arguments.disk_paths[0..arguments.disk_count]) |path| {
         hasher.update(std.fs.path.basename(path));
     }
+    // Replays are guaranteed on the same CPU model and determinism ABI only (ARCHITECTURE.md §12).
+    hasher.update(std.mem.asBytes(&VM.determinism_abi));
+    hasher.update(std.mem.asBytes(&host_cpu_signature()));
     return hasher.final();
+}
+
+/// The host CPU's vendor and family/model/stepping (CPUID leaves 0 and 1): retired-branch
+/// counts are only known to agree on the same model.
+fn host_cpu_signature() [4]u32 {
+    const vendor = cpuid_raw(0);
+    const signature = cpuid_raw(1);
+    return .{ vendor[1], vendor[3], vendor[2], signature[0] };
+}
+
+fn cpuid_raw(leaf: u32) [4]u32 {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ eax, ebx, ecx, edx };
 }
 
 /// The seed branches derive theirs from: the exploration's, or for branches from a fork point,

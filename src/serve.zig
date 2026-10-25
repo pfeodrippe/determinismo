@@ -28,6 +28,9 @@ pub const Options = struct {
     machine: []const []const u8,
     /// This executable, to start runs with.
     self: []const u8,
+    /// Run when a run finishes, through /bin/sh with {dir} and {id} replaced: long-term
+    /// storage (e.g. `rclone copy {dir} s3:bucket/runs/{id}`). Null keeps runs local only.
+    archive: ?[]const u8 = null,
 };
 
 const runs_max = 4096;
@@ -314,7 +317,23 @@ fn runs_reap(server: *Server) void {
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         const bits: u32 = @bitCast(status);
         run.status = if (bits & 0x7f == 0) (bits >> 8) & 0xff else 128 + (bits & 0x7f);
+        archive(server, run) catch |err| {
+            std.debug.print("[determinismo] archiving run {d} failed: {s}\n", .{
+                run.id, @errorName(err),
+            });
+        };
     }
+}
+
+/// Hands a finished run's directory to the archive command (in the background).
+fn archive(server: *Server, run: *const Run) !void {
+    const template = server.options.archive orelse return;
+    const directory = try run_directory(server, run.id);
+    const id = try print(server, "{d}", .{run.id});
+    const with_dir = try std.mem.replaceOwned(u8, server.arena, template, "{dir}", directory);
+    const command = try std.mem.replaceOwned(u8, server.arena, with_dir, "{id}", id);
+    const log = try std.fs.path.join(server.arena, &.{ directory, "archive.log" });
+    _ = try spawn(server.arena, &.{ "/bin/sh", "-c", command }, log);
 }
 
 fn state(run: *const Run) []const u8 {

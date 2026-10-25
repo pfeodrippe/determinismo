@@ -140,6 +140,10 @@ pub const Stats = struct {
 
 const VM = @This();
 
+/// The determinism ABI: bumped whenever the virtual-time function or the semantics of exits
+/// and stops change, so that timelines recorded under one are never replayed under another.
+pub const determinism_abi: u32 = 1;
+
 /// Kernel parameters the deterministic machine needs: the PIT is the only clock-event device, the
 /// TSC (virtualized by KVM) the only clocksource, and the boot seed the RNG's only entropy.
 pub const cmdline_deterministic = "nolapic_timer hpet=disable clocksource=tsc tsc=reliable " ++
