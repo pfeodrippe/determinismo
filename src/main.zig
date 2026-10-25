@@ -22,6 +22,7 @@ const usage =
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
     \\                            [--from-branch <index> --from-vtime-ms <ms>]
+    \\                            [--record <results.jsonl>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  --program <test program> [--profile <name>] [--scenario <name>|all] [--cache <dir>]
@@ -67,6 +68,8 @@ const Arguments = struct {
     /// snapshot there, and branch from that snapshot.
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
+    /// Write results as JSON lines here (see report.record).
+    record_path: ?[]const u8 = null,
     /// Parallel workers for branches (default: one per available CPU).
     jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
@@ -254,6 +257,21 @@ fn command_explore(
     }
     exploration.inputs = inputs_hash(options, arguments);
     std.debug.print("[determinismo] inputs {x:0>16}\n", .{exploration.inputs});
+    if (arguments.record_path) |path| {
+        if (report.record_fd == null) {
+            report.record_fd = try open_for_appending(context.arena, path);
+        }
+        report.record(.{ .run = .{
+            .scenario = scenario_of(options.cmdline),
+            .profile = arguments.profile,
+            .program = arguments.program_path,
+            .inputs = &hex16(exploration.inputs),
+            .seed = &hex16(arguments.seed),
+            .branches = arguments.branches,
+            .from_branch = arguments.from_branch,
+            .from_vtime_ms = arguments.from_vtime_ms,
+        } });
+    }
     if (arguments.tape_path) |path| {
         const overrides = try context.arena.create(tape.Overrides);
         const cwd = std.Io.Dir.cwd();
@@ -701,6 +719,8 @@ fn parse_option(
         arguments.from_branch = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-vtime-ms")) {
         arguments.from_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--record")) {
+        arguments.record_path = value;
     } else if (eql(u8, flag, "--jobs")) {
         arguments.jobs = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--strategy")) {
@@ -735,6 +755,37 @@ fn open_disks(arena: std.mem.Allocator, paths: []const []const u8) ![]const VM.D
         disk.* = .{ .fd = fd, .size = size };
     }
     return disks;
+}
+
+/// A new results file (truncated once per process; scenarios of one run append to it).
+fn open_for_appending(arena: std.mem.Allocator, path: []const u8) !linux.fd_t {
+    assert(path.len > 0);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
+    const flags: linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    };
+    const result = linux.open(path_z, flags, 0o644);
+    if (linux.errno(result) != .SUCCESS) return error.OpenFailed;
+    return @intCast(result);
+}
+
+fn hex16(value: u64) [16]u8 {
+    var text: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&text, "{x:0>16}", .{value}) catch unreachable;
+    return text;
+}
+
+/// The scenario a command line runs (`det.scenario=`), if any.
+fn scenario_of(cmdline: []const u8) ?[]const u8 {
+    var words = std.mem.tokenizeScalar(u8, cmdline, ' ');
+    while (words.next()) |word| {
+        if (std.mem.startsWith(u8, word, "det.scenario=")) return word["det.scenario=".len..];
+    }
+    return null;
 }
 
 fn open_for_writing(arena: std.mem.Allocator, path: []const u8) !linux.fd_t {

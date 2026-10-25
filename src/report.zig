@@ -8,6 +8,27 @@ const Events = @import("events.zig");
 const cpuid = @import("cpuid.zig");
 
 const print = std.debug.print;
+
+/// Where `explore --record` writes results as JSON lines: a `run` line, one `branch` line per
+/// branch as it ends, and a `summary` line. Opened with O_APPEND before workers fork, so each
+/// line (one write) stays whole.
+pub var record_fd: ?std.os.linux.fd_t = null;
+const record_line_size_max = 64 * 1024;
+
+pub fn record(value: anytype) void {
+    const fd = record_fd orelse return;
+    var buffer: [record_line_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    std.json.Stringify.value(value, .{}, &writer) catch return; // Too large: dropped.
+    writer.writeAll("\n") catch return;
+    _ = std.os.linux.write(fd, writer.buffered().ptr, writer.buffered().len);
+}
+
+fn hex(value: u64) [16]u8 {
+    var text: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&text, "{x:0>16}", .{value}) catch unreachable;
+    return text;
+}
 const tsc_per_ns = cpuid.tsc_hz / std.time.ns_per_s;
 
 pub fn run(vm: *VM, result: struct { outcome: VM.Outcome, wall_ns: u64 }) !void {
@@ -113,10 +134,27 @@ pub const Multiverse = struct {
             seconds(state.tsc / tsc_per_ns), seconds(branch.wall_ns), vm.events.count,
             vm.events.hash.final(),          failing,
         }) catch {};
+        var failing_names: [64][]const u8 = undefined;
+        var failing_count: u32 = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
             try multiverse.merge(property, branch.index);
-            if (!property.passing()) line.print("  FAIL \"{s}\"", .{property.name()}) catch {};
+            if (property.passing()) continue;
+            line.print("  FAIL \"{s}\"", .{property.name()}) catch {};
+            if (failing_count < failing_names.len) {
+                failing_names[failing_count] = property.name();
+                failing_count += 1;
+            }
         }
+        record(.{ .branch = .{
+            .index = branch.index,
+            .seed = &hex(branch.seed),
+            .outcome = @tagName(branch.outcome),
+            .vtime_ns = state.tsc / tsc_per_ns,
+            .wall_ns = branch.wall_ns,
+            .events = vm.events.count,
+            .events_hash = &hex(vm.events.hash.final()),
+            .failing = failing_names[0..failing_count],
+        } });
         line.writeAll("\n") catch {
             line.end = line_buffer.len - 1;
             line_buffer[line.end] = '\n';
@@ -192,6 +230,36 @@ pub const Multiverse = struct {
             multiverse.skid_max, multiverse.overshoots,
         });
         overshoot_warn(multiverse.overshoots);
+        multiverse.record_summary(wall_ns);
+    }
+
+    fn record_summary(multiverse: *const Multiverse, wall_ns: u64) void {
+        if (record_fd == null) return;
+        const Line = struct {
+            kind: []const u8,
+            message: []const u8,
+            branches_hit: u32,
+            branches_failing: u32,
+            example_branch: ?u32,
+        };
+        var lines: [Events.property_count_max]Line = undefined;
+        for (multiverse.aggregates[0..multiverse.aggregate_count], 0..) |*aggregate, index| {
+            lines[index] = .{
+                .kind = @tagName(aggregate.property.kind),
+                .message = aggregate.property.name(),
+                .branches_hit = aggregate.branches_hit,
+                .branches_failing = aggregate.branches_failing,
+                .example_branch = aggregate.first_failing_branch,
+            };
+        }
+        record(.{ .summary = .{
+            .branches = multiverse.branches,
+            .failing_branches = multiverse.failing_branches,
+            .wall_ns = wall_ns,
+            .skid_max = multiverse.skid_max,
+            .overshoots = multiverse.overshoots,
+            .properties = lines[0..multiverse.aggregate_count],
+        } });
     }
 };
 
