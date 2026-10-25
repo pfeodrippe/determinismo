@@ -33,7 +33,8 @@ const usage =
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
-    \\                            [--at-vtime-ms <ms> | --until '<condition>' [--rewind-ms <ms>]]
+    \\                            [--at-vtime-ms <ms>] [--until '<condition>' [--rewind-ms <ms>]]
+    \\                            (both: the condition, or that time at the latest)
     \\                            [--exec "<cmd>" | --exec-script <file>]
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
@@ -883,8 +884,8 @@ fn rewind(
     defer vm.deinit();
     if (exploration.replay) |replay| vm.overrides = replay.overrides;
     const outcome = try vm.run_until_exit();
-    if (outcome != .moment_reached) {
-        std.debug.print("[determinismo] rewind: the condition never holds in this branch\n", .{});
+    if (outcome != .moment_reached or !vm.until_hit) {
+        std.debug.print("[determinismo] rewind: the condition does not hold in time\n", .{});
         return;
     }
     const at = (try vm.moment()).vtime_ns;
@@ -1032,7 +1033,6 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.moment_command != null and arguments.moment_script_path != null) {
         return error.Usage;
     }
-    if (arguments.moment_vtime_ms != null and arguments.until != null) return error.Usage;
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
     if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;

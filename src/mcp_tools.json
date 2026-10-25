@@ -90,7 +90,7 @@
         },
         "until": {
           "type": "string",
-          "description": "A condition: the moment is the first event matching it"
+          "description": "A condition: the moment is the first event matching it (with at_vtime_ms too, that time at the latest: a timeout)"
         },
         "rewind_ms": {
           "type": "integer",

@@ -75,7 +75,7 @@ change that moves it.
 | Moment (timeline + vtime), `branch()` | `--from-branch N --from-vtime-ms T` | ✅ |
 | `rewind`, `rewind_to` | moments by vtime; `--until <condition> --rewind-ms <ms>` (MCP/HTTP `rewind_ms`, the UI's rewind field) | ✅ |
 | `wait(duration)` | `--at-vtime-ms` | ✅ |
-| `wait_until(event set, timeout)` | `--until '<condition>'` (CLI, HTTP replay, MCP replay): the moment is the first matching event; with `--exec`, a command runs there | ✅ (no timeout yet) |
+| `wait_until(event set, timeout)` | `--until '<condition>'` (CLI, HTTP replay, MCP replay): the moment is the first matching event, with `--at-vtime-ms` as its timeout ("until: timed out"); with `--exec`, a command runs there | ✅ |
 | bash on a branch (`run`, `run_in_background`), process output | `--exec` at a moment (in a node with `det-nodes exec`), `--continue` | ✅ |
 | Counterfactuals (change something, see if the bug recurs) | `--from-exec` explores futures of a changed system | ✅ |
 | `extract_file` | `determinismo extract` (and HTTP, the UI's "Extract the file" at any moment): a node's file at a moment, exact bytes | ✅ |

@@ -583,6 +583,9 @@ fn moment_arrive(vm: *VM) !?Outcome {
     vm.moment_reached = true;
     vm.target_is_moment = false;
     const moment_now = try vm.moment();
+    if (vm.until != null and !vm.until_hit) {
+        std.debug.print("[determinismo] until: timed out, the condition did not hold\n", .{});
+    }
     std.debug.print("[determinismo] at moment vtime={d}ns branches={d}\n", .{
         moment_now.vtime_ns, moment_now.branches,
     });

@@ -362,7 +362,8 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     try argv.appendSlice(server.arena, &.{ "--tape", tape });
     if (asked.at_vtime_ms) |ms| {
         try argv.appendSlice(server.arena, &.{ "--at-vtime-ms", try print(server, "{d}", .{ms}) });
-    } else if (asked.until) |condition| {
+    }
+    if (asked.until) |condition| {
         try argv.appendSlice(server.arena, &.{ "--until", condition });
         if (asked.rewind_ms) |ms| {
             const text = try print(server, "{d}", .{ms});

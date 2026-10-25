@@ -524,6 +524,17 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     const before = std.mem.indexOf(u8, report, "failing=0") != null;
     expect(context, exact and ran and before, "rewind: 5 ms before the violation " ++
         "({d}ns, then {d}ns), not failing yet", .{ holds, reached });
+    // wait_until's timeout: the condition, or this time at the latest (here, before it holds).
+    var timeout: std.ArrayList([]const u8) = .empty;
+    try timeout.appendSlice(context.arena, system);
+    try timeout.appendSlice(context.arena, &.{
+        "--branch", "4", "--until", violation, "--at-vtime-ms", "1020", "--exec", "echo late",
+    });
+    const timed = try explore(context, timeout.items);
+    const late = std.mem.indexOf(u8, timed, "until: timed out") != null and
+        std.mem.indexOf(u8, timed, "at moment vtime=1020") != null;
+    expect(context, late, "until: with a timeout, the moment is the timeout when the " ++
+        "condition has not held", .{});
 }
 
 /// extract_file and inject_file at the first violation of branch 4.

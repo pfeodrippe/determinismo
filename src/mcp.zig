@@ -142,7 +142,8 @@ fn tool_call(
         try argv.appendSlice(arena, &.{ "--branch", try number(arena, branch) });
         if (arguments.at_vtime_ms) |ms| {
             try argv.appendSlice(arena, &.{ "--at-vtime-ms", try number(arena, ms) });
-        } else if (arguments.until) |condition| {
+        }
+        if (arguments.until) |condition| {
             try argv.appendSlice(arena, &.{ "--until", condition });
             if (arguments.rewind_ms) |ms| {
                 try argv.appendSlice(arena, &.{ "--rewind-ms", try number(arena, ms) });
