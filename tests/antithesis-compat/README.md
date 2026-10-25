@@ -47,9 +47,29 @@ stopping it at 60 s and sending SIGQUIT to that leader dumped its goroutines, wh
 Fixes: select on `stopCh` around that send (or drain the buffer on step-down), and reset the
 flag in `setupLeaderState`.
 
+**Two different entries at the same index and term: logs diverge** (Antithesis's
+hashicorp/raft#695, its first mechanism). With three-minute timelines (`--timeline 3m`, the
+project's configuration being written for long ones), timeline 93 of an exploration's first 110
+fails the monitor's `[log-matching] entries agreeing on (index, term) agree on content`: at
+index 1866, term 400, node-1's entry and node-2's differ. Its log shows how:
+
+1. node-1 wins the election for term 399, and in that instant a pause fault freezes it for
+   389 ms, before it entered leader state.
+2. Meanwhile node-2 wins term 400 and sends node-1 heartbeats, which queue up.
+3. node-1 thaws. Its main thread goes on into leader state for term 399 (`runLeader`), and
+   dispatches the no-op entry a new leader writes (raft.go:624), stamped with
+   `r.getCurrentTerm()` (raft.go:1310). Meanwhile its transport goroutine handles the queued
+   heartbeats (`processHeartbeat` runs `appendEntries` off the main loop), which raised the
+   current term to 400 first: node-1 writes its own entry with term 400, a term it never led.
+4. node-2's entry at that index also has term 400: two different entries agree on (index,
+   term). node-1 truncates its suffix a few milliseconds later, but nothing prevented it from
+   replicating it in between.
+
+Fix: the leader must stamp entries with the term it was elected in (kept in its leader state),
+and heartbeats that change the term must go through the main loop.
+
 ### Not found yet
 
-Antithesis's post reports two more: log divergence and double votes from heartbeats handled
-off the main loop (safety; the monitor's log-matching and election-safety assertions would
-fail), and a snapshot installation livelock (convergence; it needs snapshots and a follower
-far behind).
+Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
+safety), and a snapshot installation livelock (convergence; it needs snapshots and a follower
+far behind, which long timelines now give).
