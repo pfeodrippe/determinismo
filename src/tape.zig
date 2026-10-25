@@ -20,7 +20,12 @@ pub const Header = struct {
 };
 
 /// A moment of a branch of the setup snapshot, where a nested snapshot is taken.
-pub const Fork = struct { branch: u32, vtime_ns: u64 };
+pub const Fork = struct {
+    branch: u32,
+    vtime_ns: u64,
+    /// A command run at the fork point before the snapshot: the branches explore its effects.
+    exec: ?[]const u8 = null,
+};
 
 pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
 
@@ -76,6 +81,10 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
         writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
             fork.branch, fork.vtime_ns,
         }) catch unreachable;
+        if (fork.exec) |command| {
+            writer.writeAll(",\"from_exec\":") catch unreachable;
+            std.json.Stringify.value(command, .{}, &writer) catch unreachable;
+        }
     }
     writer.writeAll("}\n") catch unreachable;
     write_all(fd, writer.buffered());
@@ -115,6 +124,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
             .branch = @intCast(from_branch.integer),
             .vtime_ns = @intCast((header.object.get("from_vtime_ns") orelse
                 return error.BadTape).integer),
+            .exec = if (header.object.get("from_exec")) |command| command.string else null,
         } else null,
     };
     overrides.checkpoint_count = 0;

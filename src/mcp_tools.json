@@ -45,7 +45,7 @@
   },
   {
     "name": "replay",
-    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>).",
+    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -69,6 +69,10 @@
         },
         "exec": {
           "type": "string"
+        },
+        "continue": {
+          "type": "boolean",
+          "description": "After exec, let the branch run to its end (see the effects of the change)"
         }
       },
       "required": [
@@ -103,6 +107,10 @@
         },
         "branches": {
           "type": "integer"
+        },
+        "exec": {
+          "type": "string",
+          "description": "A command to run at the fork point first: the branches explore the changed system"
         }
       },
       "required": [

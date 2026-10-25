@@ -41,6 +41,10 @@ stop_at_setup_complete: bool,
 moment_tsc: ?u64,
 moment_command: ?[]const u8,
 moment_reached: bool,
+/// Keep running after the command at the moment finished (instead of ending the run there).
+moment_continue: bool,
+/// Whether guest events are printed: from the moment until its command finishes.
+moment_printing: bool,
 /// What the guest agent receives on its next action request.
 action_pending: ?[]const u8,
 /// Whether the armed branch-count target is the moment (true) or the PIT deadline (false).
@@ -101,6 +105,8 @@ pub const Options = struct {
     /// Stop at this virtual time, and optionally run a command in the guest there.
     moment_vtime_ns: ?u64 = null,
     moment_command: ?[]const u8 = null,
+    /// After the command at the moment, run on to the end of the timeline.
+    moment_continue: bool = false,
     disks: []const Disk = &.{},
     /// The guest runs determinismo's runtime: check the built-in properties when a timeline ends.
     builtin_properties: bool = false,
@@ -206,6 +212,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .moment_tsc = if (options.moment_vtime_ns) |ns| ns * tsc_per_ns else null,
         .moment_command = options.moment_command,
         .moment_reached = false,
+        .moment_continue = options.moment_continue,
+        .moment_printing = false,
         .action_pending = null,
         .target_is_moment = false,
         .deterministic = options.deterministic,
@@ -478,6 +486,7 @@ fn moment_arrive(vm: *VM) !?Outcome {
         moment_now.vtime_ns, moment_now.branches,
     });
     const command = vm.moment_command orelse return .moment_reached;
+    vm.moment_printing = true;
     vm.action_pending = command;
     try vm.irq_pulse(irq_action);
     return null;
@@ -620,7 +629,10 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
             const setup_was_complete = vm.events.setup_complete != null;
             try vm.handle_request(std.mem.readInt(u32, bytes[0..4], .little));
             if (vm.events.last_event_is("exec_done")) {
-                if (vm.moment_reached and vm.moment_command != null) return .command_done;
+                if (vm.moment_reached and vm.moment_command != null) {
+                    vm.moment_printing = false;
+                    if (!vm.moment_continue) return .command_done;
+                }
             }
             if (vm.stop_at_setup_complete) {
                 const setup_is_complete = vm.events.setup_complete != null;
@@ -677,7 +689,7 @@ fn handle_request(vm: *VM, address: u32) !void {
                 try vm.events.emit(moment_now, line);
                 try vm.checkpoint(moment_now);
                 if (vm.strategy) |strategy| try strategy.event(moment_now, line);
-                if (vm.moment_reached) {
+                if (vm.moment_printing) {
                     std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });
                 }
             }

@@ -24,6 +24,9 @@ Tools: `describe`, `explore`, `replay`, `fork` (schemas in `src/mcp_tools.json`)
    `det-nodes exec redis redis-cli get key`. The output is identical on every replay.
 5. **Narrow down**: `fork` from a moment of the failing branch and explore its futures. If all
    futures fail, the bug happened before that moment; if none do, it is still ahead.
+   **Try a change**: `replay` with `exec` and `continue` makes a change at a moment (data, a
+   setting, a function redefined through a REPL) and lets the branch play out; `fork` with
+   `exec` explores many futures of the changed system.
 6. **Fix and verify**: change the code, explore again with the same seed and more branches; the
    property should pass in all of them. A replay of an old failing branch is not proof (the
    inputs changed, so it is a different timeline); exploration is.

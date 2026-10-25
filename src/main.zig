@@ -26,7 +26,8 @@ const usage =
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
-    \\                            [--from-branch <index> --from-vtime-ms <ms>]
+    \\                            [--continue]   (after --exec, run on to the end)
+    \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\
@@ -77,6 +78,10 @@ const Arguments = struct {
     /// snapshot there, and branch from that snapshot.
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
+    /// A command to run at the fork point before exploring its futures.
+    from_exec: ?[]const u8 = null,
+    /// After --exec at the moment, run on to the end of the timeline.
+    moment_continue: bool = false,
     /// This host runs the branches whose index modulo `shard_count` is `shard_index`
     /// (`--shard k/n`); `determinismo merge` combines the shards' records.
     shard_index: u32 = 0,
@@ -360,7 +365,11 @@ fn command_explore(
     }
     if (arguments.from_branch) |branch| {
         if (exploration.replay != null) return error.Usage; // The tape says where it forked.
-        exploration.fork = .{ .branch = branch, .vtime_ns = arguments.from_vtime_ms.? * 1_000_000 };
+        exploration.fork = .{
+            .branch = branch,
+            .vtime_ns = arguments.from_vtime_ms.? * 1_000_000,
+            .exec = arguments.from_exec,
+        };
     }
     if (arguments.strategy_command != null and exploration.replay != null) {
         return error.ReplayWithStrategy; // Tapes replace plugins.
@@ -405,11 +414,14 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     const time_start_ns = monotonic_ns();
     options.seed = branch_seed(fork.exploration.exploration_seed, fork.fork.branch);
     options.moment_vtime_ns = fork.fork.vtime_ns;
-    options.moment_command = null;
+    options.moment_command = fork.fork.exec;
+    options.moment_continue = false;
     defer options.moment_vtime_ns = null;
+    defer options.moment_command = null;
     try vm.init_from_snapshot(options, fork.from);
     const outcome = try vm.run_until_exit();
-    if (outcome != .moment_reached) {
+    const expected: VM.Outcome = if (fork.fork.exec != null) .command_done else .moment_reached;
+    if (std.meta.activeTag(outcome) != std.meta.activeTag(expected)) {
         std.debug.print("[determinismo] branch {d} ended ({s}) before {d}ns\n", .{
             fork.fork.branch, @tagName(outcome), fork.fork.vtime_ns,
         });
@@ -621,6 +633,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         const moment_ms = branches.arguments.moment_vtime_ms;
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
         options.moment_command = branches.arguments.moment_command;
+        options.moment_continue = branches.arguments.moment_continue;
         try vm.init_from_snapshot(options, branches.snapshot);
         defer vm.deinit();
         vm.strategy = exploration.strategy;
@@ -704,7 +717,10 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
 fn seed_base(exploration: *const Exploration) u64 {
     const fork = exploration.fork orelse return exploration.exploration_seed;
     const key = [3]u64{ exploration.exploration_seed, fork.branch, fork.vtime_ns };
-    return std.hash.Wyhash.hash(0x666f726b, std.mem.asBytes(&key));
+    var hasher = std.hash.Wyhash.init(0x666f726b);
+    hasher.update(std.mem.asBytes(&key));
+    if (fork.exec) |command| hasher.update(command); // A changed system: other branches.
+    return hasher.final();
 }
 
 /// Each branch's decisions derive from the exploration seed and the branch index only, so any
@@ -724,6 +740,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     while (index < argv.len) : (index += 1) {
         if (std.mem.eql(u8, argv[index], "--deterministic")) {
             arguments.deterministic = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--continue")) {
+            arguments.moment_continue = true;
             continue;
         }
         if (index + 1 == argv.len) return error.Usage;
@@ -796,6 +816,8 @@ fn parse_option(
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-branch")) {
         arguments.from_branch = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--from-exec")) {
+        arguments.from_exec = value;
     } else if (eql(u8, flag, "--from-vtime-ms")) {
         arguments.from_vtime_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--shard")) {

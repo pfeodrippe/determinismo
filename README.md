@@ -123,6 +123,9 @@ determinismo explore ... --program zig-out/bin/shop-test --seed 3 --branch 37 --
   --exec "det-nodes exec postgres psql -U postgres -c 'select * from price'"
 ```
 
+"What if": `--exec "<cmd>" --continue` makes a change at a moment and lets the branch run on;
+`--from-branch B --from-vtime-ms T --from-exec "<cmd>"` explores many futures of the changed system.
+
 `zig build test` runs the unit tests (on Linux); `zig build tidy` checks style; `zig build e2e`
 boots the examples and checks exploration, exact replays from fresh boots, and tapes (on the host,
 about 40 s).

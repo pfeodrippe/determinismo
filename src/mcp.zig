@@ -29,6 +29,7 @@ const Arguments = struct {
     branch: ?u32 = null,
     at_vtime_ms: ?u64 = null,
     exec: ?[]const u8 = null,
+    @"continue": bool = false,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
 };
@@ -111,6 +112,7 @@ fn tool_call(
         if (arguments.at_vtime_ms) |ms| {
             try argv.appendSlice(arena, &.{ "--at-vtime-ms", try number(arena, ms) });
             if (arguments.exec) |command| try argv.appendSlice(arena, &.{ "--exec", command });
+            if (arguments.@"continue") try argv.append(arena, "--continue");
         }
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return guest_lines(arena, result.stderr);
@@ -124,6 +126,7 @@ fn tool_call(
             "--from-branch",   try number(arena, branch),
             "--from-vtime-ms", try number(arena, vtime_ms),
         });
+        if (arguments.exec) |command| try argv.appendSlice(arena, &.{ "--from-exec", command });
     }
     const record = try std.fmt.allocPrint(arena, "{s}/record-{d}.jsonl", .{
         options.scratch_directory, linux.getpid(),
