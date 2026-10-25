@@ -284,6 +284,8 @@ const RunRequest = struct {
     /// --no-faults).
     faults: ?[]const u8 = null,
     no_faults: ?[]const u8 = null,
+    /// How long each timeline's drivers run, in virtual time (explore's --timeline).
+    timeline: ?[]const u8 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
     from_branch: ?u32 = null,
@@ -784,6 +786,8 @@ fn system_arguments(
     // They change the system (what its nodes allow): runs and their replays both.
     if (asked.faults) |kinds| try argv.appendSlice(arena, &.{ "--faults", kinds });
     if (asked.no_faults) |names| try argv.appendSlice(arena, &.{ "--no-faults", names });
+    // Part of the inputs (the guest's command line): replays need it too.
+    if (asked.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
 }
 
 fn run_find(server: *Server, id: u32) ?*Run {

@@ -48,6 +48,10 @@
         "compose": {
           "type": "string",
           "description": "A Compose file instead of a test program"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         }
       },
       "required": []
@@ -104,6 +108,10 @@
         "rewind_ms": {
           "type": "integer",
           "description": "With until: the moment this many milliseconds of virtual time before the condition holds (Antithesis's rewind)"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         }
       },
       "required": []
@@ -147,6 +155,10 @@
         "compose": {
           "type": "string",
           "description": "A Compose file instead of a test program"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         }
       },
       "required": [
@@ -287,6 +299,10 @@
         "futures": {
           "type": "integer",
           "description": "Futures per moment (default 16)"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         }
       },
       "required": [
@@ -328,6 +344,10 @@
         "mutants": {
           "type": "string",
           "description": "A JSON lines file: {\"name\", \"node\", \"patch\"} per mutant, patch a unified diff relative to the node's build context"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         }
       },
       "required": [

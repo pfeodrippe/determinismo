@@ -37,6 +37,8 @@ const usage =
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--time-budget <duration>]   (e.g. 90s, 10m, 2h: timelines until
     \\                            then, --branches at most)
+    \\                            [--timeline <duration>]   (each timeline's drivers run that long
+    \\                            in virtual time; part of the inputs)
     \\                            [--branching tree|flat]   (tree, the default: also from moments
     \\                            of earlier branches that reached new behaviors; replay one by
     \\                            its tape)
@@ -131,6 +133,9 @@ const Arguments = struct {
     /// `branches` timelines: as many as fit, as an Antithesis run's duration.
     time_budget_ns: ?u64 = null,
     time_budget_text: ?[]const u8 = null,
+    /// How long (virtual time) each timeline's drivers run: commands keep starting until then
+    /// (Antithesis's long timelines). Without it, a drawn number of starts (4 to 64).
+    timeline_ms: ?u64 = null,
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
@@ -315,7 +320,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     var catalog = report.Catalog{ .arena = arena };
     const scenarios = try scenarios_selected(arena, &arguments, prepared);
     for (scenarios) |scenario| {
-        options.cmdline = try cmdline_build(arena, base_cmdline, arguments.disk_count, scenario);
+        options.cmdline = try cmdline_build(arena, base_cmdline, &arguments, scenario);
         if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
         switch (arguments.command) {
             .run => try command_run(vm, &options),
@@ -516,19 +521,23 @@ fn scenarios_selected(
 fn cmdline_build(
     arena: std.mem.Allocator,
     base: []const u8,
-    disk_count: u32,
+    arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [3][]const u8 = undefined;
+    var parts: [4][]const u8 = undefined;
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
-    if (disk_count > 0) {
-        parts[count] = try VM.disks_cmdline(arena, disk_count);
+    if (arguments.disk_count > 0) {
+        parts[count] = try VM.disks_cmdline(arena, arguments.disk_count);
         count += 1;
     }
     if (scenario) |name| {
         parts[count] = try std.fmt.allocPrint(arena, "det.scenario={s}", .{name});
+        count += 1;
+    }
+    if (arguments.timeline_ms) |ms| { // det-composer's.
+        parts[count] = try std.fmt.allocPrint(arena, "det.timeline_ms={d}", .{ms});
         count += 1;
     }
     return std.mem.join(arena, " ", parts[0..count]);
@@ -606,6 +615,7 @@ fn command_explore(
             .from_vtime_ms = arguments.from_vtime_ms,
             .shard = &.{ arguments.shard_index, arguments.shard_count },
             .time_budget_s = if (arguments.time_budget_ns) |ns| ns / std.time.ns_per_s else null,
+            .timeline_ms = arguments.timeline_ms,
             .jobs = jobs_count(arguments),
             .strategy = arguments.strategy_command,
             .branching = @tagName(arguments.branching),
@@ -1743,6 +1753,8 @@ fn parse_option(
     } else if (eql(u8, flag, "--time-budget")) {
         arguments.time_budget_ns = try duration_parse(value);
         arguments.time_budget_text = value;
+    } else if (eql(u8, flag, "--timeline")) {
+        arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
     } else if (eql(u8, flag, "--branch")) {
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-branch")) {

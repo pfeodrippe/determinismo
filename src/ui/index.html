@@ -181,6 +181,7 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
     <label>Path (on the server)<input name="path" required placeholder="zig-out/bin/bank-test or a compose.yaml"></label>
     <label>Scenario<input name="scenario" placeholder="bank"></label>
     <label>Profile<input name="profile" placeholder="default"></label>
+    <label data-tip="How long each timeline's drivers run, in virtual time (empty: 4 to 64 command starts)">Timeline length<input name="timeline" placeholder="e.g. 15m"></label>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
       <label>Time budget<input name="time_budget" placeholder="e.g. 10m"></label>
       <label>Timelines (at most)<input name="branches" type="number" value="64" min="1"></label>
@@ -1376,7 +1377,7 @@ $("#run-form").addEventListener("submit", async (event) => {
   const form = new FormData($("#run-form"));
   const request = { [form.get("kind")]: form.get("path"), seed: Number(form.get("seed")) };
   if (form.get("branches")) request.branches = Number(form.get("branches"));
-  for (const key of ["scenario", "profile", "strategy", "time_budget"]) if (form.get(key)) request[key] = form.get(key);
+  for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline"]) if (form.get(key)) request[key] = form.get(key);
   request.branching = request.strategy ? "flat" : form.get("branching");
   if (form.get("jobs")) request.jobs = Number(form.get("jobs"));
   try {

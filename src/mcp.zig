@@ -32,6 +32,8 @@ const Arguments = struct {
     cpu_modulation: bool = false,
     branches: ?u32 = null,
     time_budget: ?[]const u8 = null,
+    /// How long each timeline's drivers run (virtual time); replays need the same.
+    timeline: ?[]const u8 = null,
     branch: ?u32 = null,
     /// Replays a timeline from its tape (an exploration's tape_dir/branch-<n>.jsonl): the way
     /// to replay a tree exploration's timeline past its first generation.
@@ -145,6 +147,7 @@ fn tool_call(
     if (arguments.cpu_modulation) try argv.append(arena, "--cpu-modulation");
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     if (arguments.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
+    if (arguments.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
     if (eql(u8, name, "replay")) {
         if (arguments.tape) |tape| {
             try argv.appendSlice(arena, &.{ "--tape", tape });

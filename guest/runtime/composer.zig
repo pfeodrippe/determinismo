@@ -17,6 +17,8 @@ const sdk = @import("determinismo");
 const commands_max = 64;
 const running_max = 8;
 const starts_max = 64;
+/// Command starts in one timeline, a long one (det.timeline_ms=) included: a sanity bound.
+const started_max = 1 << 24;
 const parallelism_max = 4;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
@@ -100,7 +102,7 @@ const Composer = struct {
         var buffer: [256]u8 = undefined;
         const property = command_property(&buffer, "started", command.name);
         sdk.assert_computed(.reachable, true, property, .{});
-        assert(composer.started_count < starts_max * 2);
+        assert(composer.started_count < started_max);
         const pid = if (composer.node) |node|
             spawn_logged(command.name, &.{ nodes_path, "exec", node, command.path.? })
         else
@@ -349,8 +351,11 @@ fn run_singleton(composer: *Composer) void {
 }
 
 /// Parallel and serial drivers in random order and parallelism, with anytime checks mixed in.
+/// Driver commands, started at random (Antithesis's rules): a drawn number of starts, or with
+/// a timeline length (det.timeline_ms=) starts until that much virtual time has passed.
 fn run_drivers(composer: *Composer) void {
-    const starts = 4 + sdk.random_below(starts_max - 4);
+    const timeline_ns = timeline_length_ns();
+    const starts = if (timeline_ns == null) 4 + sdk.random_below(starts_max - 4) else 0;
     const parallelism = 1 + sdk.random_below(parallelism_max);
     assert(starts <= starts_max);
     var kinds_buffer: [3]Kind = undefined;
@@ -362,23 +367,48 @@ fn run_drivers(composer: *Composer) void {
         }
     }
     assert(kinds.len > 0);
-    for (0..starts) |_| {
-        const kind = sdk.random_choice(Kind, kinds);
-        switch (kind) {
-            .serial_driver => {
-                composer.wait_all();
-                composer.run_to_completion(composer.pick(.serial_driver));
-            },
-            .parallel_driver, .anytime => {
-                while (composer.running_count >= parallelism) composer.wait_one();
-                const command = composer.pick(kind);
-                announce(command, "start");
-                composer.start(command);
-            },
-            else => unreachable,
-        }
-        pause(sdk.random_below(pause_ns_max));
+    if (timeline_ns) |length_ns| {
+        const end_ns = now_ns() + length_ns;
+        while (now_ns() < end_ns) driver_start(composer, kinds, parallelism);
+    } else {
+        for (0..starts) |_| driver_start(composer, kinds, parallelism);
     }
+}
+
+fn driver_start(composer: *Composer, kinds: []const Kind, parallelism: u64) void {
+    const kind = sdk.random_choice(Kind, kinds);
+    switch (kind) {
+        .serial_driver => {
+            composer.wait_all();
+            composer.run_to_completion(composer.pick(.serial_driver));
+        },
+        .parallel_driver, .anytime => {
+            while (composer.running_count >= parallelism) composer.wait_one();
+            const command = composer.pick(kind);
+            announce(command, "start");
+            composer.start(command);
+        },
+        else => unreachable,
+    }
+    pause(sdk.random_below(pause_ns_max));
+}
+
+/// det.timeline_ms= from the kernel command line (explore's --timeline), in nanoseconds.
+fn timeline_length_ns() ?u64 {
+    const fd = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    const key = "det.timeline_ms=";
+    var words = std.mem.tokenizeAny(u8, buffer[0..size], " \n");
+    while (words.next()) |word| {
+        if (!std.mem.startsWith(u8, word, key)) continue;
+        const ms = std.fmt.parseInt(u64, word[key.len..], 10) catch return null;
+        return ms * std.time.ns_per_ms;
+    }
+    return null;
 }
 
 /// At most one eventually command (which stops everything else) or one finally command.
