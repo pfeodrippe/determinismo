@@ -30,14 +30,16 @@ pub const Property = struct {
         return property.message[0..property.message_size];
     }
 
+    /// Whether this timeline violates the property: an `always` that was false, an
+    /// `unreachable` that was reached. `sometimes` and `reachable` (and an `always` never hit)
+    /// are about the whole multiverse, as in Antithesis: no single timeline violates them
+    /// (report.property_failing judges them across branches).
     pub fn passing(property: *const Property) bool {
         assert(property.trues <= property.hits);
         return switch (property.kind) {
-            .always => property.hits > 0 and property.trues == property.hits,
-            .always_or_unreachable => property.trues == property.hits,
-            .sometimes => property.trues > 0,
-            .reachable => property.hits > 0,
+            .always, .always_or_unreachable => property.trues == property.hits,
             .@"unreachable" => property.hits == 0,
+            .sometimes, .reachable => true,
         };
     }
 };
@@ -89,6 +91,7 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
         }
     }
     if (parsed.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
+    if (parsed.object.get("output")) |output| try events.on_output(moment, output);
     if (parsed.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
     if (parsed.object.get("antithesis_assert")) |assertion| {
         try events.on_antithesis_assert(moment, assertion);
@@ -98,6 +101,32 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
         if (status != null and std.mem.eql(u8, status.?, "complete")) {
             events.on_lifecycle(moment, .{ .string = "setup_complete" });
         }
+    }
+}
+
+/// Language properties, from what processes print (Antithesis's "No panics (Go)" and others):
+/// the signature of a panic, a fatal error, a data race or an uncaught exception, at the start
+/// of a line. Each fails its property where it appears; a property never hit passes.
+const language_signs = [_]struct { prefix: []const u8, property: []const u8 }{
+    .{ .prefix = "panic: ", .property = "no panics (Go)" },
+    .{ .prefix = "fatal error: ", .property = "no fatal errors (Go)" },
+    .{ .prefix = "WARNING: DATA RACE", .property = "no data races (Go)" },
+    .{ .prefix = "thread '", .property = "no panics (Rust)" },
+    .{ .prefix = "Exception in thread \"", .property = "no uncaught exceptions (Java)" },
+};
+
+fn on_output(events: *Events, moment: Moment, output: std.json.Value) !void {
+    if (output != .object) return;
+    const text = string_field(output.object, "text") orelse return;
+    for (language_signs) |sign| {
+        if (!std.mem.startsWith(u8, text, sign.prefix)) continue;
+        // Rust's panic line: "thread 'main' panicked at src/main.rs:4:5:".
+        const rust = std.mem.eql(u8, sign.prefix, "thread '");
+        if (rust and std.mem.indexOf(u8, text, "' panicked at ") == null) continue;
+        const property = try events.property_get_or_put(.always_or_unreachable, sign.property);
+        property.hits += 1;
+        if (property.first_failure == null) property.first_failure = moment;
+        return;
     }
 }
 
@@ -116,16 +145,26 @@ fn on_assert(events: *Events, moment: Moment, assertion: std.json.Value) !void {
     if (assertion != .object) return error.BadAssertion;
     const kind_name = string_field(assertion.object, "type") orelse return error.BadAssertion;
     const kind = std.meta.stringToEnum(Kind, kind_name) orelse return error.BadAssertion;
+    if (declaration(assertion.object)) return events.declare(kind, assertion.object);
     return events.assertion_record(moment, kind, assertion);
+}
+
+/// `"hit": false`: the assertion is declared (Antithesis's catalog), not evaluated. A declared
+/// `reachable` or `sometimes` that no timeline reaches fails, as must-hit assertions do.
+fn declaration(assertion: std.json.ObjectMap) bool {
+    const hit = assertion.get("hit") orelse return false;
+    return hit == .bool and !hit.bool;
+}
+
+fn declare(events: *Events, kind: Kind, assertion: std.json.ObjectMap) !void {
+    const message = string_field(assertion, "message") orelse return error.BadAssertion;
+    _ = try events.property_get_or_put(kind, message);
 }
 
 /// An assertion from an Antithesis SDK (`{"antithesis_assert": {...}}`): its `display_type`
 /// names the property kind; entries with `hit: false` only declare the assertion.
 fn on_antithesis_assert(events: *Events, moment: Moment, assertion: std.json.Value) !void {
     if (assertion != .object) return error.BadAssertion;
-    if (assertion.object.get("hit")) |hit| {
-        if (hit == .bool and !hit.bool) return;
-    }
     const display = string_field(assertion.object, "display_type") orelse
         return error.BadAssertion;
     const kinds = [_]struct { []const u8, Kind }{
@@ -136,9 +175,9 @@ fn on_antithesis_assert(events: *Events, moment: Moment, assertion: std.json.Val
         .{ "Unreachable", .@"unreachable" },
     };
     for (kinds) |entry| {
-        if (std.mem.eql(u8, display, entry[0])) {
-            return events.assertion_record(moment, entry[1], assertion);
-        }
+        if (!std.mem.eql(u8, display, entry[0])) continue;
+        if (declaration(assertion.object)) return events.declare(entry[1], assertion.object);
+        return events.assertion_record(moment, entry[1], assertion);
     }
     return error.BadAssertion;
 }
@@ -243,6 +282,22 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
         written += result;
     }
     assert(written <= bytes.len);
+}
+
+test "language properties from output" {
+    const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
+    defer std.testing.allocator.free(parse_buffer);
+    var events: Events = undefined;
+    events.init(parse_buffer, .{ .log_fd = null });
+    const fine = "{\"output\":{\"source\":\"api\",\"stream\":\"stderr\"," ++
+        "\"text\":\"thread 'x' started\"}}";
+    const panic = "{\"output\":{\"source\":\"api\",\"stream\":\"stderr\"," ++
+        "\"text\":\"thread 'main' panicked at src/main.rs:4:5:\"}}";
+    try events.emit(.{ .vtime_ns = 1, .branches = 10 }, fine);
+    try std.testing.expectEqual(@as(u32, 0), events.property_count);
+    try events.emit(.{ .vtime_ns = 2, .branches = 20 }, panic);
+    try std.testing.expectEqual(@as(u32, 1), events.failing_count());
+    try std.testing.expectEqualStrings("no panics (Rust)", events.properties[0].name());
 }
 
 test "always fails on the first false condition and records its moment" {

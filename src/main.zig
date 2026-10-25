@@ -19,6 +19,8 @@ const mcp = @import("mcp.zig");
 const merge = @import("merge.zig");
 const script = @import("script.zig");
 const tla = @import("tla.zig");
+const query = @import("query.zig");
+const causality = @import("causality.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -28,13 +30,16 @@ const usage =
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
-    \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
+    \\                            [--at-vtime-ms <ms> | --until '<condition>'] [--exec "<cmd>"]
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
+    \\                            [--events-dir <dir>]   (every branch's events, for query)
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
+    \\       determinismo query   <events-dir> '<condition>' [temporal conditions] (see query.zig)
+    \\       determinismo causality <options> --branch <n> --property '<message>' [--points <k>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -49,8 +54,11 @@ const usage =
     \\
 ;
 
+/// print-fatal-signals: the kernel logs every process killed by a core-dumping signal (segfault,
+/// abort, ...), even after a handler printed a trace: det-init's "no process crashes" reads it.
 const cmdline_default = "console=ttyS0 earlyprintk=serial,ttyS0 acpi=off pci=off nokaslr " ++
-    "reboot=t panic=-1 i8042.nokbd i8042.noaux tsc=reliable no_timer_check";
+    "reboot=t panic=-1 i8042.nokbd i8042.noaux tsc=reliable no_timer_check " ++
+    "print-fatal-signals=1";
 const memory_mib_min = 64;
 const memory_mib_max = VM.memory_size_max >> 20;
 const arguments_max = 64;
@@ -71,6 +79,13 @@ const Arguments = struct {
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = 0x01c4,
     events_path: ?[]const u8 = null,
+    /// The resolved system (nodes, scenarios), recorded with the run: its environment.
+    system: ?std.json.Value = null,
+    /// The moment is the first event matching this (`--until '<condition>'`, query.zig).
+    until: ?*const query.Condition = null,
+    /// Every branch's events: setup.jsonl (boot and setup, shared), fork.jsonl (from the
+    /// snapshot to a fork point), branch-<index>.jsonl (each branch after them).
+    events_directory: ?[]const u8 = null,
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
     /// Run only this branch (to replay one timeline of an exploration).
@@ -117,14 +132,8 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
-    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "tla")) {
-        const status = tla.check(arena, init.io, argv[2..]) catch |err| {
-            const message = "{s}\nusage: determinismo tla --spec <Spec.tla> " ++
-                "--events <events.jsonl> [--tla2tools <jar>]\n";
-            std.debug.print(message, .{@errorName(err)});
-            std.process.exit(2);
-        };
-        std.process.exit(status);
+    if (argv.len >= 2) {
+        if (try command_tool(arena, init.io, argv)) |status| std.process.exit(status);
     }
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "script")) {
         return script.extract(arena, init.io, argv[2]);
@@ -168,6 +177,26 @@ pub fn main(init: std.process.Init) !void {
     for (verdicts) |failing| if (failing > 0) std.process.exit(3);
 }
 
+/// The commands that read what explorations wrote (tla, query, causality): their exit status,
+/// or null for other commands. A usage error exits with 2.
+fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !?u8 {
+    const eql = std.mem.eql;
+    const name = argv[1];
+    const rest = argv[2..];
+    const result = if (eql(u8, name, "causality"))
+        causality.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "query"))
+        query.run(arena, io, rest)
+    else if (eql(u8, name, "tla"))
+        tla.check(arena, io, rest)
+    else
+        return null;
+    return result catch |err| {
+        std.debug.print("{s}\n{s}", .{ @errorName(err), usage });
+        return 2;
+    };
+}
+
 fn list_split(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     var parts = std.mem.tokenizeScalar(u8, text, ',');
@@ -203,6 +232,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
+        .until = arguments.until,
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
         .builtin_properties = has_system,
     };
@@ -299,6 +329,8 @@ fn system_prepare(
         .cache_directory = arguments.cache_directory,
     });
     if (prepared.disk_paths.len > VM.disks_max) return error.TooManyDisks;
+    const system_json = prepared.system_json;
+    arguments.system = try std.json.parseFromSliceLeaky(std.json.Value, arena, system_json, .{});
     for (prepared.disk_paths, 0..) |path, index| arguments.disk_paths[index] = path;
     arguments.disk_count = @intCast(prepared.disk_paths.len);
     std.debug.print("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}\n", .{
@@ -418,6 +450,8 @@ fn command_explore(
             .scenario = scenario_of(options.cmdline),
             .profile = arguments.profile,
             .program = arguments.program_path,
+            .compose = arguments.compose_path,
+            .system = arguments.system,
             .inputs = &hex16(exploration.inputs),
             .seed = &hex16(arguments.seed),
             .branches = arguments.branches,
@@ -457,13 +491,28 @@ fn command_explore(
     const time_start_ns = monotonic_ns();
     options.seed = exploration.exploration_seed;
     const snapshot = try context.arena.create(Snapshot);
+    if (arguments.events_directory) |directory| {
+        try std.Io.Dir.cwd().createDirPath(context.io, directory);
+        options.events_fd = try events_file(context.arena, directory, "setup.jsonl");
+    }
     try explore_snapshot(vm, options, snapshot);
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
+    if (arguments.events_directory) |directory| {
+        close(options.events_fd.?);
+        options.events_fd = if (exploration.fork != null)
+            try events_file(context.arena, directory, "fork.jsonl")
+        else
+            null;
+    }
     const start = if (exploration.fork) |fork| try explore_fork(context, vm, options, .{
         .from = snapshot,
         .exploration = &exploration,
         .fork = fork,
     }) else snapshot;
+    if (arguments.events_directory != null) {
+        if (options.events_fd) |fd| close(fd);
+        options.events_fd = null; // Each branch writes its own file.
+    }
     const multiverse = try context.arena.create(report.Multiverse);
     multiverse.* = .{};
     const branches = Branches{
@@ -484,7 +533,7 @@ fn command_explore(
         try explore_parallel(context, vm, options, branches, jobs);
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
-    return multiverse.failing_branches;
+    return multiverse.failing_properties();
 }
 
 const Fork = struct { from: *const Snapshot, exploration: *const Exploration, fork: tape.Fork };
@@ -496,6 +545,9 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     options.seed = branch_seed(fork.exploration.exploration_seed, fork.fork.branch);
     options.moment_vtime_ns = fork.fork.vtime_ns;
     options.moment_command = fork.fork.exec;
+    const until = options.until;
+    options.until = null; // The fork point is the moment; --until belongs to its branches.
+    defer options.until = until;
     options.moment_continue = false;
     defer options.moment_vtime_ns = null;
     defer options.moment_command = null;
@@ -684,10 +736,13 @@ fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
     // Moments belong to branches: none during the run to the snapshot.
     const moment_vtime_ns = options.moment_vtime_ns;
     const moment_command = options.moment_command;
+    const until = options.until;
     options.moment_vtime_ns = null;
     options.moment_command = null;
+    options.until = null;
     defer options.moment_vtime_ns = moment_vtime_ns;
     defer options.moment_command = moment_command;
+    defer options.until = until;
     try vm.init(options);
     const outcome = try vm.run_until_exit();
     if (outcome != .setup_complete) {
@@ -736,8 +791,14 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
         options.moment_command = branches.arguments.moment_command;
         options.moment_continue = branches.arguments.moment_continue;
+        options.until = branches.arguments.until;
         try vm.init_from_snapshot(options, branches.snapshot);
         defer vm.deinit();
+        if (branches.arguments.events_directory) |directory| {
+            const name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{index});
+            vm.events.log_fd = try events_file(context.arena, directory, name);
+        }
+        defer if (branches.arguments.events_directory != null) close(vm.events.log_fd.?);
         vm.strategy = exploration.strategy;
         if (exploration.replay) |replay| vm.overrides = replay.overrides;
         if (exploration.strategy) |strategy| try strategy.branch(index, options.seed);
@@ -765,6 +826,11 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             if (try strategy_branch_end(strategy, vm, end)) break;
         }
     }
+}
+
+fn events_file(arena: std.mem.Allocator, directory: []const u8, name: []const u8) !linux.fd_t {
+    const path = try std.fs.path.join(arena, &.{ directory, name });
+    return open_for_writing(arena, path);
 }
 
 /// Tells the strategy how the branch ended; returns true when it asks to stop.
@@ -885,7 +951,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.memory_mib > memory_mib_max) return error.Usage;
     if (arguments.branches == 0 or arguments.branches > branches_max) return error.Usage;
     if (arguments.command == .explore) arguments.deterministic = true;
-    if (arguments.moment_command != null and arguments.moment_vtime_ms == null) return error.Usage;
+    // A command runs at a moment: a virtual time, or the first event matching --until.
+    const moment = arguments.moment_vtime_ms != null or arguments.until != null;
+    if (arguments.moment_command != null and !moment) return error.Usage;
+    if (arguments.moment_vtime_ms != null and arguments.until != null) return error.Usage;
     if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
@@ -939,6 +1008,8 @@ fn parse_option(
         arguments.timer_slack_us = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--events")) {
         arguments.events_path = value;
+    } else if (eql(u8, flag, "--events-dir")) {
+        arguments.events_directory = value;
     } else if (eql(u8, flag, "--trace")) {
         arguments.trace_path = value;
     } else if (eql(u8, flag, "--branches")) {
@@ -972,6 +1043,10 @@ fn parse_option(
         arguments.moment_vtime_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec")) {
         arguments.moment_command = value;
+    } else if (eql(u8, flag, "--until")) {
+        const condition = try arena.create(query.Condition);
+        condition.* = try query.parse(arena, value);
+        arguments.until = condition;
     } else {
         return error.Usage;
     }
@@ -1066,6 +1141,8 @@ test {
     _ = @import("script.zig");
     _ = @import("tla.zig");
     _ = @import("guest_memory.zig");
+    _ = @import("query.zig");
+    _ = @import("causality.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

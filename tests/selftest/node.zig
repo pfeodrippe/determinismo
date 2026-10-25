@@ -20,6 +20,7 @@ var mutant = false;
 pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
+    if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
     mutant = init.environ_map.get("DET_MUTANT") != null;
     if (init.environ_map.get("DET_WORKERS")) |text| {
         const workers = try std.fmt.parseInt(u32, text, 10);
@@ -61,6 +62,14 @@ fn supervise() void {
         sdk.reachable("a killed worker is replaced", .{});
         worker_start();
     }
+}
+
+/// A write through an invalid pointer: SIGSEGV, which the kernel logs as a segfault.
+fn crash() noreturn {
+    const address: usize = 8;
+    const target: *volatile u8 = @ptrFromInt(address);
+    target.* = 1;
+    unreachable;
 }
 
 fn hog() !void {

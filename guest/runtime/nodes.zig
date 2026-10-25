@@ -15,6 +15,7 @@ const linux = std.os.linux;
 const sdk = @import("determinismo");
 const schema = sdk.schema;
 const netlink = @import("netlink.zig");
+const output = @import("output.zig");
 pub const LinkState = netlink.LinkState;
 
 pub const system_path = "/det/system.json";
@@ -74,6 +75,7 @@ pub fn start(
     try root_prepare(&paths, system, node);
     try memory_limit(&paths, node.memory_max_mib);
     const launch = try Launch.init(arena, node, &paths);
+    const output_pipes = try output.pipes();
     var sync: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&sync, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
     const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
@@ -89,9 +91,13 @@ pub fn start(
         if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
             die("unshare", error.Unshare);
         }
-        launch.exec(); // Never returns.
+        launch.exec(output_pipes.stdout[1], output_pipes.stderr[1]); // Never returns.
     }
     const pid: linux.pid_t = @intCast(result);
+    try output.forward(node.name, paths.output, output_pipes);
+    for ([_][2]linux.fd_t{ output_pipes.stdout, output_pipes.stderr }) |pipe| {
+        for (pipe) |fd| _ = linux.close(fd);
+    }
     _ = linux.close(sync[0]);
     defer _ = linux.close(sync[1]);
     try cgroup_join(&paths, pid);
@@ -595,7 +601,6 @@ fn tcp_accepts(address: netlink.Address, port: u16) bool {
 /// Everything the child needs after clone, prepared before it (the child only makes syscalls).
 const Launch = struct {
     root: [:0]const u8,
-    output: [:0]const u8,
     hostname: []const u8,
     workdir: [:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
@@ -620,7 +625,6 @@ const Launch = struct {
         const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
         return .{
             .root = paths.root,
-            .output = paths.output,
             .hostname = node.name,
             .workdir = try arena.dupeSentinel(u8, node.workdir, 0),
             .argv = argv.ptr,
@@ -633,14 +637,11 @@ const Launch = struct {
     }
 
     /// In the child, PID 1 of the node's namespaces.
-    fn exec(launch: *const Launch) noreturn {
-        const output_flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true };
-        const output = linux.open(launch.output, output_flags, 0o644);
+    /// Its stdout and stderr are the forwarder's pipes (output.zig): events and output.log.
+    fn exec(launch: *const Launch, stdout: linux.fd_t, stderr: linux.fd_t) noreturn {
         const null_input = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(output) == .SUCCESS) {
-            _ = linux.dup2(@intCast(output), 1);
-            _ = linux.dup2(@intCast(output), 2);
-        }
+        _ = linux.dup2(stdout, 1);
+        _ = linux.dup2(stderr, 2);
         if (linux.errno(null_input) == .SUCCESS) _ = linux.dup2(@intCast(null_input), 0);
         launch.mounts() catch |err| die("mounts", err);
         _ = linux.syscall2(.sethostname, @intFromPtr(launch.hostname.ptr), launch.hostname.len);

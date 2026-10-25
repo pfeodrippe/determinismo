@@ -98,6 +98,36 @@ pub fn snapshot_taken(snapshot: *const Snapshot, wall_ns: u64) void {
     });
 }
 
+/// Whether a property fails across the multiverse (Antithesis's semantics): an `always` fails
+/// where a timeline made it false or if no timeline hit it; `always_or_unreachable` and
+/// `unreachable` where a timeline violated them; `sometimes` if no timeline made it true;
+/// `reachable` if no timeline reached it.
+pub fn property_failing(kind: Events.Kind, counts: struct {
+    branches_hit: u32,
+    branches_true: u32,
+    branches_failing: u32,
+}) bool {
+    return switch (kind) {
+        .always => counts.branches_failing > 0 or counts.branches_hit == 0,
+        .always_or_unreachable, .@"unreachable" => counts.branches_failing > 0,
+        .sometimes => counts.branches_true == 0,
+        .reachable => counts.branches_hit == 0,
+    };
+}
+
+test property_failing {
+    const counts = .{ .branches_hit = 8, .branches_true = 0, .branches_failing = 0 };
+    try std.testing.expect(property_failing(.sometimes, counts)); // Never true anywhere.
+    try std.testing.expect(!property_failing(.reachable, counts));
+    try std.testing.expect(!property_failing(.always, counts));
+    const never = .{ .branches_hit = 0, .branches_true = 0, .branches_failing = 0 };
+    try std.testing.expect(property_failing(.reachable, never)); // Declared, never reached.
+    try std.testing.expect(property_failing(.always, never));
+    try std.testing.expect(!property_failing(.always_or_unreachable, never));
+    const one_true = .{ .branches_hit = 8, .branches_true = 1, .branches_failing = 0 };
+    try std.testing.expect(!property_failing(.sometimes, one_true));
+}
+
 /// Properties across all branches of an exploration.
 pub const Multiverse = struct {
     branches: u32 = 0,
@@ -113,10 +143,31 @@ pub const Multiverse = struct {
     const Aggregate = struct {
         property: Events.Property, // Identity (kind, message) of the first branch that hit it.
         branches_hit: u32 = 0,
+        /// Branches where it held at least once (what a `sometimes` asks for).
+        branches_true: u32 = 0,
+        /// Branches that violate it (an `always` false, an `unreachable` reached).
         branches_failing: u32 = 0,
         first_failing_branch: ?u32 = null,
         first_failure: ?Events.Moment = null,
+
+        fn failing(aggregate: *const Aggregate) bool {
+            return property_failing(aggregate.property.kind, .{
+                .branches_hit = aggregate.branches_hit,
+                .branches_true = aggregate.branches_true,
+                .branches_failing = aggregate.branches_failing,
+            });
+        }
     };
+
+    /// Properties that fail across the multiverse: what an exploration's verdict (exit status)
+    /// is about.
+    pub fn failing_properties(multiverse: *const Multiverse) u32 {
+        var count: u32 = 0;
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            count += @intFromBool(aggregate.failing());
+        }
+        return count;
+    }
 
     pub fn add(multiverse: *Multiverse, vm: *VM, branch: Branch) !void {
         assert(vm.deterministic);
@@ -179,6 +230,7 @@ pub const Multiverse = struct {
         assert(property.trues <= property.hits);
         const aggregate = try multiverse.aggregate_find(property);
         if (property.hits > 0) aggregate.branches_hit += 1;
+        if (property.trues > 0) aggregate.branches_true += 1;
         if (!property.passing()) {
             aggregate.branches_failing += 1;
             if (aggregate.first_failing_branch == null) {
@@ -198,6 +250,7 @@ pub const Multiverse = struct {
         for (other.aggregates[0..other.aggregate_count]) |*incoming| {
             const aggregate = try multiverse.aggregate_find(&incoming.property);
             aggregate.branches_hit += incoming.branches_hit;
+            aggregate.branches_true += incoming.branches_true;
             aggregate.branches_failing += incoming.branches_failing;
             const branch = incoming.first_failing_branch orelse continue;
             const earlier = if (aggregate.first_failing_branch) |known| branch < known else true;
@@ -217,7 +270,7 @@ pub const Multiverse = struct {
             multiverse.branches, multiverse.failing_branches, seconds(wall_ns),
         });
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
-            const status = if (aggregate.branches_failing > 0) "FAIL" else "PASS";
+            const status = if (aggregate.failing()) "FAIL" else "PASS";
             print("  {s} {s:<21} hit in {d:>4}/{d} branches, failing in {d:>4}  {s}", .{
                 status,              @tagName(aggregate.property.kind), aggregate.branches_hit,
                 multiverse.branches, aggregate.branches_failing,        aggregate.property.name(),
@@ -239,7 +292,9 @@ pub const Multiverse = struct {
         const Line = struct {
             kind: []const u8,
             message: []const u8,
+            failing: bool,
             branches_hit: u32,
+            branches_true: u32,
             branches_failing: u32,
             example_branch: ?u32,
         };
@@ -248,7 +303,9 @@ pub const Multiverse = struct {
             lines[index] = .{
                 .kind = @tagName(aggregate.property.kind),
                 .message = aggregate.property.name(),
+                .failing = aggregate.failing(),
                 .branches_hit = aggregate.branches_hit,
+                .branches_true = aggregate.branches_true,
                 .branches_failing = aggregate.branches_failing,
                 .example_branch = aggregate.first_failing_branch,
             };

@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
             .steady = steady,
             .node_exit = node_exit,
             .oom = oom,
+            .crash = crash,
             .stress = stress,
             .controller = @import("controller.zig").scenario,
             .maze = maze,
@@ -121,6 +122,16 @@ fn steady(s: *System.Scenario) void {
 
 fn node_exit(s: *System.Scenario) void {
     s.singleton_driver("kill_echo", tell_die);
+}
+
+/// A process in the echo node dies of SIGSEGV: "no process crashes" must fail.
+fn crash(s: *System.Scenario) void {
+    s.singleton_driver("segfault", segfault);
+}
+
+fn segfault(context: *System.Context) !void {
+    const node = context.nodes.echo orelse return error.NoEchoNode;
+    _ = try node.exec(&.{ "/bin/det-selftest-node", "crash" });
 }
 
 fn oom(s: *System.Scenario) void {

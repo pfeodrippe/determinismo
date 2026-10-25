@@ -6,6 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const query = @import("query.zig");
 
 pub const Options = struct {
     machine: []const []const u8,
@@ -21,7 +22,9 @@ const result_size_max = 4 << 20;
 const tools_json = @embedFile("mcp_tools.json");
 
 const Arguments = struct {
-    program: []const u8,
+    /// The system: a test program or a Compose file.
+    program: ?[]const u8 = null,
+    compose: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
@@ -32,6 +35,10 @@ const Arguments = struct {
     @"continue": bool = false,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
+    until: ?[]const u8 = null,
+    property: ?[]const u8 = null,
+    points: u32 = 8,
+    futures: u32 = 16,
 };
 
 pub fn serve(arena_parent: std.mem.Allocator, io: std.Io, options: Options) !void {
@@ -90,19 +97,31 @@ fn tool_call(
     name: []const u8,
     value: std.json.Value,
 ) ![]const u8 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "query")) {
+        // An exploration's events directory, and the query (query.Request's fields).
+        const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const Where = struct { events_dir: []const u8 };
+        const where = try std.json.parseFromValueLeaky(Where, arena, value, options_json);
+        const asked = try std.json.parseFromValueLeaky(query.Request, arena, value, options_json);
+        return query.answer(arena, io, where.events_dir, asked);
+    }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
     });
-    const eql = std.mem.eql;
     if (eql(u8, name, "describe")) {
-        const describe = [_][]const u8{ arguments.program, "--describe" };
+        const program = arguments.program orelse return error.MissingProgram;
+        const describe = [_][]const u8{ program, "--describe" };
         const result = try std.process.run(arena, io, .{ .argv = &describe });
         return result.stdout;
     }
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ options.self, "explore" });
+    const command = if (eql(u8, name, "causality")) "causality" else "explore";
+    try argv.appendSlice(arena, &.{ options.self, command });
     try argv.appendSlice(arena, options.machine);
-    try argv.appendSlice(arena, &.{ "--program", arguments.program });
+    if ((arguments.program == null) == (arguments.compose == null)) return error.ProgramOrCompose;
+    if (arguments.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
+    if (arguments.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
     try argv.appendSlice(arena, &.{ "--seed", try number(arena, arguments.seed) });
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     if (arguments.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
@@ -111,11 +130,27 @@ fn tool_call(
         try argv.appendSlice(arena, &.{ "--branch", try number(arena, branch) });
         if (arguments.at_vtime_ms) |ms| {
             try argv.appendSlice(arena, &.{ "--at-vtime-ms", try number(arena, ms) });
-            if (arguments.exec) |command| try argv.appendSlice(arena, &.{ "--exec", command });
+        } else if (arguments.until) |condition| {
+            try argv.appendSlice(arena, &.{ "--until", condition });
+        }
+        if (arguments.at_vtime_ms != null or arguments.until != null) {
+            if (arguments.exec) |exec| try argv.appendSlice(arena, &.{ "--exec", exec });
             if (arguments.@"continue") try argv.append(arena, "--continue");
         }
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return guest_lines(arena, result.stderr);
+    }
+    if (eql(u8, name, "causality")) {
+        const branch = arguments.branch orelse return error.MissingBranch;
+        const property = arguments.property orelse return error.MissingProperty;
+        try argv.appendSlice(arena, &.{
+            "--branch",  try number(arena, branch), "--property", property,
+            "--points",  try number(arena, arguments.points),
+            "--futures", try number(arena, arguments.futures),
+            "--json",
+        });
+        const result = try std.process.run(arena, io, .{ .argv = argv.items });
+        return result.stdout;
     }
     if (!eql(u8, name, "explore") and !eql(u8, name, "fork")) return error.UnknownTool;
     try argv.appendSlice(arena, &.{ "--branches", try number(arena, arguments.branches) });
@@ -126,15 +161,27 @@ fn tool_call(
             "--from-branch",   try number(arena, branch),
             "--from-vtime-ms", try number(arena, vtime_ms),
         });
-        if (arguments.exec) |command| try argv.appendSlice(arena, &.{ "--from-exec", command });
+        if (arguments.exec) |exec| try argv.appendSlice(arena, &.{ "--from-exec", exec });
     }
-    const record = try std.fmt.allocPrint(arena, "{s}/record-{d}.jsonl", .{
-        options.scratch_directory, linux.getpid(),
+    explorations += 1;
+    const record = try std.fmt.allocPrint(arena, "{s}/record-{d}-{d}.jsonl", .{
+        options.scratch_directory, linux.getpid(), explorations,
     });
-    try argv.appendSlice(arena, &.{ "--record", record });
+    const events = try std.fmt.allocPrint(arena, "{s}/events-{d}-{d}", .{
+        options.scratch_directory, linux.getpid(), explorations,
+    });
+    try argv.appendSlice(arena, &.{ "--record", record, "--events-dir", events });
     _ = try std.process.run(arena, io, .{ .argv = argv.items });
-    return std.Io.Dir.cwd().readFileAlloc(io, record, arena, .limited(result_size_max));
+    const cwd = std.Io.Dir.cwd();
+    const results = try cwd.readFileAlloc(io, record, arena, .limited(result_size_max));
+    // Where every branch's events are, for the query tool.
+    return std.fmt.allocPrint(arena, "{s}{{\"events_dir\":{f}}}\n", .{
+        results, std.json.fmt(events, .{}),
+    });
 }
+
+/// Explorations this server ran: each records its events in its own directory.
+var explorations: u32 = 0;
 
 /// From a replay's output: the determinismo lines and what the guest said at the moment.
 fn guest_lines(arena: std.mem.Allocator, output: []const u8) ![]const u8 {

@@ -19,6 +19,7 @@ const PIT = @import("pit.zig");
 const VirtioBlock = @import("virtio_block.zig");
 const Decisions = @import("decisions.zig");
 const Events = @import("events.zig");
+const query = @import("query.zig");
 const Snapshot = @import("snapshot.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
@@ -45,6 +46,10 @@ moment_command: ?[]const u8,
 moment_reached: bool,
 /// Keep running after the command at the moment finished (instead of ending the run there).
 moment_continue: bool,
+/// The moment can also be the first event matching a condition (`--until`, as Antithesis's
+/// wait_until), the instant the guest emits it.
+until: ?*const query.Condition,
+until_hit: bool,
 /// Whether guest events are printed: from the moment until its command finishes.
 moment_printing: bool,
 /// What the guest agent receives on its next action request.
@@ -109,6 +114,8 @@ pub const Options = struct {
     moment_command: ?[]const u8 = null,
     /// After the command at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    /// Or the moment is the first event matching this condition.
+    until: ?*const query.Condition = null,
     disks: []const Disk = &.{},
     /// The guest runs determinismo's runtime: check the built-in properties when a timeline ends.
     builtin_properties: bool = false,
@@ -221,6 +228,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .moment_command = options.moment_command,
         .moment_reached = false,
         .moment_continue = options.moment_continue,
+        .until = options.until,
+        .until_hit = false,
         .moment_printing = false,
         .action_pending = null,
         .target_is_moment = false,
@@ -650,6 +659,9 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
             if (bytes.len != 4) return error.BadGuestRequest;
             const setup_was_complete = vm.events.setup_complete != null;
             try vm.handle_request(std.mem.readInt(u32, bytes[0..4], .little));
+            if (vm.until_hit and !vm.moment_reached) {
+                if (try vm.moment_arrive()) |outcome| return outcome;
+            }
             if (vm.events.last_event_is("exec_done")) {
                 if (vm.moment_reached and vm.moment_command != null) {
                     vm.moment_printing = false;
@@ -692,6 +704,24 @@ fn moment(vm: *VM) !Events.Moment {
     };
 }
 
+/// Whether an event matches `--until` (the events' parse buffer is free again after emit).
+fn until_matches(vm: *VM, moment_now: Events.Moment, line: []const u8) bool {
+    const condition = vm.until orelse return false;
+    var fba = std.heap.FixedBufferAllocator.init(vm.events.parse_buffer);
+    const value = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), line, .{}) catch
+        return false;
+    const event = query.Event{
+        .branch = 0,
+        .seq = vm.events.count,
+        .vtime_ns = moment_now.vtime_ns,
+        .value = value,
+        .line = line,
+    };
+    if (!condition.matches(&event)) return false;
+    std.debug.print("[determinismo] until: {s}\n", .{line});
+    return true;
+}
+
 /// One request from the guest module: a page holding { op: u32, len: u32, result: u64, data }.
 fn handle_request(vm: *VM, address: u32) !void {
     if (address % page_size != 0) return error.BadGuestRequest;
@@ -719,6 +749,9 @@ fn handle_request(vm: *VM, address: u32) !void {
             while (lines.next()) |line| {
                 try vm.events.emit(moment_now, line);
                 try vm.checkpoint(moment_now);
+                if (vm.until != null and !vm.until_hit and !vm.moment_reached) {
+                    vm.until_hit = vm.until_matches(moment_now, line);
+                }
                 if (vm.strategy) |strategy| try strategy.event(moment_now, source, line);
                 if (vm.moment_printing) {
                     std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });

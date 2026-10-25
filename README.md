@@ -35,7 +35,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 - **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
   that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
   scripts that carry a failure's shape to new seeds and new builds.
-- **Debugging in the multiverse**: run a command in the guest or inside a node at an exact moment;
+- **Debugging in the multiverse**: causality analysis (how likely the bug was at each moment
+  of a failing timeline, from forked futures: where it jumps is where it was decided); stop a
+  branch at the first event matching a condition (`--until`); run a command in the guest or
+  inside a node at an exact moment;
   let the branch continue after a change (`--continue`), or explore futures of a changed system
   (`--from-exec`), e.g. a function redefined through a service's REPL.
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
@@ -43,8 +46,15 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   timelines that reach something new and changes the decisions of the process that got there
   (it solves a 1-in-10000 maze in about 100 branches, in Python or Java under faults in about
   200), and parallel workers share one corpus.
+- **Searching the multiverse**: every branch's events, node and command output included, with
+  `determinismo query` (HTTP, MCP too): conditions on any field, and Antithesis-style temporal
+  ones, "failures preceded by a fault within 1s", "with no fault before", each match with the
+  moment to branch from.
 - **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
   mutation testing with mutant profiles.
+- **A web UI** (`determinismo serve`, then open it): runs live, properties with their failing
+  and passing examples, a multiverse map of every timeline with its faults and failures,
+  search, a timeline's logs up to any moment, and a command run at that exact moment.
 - **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.
 
 ## A test program

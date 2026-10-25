@@ -17,7 +17,7 @@
   },
   {
     "name": "explore",
-    "description": "Explore a scenario: snapshot after setup, run many branches (each a different interleaving, faults and inputs), and report which properties failed and in which branches.",
+    "description": "Explore a scenario: snapshot after setup, run many branches (each a different interleaving, faults and inputs), and report which properties failed and in which branches. The result ends with events_dir: every branch's events, for the query tool.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -36,16 +36,18 @@
         "branches": {
           "type": "integer",
           "description": "How many timelines (default 16)"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
         }
       },
-      "required": [
-        "program"
-      ]
+      "required": []
     }
   },
   {
     "name": "replay",
-    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out.",
+    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out. Instead of at_vtime_ms, until stops at the first event matching a condition (the query tool's syntax), as Antithesis's wait_until.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -73,10 +75,17 @@
         "continue": {
           "type": "boolean",
           "description": "After exec, let the branch run to its end (see the effects of the change)"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "until": {
+          "type": "string",
+          "description": "A condition: the moment is the first event matching it"
         }
       },
       "required": [
-        "program",
         "branch"
       ]
     }
@@ -111,12 +120,113 @@
         "exec": {
           "type": "string",
           "description": "A command to run at the fork point first: the branches explore the changed system"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
         }
       },
       "required": [
-        "program",
         "from_branch",
         "from_vtime_ms"
+      ]
+    }
+  },
+  {
+    "name": "query",
+    "description": "Search the events of an exploration (its events_dir), as Antithesis's Logs Explorer: a condition of terms 'path op value' joined by and/or over the event JSON (event=fault, details.kind=partition, output.text~refused, assert.condition=false, output.source=redis) or vtime/branch/seq; operators = != ~ !~ < <= > >= ? !?. Temporal conditions look in the same timeline before (preceded_by) or after (followed_by) the event, within some virtual seconds. Each match comes with its moment (branch, vtime_ns) to replay or fork from.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "condition": {
+          "type": "string"
+        },
+        "preceded_by": {
+          "type": "string"
+        },
+        "not_preceded_by": {
+          "type": "string"
+        },
+        "followed_by": {
+          "type": "string"
+        },
+        "not_followed_by": {
+          "type": "string"
+        },
+        "within": {
+          "type": "number",
+          "description": "Seconds of virtual time for the temporal conditions"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "up_to_vtime": {
+          "type": "number",
+          "description": "Seconds: only events up to this moment"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Events to return (default 100)"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "events",
+            "count",
+            "branches"
+          ]
+        }
+      },
+      "required": [
+        "events_dir",
+        "condition"
+      ]
+    }
+  },
+  {
+    "name": "causality",
+    "description": "Causality analysis (as Antithesis's): how likely a property's failure was at moments of a branch where it failed. Finds the first failure in the branch, then at several moments from the snapshot to it forks many futures and counts how many fail. Jumps in probability mark where the timeline made the bug likely: query the branch's events just before each jump.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "compose": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "property": {
+          "type": "string",
+          "description": "The property's message"
+        },
+        "points": {
+          "type": "integer",
+          "description": "Moments to measure (default 8)"
+        },
+        "futures": {
+          "type": "integer",
+          "description": "Futures per moment (default 16)"
+        }
+      },
+      "required": [
+        "branch",
+        "property"
       ]
     }
   }

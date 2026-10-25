@@ -232,12 +232,14 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
 }
 
 /// Built-in properties from the kernel's log (all of it, whatever the console shows), read
-/// once when the timeline ends: no OOM kills, and no warnings, BUGs, oopses or hung tasks.
+/// once when the timeline ends: no OOM kills, no process killed by an error signal (Antithesis's
+/// "no unexpected crashes"), and no warnings, BUGs, oopses or hung tasks.
 const oom_property = "the kernel kills no process for lack of memory";
+const crash_property = "no process crashes (segfault, illegal instruction, ...)";
 const kernel_property = "the kernel reports no warnings, BUGs or hung tasks";
 const kmsg_records_max = 1 << 16;
 
-const KernelProblem = enum { oom_kill, kernel };
+const KernelProblem = enum { oom_kill, crash, kernel };
 
 fn kernel_check() void {
     var seen = std.EnumArray(KernelProblem, bool).initFill(false);
@@ -256,11 +258,16 @@ fn kernel_check() void {
             const record = kmsg_record(buffer[0..size]) orelse continue;
             const problem = kernel_problem(record.text) orelse continue;
             seen.set(problem, true);
-            const property = if (problem == .oom_kill) oom_property else kernel_property;
+            const property = switch (problem) {
+                .oom_kill => oom_property,
+                .crash => crash_property,
+                .kernel => kernel_property,
+            };
             sdk.always(false, property, .{ .kernel_us = record.time_us, .line = record.text });
         }
     }
     if (!seen.get(.oom_kill)) sdk.always(true, oom_property, .{});
+    if (!seen.get(.crash)) sdk.always(true, crash_property, .{});
     if (!seen.get(.kernel)) sdk.always(true, kernel_property, .{});
 }
 
@@ -281,6 +288,14 @@ fn kmsg_record(record: []const u8) ?KmsgRecord {
 fn kernel_problem(text: []const u8) ?KernelProblem {
     // "Out of memory: Killed process ..." and "Memory cgroup out of memory: Killed process ...".
     if (std.mem.indexOf(u8, text, "of memory: Killed process") != null) return .oom_kill;
+    // A user process killed by an error signal ("prog[42]: segfault at 0 ip ...", "traps:
+    // prog[42] general protection fault ...", "... trap invalid opcode ...").
+    const crashes = [_][]const u8{
+        " segfault at ", "traps: ", "potentially unexpected fatal signal",
+    };
+    for (crashes) |sign| {
+        if (std.mem.indexOf(u8, text, sign) != null) return .crash;
+    }
     const signs = [_][]const u8{
         "WARNING: CPU:",            "BUG: ",                 "kernel BUG at", "Oops: ",
         "general protection fault", "blocked for more than", "UBSAN:",        "Kernel panic",
@@ -315,6 +330,10 @@ test kernel_problem {
     try std.testing.expectEqual(KernelProblem.oom_kill, kernel_problem(record.text).?);
     const warning = kmsg_record("4,90,1000,-;WARNING: CPU: 0 PID: 1 at mm/slub.c:42 f+0x1/0x2").?;
     try std.testing.expectEqual(KernelProblem.kernel, kernel_problem(warning.text).?);
+    const segfault = kmsg_record("6,91,2000,-;bank[42]: segfault at 0 ip 0000 sp 0000 error 4").?;
+    try std.testing.expectEqual(KernelProblem.crash, kernel_problem(segfault.text).?);
+    const trap = kmsg_record("6,92,2000,-;traps: bank[42] general protection fault ip:401000").?;
+    try std.testing.expectEqual(KernelProblem.crash, kernel_problem(trap.text).?);
     const fine = kmsg_record("6,1,0,-;Linux version 6.12.113").?;
     try std.testing.expect(kernel_problem(fine.text) == null);
 }

@@ -6,19 +6,29 @@
 //!   <data>/runs/<id>/output.log     its output
 //!   <data>/runs/<id>/record.jsonl   its results (explore --record)
 //!   <data>/runs/<id>/tapes/         the tapes of its branches
+//!   <data>/runs/<id>/events/        every branch's events (explore --events-dir)
 //!
 //! Endpoints (JSON in, JSON out):
-//!   POST /runs               {program, scenario?, profile?, seed?, branches?, jobs?, strategy?,
-//!                             from_branch?, from_vtime_ms?}  -> {id}
+//!   GET  /                   the web UI (ui/index.html): runs, properties, logs, search, map
+//!   POST /runs               {program | compose, scenario?, profile?, seed?, branches?, jobs?,
+//!                             strategy?, from_branch?, from_vtime_ms?}  -> {id}
 //!   GET  /runs               every run with its state
 //!   GET  /runs/<id>          its state and record (run, branches, summary)
 //!   GET  /runs/<id>/output   its output, as text
-//!   POST /runs/<id>/replay   {branch, at_vtime_ms?, exec?} -> the replay's output, as text
+//!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until?, exec?} -> its output, as text
+//!   POST /runs/<id>/causality {branch, property, points?, futures?} -> {id} (in the background)
+//!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
+//!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
+//!                             since the previous finished run of the same system and scenario
+//!   POST /runs/<id>/query    {condition, preceded_by?, followed_by?, not_preceded_by?,
+//!                             not_followed_by?, within?, branch?, up_to_vtime?, limit?,
+//!                             output?: events|count|branches} -> JSON lines (query.zig)
 //!
 //! One request at a time, with fixed buffers; runs proceed in the background meanwhile.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const query = @import("query.zig");
 
 pub const Options = struct {
     /// "address:port", e.g. 127.0.0.1:7878. Bind to loopback unless the network is trusted.
@@ -34,6 +44,7 @@ pub const Options = struct {
 };
 
 const runs_max = 4096;
+const jobs_max = 256;
 const request_size_max = 64 * 1024;
 const response_size_max = 4 << 20;
 const arguments_max = 64;
@@ -45,7 +56,17 @@ const Run = struct {
     status: ?u32 = null,
 };
 
+/// A causality analysis (causality.zig) of a run's branch, in the background.
+const Job = struct {
+    run: u32,
+    index: u32,
+    pid: linux.pid_t,
+    done: bool = false,
+};
+
 const Server = struct {
+    jobs: [jobs_max]Job = undefined,
+    job_count: u32 = 0,
     options: Options,
     io: std.Io,
     arena: std.mem.Allocator,
@@ -105,10 +126,17 @@ fn listen(address_text: []const u8) !linux.fd_t {
 
 const Request = struct { method: []const u8, path: []const u8, body: []const u8 };
 
+/// The web UI: one page, no build step, talking to this API.
+const ui_html = @embedFile("ui/index.html");
+
 fn handle(server: *Server, client: linux.fd_t) void {
     const request = request_read(server, client) catch {
         return respond(client, 400, "text/plain", "bad request\n");
     };
+    const page = std.mem.eql(u8, request.path, "/") or std.mem.eql(u8, request.path, "/index.html");
+    if (page and std.mem.eql(u8, request.method, "GET")) {
+        return respond(client, 200, "text/html; charset=utf-8", ui_html);
+    }
     var writer: std.Io.Writer = .fixed(server.response);
     const status = route(server, request, &writer) catch |err| blk: {
         writer.end = 0;
@@ -147,12 +175,33 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     if (eql(u8, action, "replay") and eql(u8, request.method, "POST")) {
         return run_replay(server, run, request.body, out);
     }
+    if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
+        return findings_show(server, run, out);
+    }
+    if (eql(u8, action, "causality")) {
+        if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
+        const index_text = parts.next() orelse return error.NotFound;
+        const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
+        return causality_show(server, run, index, out);
+    }
+    if (eql(u8, action, "query") and eql(u8, request.method, "POST")) {
+        const asked = try std.json.parseFromSliceLeaky(query.Request, server.arena, request.body, .{
+            .ignore_unknown_fields = true,
+        });
+        const events = try std.fs.path.join(server.arena, &.{
+            try run_directory(server, run.id), "events",
+        });
+        try out.writeAll(try query.answer(server.arena, server.io, events, asked));
+        return 200;
+    }
     return error.NotFound;
 }
 
 /// What a client may ask for; mirrors explore's flags.
 const RunRequest = struct {
-    program: []const u8,
+    /// The system: a test program, or a Compose file (exactly one).
+    program: ?[]const u8 = null,
+    compose: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
@@ -178,10 +227,13 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, server.options.machine);
-    try argv.appendSlice(server.arena, &.{ "--program", asked.program });
+    try system_arguments(server.arena, &argv, &asked);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed}) });
     const branches = try print(server, "{d}", .{asked.branches});
     try argv.appendSlice(server.arena, &.{ "--branches", branches });
+    try argv.appendSlice(server.arena, &.{
+        "--events-dir", try std.fs.path.join(server.arena, &.{ directory, "events" }),
+    });
     try argv.appendSlice(server.arena, &.{
         "--record",   try std.fs.path.join(server.arena, &.{ directory, "record.jsonl" }),
         "--tape-dir", try std.fs.path.join(server.arena, &.{ directory, "tapes" }),
@@ -244,7 +296,13 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     return 200;
 }
 
-const ReplayRequest = struct { branch: u32, at_vtime_ms: ?u64 = null, exec: ?[]const u8 = null };
+const ReplayRequest = struct {
+    branch: u32,
+    at_vtime_ms: ?u64 = null,
+    /// Or the moment is the first event matching this condition (query.zig).
+    until: ?[]const u8 = null,
+    exec: ?[]const u8 = null,
+};
 
 /// Replays one branch of a run (synchronously) and returns its output.
 fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
@@ -258,7 +316,8 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, server.options.machine);
-    try argv.appendSlice(server.arena, &.{ "--program", original.program });
+    try system_arguments(server.arena, &argv, &original);
+    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed}) });
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     }
@@ -271,12 +330,193 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     try argv.appendSlice(server.arena, &.{ "--tape", tape });
     if (asked.at_vtime_ms) |ms| {
         try argv.appendSlice(server.arena, &.{ "--at-vtime-ms", try print(server, "{d}", .{ms}) });
-        if (asked.exec) |command| try argv.appendSlice(server.arena, &.{ "--exec", command });
+    } else if (asked.until) |condition| {
+        try argv.appendSlice(server.arena, &.{ "--until", condition });
+    }
+    const moment = asked.at_vtime_ms != null or asked.until != null;
+    if (asked.exec) |command| {
+        if (moment) try argv.appendSlice(server.arena, &.{ "--exec", command });
     }
     const result = try std.process.run(server.arena, server.io, .{ .argv = argv.items });
     try out.writeAll(result.stdout);
     try out.writeAll(result.stderr);
     return 200;
+}
+
+const CausalityRequest = struct {
+    branch: u32,
+    property: []const u8,
+    points: u32 = 8,
+    futures: u32 = 16,
+};
+
+fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
+    const asked = try std.json.parseFromSliceLeaky(CausalityRequest, server.arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+    if (server.job_count == jobs_max) return error.TooManyJobs;
+    const original = try std.json.parseFromSliceLeaky(
+        RunRequest,
+        server.arena,
+        try run_file(server, run.id, "request.json"),
+        .{ .ignore_unknown_fields = true },
+    );
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(server.arena, &.{ server.options.self, "causality" });
+    try argv.appendSlice(server.arena, server.options.machine);
+    try system_arguments(server.arena, &argv, &original);
+    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed}) });
+    if (original.scenario) |scenario| {
+        try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
+    }
+    if (original.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
+    try argv.appendSlice(server.arena, &.{
+        "--branch",  try print(server, "{d}", .{asked.branch}),
+        "--property", asked.property,
+        "--points",  try print(server, "{d}", .{asked.points}),
+        "--futures", try print(server, "{d}", .{asked.futures}),
+        "--json",
+    });
+    var index: u32 = 0;
+    for (server.jobs[0..server.job_count]) |job| {
+        if (job.run == run.id) index = @max(index, job.index + 1);
+    }
+    const name = try print(server, "causality-{d}.jsonl", .{index});
+    const directory = try run_directory(server, run.id);
+    const output = try std.fs.path.join(server.arena, &.{ directory, name });
+    const pid = try spawn(server.arena, argv.items, output);
+    server.jobs[server.job_count] = .{ .run = run.id, .index = index, .pid = pid };
+    server.job_count += 1;
+    try out.print("{{\"id\":{d}}}\n", .{index});
+    return 201;
+}
+
+fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
+    const job = for (server.jobs[0..server.job_count]) |*job| {
+        if (job.run == run.id and job.index == index) break job;
+    } else return error.NotFound;
+    const name = try print(server, "causality-{d}.jsonl", .{index});
+    const output = run_file(server, run.id, name) catch "";
+    try out.print("{{\"done\":{},\"points\":[", .{job.done});
+    var first = true;
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"vtime_ms\"")) continue;
+        if (!first) try out.writeAll(",");
+        first = false;
+        try out.writeAll(line);
+    }
+    try out.writeAll("]}\n");
+    return 200;
+}
+
+/// A property as a finished run's summary has it.
+const SummaryProperty = struct {
+    kind: []const u8,
+    message: []const u8,
+    /// Absent from records written before multiverse verdicts: violated in some branch then.
+    failing: ?bool = null,
+    branches_failing: u32 = 0,
+
+    fn failed(property: SummaryProperty) bool {
+        return property.failing orelse (property.branches_failing > 0);
+    }
+};
+const SummaryLine = struct {
+    summary: struct { branches: u32, properties: []const SummaryProperty },
+};
+
+fn summary_read(server: *Server, id: u32) ?[]const SummaryProperty {
+    const record = run_file(server, id, "record.jsonl") catch return null;
+    var lines = std.mem.tokenizeScalar(u8, record, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"summary\":")) continue;
+        const parsed = std.json.parseFromSliceLeaky(SummaryLine, server.arena, line, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        return parsed.summary.properties;
+    }
+    return null;
+}
+
+/// The previous finished run of the same system and scenario, as Antithesis compares runs.
+fn run_previous(server: *Server, run: *const Run) !?u32 {
+    const mine = try run_identity(server, run.id);
+    var index = server.run_count;
+    while (index > 0) {
+        index -= 1;
+        const other = &server.runs[index];
+        if (other.id >= run.id or other.status == null) continue;
+        const theirs = run_identity(server, other.id) catch continue;
+        if (std.mem.eql(u8, mine, theirs)) return other.id;
+    }
+    return null;
+}
+
+fn run_identity(server: *Server, id: u32) ![]const u8 {
+    const asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, try run_file(
+        server,
+        id,
+        "request.json",
+    ), .{ .ignore_unknown_fields = true });
+    return print(server, "{s}|{s}|{s}|{s}", .{
+        asked.program orelse "", asked.compose orelse "", asked.scenario orelse "",
+        asked.profile orelse "",
+    });
+}
+
+/// New (fails now, not in the previous run), ongoing (fails in both), resolved (failed before,
+/// passes now); rare when only one timeline showed it.
+fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
+    const now = summary_read(server, run.id) orelse return error.NotFinished;
+    const previous_id = try run_previous(server, run);
+    const before: []const SummaryProperty = if (previous_id) |id| summary_read(server, id) orelse
+        &.{} else &.{};
+    try out.writeAll("{\"previous\":");
+    if (previous_id) |id| try out.print("{d}", .{id}) else try out.writeAll("null");
+    try out.writeAll(",\"findings\":[");
+    var first = true;
+    for (now) |property| {
+        const earlier = for (before) |other| {
+            if (std.mem.eql(u8, other.message, property.message)) break other;
+        } else null;
+        const failed_before = if (earlier) |other| other.failed() else false;
+        const finding: ?[]const u8 = if (property.failed())
+            (if (failed_before) "ongoing" else "new")
+        else if (failed_before) "resolved" else null;
+        const kind = finding orelse continue;
+        if (!first) try out.writeAll(",");
+        first = false;
+        try out.print("{{\"message\":{f},\"kind\":{f},\"finding\":\"{s}\",\"rare\":{}}}", .{
+            std.json.fmt(property.message, .{}), std.json.fmt(property.kind, .{}), kind,
+            property.failed() and property.branches_failing == 1,
+        });
+    }
+    // Properties that failed before and no longer exist (code removed) are resolved too.
+    for (before) |other| {
+        if (!other.failed()) continue;
+        const still = for (now) |property| {
+            if (std.mem.eql(u8, property.message, other.message)) break true;
+        } else false;
+        if (still) continue;
+        if (!first) try out.writeAll(",");
+        first = false;
+        try out.print("{{\"message\":{f},\"kind\":{f},\"finding\":\"resolved\",\"rare\":false}}", .{
+            std.json.fmt(other.message, .{}), std.json.fmt(other.kind, .{}),
+        });
+    }
+    try out.writeAll("]}\n");
+    return 200;
+}
+
+fn system_arguments(
+    arena: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    asked: *const RunRequest,
+) !void {
+    if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
+    if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
+    if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
 }
 
 fn run_find(server: *Server, id: u32) ?*Run {
@@ -310,6 +550,12 @@ fn recorded_status(record: []const u8) u32 {
 }
 
 fn runs_reap(server: *Server) void {
+    for (server.jobs[0..server.job_count]) |*job| {
+        if (job.done) continue;
+        var status: i32 = 0;
+        const result = linux.wait4(job.pid, &status, linux.W.NOHANG, null);
+        if (linux.errno(result) == .SUCCESS and result != 0) job.done = true;
+    }
     for (server.runs[0..server.run_count]) |*run| {
         if (run.status != null) continue;
         var status: i32 = 0;
@@ -426,7 +672,7 @@ fn respond(client: linux.fd_t, status: u16, content_type: []const u8, body: []co
         else => "Internal Server Error",
     };
     const head = std.fmt.bufPrint(&header, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n" ++
-        "Content-Length: {d}\r\nConnection: close\r\n\r\n", .{
+        "Content-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{
         status, reason, content_type, body.len,
     }) catch unreachable;
     write_all(client, head);

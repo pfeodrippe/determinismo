@@ -23,6 +23,7 @@ const faults_path = "/opt/determinismo/bin/det-faults";
 const program_path = "/det/program";
 const nodes_path = "/opt/determinismo/bin/det-nodes";
 const nodes = @import("nodes.zig");
+const output = @import("output.zig");
 const schema = sdk.schema;
 const Kind = schema.Kind;
 
@@ -72,11 +73,13 @@ const Composer = struct {
 
     fn start(composer: *Composer, command: *const Command) void {
         assert(composer.running_count < running_max);
+        var buffer: [256]u8 = undefined;
+        sdk.reachable(command_property(&buffer, "started", command.name), .{});
         assert(composer.started_count < starts_max * 2);
         const pid = if (composer.node) |node|
-            spawn(&.{ nodes_path, "exec", node, command.path.? })
+            spawn_logged(command.name, &.{ nodes_path, "exec", node, command.path.? })
         else
-            spawn(&.{ program_path, "run", composer.scenario, command.name });
+            spawn_logged(command.name, &.{ program_path, "run", composer.scenario, command.name });
         composer.running[composer.running_count] = .{ .pid = pid, .command = command };
         composer.running_count += 1;
         composer.started_count += 1;
@@ -173,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
     if (setup) |*command| composer.run_to_completion(command);
     sdk.setup_complete(.{ .scenario = composer.scenario });
     kernel_reseed();
+    commands_declare(&composer);
     const drivers = composer.kind_count(.parallel_driver) + composer.kind_count(.serial_driver);
     const singletons = composer.kind_count(.singleton_driver);
     if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
@@ -378,8 +382,49 @@ fn spawn(arguments: []const [*:0]const u8) linux.pid_t {
     return @intCast(result);
 }
 
+/// A test command, its output as events (output.zig) named after it, and in the commands' log.
+fn spawn_logged(name: []const u8, arguments: []const [*:0]const u8) linux.pid_t {
+    const pipes = output.pipes() catch return spawn(arguments);
+    defer for ([_][2]linux.fd_t{ pipes.stdout, pipes.stderr }) |pipe| {
+        for (pipe) |fd| _ = linux.close(fd);
+    };
+    const result = linux.fork();
+    assert(linux.errno(result) == .SUCCESS);
+    if (result == 0) {
+        _ = linux.dup2(pipes.stdout[1], 1);
+        _ = linux.dup2(pipes.stderr[1], 2);
+        var argv: [spawn_arguments_max:null]?[*:0]const u8 = @splat(null);
+        for (arguments, 0..) |argument, index| argv[index] = argument;
+        _ = linux.execve(arguments[0], &argv, &environment);
+        linux.exit_group(127);
+    }
+    output.forward(name, commands_log, pipes) catch {};
+    return @intCast(result);
+}
+
+const commands_log = "/run/det/commands.log";
+
+/// Built-in properties, as Antithesis's test composer has: every command is started, and runs
+/// to completion, in some timeline.
+fn commands_declare(composer: *const Composer) void {
+    for (composer.commands[0..composer.command_count]) |*command| {
+        var buffer: [256]u8 = undefined;
+        sdk.declare("reachable", command_property(&buffer, "started", command.name));
+        sdk.declare("reachable", command_property(&buffer, "completed", command.name));
+    }
+}
+
+fn command_property(buffer: *[256]u8, what: []const u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "test command {s}: {s}", .{ what, name }) catch
+        buffer[0..0];
+}
+
 fn report_exit(command: *const Command, status: u32) void {
     const exited = status & 0x7f == 0;
+    if (exited) {
+        var buffer: [256]u8 = undefined;
+        sdk.reachable(command_property(&buffer, "completed", command.name), .{});
+    }
     const code = if (exited) (status >> 8) & 0xff else 128 + (status & 0x7f);
     const name = command.name;
     sdk.event("command_exit", .{ .command = name, .status = code });

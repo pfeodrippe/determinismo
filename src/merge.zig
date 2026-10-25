@@ -4,9 +4,11 @@
 //!
 //! The shards must have explored the same thing (inputs, seed, scenario, fork point); their
 //! branches must not overlap. The merged record (run, branches, summary) goes to stdout as JSON
-//! lines; the summary is printed as explore prints it. Returns the number of failing branches.
+//! lines; the summary is printed as explore prints it. Returns the number of failing properties.
 const std = @import("std");
 const assert = std.debug.assert;
+const report = @import("report.zig");
+const Events = @import("events.zig");
 
 const Run = struct {
     scenario: ?[]const u8 = null,
@@ -34,7 +36,10 @@ const Branch = struct {
 const Property = struct {
     kind: []const u8,
     message: []const u8,
+    /// Across the merged multiverse (report.property_failing), set once merged.
+    failing: bool = false,
     branches_hit: u32,
+    branches_true: u32 = 0,
     branches_failing: u32,
     example_branch: ?u32 = null,
 };
@@ -76,10 +81,20 @@ pub fn merge(arena: std.mem.Allocator, io: std.Io, paths: []const [:0]const u8) 
         }
     }
     const merged_run = run orelse return error.NoRunLine;
+    var failing: u32 = 0;
+    for (properties.items) |*property| {
+        const kind = std.meta.stringToEnum(Events.Kind, property.kind) orelse return error.BadKind;
+        property.failing = report.property_failing(kind, .{
+            .branches_hit = property.branches_hit,
+            .branches_true = property.branches_true,
+            .branches_failing = property.branches_failing,
+        });
+        failing += @intFromBool(property.failing);
+    }
     total.properties = properties.items;
     try output(io, merged_run, branches.items, total);
     summary_print(&total, merged_run);
-    return total.failing_branches;
+    return failing;
 }
 
 fn run_check(known: *?Run, run: Run, path: []const u8) !void {
@@ -133,6 +148,7 @@ fn summary_add(
             continue;
         };
         property.branches_hit += incoming.branches_hit;
+        property.branches_true += incoming.branches_true;
         property.branches_failing += incoming.branches_failing;
         const example = incoming.example_branch orelse continue;
         if (property.example_branch == null or example < property.example_branch.?) {
@@ -174,7 +190,7 @@ fn summary_print(total: *const Summary, run: Run) void {
         total.branches, run.branches, total.failing_branches,
     });
     for (total.properties) |property| {
-        const status = if (property.branches_failing > 0) "FAIL" else "PASS";
+        const status = if (property.failing) "FAIL" else "PASS";
         print("  {s} {s:<21} hit in {d:>4}/{d} branches, failing in {d:>4}  {s}", .{
             status,         property.kind,             property.branches_hit,
             total.branches, property.branches_failing, property.message,

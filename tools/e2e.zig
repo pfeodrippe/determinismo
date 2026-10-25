@@ -65,6 +65,9 @@ pub fn main(init: std.process.Init) !void {
     try check_python_strategy(&context);
     try check_builtin_properties(&context);
     try check_kernel_entropy(&context);
+    try check_query(&context);
+    try check_serve(&context);
+    try check_until_and_causality(&context);
     try check_coverage(&context);
     try check_parallel(&context);
     try check_fork(&context);
@@ -284,6 +287,159 @@ fn check_k3s_compose(
     expect(context, same, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
 }
 
+/// Every branch's events, queried as Antithesis's Logs Explorer does: the failing timelines are
+/// found, node output is searchable, and a temporal condition splits the violations exactly
+/// (those preceded by a fault and those not add up to all).
+fn check_query(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "query-events" });
+    const report = try explore(context, &.{
+        "--program", program, "--scenario", "bank", "--seed", "3", "--branches", "16",
+        "--events-dir", events,
+    });
+    const failing_report = std.mem.indexOf(u8, report, "with failing properties") != null;
+    const violation = "assert.message=\"total balance is conserved\" assert.condition=false";
+    const all = try query_count(context, &.{ events, violation });
+    const fault = "event=fault";
+    const after_fault = try query_count(context, &.{ events, violation, "--preceded-by", fault });
+    const no_fault = try query_count(context, &.{ events, violation, "--not-preceded-by", fault });
+    const output = try query_count(context, &.{ events, "output.source=redis" });
+    const found = failing_report and all > 0 and output > 0 and after_fault + no_fault == all;
+    expect(context, found, "query: {d} violations ({d} after a fault, {d} without), {d} redis " ++
+        "output lines", .{ all, after_fault, no_fault, output });
+}
+
+/// The HTTP API and its web UI: `serve` answers with the page, starts a run, records every
+/// branch's events, and answers queries about them.
+fn check_serve(context: *Context) !void {
+    const arena = context.arena;
+    const address = "127.0.0.1:7891";
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "serve" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address });
+    try argv.appendSlice(arena, &.{ "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer server.kill(context.io);
+    const url = "http://" ++ address;
+    var page: []const u8 = "";
+    for (0..50) |_| {
+        page = curl(context, &.{url ++ "/"}) catch "";
+        if (page.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const body = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
+        "\"seed\":3,\"branches\":8}}", .{std.json.fmt(program, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", body, url ++ "/runs" });
+    var run: []const u8 = "";
+    for (0..600) |_| {
+        run = try curl(context, &.{url ++ "/runs/1"});
+        if (std.mem.indexOf(u8, run, "\"state\":\"running\"") == null) break;
+        sleep_ms(200);
+    }
+    const asked = "{\"condition\":\"output.source=redis\",\"output\":\"count\"}";
+    const answer = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs/1/query" });
+    const ui = std.mem.indexOf(u8, page, "<title>determinismo</title>") != null;
+    const finished = std.mem.indexOf(u8, run, "\"summary\"") != null;
+    const queried = std.mem.indexOf(u8, answer, "\"events\":") != null and
+        std.mem.indexOf(u8, answer, "\"events\":0,") == null;
+    expect(context, ui and finished and queried, "serve: the UI, a run over HTTP, and a query " ++
+        "of its events ({s})", .{std.mem.trim(u8, answer, "\n")});
+}
+
+fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    const json = "Content-Type: application/json";
+    try argv.appendSlice(context.arena, &.{ "curl", "-s", "--fail", "-H", json });
+    try argv.appendSlice(context.arena, arguments);
+    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    if (!result.term.success()) return error.RequestFailed;
+    return result.stdout;
+}
+
+fn sleep_ms(duration_ms: u64) void {
+    const request = std.os.linux.timespec{
+        .sec = @intCast(duration_ms / 1000),
+        .nsec = @intCast((duration_ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&request, null);
+}
+
+/// `--until` (Antithesis's wait_until) stops a branch at its first violation and runs a command
+/// there, the same on every replay; causality analysis measures the failure's probability at
+/// moments before it (certain at the failure itself).
+fn check_until_and_causality(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
+    const violation = "assert.message=\"total balance is conserved\" assert.condition=false";
+    var outputs: [2][]const u8 = undefined;
+    for (&outputs) |*output| {
+        const read = "det-nodes exec redis redis-cli mget account:0 account:1";
+        const report = try explore(context, &(system ++ [_][]const u8{
+            "--branch", "4", "--until", violation, "--exec", read,
+        }));
+        output.* = try lines_with(arena, report, &.{ "at moment", "exec_output" });
+    }
+    const stopped = std.mem.indexOf(u8, outputs[0], "exec_output") != null and
+        std.mem.eql(u8, outputs[0], outputs[1]);
+    expect(context, stopped, "until: branch 4 stops at its first violation, the same twice", .{});
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
+    try argv.appendSlice(arena, context.machine);
+    try argv.appendSlice(arena, &system);
+    try argv.appendSlice(arena, &.{
+        "--branch",  "4", "--property", "total balance is conserved", "--points", "4",
+        "--futures", "8", "--json",
+    });
+    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const Point = struct { vtime_ms: u64, probability: f64 };
+    var points: u32 = 0;
+    var last: f64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const point = std.json.parseFromSliceLeaky(Point, arena, line, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (point.probability < 0 or point.probability > 1) break;
+        points += 1;
+        last = point.probability;
+    }
+    expect(context, points == 4 and last == 1, "causality: {d} moments, certain at the " ++
+        "failure ({d:.2})", .{ points, last });
+}
+
+/// The lines of `text` containing any of `keys`, joined.
+fn lines_with(arena: std.mem.Allocator, text: []const u8, keys: []const []const u8) ![]const u8 {
+    var kept: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        for (keys) |key| {
+            if (std.mem.indexOf(u8, line, key) == null) continue;
+            try kept.appendSlice(arena, line);
+            try kept.append(arena, '\n');
+            break;
+        }
+    }
+    return kept.items;
+}
+
+/// How many events `determinismo query` finds (its --count line).
+fn query_count(context: *Context, arguments: []const []const u8) !u64 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(context.arena, &.{ context.determinismo, "query" });
+    try argv.appendSlice(context.arena, arguments);
+    try argv.append(context.arena, "--count");
+    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const end = std.mem.indexOfScalar(u8, result.stdout, ' ') orelse return 0;
+    return std.fmt.parseInt(u64, result.stdout[0..end], 10) catch 0;
+}
+
 /// The guest kernel's random generator after the snapshot: different in every branch, the same
 /// when a branch replays.
 fn check_kernel_entropy(context: *Context) !void {
@@ -351,6 +507,11 @@ fn check_builtin_properties(context: *Context) !void {
     const oom_caught = std.mem.indexOf(u8, hog, oom) != null and
         std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null;
     expect(context, oom_caught, "built-in properties catch an OOM kill in a node", .{});
+    const crashed = try explore(context, &.{
+        "--program", program, "--scenario", "crash", "--seed", "1", "--branches", "1",
+    });
+    const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
+    expect(context, crash_caught, "built-in properties catch a crash (SIGSEGV) in a node", .{});
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

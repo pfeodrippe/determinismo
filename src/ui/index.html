@@ -1,0 +1,632 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- determinismo's web UI, served by `determinismo serve` at /. One page, no build step, no
+     dependencies: it reads the HTTP API (src/serve.zig) and updates live while runs go. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>determinismo</title>
+<style>
+:root {
+  --bg: #15161a; --panel: #1d1f25; --panel-2: #24262e; --line: #30333d; --text: #e6e7eb;
+  --muted: #9a9eab; --accent: #8f7cf7; --pass: #3fbf7f; --fail: #f0506e; --warn: #f0a650;
+  --info: #5aa9f0; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
+a { color: var(--accent); cursor: pointer; text-decoration: none; }
+button, input, select, textarea {
+  font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 10px;
+}
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+.layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+aside { background: var(--panel); border-right: 1px solid var(--line); padding: 16px; }
+main { padding: 20px 28px; min-width: 0; }
+h1 { font-size: 18px; margin: 0 0 14px; letter-spacing: .3px; }
+h1 span { color: var(--accent); }
+h2 { font-size: 20px; margin: 0; }
+.runs { list-style: none; padding: 0; margin: 12px 0 0; }
+.runs li { padding: 8px 10px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; }
+.runs li:hover, .runs li.selected { background: var(--panel-2); }
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid; white-space: nowrap; }
+.badge.pass { color: var(--pass); border-color: var(--pass); }
+.badge.fail { color: var(--fail); border-color: var(--fail); }
+.badge.running { color: var(--info); border-color: var(--info); }
+.badge.error { color: var(--warn); border-color: var(--warn); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; }
+section > header { display: flex; align-items: baseline; gap: 12px; padding: 12px 16px; cursor: pointer; }
+section > header h3 { margin: 0; font-size: 17px; color: #c9cbd3; }
+section > header .summary { color: var(--muted); font-size: 13px; }
+section > .body { padding: 4px 16px 16px; }
+section.closed > .body { display: none; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+.progress { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+.progress div { height: 100%; background: var(--accent); transition: width .4s; }
+.tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.tabs button { border: 0; border-radius: 0; background: transparent; padding: 4px 12px; }
+.tabs button.on { background: var(--panel-2); }
+.group-title { margin: 14px 0 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+.property { border-top: 1px solid var(--line); }
+.property > .row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; cursor: pointer; }
+.property > .row .name { flex: 1; }
+.property > .row .counts { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.examples { margin: 0 0 10px 28px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+td { padding: 4px 8px; border-bottom: 1px solid #262830; vertical-align: top; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: var(--panel-2); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.fail-text { color: var(--fail); }
+.pass-text { color: var(--pass); }
+.muted { color: var(--muted); }
+.search-form { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.search-form .temporal { display: grid; grid-template-columns: 180px 1fr 110px; gap: 8px; }
+.search-form .actions { display: flex; gap: 8px; align-items: center; }
+.logs { max-height: 560px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.logs table td { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.logs table td:first-child, .logs table td:nth-child(2) { white-space: nowrap; }
+.logs tr.here { background: #3a2a44; }
+.kind { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--panel-2); color: var(--muted); }
+.kind.fault { color: var(--warn); }
+.kind.assert-fail { color: var(--fail); }
+.kind.assert { color: var(--pass); }
+.kind.output { color: var(--info); }
+.kind.command { color: var(--accent); }
+.map { width: 100%; overflow-x: auto; }
+.map svg { display: block; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; width: 520px; }
+dialog::backdrop { background: rgba(0,0,0,.55); }
+dialog form { display: grid; gap: 10px; }
+dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+pre.output { background: #101114; border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+.empty { color: var(--muted); padding: 30px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1><span>{·}</span> determinismo</h1>
+    <button class="primary" id="new-run" style="width:100%">New run</button>
+    <ul class="runs" id="runs"></ul>
+  </aside>
+  <main id="main"><div class="empty">Choose a run, or start one.</div></main>
+</div>
+
+<dialog id="run-dialog">
+  <form method="dialog" id="run-form">
+    <h3 style="margin:0">New run</h3>
+    <label>System
+      <select name="kind"><option value="program">Test program</option><option value="compose">Compose file</option></select>
+    </label>
+    <label>Path (on the server)<input name="path" required placeholder="zig-out/bin/bank-test or examples/k3s/compose.yaml"></label>
+    <label>Scenario<input name="scenario" placeholder="bank"></label>
+    <label>Profile<input name="profile" placeholder="default"></label>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+      <label>Branches<input name="branches" type="number" value="64" min="1"></label>
+      <label>Seed<input name="seed" type="number" value="0" min="0"></label>
+      <label>Workers<input name="jobs" type="number" placeholder="all CPUs" min="1"></label>
+    </div>
+    <label>Strategy (optional)<input name="strategy" placeholder="det-strategy-mutate --sync-dir /tmp/corpus"></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button class="primary" value="start">Start</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const state = {
+  runs: [], runId: null, run: null, poll: null, tab: "all", filter: "", logs: null,
+  open: new Set(["findings", "properties", "map"]), // Sections shown expanded.
+};
+const $ = (selector, root = document) => root.querySelector(selector);
+const escape = (text) => String(text).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const seconds = (ns) => (ns / 1e9).toFixed(3) + "s";
+const quote = (text) => '"' + String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(text);
+  return text;
+}
+const apiJson = async (path, body) => JSON.parse(await api(path, body));
+const lines = (text) => text.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line));
+const query = async (request) => lines(await api(`/runs/${state.runId}/query`, request));
+
+// Runs ------------------------------------------------------------------------------------
+async function runsRefresh() {
+  try { state.runs = await apiJson("/runs"); } catch { return; }
+  const list = $("#runs");
+  list.innerHTML = state.runs.slice().reverse().map((run) =>
+    `<li data-id="${run.id}" class="${run.id === state.runId ? "selected" : ""}">
+       <span>Run ${run.id}</span>${stateBadge(run.state)}</li>`).join("");
+  list.querySelectorAll("li").forEach((item) =>
+    item.addEventListener("click", () => runOpen(Number(item.dataset.id))));
+}
+function stateBadge(name) {
+  const kind = { passed: "pass", failed: "fail", running: "running" }[name] || "error";
+  return `<span class="badge ${kind}">${escape(name)}</span>`;
+}
+
+async function runOpen(id) {
+  state.runId = id;
+  state.logs = null;
+  clearInterval(state.poll);
+  await runRefresh();
+  runsRefresh();
+  state.poll = setInterval(async () => {
+    if (state.run && state.run.state === "running") { await runRefresh(); runsRefresh(); }
+  }, 2000);
+}
+
+async function runRefresh() {
+  state.run = await apiJson(`/runs/${state.runId}`);
+  render();
+}
+
+// Rendering -------------------------------------------------------------------------------
+function render() {
+  const run = state.run;
+  const info = run.run || {};
+  const total = info.branches || 0;
+  const done = run.branches.length;
+  const failing = run.branches.filter((branch) => branch.failing.length > 0).length;
+  const isOpen = (id) => state.open.has(id);
+  $("#main").innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:14px">
+      <h2>Run ${run.id} ${info.scenario ? "· " + escape(info.scenario) : ""}</h2>${stateBadge(run.state)}
+    </div>
+    <div class="muted" style="margin-top:4px">${escape(info.program || info.compose || "")}
+      · seed ${escape(info.seed || "")} · inputs ${escape(info.inputs || "")}
+      ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
+    <div class="progress"><div style="width:${total ? (100 * done / total) : 0}%"></div></div>
+    <div class="muted" style="margin-top:4px">${done} of ${total} branches · ${failing} with failing properties</div>
+    ${sectionHtml("findings", "Findings", run.state === "running" ? "when the run finishes" : "", `<div id="findings-body" class="muted">${run.state === "running" ? "Compared with the previous run of this system once this one finishes." : "Loading…"}</div>`, isOpen("findings"))}
+    ${sectionHtml("environment", "Environment", environmentSummary(), environmentBody(), isOpen("environment"))}
+    ${sectionHtml("utilization", "Utilization", utilizationSummary(), utilizationBody(), isOpen("utilization"))}
+    ${sectionHtml("properties", "Properties", propertiesSummary(), propertiesBody(), isOpen("properties"))}
+    ${sectionHtml("map", "Multiverse map", `${done} timelines`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
+    ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
+    ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}
+  `;
+  document.querySelectorAll("section > header").forEach((header) => header.addEventListener("click", () => {
+    const section = header.parentElement;
+    section.classList.toggle("closed");
+    if (section.classList.contains("closed")) state.open.delete(section.id); else state.open.add(section.id);
+    if (section.id === "map" && !section.classList.contains("closed")) mapDraw();
+  }));
+  propertiesWire();
+  searchWire();
+  mapDraw();
+  findingsLoad();
+  logsWire();
+}
+
+function sectionHtml(id, title, summary, body, open) {
+  return `<section id="${id}" class="${open ? "" : "closed"}"><header><h3>${title}</h3>
+    <span class="summary">${summary}</span></header><div class="body">${body}</div></section>`;
+}
+
+// Environment: what was tested (the resolved system recorded with the run).
+function environmentSummary() {
+  const system = (state.run.run || {}).system;
+  return system ? escape(system.nodes.map((node) => node.name).join(", ")) : "";
+}
+function environmentBody() {
+  const system = (state.run.run || {}).system;
+  if (!system) return `<div class="muted">Not recorded for this run.</div>`;
+  const faults = (node) => Object.entries(node.faults || {}).filter(([, on]) => on).map(([name]) => name).join(", ") || "none";
+  return `<dl class="kv"><dt>Profile</dt><dd>${escape(system.profile)}</dd>
+      <dt>Scenarios</dt><dd>${escape(system.scenarios.map((s) => s.name).join(", "))}</dd></dl>
+    <table style="margin-top:10px"><tr><th>Node</th><th>Address</th><th>Content</th><th>Command</th><th>Ready</th><th>Limits</th><th>Faults allowed</th></tr>
+    ${system.nodes.map((node) => `<tr><td>${escape(node.name)}</td><td class="mono">${escape(node.address)}</td>
+      <td class="mono" title="${escape(node.digest)}">${escape(node.digest.slice(0, 19))}</td>
+      <td class="mono">${escape(node.command.join(" "))}</td><td class="mono">${node.ready ? "tcp " + node.ready.tcp : ""}</td>
+      <td>${[node.memory_max_mib ? node.memory_max_mib + " MiB" : "", node.privileged ? "privileged" : ""].filter(Boolean).join(", ")}</td>
+      <td>${escape(faults(node))}</td></tr>`).join("")}</table>`;
+}
+
+function utilizationSummary() {
+  const vtime = state.run.branches.reduce((sum, branch) => sum + branch.vtime_ns, 0);
+  return `${(vtime / 1e9).toFixed(1)} virtual seconds explored`;
+}
+function utilizationBody() {
+  const run = state.run;
+  const vtime = run.branches.reduce((sum, branch) => sum + branch.vtime_ns, 0);
+  const wall = run.summary ? run.summary.wall_ns : run.branches.reduce((sum, b) => sum + b.wall_ns, 0);
+  const rows = [
+    ["Branches", `${run.branches.length} of ${(run.run || {}).branches || "?"}`],
+    ["Virtual time", seconds(vtime)],
+    ["Wall time", seconds(wall)],
+    ["Virtual per wall", wall ? (vtime / wall).toFixed(2) + "×" : "–"],
+    ["Exact stops", run.summary ? `largest skid ${run.summary.skid_max} branches, ${run.summary.overshoots} overshoots` : "–"],
+  ];
+  return `<dl class="kv">${rows.map(([key, value]) => `<dt>${key}</dt><dd>${escape(value)}</dd>`).join("")}</dl>`;
+}
+
+// Properties: from the summary, or (while running) from the failing branches so far.
+const builtin = new Set(["test commands exit successfully", "nodes do not exit unexpectedly",
+  "no process crashes (segfault, illegal instruction, ...)",
+  "the kernel kills no process for lack of memory", "the kernel reports no warnings, BUGs or hung tasks",
+  "the guest finishes its scenario (no panic, hang or crash)"]);
+function properties() {
+  if (state.run.summary) return state.run.summary.properties;
+  const failing = new Map();
+  for (const branch of state.run.branches) for (const name of branch.failing) {
+    const property = failing.get(name) || { kind: "?", message: name, branches_hit: 0, branches_failing: 0, example_branch: branch.index };
+    property.branches_failing += 1;
+    failing.set(name, property);
+  }
+  return [...failing.values()];
+}
+// The summary's verdict across the multiverse (a sometimes never true, a reachable never
+// reached fail too); while a run goes, the violations seen so far.
+const isFailing = (property) => property.failing ?? property.branches_failing > 0;
+function propertiesSummary() {
+  const list = properties();
+  const failed = list.filter(isFailing).length;
+  return `<span class="${failed ? "fail-text" : "pass-text"}">${failed} failing</span> of ${list.length}${state.run.summary ? "" : " (so far)"}`;
+}
+function propertiesBody() {
+  const list = properties();
+  const passed = list.filter((p) => !isFailing(p)).length;
+  const counts = { all: list.length, passed, failed: list.length - passed };
+  const tabs = ["all", "passed", "failed"].map((tab) =>
+    `<button data-tab="${tab}" class="${state.tab === tab ? "on" : ""}">${tab[0].toUpperCase() + tab.slice(1)} ${counts[tab]}</button>`).join("");
+  const shown = list.filter((p) => (state.tab === "all" || (state.tab === "passed") === !isFailing(p))
+    && p.message.toLowerCase().includes(state.filter.toLowerCase()));
+  const command = (p) => p.message.startsWith("test command ");
+  const own = (p) => !builtin.has(p.message) && !command(p);
+  const groups = [
+    ["determinismo", shown.filter((p) => builtin.has(p.message))],
+    ["Test commands", shown.filter(command)],
+    ["Always assertions", shown.filter((p) => own(p) && p.kind.startsWith("always"))],
+    ["Sometimes assertions", shown.filter((p) => own(p) && p.kind === "sometimes")],
+    ["Reachability assertions", shown.filter((p) => own(p) && (p.kind === "reachable" || p.kind === "unreachable"))],
+  ].filter(([, items]) => items.length);
+  return `<div style="display:flex;gap:10px;align-items:center"><div class="tabs">${tabs}</div>
+      <input id="property-filter" placeholder="Filter" value="${escape(state.filter)}" style="width:300px"></div>
+    ${groups.map(([title, items]) => `<div class="group-title">${title}</div>${items.map(propertyHtml).join("")}`).join("")
+      || `<div class="empty">No properties ${state.run.state === "running" ? "yet" : ""}</div>`}`;
+}
+function propertyHtml(property) {
+  const failed = isFailing(property);
+  return `<div class="property" data-message="${escape(property.message)}">
+    <div class="row"><span class="badge ${failed ? "fail" : "pass"}">${failed ? "failed" : "passed"}</span>
+      <span class="name">${escape(property.message)}</span>
+      <span class="counts">${escape(property.kind)} · hit in ${property.branches_hit}${property.kind === "sometimes" ? ` · true in ${property.branches_true ?? "?"}` : ""} · failing in ${property.branches_failing}</span></div>
+    <div class="examples" hidden></div></div>`;
+}
+function propertiesWire() {
+  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation(); state.tab = button.dataset.tab; render();
+  }));
+  const filter = $("#property-filter");
+  if (filter) filter.addEventListener("input", () => {
+    state.filter = filter.value;
+    const position = filter.selectionStart;
+    render();
+    const again = $("#property-filter"); again.focus(); again.setSelectionRange(position, position);
+  });
+  document.querySelectorAll(".property > .row").forEach((row) => row.addEventListener("click", () =>
+    examplesToggle(row.parentElement)));
+}
+
+// Examples: the moments a property failed (and passed), by timeline.
+async function examplesToggle(element) {
+  const box = $(".examples", element);
+  box.hidden = !box.hidden;
+  if (box.hidden || box.dataset.loaded) return;
+  box.innerHTML = `<div class="muted">Loading examples…</div>`;
+  const message = element.dataset.message;
+  const field = `assert.message=${quote(message)}`;
+  try {
+    const failing = await query({ condition: `${field} assert.condition=false or antithesis_assert.message=${quote(message)} antithesis_assert.condition=false`, output: "branches", limit: 1000000 });
+    const passing = await query({ condition: `${field} assert.condition=true or antithesis_assert.message=${quote(message)} antithesis_assert.condition=true`, output: "branches", limit: 1000000 });
+    const failingBranches = new Set(failing.map((example) => example.branch));
+    const rows = [
+      ...failing.slice(0, 10).map((example) => ({ ...example, failing: true })),
+      ...passing.filter((example) => !failingBranches.has(example.branch)).slice(0, 5).map((example) => ({ ...example, failing: false })),
+    ];
+    box.dataset.loaded = "1";
+    box.innerHTML = rows.length ? `<table><tr><th>Example</th><th>Branch</th><th>Time</th><th>Hits</th><th></th></tr>
+      ${rows.map((row) => `<tr class="clickable" data-branch="${row.branch}" data-vtime="${row.first_vtime_ns}">
+        <td class="${row.failing ? "fail-text" : "pass-text"}">${row.failing ? "Failing" : "Passing"}</td>
+        <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
+        <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
+      </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.length} passing. Click an example for its logs.</div>
+      <div class="causality-result"></div>`
+      : `<div class="muted">No assertion events for this property (determinismo checks it when a timeline ends).</div>`;
+    box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
+      logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
+    box.querySelectorAll("button.causality").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      causalityRun($(".causality-result", box), Number(button.dataset.branch), message);
+    }));
+  } catch (error) { box.innerHTML = `<div class="fail-text">${escape(error.message)}</div>`; }
+}
+
+// Findings: what changed since the previous run of the same system and scenario.
+async function findingsLoad() {
+  const body = $("#findings-body");
+  if (!body || state.run.state === "running") return;
+  let result;
+  try { result = await apiJson(`/runs/${state.runId}/findings`); }
+  catch { body.textContent = "No summary for this run."; return; }
+  const counts = {};
+  for (const finding of result.findings) counts[finding.finding] = (counts[finding.finding] || 0) + 1;
+  const summary = $("#findings .summary");
+  if (summary) summary.innerHTML = ["new", "ongoing", "resolved"].filter((kind) => counts[kind])
+    .map((kind) => `<span class="${kind === "resolved" ? "pass-text" : kind === "new" ? "fail-text" : ""}">${counts[kind]} ${kind}</span>`).join(", ")
+    || (result.previous == null ? "first run of this system" : "nothing changed");
+  const badge = { new: "fail", ongoing: "error", resolved: "pass" };
+  body.innerHTML = result.findings.length ? result.findings.map((finding) =>
+    `<div class="property" style="cursor:pointer" data-goto="${escape(finding.message)}"><div class="row">
+      <span class="badge ${badge[finding.finding]}">${finding.finding.toUpperCase()}</span>
+      ${finding.rare ? `<span class="badge running" title="Only one timeline showed it: the next run may miss it">RARE</span>` : ""}
+      <span class="name">${escape(finding.message)}</span><span class="counts">${escape(finding.kind)}</span></div></div>`).join("")
+    + `<div class="muted" style="margin-top:6px">${result.previous == null ? "No earlier run of this system and scenario: every failure is new." : `Compared with run ${result.previous}.`}</div>`
+    : `<div class="muted">${result.previous == null ? "First run of this system and scenario, and nothing failed." : `Nothing changed since run ${result.previous}.`}</div>`;
+  body.querySelectorAll("[data-goto]").forEach((element) => element.addEventListener("click", () => {
+    const property = document.querySelector(`.property[data-message="${CSS.escape(element.dataset.goto)}"]`);
+    if (!property) return;
+    property.scrollIntoView({ behavior: "smooth", block: "center" });
+    if ($(".examples", property).hidden) examplesToggle(property);
+  }));
+}
+
+// Causality analysis (causality.zig): the failure's probability at moments of the timeline,
+// from futures forked there. Jumps mark where the timeline made the bug likely.
+async function causalityRun(box, branch, property) {
+  box.innerHTML = `<div class="muted">Causality of branch ${branch}: forking futures…</div>`;
+  let job;
+  try { job = await apiJson(`/runs/${state.runId}/causality`, { branch, property, points: 10, futures: 16 }); }
+  catch (error) { box.innerHTML = `<div class="fail-text">${escape(error.message)}</div>`; return; }
+  for (;;) {
+    const result = await apiJson(`/runs/${state.runId}/causality/${job.id}`);
+    box.innerHTML = causalityChart(branch, result.points, result.done);
+    box.querySelectorAll("[data-vtime]").forEach((bar) => bar.addEventListener("click", () =>
+      logsOpen(branch, Number(bar.dataset.vtime))));
+    if (result.done) return;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+function causalityChart(branch, points, done) {
+  if (!points.length) return `<div class="muted">Causality of branch ${branch}: ${done ? "the property did not fail again" : "forking futures…"}</div>`;
+  const width = 520, height = 140, left = 36, bottom = 22, step = (width - left) / points.length;
+  const bars = points.map((point, i) => {
+    const h = (height - bottom - 8) * point.probability;
+    return `<g data-vtime="${point.vtime_ms * 1e6}" style="cursor:pointer"><rect x="${left + i * step + 2}" y="${height - bottom - h}"
+      width="${step - 4}" height="${Math.max(h, 1)}" fill="${point.probability >= 0.99 ? "#f0506e" : "#8f7cf7"}">
+      <title>${point.vtime_ms}ms: ${(point.probability * 100).toFixed(0)}% (${point.failing}/${point.futures}) — click for the logs up to here</title></rect>
+      <text x="${left + i * step + step / 2}" y="${height - 6}" fill="#9a9eab" font-size="9" text-anchor="middle">${point.vtime_ms}</text></g>`;
+  }).join("");
+  const axis = [0, 0.5, 1].map((p) => `<text x="${left - 6}" y="${height - bottom - (height - bottom - 8) * p + 3}" fill="#9a9eab" font-size="9" text-anchor="end">${p * 100}%</text>`).join("");
+  return `<div class="group-title">Causality of branch ${branch}${done ? "" : " (running)"}: probability of the failure, by moment (ms)</div>
+    <svg width="${width}" height="${height}">${axis}${bars}</svg>
+    <div class="muted">A jump means the timeline made the bug likely just before: click the bar after it for the logs up to there.</div>`;
+}
+
+// Multiverse map: one bar per timeline; failures and faults where they happened.
+async function mapDraw() {
+  const body = $("#map-body");
+  if (!body || $("#map").classList.contains("closed")) return;
+  const branches = state.run.branches.slice().sort((a, b) => a.index - b.index);
+  if (!branches.length) { body.textContent = "No timelines yet."; return; }
+  let failures = [], faults = [];
+  try {
+    failures = await query({ condition: "assert.condition=false or antithesis_assert.condition=false", limit: 20000 });
+    faults = await query({ condition: "event=fault", limit: 20000 });
+  } catch { /* The map still shows the timelines. */ }
+  const end = Math.max(...branches.map((b) => b.vtime_ns));
+  const start = Math.min(...failures.concat(faults).map((e) => e.vtime_ns), ...branches.map((b) => b.vtime_ns)) * 0.98;
+  const width = Math.max(700, body.clientWidth - 10), left = 70, row = 14;
+  const x = (ns) => left + (width - left - 10) * (ns - start) / Math.max(1, end - start);
+  const index = new Map(branches.map((branch, i) => [branch.index, i]));
+  const height = branches.length * row + 24;
+  const bars = branches.map((branch, i) => `<g class="timeline" data-branch="${branch.index}" data-vtime="${branch.vtime_ns}" style="cursor:pointer">
+    <text x="4" y="${i * row + 11}" fill="#9a9eab" font-size="10" font-family="monospace">#${branch.index}</text>
+    <rect x="${x(start)}" y="${i * row + 4}" width="${Math.max(1, x(branch.vtime_ns) - x(start))}" height="7" rx="2"
+      fill="${branch.failing.length ? "#5c2332" : "#273a31"}"></rect></g>`).join("");
+  const marks = (events, color, size) => events.filter((e) => index.has(e.branch)).map((e) =>
+    `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${x(e.vtime_ns) - size / 2}" y="${index.get(e.branch) * row + 2}"
+      width="${size}" height="11" fill="${color}" style="cursor:pointer"><title>${escape(describe(e.event).text)} @ ${seconds(e.vtime_ns)}</title></rect>`).join("");
+  const ticks = Array.from({ length: 6 }, (_, i) => start + (end - start) * i / 5).map((ns) =>
+    `<text x="${x(ns)}" y="${height - 4}" fill="#9a9eab" font-size="10" text-anchor="middle">${(ns / 1e9).toFixed(2)}s</text>`).join("");
+  body.innerHTML = `<div class="legend"><span><i style="background:#273a31"></i>passing timeline</span>
+      <span><i style="background:#5c2332"></i>failing timeline</span><span><i style="background:var(--warn)"></i>fault</span>
+      <span><i style="background:var(--fail)"></i>failed assertion</span></div>
+    <div class="map"><svg width="${width}" height="${height}">${bars}${marks(faults, "#f0a650", 2)}${marks(failures, "#f0506e", 3)}${ticks}</svg></div>`;
+  body.querySelectorAll(".timeline, .mark").forEach((element) => element.addEventListener("click", (event) => {
+    event.stopPropagation();
+    logsOpen(Number(element.dataset.branch), Number(element.dataset.vtime));
+  }));
+}
+
+// Search: conditions and temporal conditions over every timeline (src/query.zig).
+function searchBody() {
+  return `<div class="search-form">
+    <input id="q-condition" placeholder='Condition, e.g. assert.condition=false   or   output.text~"connection refused"   or   event=fault details.kind=partition'>
+    <div class="temporal"><select id="q-temporal"><option value="">no temporal condition</option>
+        <option value="preceded_by">preceded by</option><option value="not_preceded_by">not preceded by</option>
+        <option value="followed_by">followed by</option><option value="not_followed_by">not followed by</option></select>
+      <input id="q-temporal-condition" placeholder="event=fault"><input id="q-within" placeholder="within (s)" type="number" step="any"></div>
+    <div class="actions"><select id="q-output"><option value="events">events</option><option value="branches">timelines</option><option value="count">count</option></select>
+      <button class="primary" id="q-run">Search</button><span class="muted" id="q-status"></span></div>
+    <div id="q-results"></div></div>`;
+}
+function searchWire() {
+  const button = $("#q-run");
+  if (!button) return;
+  const run = async () => {
+    const request = { condition: $("#q-condition").value.trim(), output: $("#q-output").value, limit: 500 };
+    if (!request.condition) return;
+    const temporal = $("#q-temporal").value, other = $("#q-temporal-condition").value.trim();
+    if (temporal && other) request[temporal] = other;
+    if ($("#q-within").value) request.within = Number($("#q-within").value);
+    $("#q-status").textContent = "Searching…";
+    try {
+      const results = await query(request);
+      $("#q-status").textContent = "";
+      $("#q-results").innerHTML = resultsHtml(request.output, results);
+      $("#q-results").querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
+        logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
+    } catch (error) { $("#q-status").innerHTML = `<span class="fail-text">${escape(error.message)}</span>`; }
+  };
+  button.addEventListener("click", run);
+  $("#q-condition").addEventListener("keydown", (event) => { if (event.key === "Enter") run(); });
+}
+function resultsHtml(output, results) {
+  if (output === "count") {
+    const count = results[0] || { events: 0, branches: 0, timelines: 0 };
+    return `<p>${count.events} events in ${count.branches} of ${count.timelines} timelines</p>`;
+  }
+  if (!results.length) return `<p class="muted">Nothing matched.</p>`;
+  if (output === "branches") {
+    return `<table><tr><th>Branch</th><th>Matches</th><th>First at</th></tr>${results.map((r) =>
+      `<tr class="clickable" data-branch="${r.branch}" data-vtime="${r.first_vtime_ns}"><td class="mono">${r.branch}</td>
+       <td class="mono">${r.matches}</td><td class="mono">${seconds(r.first_vtime_ns)}</td></tr>`).join("")}</table>`;
+  }
+  return `<table><tr><th>Branch</th><th>Time</th><th>Event</th></tr>${results.map((r) => {
+    const { kind, text, css } = describe(r.event);
+    return `<tr class="clickable" data-branch="${r.branch}" data-vtime="${r.vtime_ns}"><td class="mono">${r.branch}</td>
+      <td class="mono">${seconds(r.vtime_ns)}</td><td><span class="kind ${css}">${escape(kind)}</span> <span class="mono">${escape(text)}</span></td></tr>`;
+  }).join("")}</table>`;
+}
+
+// Logs: a timeline's events up to a moment, and what to do there.
+// Only the Logs section changes: what is expanded elsewhere (examples, search) stays.
+async function logsOpen(branch, vtime_ns) {
+  state.logs = { branch, vtime_ns, events: null, filter: "" };
+  state.open.add("logs");
+  const section = $("#logs");
+  section.classList.remove("closed");
+  $(".summary", section).textContent = logsSummary();
+  $(".body", section).innerHTML = logsBody();
+  section.scrollIntoView({ behavior: "smooth" });
+  await logsLoad();
+}
+function logsSummary() {
+  return state.logs ? `branch ${state.logs.branch} up to ${seconds(state.logs.vtime_ns)}`
+    : "pick an example, a search result or a timeline";
+}
+async function logsLoad() {
+  const logs = state.logs;
+  const condition = logs.filter || "seq>=0";
+  try {
+    logs.events = await query({ condition, branch: logs.branch, up_to_vtime: logs.vtime_ns / 1e9 + 2, limit: 5000 });
+  } catch (error) { logs.error = error.message; }
+  const body = $("#logs .body");
+  if (body) { body.innerHTML = logsBody(); logsWire(); }
+  const here = $("#logs tr.here");
+  if (here) here.scrollIntoView({ block: "center" });
+}
+function logsBody() {
+  const logs = state.logs;
+  if (!logs) return `<div class="empty">Pick a property example, a search result or a timeline on the map.</div>`;
+  const events = logs.events || [];
+  let hereIndex = -1;
+  events.forEach((event, i) => { if (event.vtime_ns <= logs.vtime_ns) hereIndex = i; });
+  return `<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+      <input id="logs-filter" style="flex:1" placeholder="Filter this timeline (a condition), e.g. output.source=postgres" value="${escape(logs.filter)}">
+      <button id="logs-apply">Filter</button></div>
+    <div class="logs">${logs.events === null ? `<div class="empty">Loading…</div>` : `<table>${events.map((event, i) => {
+      const { kind, text, css } = describe(event.event);
+      return `<tr class="${i === hereIndex ? "here" : ""}"><td class="muted">${seconds(event.vtime_ns)}</td>
+        <td><span class="kind ${css}">${escape(kind)}</span></td><td>${escape(text)}</td></tr>`;
+    }).join("")}</table>`}</div>
+    ${logs.error ? `<div class="fail-text">${escape(logs.error)}</div>` : ""}
+    <div style="margin-top:12px"><div class="group-title">At this moment (branch ${logs.branch}, ${seconds(logs.vtime_ns)})</div>
+      <div style="display:flex;gap:8px"><input id="moment-command" style="flex:1" placeholder="A command to run there, e.g. det-nodes exec redis redis-cli get balance:0">
+        <button class="primary" id="moment-run">Run at this moment</button></div>
+      <div class="muted" style="margin-top:4px">Replays the branch exactly to this moment and runs the command in the guest (or a node, with det-nodes exec).
+        Or branch from here: <span class="mono">explore … --from-branch ${logs.branch} --from-vtime-ms ${Math.floor(logs.vtime_ns / 1e6)}</span></div>
+      <pre class="output" id="moment-output" hidden></pre></div>`;
+}
+function logsWire() {
+  const apply = $("#logs-apply");
+  if (!apply) return;
+  const filter = () => { state.logs.filter = $("#logs-filter").value.trim(); state.logs.events = null; logsLoad(); };
+  apply.addEventListener("click", filter);
+  $("#logs-filter").addEventListener("keydown", (event) => { if (event.key === "Enter") filter(); });
+  $("#moment-run").addEventListener("click", async () => {
+    const output = $("#moment-output");
+    output.hidden = false;
+    output.textContent = "Replaying to the moment…";
+    try {
+      const text = await api(`/runs/${state.runId}/replay`, {
+        branch: state.logs.branch, at_vtime_ms: Math.floor(state.logs.vtime_ns / 1e6),
+        exec: $("#moment-command").value || undefined,
+      });
+      output.textContent = momentOutput(text);
+    } catch (error) { output.textContent = error.message; }
+  });
+}
+// From a replay's output: what the command printed, then determinismo's own lines.
+function momentOutput(text) {
+  const printed = [], other = [];
+  for (const line of text.split("\n")) {
+    const at = line.indexOf('{"event":"exec_output"');
+    if (at >= 0) { try { printed.push(JSON.parse(line.slice(at)).details.text); } catch { /* skip */ } }
+    else if (line.startsWith("[determinismo]") || line.startsWith("[branch")) other.push(line);
+  }
+  return (printed.join("") || "(no output)") + "\n\n" + other.join("\n");
+}
+
+// One line for an event, whatever its kind.
+function describe(event) {
+  if (!event || typeof event !== "object") return { kind: "text", text: String(event), css: "" };
+  if (event.output) return { kind: `${event.output.source} ${event.output.stream}`, text: event.output.text, css: "output" };
+  if (event.assert) {
+    const failed = event.assert.condition === false && ["always", "always_or_unreachable"].includes(event.assert.type)
+      || event.assert.type === "unreachable";
+    return { kind: event.assert.type, text: `${event.assert.message}${event.assert.condition === false ? " (false)" : ""} ${JSON.stringify(event.assert.details || {})}`, css: failed ? "assert-fail" : "assert" };
+  }
+  if (event.antithesis_assert) {
+    const a = event.antithesis_assert;
+    return { kind: a.display_type || "assert", text: `${a.message}${a.condition === false ? " (false)" : ""}`, css: a.condition === false ? "assert-fail" : "assert" };
+  }
+  if (event.event) {
+    const css = event.event === "fault" ? "fault" : event.event.startsWith("command") ? "command" : "";
+    return { kind: event.event, text: JSON.stringify(event.details || {}), css };
+  }
+  if (event.lifecycle) return { kind: "lifecycle", text: event.lifecycle, css: "" };
+  return { kind: "event", text: JSON.stringify(event), css: "" };
+}
+
+// New runs --------------------------------------------------------------------------------
+$("#new-run").addEventListener("click", () => $("#run-dialog").showModal());
+$("#run-form").addEventListener("submit", async (event) => {
+  if (event.submitter && event.submitter.value === "cancel") return;
+  const form = new FormData($("#run-form"));
+  const request = { [form.get("kind")]: form.get("path"), branches: Number(form.get("branches")), seed: Number(form.get("seed")) };
+  for (const key of ["scenario", "profile", "strategy"]) if (form.get(key)) request[key] = form.get(key);
+  if (form.get("jobs")) request.jobs = Number(form.get("jobs"));
+  try {
+    const created = await apiJson("/runs", request);
+    await runsRefresh();
+    runOpen(created.id);
+  } catch (error) { alert(error.message); }
+});
+
+runsRefresh();
+setInterval(runsRefresh, 5000);
+const fromHash = Number(location.hash.slice(1));
+if (fromHash) runOpen(fromHash);
+</script>
+</body>
+</html>

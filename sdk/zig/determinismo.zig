@@ -128,6 +128,19 @@ pub fn assert_unreachable(message: []const u8, details: anytype) void {
     emit_assertion("unreachable", .{ .condition = true, .message = message }, details);
 }
 
+/// Declares an assertion without evaluating it (Antithesis's catalog): a `reachable` or
+/// `sometimes` declared and never reached (or never true) in any timeline fails, as an
+/// `always` never hit does.
+pub fn declare(comptime kind: []const u8, message: []const u8) void {
+    assert(message.len > 0);
+    var buffer: [message_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"assert\":{\"type\":\"" ++ kind ++ "\",\"message\":") catch unreachable;
+    json_write(&writer, message);
+    writer.writeAll(",\"hit\":false}}") catch unreachable;
+    emit_raw(writer.buffered());
+}
+
 /// The system is ready: the platform snapshots here and starts exploring.
 pub fn setup_complete(details: anytype) void {
     lifecycle("setup_complete", details);
