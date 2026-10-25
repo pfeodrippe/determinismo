@@ -20,6 +20,7 @@ const starts_max = 64;
 const parallelism_max = 4;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
+const faults_control_path = "/opt/determinismo/faults-control"; // faults.zig's control_path.
 const program_path = "/det/program";
 const nodes_path = "/opt/determinismo/bin/det-nodes";
 const nodes = @import("nodes.zig");
@@ -48,6 +49,7 @@ const Composer = struct {
     /// Whether the scenario uses the fault injector, and its process while it runs.
     faults: bool = false,
     faults_pid: ?linux.pid_t = null,
+    faults_control: ?linux.fd_t = null,
 
     fn kind_count(composer: *const Composer, kind: Kind) u32 {
         var count: u32 = 0;
@@ -122,6 +124,13 @@ const Composer = struct {
     fn faults_start(composer: *Composer) void {
         assert(composer.faults_pid == null);
         if (!composer.faults) return;
+        // The control FIFO, held open through the driver phase: requests a driver writes before
+        // the injector reads (quiet periods, injected faults) wait in it, not lost.
+        const fifo = linux.S.IFIFO | 0o622;
+        _ = linux.mknodat(linux.AT.FDCWD, faults_control_path, fifo, 0);
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true };
+        const control = linux.open(faults_control_path, flags, 0);
+        if (linux.errno(control) == .SUCCESS) composer.faults_control = @intCast(control);
         composer.faults_pid = spawn(&.{ faults_path, "--scenario", composer.scenario });
         // Declared only when the scenario has faults (commands_declare): not in the catalog.
         sdk.assert_computed(.reachable, true, faults_property, .{});
@@ -133,6 +142,8 @@ const Composer = struct {
         var status: i32 = 0;
         _ = linux.waitpid(pid, &status, 0);
         composer.faults_pid = null;
+        if (composer.faults_control) |control| _ = linux.close(control);
+        composer.faults_control = null;
     }
 
     fn wait_all(composer: *Composer) void {

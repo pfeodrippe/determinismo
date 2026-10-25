@@ -212,8 +212,9 @@ test hunks {
         \\@@ -10,3 +10,4 @@ def transfer():
         \\ x
     ;
-    const found = try hunks(std.testing.allocator, patch);
-    defer std.testing.allocator.free(found);
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const found = try hunks(state.allocator(), patch);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqualStrings("src/bank.py", found[0].file);
     try std.testing.expectEqual(@as(u32, 13), found[0].last);

@@ -208,34 +208,29 @@ pub fn kill(name: []const u8) !void {
     sdk.event("node_kill", .{ .node = name });
 }
 
-/// A graceful stop: its main process gets SIGTERM and `grace_ns` to exit (with the rest of
-/// the node); whatever is left is killed.
-pub fn stop(name: []const u8, grace_ns: u64) !void {
+/// A graceful stop begins: SIGTERM to its main process (its exit is expected from now on).
+/// `kill_remaining` ends it if the node is still running after its grace period.
+pub fn stop_signal(name: []const u8) !void {
     var paths: Paths = undefined;
     try paths.init(name);
-    const pid = pid_read(name) orelse return; // Not running.
+    const pid = pid_read(name) orelse return error.NotRunning;
     // The pidfile goes first: its exit is expected (see det-init).
     _ = linux.unlink(paths.pid);
     _ = linux.kill(pid, .TERM);
-    const deadline_ns = monotonic_ns() + grace_ns;
-    while (monotonic_ns() < deadline_ns) {
-        if (!try cgroup_populated(&paths)) break;
-        sleep_ns(poll_interval_ns);
-    }
-    if (try cgroup_populated(&paths)) {
-        try file_write(paths.cgroup_kill, "1");
-        for (0..stop_attempts_max) |_| {
-            if (!try cgroup_populated(&paths)) break;
-            sleep_ns(poll_interval_ns);
-        } else return error.NodeDidNotStop;
-    }
     sdk.event("node_stop", .{ .node = name });
 }
 
-fn monotonic_ns() u64 {
-    var now: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &now);
-    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+/// Kills whatever is left of the node (after a graceful stop: its pidfile is already gone).
+pub fn kill_remaining(name: []const u8) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    if (!try cgroup_populated(&paths)) return;
+    try file_write(paths.cgroup_kill, "1");
+    for (0..stop_attempts_max) |_| {
+        if (!try cgroup_populated(&paths)) return;
+        sleep_ns(poll_interval_ns);
+    }
+    return error.NodeDidNotStop;
 }
 
 /// A power loss: the node's disk keeps what reached it (synced, or written back already) and

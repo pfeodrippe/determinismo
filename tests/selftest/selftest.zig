@@ -232,9 +232,11 @@ fn faults_on_request(context: *System.Context) !void {
     sdk.sleep_ms(100);
     sdk.always(!answering(echo.address), "an injected pause stops the node", .{});
     try sdk.retry(100, 100, answers, .{echo.address});
+    // The node ignores SIGTERM (no handler, init of its PID namespace): down when its grace
+    // period ends in a kill.
     sdk.fault(.{ .kind = "stop", .node = echo.name, .duration_ms = 1000 });
-    sdk.sleep_ms(200);
-    sdk.always(!answering(echo.address), "an injected stop takes the node down", .{});
+    const down = if (sdk.retry(60, 100, gone, .{echo.address})) |_| true else |_| false;
+    sdk.always(down, "an injected stop takes the node down", .{});
     try sdk.retry(100, 100, answers, .{echo.address});
     sdk.fault(.{
         .kind = "partition_groups",
@@ -247,6 +249,10 @@ fn faults_on_request(context: *System.Context) !void {
     try sdk.retry(100, 100, answers, .{echo.address});
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
+}
+
+fn gone(address: [4]u8) !void {
+    if (answering(address)) return error.StillAnswering;
 }
 
 fn answering(address: [4]u8) bool {
@@ -387,6 +393,12 @@ fn request(address: [4]u8, message: []const u8, reply: []u8) ![]const u8 {
     if (linux.errno(socket) != .SUCCESS) return error.Socket;
     const fd: linux.fd_t = @intCast(socket);
     defer _ = linux.close(fd);
+    // An answer within a second (virtual time), or none: a paused node must not answer later.
+    const timeout = linux.timeval{ .sec = 1, .usec = 0 };
+    const option = std.mem.asBytes(&timeout);
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, option.ptr, option.len);
+    // Connecting too (a dropped SYN is retried past a short partition otherwise).
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, option.ptr, option.len);
     const target = linux.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = @bitCast(address),

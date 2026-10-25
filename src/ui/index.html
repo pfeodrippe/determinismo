@@ -697,7 +697,8 @@ function faultTip(event, decision) {
     ["rate", netem.rate_bytes_per_second ? `${netem.rate_bytes_per_second} B/s` : undefined],
     ["cpu", d.cpu_percent ? d.cpu_percent + "%" : undefined], ["clock skip", d.skip_ns ? ms(d.skip_ns) : undefined],
     ["groups", groups], ["permanent", d.permanent ? "yes" : undefined], ["program", d.program || undefined]];
-  const why = decision ? `<div class="t-why"><b>Why this fault</b><br>${escape(decision.event.details.reason)}</div>`
+  const why = d.injected ? `<div class="t-why"><b>Why this fault</b><br>The scenario asked for it (sdk.fault or det-faults inject), at this moment.</div>`
+    : decision ? `<div class="t-why"><b>Why this fault</b><br>${escape(decision.event.details.reason)}</div>`
     : `<div class="t-why"><b>Why this fault</b><br>Chosen at random from this timeline's seed (a replay chooses the same). A strategy (mutate, the LLM) gives its reasons here.</div>`;
   return `<div class="t-title"><span class="t-dot" style="background:var(--warn);border-radius:2px"></span>Fault: ${escape(kind || "fault")}</div>
     ${kvHtml(pairs)}${kvHtml([["timeline", `#${event.branch} at ${(event.vtime_ns / 1e9).toFixed(3)}s`]])}${why}

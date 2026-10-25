@@ -442,14 +442,19 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
 const NodeFault = struct {
     applied: Applied,
     end_ns: u64,
+    /// A stop: when what the node left running is killed (its grace period ends), if still
+    /// pending.
+    grace_end_ns: ?u64 = null,
     /// The process or thread stopped (process_pause, thread_pause).
     pid: linux.pid_t = 0,
 };
 var nodes_faulted: [schema.nodes_max]?NodeFault = @splat(null);
 /// For starting nodes again when their fault ends (set once faults start).
 var arena_active: ?std.mem.Allocator = null;
-/// How long a graceful stop waits for the node to exit before it is killed.
-const stop_grace_ns = 5 * std.time.ns_per_s;
+/// How long a graceful stop waits for the node to exit before it is killed. A node's main
+/// process is the init of its PID namespace: without a SIGTERM handler, it ignores the signal
+/// (as in a container), and the grace period ends in a kill.
+const stop_grace_ns = 3 * std.time.ns_per_s;
 
 fn node_slot(system: *const schema.System, name: []const u8) ?*?NodeFault {
     const index = endpoint_index(system, name) orelse return null;
@@ -466,7 +471,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .restart => nodes.kill(applied.node),
         .crash => nodes.crash(applied.node),
         .wipe => nodes.wipe(applied.node),
-        .stop => nodes.stop(applied.node, stop_grace_ns),
+        .stop => stop_begin(applied.node, &fault),
         .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
@@ -487,6 +492,7 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
     switch (fault.applied.kind) {
         .pause => nodes.freeze(name, .thawed) catch {},
         .restart, .crash, .wipe, .stop => {
+            if (fault.grace_end_ns != null) nodes.kill_remaining(name) catch {}; // Healed early.
             const node = system.node(name) orelse return;
             const arena = arena_active orelse return;
             nodes.start(arena, system, node) catch |err| {
@@ -504,9 +510,22 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
 
 fn node_expire(system: *const schema.System, now_ns: u64) void {
     for (&nodes_faulted) |*slot| {
-        const fault = slot.* orelse continue;
+        const fault = &(slot.* orelse continue);
+        if (fault.grace_end_ns) |grace_end_ns| if (grace_end_ns <= now_ns) {
+            nodes.kill_remaining(fault.applied.node) catch {};
+            slot.*.?.grace_end_ns = null;
+        };
         if (fault.end_ns <= now_ns) node_end(system, slot);
     }
+}
+
+/// A graceful stop begins: SIGTERM to the node's main process; what is left when the grace
+/// period ends is killed (node_expire), and the node starts again at the fault's end.
+fn stop_begin(name: []const u8, fault: *NodeFault) !void {
+    try nodes.stop_signal(name);
+    const grace_end_ns = monotonic_ns() + stop_grace_ns;
+    fault.grace_end_ns = grace_end_ns;
+    fault.end_ns = @max(fault.end_ns, grace_end_ns);
 }
 
 fn node_next_end() ?u64 {
@@ -514,6 +533,7 @@ fn node_next_end() ?u64 {
     for (nodes_faulted) |slot| {
         const fault = slot orelse continue;
         next = @min(next orelse fault.end_ns, fault.end_ns);
+        if (fault.grace_end_ns) |grace_end_ns| next = @min(next.?, grace_end_ns);
     }
     return next;
 }
@@ -926,13 +946,9 @@ fn sleep_ns(duration_ns: u64) void {
         const result = linux.ppoll(&poll, 1, &timeout, null);
         if (linux.errno(result) == .INTR) return; // A stop.
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
-        if (requests_read() > 0) {
-            if (system_active) |system| {
-                network_heal(system);
-                node_heal(system);
-            }
-            return;
-        }
+        // A quiet period healed what was under way as its request was read (before faults
+        // injected after it): the caller undoes its own.
+        if (requests_read() > 0) return;
     }
 }
 
@@ -977,6 +993,11 @@ fn requests_read() u32 {
 }
 
 fn quiet_request(duration_ns: u64) void {
+    // The fault under way ends where a quiet period begins.
+    if (duration_ns > 0) if (system_active) |system| {
+        network_heal(system);
+        node_heal(system);
+    };
     if (duration_ns == 0) {
         // A zero-length request ends the quiet period (Antithesis's unpause).
         quiet_until_ns = 0;
