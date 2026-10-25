@@ -20,6 +20,7 @@
 //!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
 //!   GET  /runs/<id>/discovery  {points: [[branches, behaviors], ...]}: new behavior discovery
+//!   GET  /runs/<id>/notebook  {source}; PUT {source}: the run's notebook (JavaScript cells)
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
 //!                             since the previous finished run of the same system and scenario
 //!                             (new, ongoing, resolved, or unseen: maybe missed by chance)
@@ -197,6 +198,7 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
         return findings_show(server, run, out);
     }
+    if (eql(u8, action, "notebook")) return notebook(server, run, request, out);
     if (eql(u8, action, "causality")) {
         if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
         const index_text = parts.next() orelse return error.NotFound;
@@ -609,6 +611,33 @@ test resolution {
     try std.testing.expectEqualStrings("resolved", resolution(common, 100, 16));
     const sometimes = SummaryProperty{ .kind = "sometimes", .message = "m", .failing = true };
     try std.testing.expectEqualStrings("resolved", resolution(sometimes, 100, 1));
+}
+
+/// The run's notebook (the UI's, or an agent's): JavaScript cells, kept in the run's directory
+/// so that whoever opens the run sees it. GET answers {source} (null before any save); PUT
+/// takes {source}.
+fn notebook(server: *Server, run: *const Run, request: Request, out: *std.Io.Writer) !u16 {
+    const path = try std.fs.path.join(server.arena, &.{
+        try run_directory(server, run.id), "notebook.js",
+    });
+    if (std.mem.eql(u8, request.method, "PUT")) {
+        const Saved = struct { source: []const u8 };
+        const saved = try std.json.parseFromSliceLeaky(Saved, server.arena, request.body, .{
+            .ignore_unknown_fields = true,
+        });
+        try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = saved.source });
+        try out.writeAll("{\"saved\":true}\n");
+        return 200;
+    }
+    if (!std.mem.eql(u8, request.method, "GET")) return error.NotFound;
+    const limit: std.Io.Limit = .limited(request_size_max);
+    const source = std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, limit) catch
+        |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    try out.print("{{\"source\":{f}}}\n", .{std.json.fmt(source, .{})});
+    return 200;
 }
 
 fn system_arguments(

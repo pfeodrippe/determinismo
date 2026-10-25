@@ -85,5 +85,5 @@ change that moves it.
 | Core dumps | det-core (the kernel's core_pattern) keeps every crashed process's core in `/run/det/cores`, with a `core_dump` event; `extract --file runner:<path>` takes it out | ✅ |
 | Debuggers (gdb, delve, jdb) | `determinismo stacks`: every thread's named stack at a moment (`thread apply all bt`, jstack); gdb and the like through `--exec` with the tools in the image, on the process or a core dump | ✅ |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
-| Notebook | web UI (logs, search, run a command at a moment), MCP tools, HTTP API, CLI | 🟡 no scripting notebook |
+| Notebook | the UI's Notebook view of a run: JavaScript cells run in order with shared names, `print`, `md`, `query`, `events`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`, `action`); kept with the run (`/runs/<id>/notebook`) | ✅ |
 | Snouty CLI for agents (runs, properties, search, exec, debug) | CLI, MCP (`describe`, `explore`, `replay`, `fork`, `query`) | ✅ |

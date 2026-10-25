@@ -407,6 +407,15 @@ fn check_serve(context: *Context) !void {
         std.mem.indexOf(u8, answer, "\"events\":0,") == null;
     expect(context, ui and finished and queried, "serve: the UI, a run over HTTP, and a query " ++
         "of its events ({s})", .{std.mem.trim(u8, answer, "\n")});
+    // The run's notebook: none at first, then what was saved.
+    const empty = try curl(context, &.{url ++ "/runs/1/notebook"});
+    const cells = "{\"source\":\"print(1)\\n// %%\\nprint(2)\"}";
+    _ = try curl(context, &.{ "-X", "PUT", "-d", cells, url ++ "/runs/1/notebook" });
+    const saved = try curl(context, &.{url ++ "/runs/1/notebook"});
+    const notebook = std.mem.indexOf(u8, empty, "\"source\":null") != null and
+        std.mem.indexOf(u8, saved, "print(1)\\n// %%\\nprint(2)") != null;
+    const in_page = std.mem.indexOf(u8, page, "notebookEvaluate") != null;
+    expect(context, notebook and in_page, "serve: the notebook is kept with the run", .{});
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {

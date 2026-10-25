@@ -71,7 +71,9 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   mutation testing with mutant profiles.
 - **A web UI** (`determinismo serve`, then open it): runs live, properties with their failing
   and passing examples, a multiverse map of every timeline with its faults and failures,
-  search, a timeline's logs up to any moment, and a command run at that exact moment.
+  search, a timeline's logs up to any moment, and a command run at that exact moment; a
+  notebook per run (JavaScript cells: queries, event sets, replays, stacks, profiles, files),
+  kept with the run.
 - **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.
 
 ## A test program

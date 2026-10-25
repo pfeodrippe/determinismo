@@ -89,6 +89,20 @@ dialog form { display: grid; gap: 10px; }
 dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
 pre.output { background: #101114; border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
 .empty { color: var(--muted); padding: 30px; text-align: center; }
+.view-tabs { margin: 14px 0 0; }
+.cell { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; }
+.cell textarea { width: 100%; border: 0; border-radius: 8px 8px 0 0; background: #101114; font-family: var(--mono);
+  font-size: 12.5px; resize: vertical; min-height: 44px; padding: 10px; }
+.cell .out { padding: 8px 12px; font-size: 13px; }
+.cell .out:empty { display: none; }
+.cell .out pre { margin: 4px 0; white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+.cell .out .error { color: var(--fail); white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+.cell .tools { display: flex; gap: 6px; justify-content: flex-end; padding: 0 8px 8px; }
+.cell .tools button { padding: 2px 8px; font-size: 12px; }
+.notebook-bar { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.action { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.md h1, .md h2, .md h3 { margin: 6px 0; }
+.md code { font-family: var(--mono); background: var(--panel-2); padding: 0 4px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -127,6 +141,7 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
 "use strict";
 const state = {
   runs: [], runId: null, run: null, poll: null, tab: "all", filter: "", logs: null,
+  view: "report", notebook: null, // The run's notebook: cells, their outputs, action results.
   open: new Set(["findings", "properties", "map"]), // Sections shown expanded.
 };
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -165,6 +180,7 @@ function stateBadge(name) {
 async function runOpen(id) {
   state.runId = id;
   state.logs = null;
+  state.notebook = null;
   clearInterval(state.poll);
   await runRefresh();
   runsRefresh();
@@ -175,6 +191,7 @@ async function runOpen(id) {
 
 async function runRefresh() {
   state.run = await apiJson(`/runs/${state.runId}`);
+  if (state.view === "notebook" && $("#notebook")) return; // Never under the writer's cursor.
   render();
 }
 
@@ -186,7 +203,7 @@ function render() {
   const done = run.branches.length;
   const failing = run.branches.filter((branch) => branch.failing.length > 0).length;
   const isOpen = (id) => state.open.has(id);
-  $("#main").innerHTML = `
+  const header = `
     <div style="display:flex;align-items:baseline;gap:14px">
       <h2>Run ${run.id} ${info.scenario ? "· " + escape(info.scenario) : ""}</h2>${stateBadge(run.state)}
     </div>
@@ -195,6 +212,15 @@ function render() {
       ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
     <div class="progress"><div style="width:${total ? (100 * done / total) : 0}%"></div></div>
     <div class="muted" style="margin-top:4px">${done} of ${total} branches · ${failing} with failing properties</div>
+    <div class="tabs view-tabs"><button data-view="report" class="${state.view === "report" ? "on" : ""}">Report</button>
+      <button data-view="notebook" class="${state.view === "notebook" ? "on" : ""}">Notebook</button></div>`;
+  if (state.view === "notebook") {
+    $("#main").innerHTML = header + `<div id="notebook"></div>`;
+    viewTabsWire();
+    notebookOpen();
+    return;
+  }
+  $("#main").innerHTML = header + `
     ${sectionHtml("findings", "Findings", run.state === "running" ? "when the run finishes" : "", `<div id="findings-body" class="muted">${run.state === "running" ? "Compared with the previous run of this system once this one finishes." : "Loading…"}</div>`, isOpen("findings"))}
     ${sectionHtml("environment", "Environment", environmentSummary(), environmentBody(), isOpen("environment"))}
     ${sectionHtml("utilization", "Utilization", utilizationSummary(), utilizationBody(), isOpen("utilization"))}
@@ -203,6 +229,7 @@ function render() {
     ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
     ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}
   `;
+  viewTabsWire();
   document.querySelectorAll("section > header").forEach((header) => header.addEventListener("click", () => {
     const section = header.parentElement;
     section.classList.toggle("closed");
@@ -216,6 +243,13 @@ function render() {
   findingsLoad();
   discoveryDraw();
   logsWire();
+}
+
+function viewTabsWire() {
+  document.querySelectorAll(".view-tabs button").forEach((button) => button.addEventListener("click", () => {
+    state.view = button.dataset.view;
+    render();
+  }));
 }
 
 function sectionHtml(id, title, summary, body, open) {
@@ -619,6 +653,205 @@ function logsWire() {
     } catch (error) { output.textContent = error.message; }
   });
 }
+// Notebook --------------------------------------------------------------------------------
+// JavaScript cells, run in order (as Antithesis's notebook): a name assigned without let,
+// const or var is the notebook's, for later cells. Built-ins: print, md`...`, query(condition,
+// options), events(pipeline, options), and actions, which run only when clicked: replay({branch,
+// at_vtime_ms | until, rewind_ms, exec}), stacks({..., node}), profile({..., node, ms}),
+// extract({branch, at_vtime_ms | until, node, path}), action(label, async function). An
+// action's `result` is there for later cells once it ran. `run` is the run's record.
+const cellSeparator = "\n// %%\n";
+const actionMark = Symbol("action");
+const notebookTemplate = [
+  'md`# Run notes\nWhat failed, where, and what the system looked like there.`',
+  'failures = await query("assert.condition=false", { limit: 20 })\nprint(failures)',
+  'first = failures[0]\nnodes = (run.system || { nodes: [] }).nodes.map((node) => node.name)\n' +
+    'print(first ? `first failure: branch ${first.branch} at ${(first.vtime_ns / 1e9).toFixed(3)}s` : "no failures")',
+  'if (first && nodes.length) print(stacks({ branch: first.branch, at_vtime_ms: Math.floor(first.vtime_ns / 1e6), node: nodes[0] }))',
+].join(cellSeparator);
+
+async function notebookOpen() {
+  if (!state.notebook || state.notebook.runId !== state.runId) {
+    let source = null;
+    try { source = (await apiJson(`/runs/${state.runId}/notebook`)).source; } catch { /* none yet */ }
+    state.notebook = { runId: state.runId, cells: (source || notebookTemplate).split(cellSeparator),
+      results: new Map(), cache: new Map(), saved: source !== null, timer: null, generation: 0 };
+  }
+  notebookDraw();
+  notebookEvaluate();
+}
+
+function notebookDraw() {
+  const book = state.notebook;
+  $("#notebook").innerHTML = `<div class="notebook-bar">
+      <button class="primary" id="notebook-save">Save</button>
+      <span class="muted" id="notebook-state">${book.saved ? "saved with the run" : "not saved"}</span>
+      <span class="muted" style="margin-left:auto">print · md\`…\` · query · events · replay · stacks · profile · extract · action</span></div>
+    ${book.cells.map((code, index) => `<div class="cell" data-index="${index}">
+      <textarea spellcheck="false" rows="${Math.max(2, code.split("\n").length)}">${escape(code)}</textarea>
+      <div class="out"></div>
+      <div class="tools"><button data-do="above">+ above</button><button data-do="below">+ below</button>
+        <button data-do="delete">delete</button></div></div>`).join("")}`;
+  $("#notebook-save").addEventListener("click", notebookSave);
+  document.querySelectorAll("#notebook .cell").forEach((cell) => {
+    const index = Number(cell.dataset.index);
+    $("textarea", cell).addEventListener("input", (event) => {
+      book.cells[index] = event.target.value;
+      book.saved = false;
+      $("#notebook-state").textContent = "not saved";
+      clearTimeout(book.timer);
+      book.timer = setTimeout(notebookEvaluate, 500);
+    });
+    cell.querySelectorAll(".tools button").forEach((button) => button.addEventListener("click", () => {
+      const what = button.dataset.do;
+      if (what === "delete") book.cells.splice(index, 1);
+      else book.cells.splice(what === "above" ? index : index + 1, 0, "");
+      if (book.cells.length === 0) book.cells.push("");
+      book.saved = false;
+      notebookDraw();
+      notebookEvaluate();
+    }));
+  });
+}
+
+async function notebookSave() {
+  const book = state.notebook;
+  const response = await fetch(`/runs/${book.runId}/notebook`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: book.cells.join(cellSeparator) }),
+  });
+  book.saved = response.ok;
+  $("#notebook-state").textContent = response.ok ? "saved with the run" : await response.text();
+}
+
+// Runs every cell in order with one shared scope; an edit mid-run starts a new generation.
+async function notebookEvaluate() {
+  const book = state.notebook;
+  const generation = ++book.generation;
+  const scope = Object.create(null);
+  const outputs = [...document.querySelectorAll("#notebook .cell .out")];
+  outputs.forEach((out) => { out.innerHTML = ""; });
+  for (const [index, code] of book.cells.entries()) {
+    if (generation !== book.generation) return;
+    const out = outputs[index];
+    const builtins = notebookBuiltins(book, out);
+    try {
+      await cellRun(code, scope, builtins);
+    } catch (error) {
+      if (generation !== book.generation) return;
+      out.insertAdjacentHTML("beforeend", `<div class="error">${escape(error && error.stack || error)}</div>`);
+      return; // Later cells may need what this one failed to define.
+    }
+  }
+}
+
+function cellRun(code, scope, builtins) {
+  const proxy = new Proxy(scope, {
+    has: (target, key) => typeof key === "string" &&
+      (key in target || key in builtins || !(key in globalThis)),
+    get: (target, key) => {
+      if (key === Symbol.unscopables) return undefined;
+      if (key in target) return target[key];
+      if (key in builtins) return builtins[key];
+      throw new ReferenceError(`${String(key)} is not defined`);
+    },
+    set: (target, key, value) => { target[key] = value; return true; },
+  });
+  // Sloppy mode on purpose: `with` gives cells the notebook's names.
+  const body = new Function("scope", `with (scope) { return (async () => {\n${code}\n})(); }`);
+  return body(proxy);
+}
+
+function notebookBuiltins(book, out) {
+  const runId = book.runId;
+  const cached = (key, compute) => {
+    if (!book.cache.has(key)) book.cache.set(key, compute());
+    return book.cache.get(key);
+  };
+  const print = (...values) => {
+    // An action shows itself where it is made: printing it adds nothing.
+    for (const value of values) if (!(value && value[actionMark])) out.insertAdjacentHTML("beforeend", valueHtml(value));
+  };
+  const action = (label, perform) => {
+    const done = book.results.get(label);
+    const handle = { label, result: done ? done.result : undefined, error: done ? done.error : undefined,
+      [actionMark]: true };
+    const id = "action-" + Math.random().toString(36).slice(2);
+    out.insertAdjacentHTML("beforeend", `<div class="action" id="${id}"><button>${done ? "Run again" : "Run"}</button>
+      <span class="mono">${escape(label)}</span></div>${done ? valueHtml(done.error ? new Error(done.error) : done.result) : ""}`);
+    $(`#${id} button`).addEventListener("click", async (event) => {
+      event.target.disabled = true;
+      event.target.textContent = "Running…";
+      try { book.results.set(label, { result: await perform() }); }
+      catch (error) { book.results.set(label, { error: error.message }); }
+      notebookEvaluate();
+    });
+    return handle;
+  };
+  const moment = (options) => {
+    const asked = { branch: options.branch };
+    for (const key of ["at_vtime_ms", "until", "rewind_ms"]) if (options[key] !== undefined) asked[key] = options[key];
+    return asked;
+  };
+  const replay = (options) => action(`replay ${JSON.stringify(options)}`, async () =>
+    momentOutput(await api(`/runs/${runId}/replay`, { ...moment(options), exec: options.exec })));
+  const profiler = "/opt/determinismo/bin/det-profile";
+  return {
+    run: (state.run && state.run.run) || {},
+    print,
+    md: (strings, ...values) => {
+      const text = strings.reduce((all, part, index) => all + part + (index < values.length ? values[index] : ""), "");
+      out.insertAdjacentHTML("beforeend", `<div class="md">${markdown(text)}</div>`);
+    },
+    query: (condition, options = {}) => cached(`query ${condition} ${JSON.stringify(options)}`, async () =>
+      lines(await api(`/runs/${runId}/query`, { condition, ...options }))),
+    events: (pipeline, options = {}) => cached(`events ${JSON.stringify([pipeline, options])}`, async () =>
+      lines(await api(`/runs/${runId}/events`, { pipeline, ...options }))),
+    action,
+    replay,
+    stacks: (options) => replay({ ...options, exec: `${profiler} ${options.node} --stacks` }),
+    profile: (options) => replay({ ...options, exec: `${profiler} ${options.node} --ms ${options.ms || 1000} --all` }),
+    extract: (options) => action(`extract ${JSON.stringify(options)}`, async () => {
+      const response = await fetch(`/runs/${runId}/extract`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...moment(options), node: options.node, path: options.path }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      return { bytes: blob.size, url: URL.createObjectURL(blob), name: options.path.split("/").pop() };
+    }),
+  };
+}
+
+// A value as the notebook shows it: events as a log table, files as links, text as is.
+function valueHtml(value) {
+  if (value instanceof Error) return `<div class="error">${escape(value.message)}</div>`;
+  if (typeof value === "string") return `<pre>${escape(value)}</pre>`;
+  if (Array.isArray(value) && value.length && value.every((item) => item && item.event !== undefined && item.vtime_ns !== undefined)) {
+    return `<div class="logs" style="max-height:300px"><table>${value.map((item) => {
+      const { kind, text, css } = describe(item.event);
+      return `<tr><td class="muted">${item.branch !== undefined ? "#" + item.branch : ""}</td><td class="muted">${seconds(item.vtime_ns)}</td>
+        <td><span class="kind ${css}">${escape(kind)}</span></td><td>${escape(text)}</td></tr>`;
+    }).join("")}</table></div><div class="muted">${value.length} events</div>`;
+  }
+  if (value && value.url && value.bytes !== undefined) {
+    return `<a href="${value.url}" download="${escape(value.name)}">${escape(value.name)}</a> <span class="muted">${value.bytes} bytes</span>`;
+  }
+  return `<pre>${escape(JSON.stringify(value, null, 2))}</pre>`;
+}
+
+// Markdown enough for notes: headings, lists, code, bold, italics, paragraphs.
+function markdown(text) {
+  const inline = (line) => escape(line).replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/\*([^*]+)\*/g, "<i>$1</i>");
+  return text.split("\n").map((line) => {
+    const heading = /^(#{1,3}) (.*)$/.exec(line);
+    if (heading) return `<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`;
+    if (/^[-*] /.test(line)) return `<li>${inline(line.slice(2))}</li>`;
+    return line.trim() ? `<p style="margin:4px 0">${inline(line)}</p>` : "";
+  }).join("");
+}
+
 // From a replay's output: what the command printed, then determinismo's own lines.
 function momentOutput(text) {
   const printed = [], other = [];
