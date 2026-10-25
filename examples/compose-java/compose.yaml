@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The maze on the JVM, for code coverage through the Java agent (sdk/java/DeterminismoCoverage):
+#   determinismo explore ... --compose examples/compose-java/compose.yaml --scenario maze \
+#     --strategy "det-strategy-mutate --sync-dir <fresh dir>"
+# The client's build context is the repository root so that its image can include sdk/java.
+services:
+  client:
+    build:
+      context: ../..
+      dockerfile: examples/compose-java/client/Dockerfile
+    command: [sleep, infinity]

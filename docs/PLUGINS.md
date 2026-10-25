@@ -68,13 +68,24 @@ For code coverage:
 - **Python** (3.12+): `determinismo.coverage_start(paths=[...])` reports each line under those
   prefixes the first time it runs (`"line <file>:<n>"`), through `sys.monitoring`; a reported
   line costs nothing afterwards.
+- **JVM** (JDK 24+; Java, Clojure, Kotlin, ...): run with the agent in
+  `sdk/java/DeterminismoCoverage.java`, `-javaagent:determinismo-coverage.jar=<class prefixes>`;
+  each source line of those classes reports itself the first time it runs (`"line
+  <class>:<n>"`), classes defined at run time included (see `examples/compose-java`).
+
+Coverage can also be semantic: any `{"event":"coverage","details":{"name":"..."}}` is a
+feature, so a system can report an abstraction of its own state (a spec's abstract state, a
+protocol phase, "two leaders seen") from any SDK, and strategies then search for timelines that
+reach new abstract states, as spec-guided fuzzers do. Keep the abstraction small: a name per
+distinct balance sheet, say, makes every timeline new and guides nothing.
 
 `plugins/mutate.zig` keeps timelines that reach new features and mutates the decisions of the
 process that reached them, around where it did. The benchmark is a maze (four digit checks, 1
-in 10000 timelines by chance) in C and Zig (`tests/selftest/maze.c`, `maze.zig`) and in Python
-under faults (`examples/compose-python`, template `maze`); `zig build e2e` checks each is
-solved and that the solving branch replays from its tape. First solving branch, 6 seeds, 8
-synced workers: C 24 to 211, Zig 24 to 225 (300 branches), Python 116 to 352 (1000 branches).
+in 10000 timelines by chance) in C and Zig (`tests/selftest/maze.c`, `maze.zig`), and in Python
+and Java under faults (`examples/compose-python` and `examples/compose-java`, template `maze`);
+`zig build e2e` checks each is solved and that the solving branch replays from its tape. First
+solving branch, 6 seeds, 8 synced workers: C 24 to 211, Zig 24 to 225 (300 branches), Python 116
+to 352, Java 65 to 224 (1000 branches).
 
 Each worker runs its own strategy process; `mutate --sync-dir <dir>` makes them share one corpus
 (each writes the timelines it keeps, with the features they reached first, and imports the

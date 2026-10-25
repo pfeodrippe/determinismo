@@ -36,10 +36,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   let the branch continue after a change (`--continue`), or explore futures of a changed system
   (`--from-exec`), e.g. a function redefined through a service's REPL.
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
-  event and decision) and code coverage (C and Zig edges, Python lines); `mutate` keeps
+  event and decision) and code coverage (C and Zig edges, Python and JVM lines); `mutate` keeps
   timelines that reach something new and changes the decisions of the process that got there
-  (it solves a 1-in-10000 maze in about 100 branches, in Python under faults in about 200), and
-  parallel workers share one corpus.
+  (it solves a 1-in-10000 maze in about 100 branches, in Python or Java under faults in about
+  200), and parallel workers share one corpus.
 - **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
   mutation testing with mutant profiles.
 - **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.

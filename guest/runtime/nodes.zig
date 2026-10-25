@@ -135,10 +135,20 @@ pub fn exec(
         }
         if (linux.errno(linux.fchdir(@intCast(root_fd))) != .SUCCESS) die("root", error.Chdir);
         if (linux.errno(linux.chroot(".")) != .SUCCESS) die("chroot", error.Chroot);
-        launch.exec_in_root(); // Never returns.
+        // Joining a PID namespace places only the children: the command runs in a second
+        // fork, or /proc/self would not resolve in the node (musl finds $ORIGIN through it).
+        const command = linux.fork();
+        if (linux.errno(command) != .SUCCESS) die("fork", error.Fork);
+        if (command == 0) launch.exec_in_root(); // Never returns.
+        linux.exit_group(wait_status(@intCast(command)));
     }
+    return wait_status(@intCast(child));
+}
+
+/// The exit status of `pid`, or 128 + the signal that killed it (as shells report it).
+fn wait_status(pid: linux.pid_t) u8 {
     var status: i32 = 0;
-    _ = linux.wait4(@intCast(child), &status, 0, null);
+    _ = linux.wait4(pid, &status, 0, null);
     const bits: u32 = @bitCast(status);
     return if (bits & 0x7f == 0) @intCast((bits >> 8) & 0xff) else @intCast(128 + (bits & 0x7f));
 }

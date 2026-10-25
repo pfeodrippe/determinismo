@@ -155,9 +155,9 @@ fn check_tapes(context: *Context) !void {
 }
 
 /// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance): with coverage
-/// from the C, Zig and Python SDKs, one worker or several sharing one corpus, and in Python
-/// under faults (decisions and events of other processes interleaved). The solving branch
-/// replays from its tape.
+/// from the C, Zig, Python and JVM SDKs, one worker or several sharing one corpus, and in
+/// Python and Java under faults (decisions and events of other processes interleaved). The
+/// solving branch replays from its tape.
 fn check_coverage(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const c = [_][]const u8{ "--program", program, "--profile", "maze", "--scenario", "maze" };
@@ -167,11 +167,15 @@ fn check_coverage(context: *Context) !void {
     const python = [_][]const u8{
         "--compose", "examples/compose-python/compose.yaml", "--scenario", "maze",
     };
+    const java = [_][]const u8{
+        "--compose", "examples/compose-java/compose.yaml", "--scenario", "maze",
+    };
     const mazes = [_]Maze{
         .{ .label = "C, one worker", .system = &c, .jobs = 1, .branches = 300 },
         .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 300 },
         .{ .label = "C, 4 synced workers", .system = &c, .jobs = 4, .branches = 300 },
         .{ .label = "Python, 8 synced workers", .system = &python, .jobs = 8, .branches = 1000 },
+        .{ .label = "Java, 8 synced workers", .system = &java, .jobs = 8, .branches = 1000 },
     };
     for (mazes, 0..) |maze, index| try check_maze(context, maze, index);
 }

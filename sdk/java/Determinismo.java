@@ -11,10 +11,11 @@
  *   Determinismo.always(total == 1000, "total balance is conserved", "{\"total\":" + total + "}");
  *   long account = Determinismo.randomBelow(10);
  */
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.SecureRandom;
 
 public final class Determinismo {
@@ -26,6 +27,9 @@ public final class Determinismo {
   private Determinismo() {}
 
   private static RandomAccessFile open() {
+    // Only the device: "rw" would create a plain file where /dev is writable (containers).
+    Path path = Path.of(DEVICE_PATH);
+    if (!Files.exists(path) || Files.isRegularFile(path)) return null;
     try {
       return new RandomAccessFile(DEVICE_PATH, "rw");
     } catch (IOException notInsideDeterminismo) {
@@ -42,7 +46,11 @@ public final class Determinismo {
     }
     try {
       int done = 0;
-      while (done < count) done += device.read(bytes, done, Math.min(256, count - done));
+      while (done < count) {
+        int got = device.read(bytes, done, Math.min(256, count - done));
+        if (got <= 0) throw new IOException("short read from " + DEVICE_PATH);
+        done += got;
+      }
     } catch (IOException e) {
       throw new IllegalStateException("determinismo: randomness unavailable", e);
     }
