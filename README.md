@@ -29,8 +29,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   hosts, branching from any moment of a branch, strategy plugins in any language (decisions and
   events) and outer-loop control through MCP or HTTP.
 - **Faults as decisions**: pause, isolate, partition and restart nodes; delay, loss, duplication,
-  corruption, reordering and congestion per link direction; CPU throttling; process pauses;
-  clock skips.
+  corruption, reordering and congestion per link direction; CPU throttling; process pauses and
+  kills (a crash for a supervisor or kubelet to recover from); clock skips.
 - **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
   that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
   scripts that carry a failure's shape to new seeds and new builds.
@@ -82,6 +82,23 @@ SDK ([sdk/python](sdk/python), one file) in [examples/compose-python](examples/c
 the C SDK ([sdk/c](sdk/c), one header, for C, C++ and any FFI), the JVM SDK
 ([sdk/java](sdk/java), one file, used from Clojure in examples/clojure-bank), or any Antithesis
 SDK (see below).
+
+## Randomness
+
+Each branch has its own seed (from the exploration seed and the branch index), and every
+decision in it derives from that seed:
+
+- **SDK randomness** (`random_below`, `random_choice`, ... in Zig, C, Python and the JVM): every
+  value is a platform decision, which strategies can steer and tapes replay. Use it in drivers
+  and for choices that matter in services (which account, retry jitter, timeouts). Code that
+  takes an RNG can receive one: `sdk.rng()` is a standard generator (`std.Random`,
+  `random.Random`, `java.util.Random`) whose every draw is a decision, and `sdk.prng()` a fast
+  one seeded from a single decision, for hot loops.
+- **The OS's randomness** (`getrandom`, `/dev/urandom`, generators seeded from them): the guest
+  kernel's generator is reseeded from a decision as each branch starts, so it differs per
+  branch and replays exactly, but its values are not steered one by one.
+- A process that seeded its own generator before the snapshot keeps that state in every
+  branch: draw through the SDK, or seed after the snapshot, where variety matters.
 
 ## Coming from Antithesis
 

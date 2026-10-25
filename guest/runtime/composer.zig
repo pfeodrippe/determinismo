@@ -172,6 +172,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (setup) |*command| composer.run_to_completion(command);
     sdk.setup_complete(.{ .scenario = composer.scenario });
+    kernel_reseed();
     const drivers = composer.kind_count(.parallel_driver) + composer.kind_count(.serial_driver);
     const singletons = composer.kind_count(.singleton_driver);
     if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
@@ -208,6 +209,28 @@ pub const Script = struct {
 pub const ScriptCommand = struct { at_ns: u64, name: []const u8, mode: []const u8 };
 
 pub const script_path = "/det/script.json";
+
+/// Every branch starts from the same snapshot, the guest kernel's random generator included:
+/// without this, what processes draw from it afresh (getrandom, /dev/urandom, TCP sequence
+/// numbers) would repeat in every branch. The new seed is a platform decision, so it differs
+/// per branch and replays from tapes like any other.
+fn kernel_reseed() void {
+    const rnd_add_entropy = 0x40085203; // _IOW('R', 3, int[2])
+    const rnd_reseed_crng = 0x5207; // _IO('R', 7)
+    const seed_size = 32;
+    // struct rand_pool_info: entropy bits, buffer size, buffer.
+    var request: extern struct { bits: i32, size: i32, bytes: [seed_size]u8 } = .{
+        .bits = seed_size * 8,
+        .size = seed_size,
+        .bytes = undefined,
+    };
+    sdk.random_bytes(&request.bytes);
+    const fd = linux.open("/dev/urandom", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.ioctl(@intCast(fd), rnd_add_entropy, @intFromPtr(&request));
+    _ = linux.ioctl(@intCast(fd), rnd_reseed_crng, 0);
+}
 
 fn script_read(arena: std.mem.Allocator) ?Script {
     const fd = linux.open(script_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);

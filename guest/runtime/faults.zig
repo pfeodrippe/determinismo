@@ -30,6 +30,7 @@ const Kind = enum {
     restart,
     throttle,
     process_pause,
+    process_kill,
     clock_skip,
 };
 const throttle_percent_min = 5;
@@ -111,7 +112,9 @@ fn draw(fault: *const Fault) Applied {
             const range = throttle_percent_max - throttle_percent_min;
             applied.cpu_percent = @intCast(throttle_percent_min + sdk.random_below(range + 1));
         },
-        .process_pause => applied.process_index = @intCast(sdk.random_below(processes_max)),
+        .process_pause, .process_kill => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
         .degrade => {
             const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
             applied.flavor = flavor;
@@ -177,6 +180,9 @@ fn faults_collect(
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
+        }
+        if (allowed.process_kill) {
+            faults_add(faults, &count, .{ .kind = .process_kill, .node = node.name });
         }
         links_collect(system, index, faults, &count);
     }
@@ -247,6 +253,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
             nodes.cpu_limit(applied.node, null) catch {};
         },
         .process_pause => apply_process_pause(applied),
+        .process_kill => apply_process_kill(applied),
         .isolate, .partition, .degrade => apply_link(system, applied),
         .clock_skip => {
             sdk.event("fault", applied.*);
@@ -266,6 +273,23 @@ fn apply_process_pause(applied: *const Applied) void {
     sdk.event("fault", applied.*);
     sleep_ns(applied.duration_ns);
     _ = linux.kill(pid, .CONT);
+}
+
+/// A crash: one of the node's processes other than its main one (a worker, a pod's process)
+/// is killed, for whatever supervises it to notice. Nothing to undo.
+fn apply_process_kill(applied: *const Applied) void {
+    var pids: [processes_max]linux.pid_t = undefined;
+    const count = nodes.processes(applied.node, &pids) catch return;
+    const main_pid = nodes.pid_recorded(applied.node);
+    var others: u32 = 0;
+    for (pids[0..count]) |pid| {
+        if (pid == main_pid) continue;
+        pids[others] = pid;
+        others += 1;
+    }
+    if (others == 0) return;
+    _ = linux.kill(pids[applied.process_index % others], .KILL);
+    sdk.event("fault", applied.*);
 }
 
 fn apply_link(system: *const schema.System, applied: *const Applied) void {

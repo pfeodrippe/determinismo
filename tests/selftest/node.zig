@@ -3,10 +3,12 @@
 //! Answers each line with the same line; on "die" it exits with status 3, as a crashing
 //! service would. With DET_MUTANT set it answers in uppercase: a mutant the tests must catch.
 //! `det-selftest-node hog` instead touches memory until the kernel kills it (the node's memory
-//! limit makes that an OOM kill).
+//! limit makes that an OOM kill). With DET_WORKERS=<n> it also supervises n worker processes,
+//! replacing any that dies (what process_kill faults test).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const sdk = @import("determinismo");
 
 const port = 7000;
 const connections_max = 1_000_000;
@@ -19,6 +21,11 @@ pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
     mutant = init.environ_map.get("DET_MUTANT") != null;
+    if (init.environ_map.get("DET_WORKERS")) |text| {
+        const workers = try std.fmt.parseInt(u32, text, 10);
+        for (0..workers) |_| worker_start();
+        _ = try std.Thread.spawn(.{}, supervise, .{});
+    }
     const listener = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(listener) != .SUCCESS) return error.Socket;
     const fd: linux.fd_t = @intCast(listener);
@@ -34,6 +41,25 @@ pub fn main(init: std.process.Init) !void {
         if (linux.errno(client) != .SUCCESS) continue;
         defer _ = linux.close(@intCast(client));
         serve(@intCast(client));
+    }
+}
+
+fn worker_start() void {
+    const pid = linux.fork();
+    if (pid == 0) {
+        while (true) _ = linux.pause(); // A worker: here to be killed.
+    }
+}
+
+/// Replaces every worker that dies.
+fn supervise() void {
+    while (true) {
+        var status: i32 = 0;
+        const result = linux.wait4(-1, &status, 0, null);
+        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) != .SUCCESS) return; // No children left.
+        sdk.reachable("a killed worker is replaced", .{});
+        worker_start();
     }
 }
 

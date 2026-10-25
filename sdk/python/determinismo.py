@@ -11,6 +11,7 @@ everywhere. One file, standard library only: copy it next to your code.
     det.always(total == 1000, "total balance is conserved", {"total": total})
 """
 import json
+import random
 import os
 import sys
 
@@ -56,6 +57,40 @@ def random_below(count):
 def random_choice(items):
     assert len(items) > 0
     return items[random_below(len(items))]
+
+
+class Random(random.Random):
+    """A random.Random whose every draw is a platform decision, for code that takes an RNG
+    (shuffle, choice, sample, uniform, ...): what it draws is steerable by strategies and replays
+    from tapes. Each draw is one request to the platform; for hot loops, prng()."""
+
+    def seed(self, *arguments, **options):
+        pass  # The platform decides.
+
+    def random(self):
+        return (random_u64() >> 11) * (1.0 / (1 << 53))
+
+    def getrandbits(self, k):
+        if k <= 0:
+            return 0
+        return int.from_bytes(random_bytes((k + 7) // 8), "little") >> (-k % 8)
+
+    def getstate(self):
+        raise NotImplementedError("platform randomness has no state to save")
+
+    def setstate(self, state):
+        raise NotImplementedError("platform randomness has no state to restore")
+
+
+def rng():
+    """A random.Random backed by platform decisions (see Random)."""
+    return Random()
+
+
+def prng():
+    """A fast random.Random seeded from one platform decision: deterministic and different in
+    every branch, steered only through its seed."""
+    return random.Random(random_u64())
 
 
 def _emit(message):

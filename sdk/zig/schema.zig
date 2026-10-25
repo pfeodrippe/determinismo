@@ -99,6 +99,9 @@ pub const Faults = struct {
     throttle: bool = true,
     /// Stop one of its processes (SIGSTOP) for a while.
     process_pause: bool = true,
+    /// Kill one of its processes other than its main one (SIGKILL), as a crash its supervisor
+    /// must recover from (a worker, a pod's process under kubelet).
+    process_kill: bool = false,
 };
 
 pub const Scenario = struct {

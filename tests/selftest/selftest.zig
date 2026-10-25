@@ -73,6 +73,16 @@ fn describe(d: *System.Describe) !void {
         .faults = quiet,
         .memory_max_mib = 32,
     });
+    // Workers under a supervisor, and faults that kill processes (never the main one).
+    const workers = try d.profile("workers");
+    var kills = quiet;
+    kills.process_kill = true;
+    workers.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_WORKERS=3"},
+        .ready = .{ .tcp = port },
+        .faults = kills,
+    });
     const maze_profile = try d.profile("maze");
     maze_profile.node(.maze, .{
         .binary = "zig-out/bin/det-maze",
@@ -104,6 +114,7 @@ fn describe(d: *System.Describe) !void {
 }
 
 fn steady(s: *System.Scenario) void {
+    s.first("entropy", entropy);
     s.parallel_driver("ping", ping);
     s.finally("ping_after", ping);
 }
@@ -204,6 +215,21 @@ fn ping(context: *System.Context) !void {
     var reply: [16]u8 = undefined;
     const answer = try request(context.nodes.echo.?.address, "ping\n", &reply);
     sdk.always(std.mem.eql(u8, answer, "ping\n"), "the echo node echoes", .{});
+}
+
+/// What the guest kernel's random generator gives after the snapshot: different in every
+/// branch (the composer reseeds it from a platform decision), the same when a branch replays.
+fn entropy(_: *System.Context) !void {
+    var bytes: [8]u8 = undefined;
+    const fd = linux.open("/dev/urandom", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.NoUrandom;
+    defer _ = linux.close(@intCast(fd));
+    if (linux.read(@intCast(fd), &bytes, bytes.len) != bytes.len) return error.ShortRead;
+    sdk.event("kernel_entropy", .{ .value = std.mem.readInt(u64, &bytes, .little) });
+    // An RNG passed to code that takes one: every draw a platform decision.
+    var deck = [_]u16{ 1, 2, 3, 4, 5 };
+    sdk.rng().shuffle(u16, &deck);
+    sdk.event("shuffled", .{ .deck = &deck });
 }
 
 fn tell_die(context: *System.Context) !void {

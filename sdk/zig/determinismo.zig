@@ -83,6 +83,30 @@ pub fn random_bytes(target: []u8) void {
     }
 }
 
+/// A `std.Random` whose every draw is a platform decision, for code that takes an RNG: what it
+/// draws is steerable by strategies and replays from tapes. Each draw is one request to the
+/// platform; for hot loops, `prng`.
+pub fn rng() std.Random {
+    return .{ .ptr = &rng_context, .fillFn = rng_fill };
+}
+
+var rng_context: u8 = 0;
+
+fn rng_fill(_: *anyopaque, target: []u8) void {
+    var rest = target;
+    while (rest.len > 0) {
+        const size = @min(rest.len, message_size_max);
+        random_bytes(rest[0..size]);
+        rest = rest[size..];
+    }
+}
+
+/// A fast generator seeded from one platform decision: deterministic and different in every
+/// branch, steered only through its seed. For drawing many values cheaply.
+pub fn prng() std.Random.DefaultPrng {
+    return .init(random_u64());
+}
+
 pub fn always(condition: bool, message: []const u8, details: anytype) void {
     emit_assertion("always", .{ .condition = condition, .message = message }, details);
 }
@@ -232,4 +256,11 @@ fn device_get() Device {
 test {
     _ = schema;
     _ = system;
+}
+
+test "rng and prng draw (from the OS outside determinismo)" {
+    const value = rng().intRangeLessThan(u32, 0, 10);
+    try std.testing.expect(value < 10);
+    var generator = prng();
+    try std.testing.expect(generator.random().intRangeLessThan(u32, 0, 10) < 10);
 }

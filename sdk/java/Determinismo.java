@@ -70,6 +70,33 @@ public final class Determinismo {
     return Long.remainderUnsigned(randomLong(), count);
   }
 
+  /**
+   * A {@link java.util.Random} whose every draw is a platform decision, for code that takes an
+   * RNG: what it draws is steerable by strategies and replays from tapes. Each draw is one
+   * request to the platform; for hot loops, {@link #prng()}.
+   */
+  public static java.util.Random rng() {
+    return new java.util.Random() {
+      private static final long serialVersionUID = 1L;
+
+      @Override
+      protected int next(int bits) {
+        return (int) (randomLong() >>> (64 - bits));
+      }
+
+      @Override
+      public synchronized void setSeed(long seed) {} // The platform decides.
+    };
+  }
+
+  /**
+   * A fast generator seeded from one platform decision: deterministic and different in every
+   * branch, steered only through its seed.
+   */
+  public static java.util.SplittableRandom prng() {
+    return new java.util.SplittableRandom(randomLong());
+  }
+
   public static void always(boolean condition, String message, String details) {
     assertion("always", condition, message, details);
   }

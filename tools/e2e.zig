@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     try check_tapes(&context);
     try check_python_strategy(&context);
     try check_builtin_properties(&context);
+    try check_kernel_entropy(&context);
     try check_coverage(&context);
     try check_parallel(&context);
     try check_fork(&context);
@@ -283,6 +284,36 @@ fn check_k3s_compose(
     expect(context, same, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
 }
 
+/// The guest kernel's random generator after the snapshot: different in every branch, the same
+/// when a branch replays.
+fn check_kernel_entropy(context: *Context) !void {
+    var values: [3][]const u8 = undefined;
+    for ([_][]const u8{ "0", "1", "0" }, &values, 0..) |branch, *value, run| {
+        const name = try std.fmt.allocPrint(context.arena, "entropy-{d}.jsonl", .{run});
+        const events = try std.fs.path.join(context.arena, &.{ context.scratch, name });
+        const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+        _ = try explore(context, &.{
+            "--program", program, "--scenario", "steady", "--seed", "1", "--branch", branch,
+            "--events",  events,
+        });
+        const log = std.Io.Dir.cwd().readFileAlloc(context.io, events, context.arena,
+            .limited(1 << 24)) catch "";
+        const key = "\"kernel_entropy\",\"details\":{\"value\":";
+        const at = std.mem.indexOf(u8, log, key) orelse {
+            value.* = "";
+            continue;
+        };
+        const start = at + key.len;
+        const end = std.mem.indexOfScalarPos(u8, log, start, '}') orelse start;
+        value.* = log[start..end];
+    }
+    const found = values[0].len > 0 and values[1].len > 0;
+    const differs = found and !std.mem.eql(u8, values[0], values[1]);
+    const replays = found and std.mem.eql(u8, values[0], values[2]);
+    expect(context, differs and replays, "kernel randomness: {s} and {s} in two branches, " ++
+        "{s} on replay", .{ values[0], values[1], values[2] });
+}
+
 /// The built-in properties pass on a steady system and catch a node that exits by itself and an
 /// OOM kill.
 fn check_builtin_properties(context: *Context) !void {
@@ -308,6 +339,14 @@ fn check_builtin_properties(context: *Context) !void {
         "--program", program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
         "--branches", "1",
     });
+    const workers = try explore(context, &.{
+        "--program", program, "--profile", "workers", "--scenario", "steady", "--seed", "1",
+        "--branches", "8",
+    });
+    const all_pass = "8 branches, 0 with failing properties";
+    const replaced = std.mem.indexOf(u8, workers, all_pass) != null and
+        std.mem.indexOf(u8, workers, "PASS reachable") != null;
+    expect(context, replaced, "process kills hit workers, never a node's main process", .{});
     const oom = "FAIL \"the kernel kills no process for lack of memory\"";
     const oom_caught = std.mem.indexOf(u8, hog, oom) != null and
         std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null;
