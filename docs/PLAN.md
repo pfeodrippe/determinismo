@@ -36,8 +36,12 @@ build e2e` tests it.
    with restarts), with the tree explorer and the strategies; findings documented in each
    example's README. Antithesis's own Raft project (antithesishq/hashicorp-raft-poc) runs
    unchanged through the Compose importer (its Go SDK writes to detfs, a regular file; its
-   client declares the setup, where the snapshot is taken): an hour's exploration, then its
-   findings against the blog post's.
+   client declares the setup, where the snapshot is taken). Found blind in its first hour: the
+   leadership-transfer deadlock (hashicorp/raft#696), explained by a replay's goroutine dump
+   (tests/antithesis-compat/README.md). Not yet: the async-heartbeat divergence (#695) and
+   the snapshot livelock (#697), which need long timelines (`--timeline`, the project's
+   "15-minute timelines"): runs with them next. Long timelines make the tree's replays to a
+   moment expensive, which makes in-run snapshots (item 2) the next speed item.
 
 ## Antithesis parity found missing
 
