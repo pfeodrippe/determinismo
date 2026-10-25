@@ -647,9 +647,17 @@ fn command_explore(
     // A tree explorer's branch replays along its path: each ancestor to the moment the next
     // branched from it, snapshotted there as the exploration did.
     if (exploration.replay) |replay| {
+        // Ancestors' tapes are beside this one: what a strategy decided in them, replayed.
+        const directory = std.fs.path.dirname(arguments.tape_path.?) orelse ".";
+        const ancestor = if (replay.header.chain.len > 0)
+            try context.arena.create(tape.Overrides)
+        else
+            undefined;
         for (replay.header.chain) |segment| {
+            const overrides = try tape_overrides(context, directory, segment.branch, ancestor);
             const arena = context.arena;
-            start = try node_make(arena, vm, options, start, segment.seed, segment.vtime_ns);
+            const at = segment.vtime_ns;
+            start = try node_make(arena, vm, options, start, segment.seed, at, overrides);
         }
     }
     if (arguments.events_directory != null) {
@@ -667,6 +675,10 @@ fn command_explore(
     };
     const jobs = jobs_count(arguments);
     if (arguments.branching == .tree) {
+        // A strategy decides within its branches and chooses where the tree returns: an
+        // instance here (and one per worker).
+        try strategy_start(context, arguments, &exploration);
+        defer if (exploration.strategy) |strategy| strategy.stop();
         try explore_tree(context, vm, options, branches, jobs);
     } else if (jobs == 1) {
         try strategy_start(context, arguments, &exploration);
@@ -758,7 +770,16 @@ fn jobs_count(arguments: *const Arguments) u32 {
 /// branch, shards, a moment): then flat; asked for a tree, an error.
 fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     if (arguments.branching != .tree) return;
-    const planned = arguments.strategy_command != null or arguments.branch_only != null or
+    // A strategy in a tree (asked for): its parents are replayed with their tapes.
+    if (arguments.branching_given and arguments.strategy_command != null) {
+        if (arguments.tape_directory == null) {
+            std.debug.print("[determinismo] a strategy in a tree needs --tape-dir: nodes " ++
+                "replay their parents' decisions from their tapes\n", .{});
+            return error.Usage;
+        }
+    }
+    const strategy_planned = arguments.strategy_command != null and !arguments.branching_given;
+    const planned = strategy_planned or arguments.branch_only != null or
         arguments.tape_path != null or arguments.from_branch != null or
         arguments.shard_count > 1 or at_moment;
     if (planned and arguments.branching_given) return error.Usage;
@@ -1032,18 +1053,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         defer if (branches.arguments.events_directory != null) close(vm.events.log_fd.?);
         vm.strategy = exploration.strategy;
         if (exploration.replay) |replay| vm.overrides = replay.overrides;
-        if (exploration.strategy) |strategy| try strategy.branch(index, options.seed);
-        if (exploration.tape_directory) |directory| {
-            vm.tape_fd = try open_tape(context.arena, directory, index);
-            tape.write_header(vm.tape_fd.?, .{
-                .inputs = exploration.inputs,
-                .exploration_seed = exploration.exploration_seed,
-                .branch = index,
-                .branch_seed = options.seed,
-                .fork = exploration.fork,
-                .chain = place.path,
-            });
-        }
+        try branch_announce(context, vm, exploration, place);
         defer if (vm.tape_fd) |fd| close(fd);
         const time_start_ns = monotonic_ns();
         const outcome = try vm.run_until_exit();
@@ -1062,6 +1072,33 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             const end = BranchResult{ .index = index, .outcome = outcome };
             if (try strategy_branch_end(strategy, vm, end)) break;
         }
+    }
+}
+
+/// Tells the strategy a branch starts (and where), and opens its tape.
+fn branch_announce(
+    context: Context,
+    vm: *VM,
+    exploration: *const Exploration,
+    place: Planned,
+) !void {
+    if (exploration.strategy) |strategy| {
+        const from: ?Strategy.From = if (place.path.len == 0) null else .{
+            .branch = place.path[place.path.len - 1].branch,
+            .vtime_ns = place.path[place.path.len - 1].vtime_ns,
+        };
+        try strategy.branch(place.index, place.seed, from);
+    }
+    if (exploration.tape_directory) |directory| {
+        vm.tape_fd = try open_tape(context.arena, directory, place.index);
+        tape.write_header(vm.tape_fd.?, .{
+            .inputs = exploration.inputs,
+            .exploration_seed = exploration.exploration_seed,
+            .branch = place.index,
+            .branch_seed = place.seed,
+            .fork = exploration.fork,
+            .chain = place.path,
+        });
     }
 }
 
@@ -1171,6 +1208,11 @@ fn explore_tree(
     }
     var generation: u32 = 0;
     const items = try arena.alloc(Summary, tree.generation_size);
+    // Parents' tapes are read into this (a strategy's overrides), one at a time.
+    const tape_buffer = if (exploration.strategy != null)
+        try arena.create(tape.Overrides)
+    else
+        undefined;
     while (plan.items.len > 0) : (generation += 1) {
         if (branches.deadline_ns) |deadline| {
             if (monotonic_ns() >= deadline) break;
@@ -1219,42 +1261,31 @@ fn explore_tree(
         }
         const chosen = candidates[0..candidate_count];
         std.sort.insertion(Candidate, chosen, {}, candidate_before);
+        const returns = try tree_returns(arena, exploration.strategy, generation, chosen, &random);
         var next: std.ArrayList(Planned) = .empty;
         var made: u32 = 0;
-        for (chosen) |candidate| {
-            if (made == tree.nodes or next_index >= total) break;
-            const summary = candidate.summary;
+        for (returns) |back| {
+            if (next_index >= total) break;
             const parent = for (plan.items) |entry| {
-                if (entry.index == summary.index) break entry;
-            } else unreachable;
-            // Just after a new behavior, else (nothing new) anywhere in the branch.
-            const span = summary.end_ns -| summary.start_ns;
-            if (span < 2 * std.time.ns_per_ms) continue;
-            const after = if (candidate.moment) |moment| moment + std.time.ns_per_us else
-                summary.start_ns + random.random().uintLessThan(u64, span);
-            const at = std.math.clamp(
-                after,
-                summary.start_ns + std.time.ns_per_ms,
-                summary.end_ns - std.time.ns_per_ms,
-            );
+                if (entry.index == back.branch) break entry;
+            } else continue;
+            // A strategy's decisions in the parent are in its tape: replayed to the moment.
+            const overrides = if (exploration.strategy != null) try tape_overrides(
+                context,
+                branches.arguments.tape_directory.?,
+                parent.index,
+                tape_buffer,
+            ) else null;
             const from = parent.snapshot;
-            const snapshot = node_make(arena, vm, options, from, parent.seed, at) catch |err| {
+            const at = back.vtime_ns;
+            const seed = parent.seed;
+            const snapshot = node_make(arena, vm, options, from, seed, at, overrides) catch |err| {
                 std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
                     at, parent.index, @errorName(err),
                 });
                 continue;
             };
             made += 1;
-            const why = if (candidate.moment != null)
-                try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
-                    "{s} ({d} behaviors no timeline before it had): its frontier.", .{
-                    parent.index, candidate.label, candidate.novel,
-                })
-            else
-                try std.fmt.allocPrint(arena, "A random moment of #{d}: no timeline of this " ++
-                    "generation reached anything new, so a moment is chosen at random.", .{
-                    parent.index,
-                });
             const path = try arena.alloc(tape.Segment, parent.path.len + 1);
             @memcpy(path[0..parent.path.len], parent.path);
             path[parent.path.len] = .{
@@ -1270,7 +1301,7 @@ fn explore_tree(
                     .snapshot = snapshot,
                     .path = path,
                     .generation = generation + 1,
-                    .why = why,
+                    .why = back.why,
                 });
                 next_index += 1;
             }
@@ -1299,6 +1330,74 @@ fn explore_tree(
 
 const Candidate = struct { summary: *const Summary, novel: u32, moment: ?u64, label: []const u8 };
 
+const TreeReturn = struct { branch: u32, vtime_ns: u64, why: []const u8 };
+
+/// Where the next generation returns: the strategy's choice when it makes one; else the
+/// branches with the most new behaviors, just after the last of them that leaves room (Go-
+/// Explore's frontier), or a random moment of a branch when nothing was new.
+fn tree_returns(
+    arena: std.mem.Allocator,
+    strategy: ?*Strategy,
+    generation: u32,
+    chosen: []const Candidate,
+    random: *std.Random.DefaultPrng,
+) ![]const TreeReturn {
+    var list: std.ArrayList(TreeReturn) = .empty;
+    if (strategy) |plugin| {
+        var offered: [tree.generation_size]Strategy.Candidate = undefined;
+        for (chosen, offered[0..chosen.len]) |candidate, *offer| offer.* = .{
+            .branch = candidate.summary.index,
+            .start_ns = candidate.summary.start_ns,
+            .end_ns = candidate.summary.end_ns,
+            .novel = candidate.novel,
+            .moment_ns = candidate.moment,
+            .label = candidate.label,
+        };
+        const answer = try plugin.returns(arena, generation, offered[0..chosen.len], tree.nodes);
+        for (answer) |back| {
+            const candidate = for (chosen) |candidate| {
+                if (candidate.summary.index == back.branch) break candidate;
+            } else continue;
+            const summary = candidate.summary;
+            if (back.vtime_ns <= summary.start_ns or back.vtime_ns >= summary.end_ns) continue;
+            const reason = if (back.reason.len > 0) back.reason else "(it gave no reason)";
+            try list.append(arena, .{
+                .branch = back.branch,
+                .vtime_ns = back.vtime_ns,
+                .why = try std.fmt.allocPrint(arena, "The strategy returned to #{d} here: {s}", .{
+                    back.branch, reason,
+                }),
+            });
+        }
+        if (list.items.len > 0) return list.items;
+    }
+    for (chosen) |candidate| {
+        if (list.items.len == tree.nodes) break;
+        const summary = candidate.summary;
+        const span = summary.end_ns -| summary.start_ns;
+        if (span < 2 * std.time.ns_per_ms) continue;
+        const after = if (candidate.moment) |moment| moment + std.time.ns_per_us else
+            summary.start_ns + random.random().uintLessThan(u64, span);
+        const at = std.math.clamp(
+            after,
+            summary.start_ns + std.time.ns_per_ms,
+            summary.end_ns - std.time.ns_per_ms,
+        );
+        const why = if (candidate.moment != null)
+            try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
+                "{s} ({d} behaviors no timeline before it had): its frontier.", .{
+                summary.index, candidate.label, candidate.novel,
+            })
+        else
+            try std.fmt.allocPrint(arena, "A random moment of #{d}: no timeline of this " ++
+                "generation reached anything new, so a moment is chosen at random.", .{
+                summary.index,
+            });
+        try list.append(arena, .{ .branch = summary.index, .vtime_ns = at, .why = why });
+    }
+    return list.items;
+}
+
 fn candidate_before(_: void, a: Candidate, b: Candidate) bool {
     if (a.novel != b.novel) return a.novel > b.novel;
     return a.summary.index < b.summary.index;
@@ -1314,6 +1413,22 @@ fn new_behaviors(candidates: []const Candidate) u32 {
     return sum;
 }
 
+/// The overrides of branch `index`'s tape in `directory` (null when it has no tape).
+fn tape_overrides(
+    context: Context,
+    directory: []const u8,
+    index: u32,
+    overrides: *tape.Overrides,
+) !?*tape.Overrides {
+    const name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{index});
+    const path = try std.fs.path.join(context.arena, &.{ directory, name });
+    const source = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .unlimited) catch
+        return null;
+    var scratch: [64 * 1024]u8 = undefined;
+    _ = try tape.parse(source, &scratch, overrides);
+    return overrides;
+}
+
 /// A snapshot at `vtime_ns` of the branch that starts at `from` with `seed`: replays it there.
 fn node_make(
     arena: std.mem.Allocator,
@@ -1322,6 +1437,8 @@ fn node_make(
     from: *const Snapshot,
     seed: u64,
     vtime_ns: u64,
+    /// The branch's tape when a strategy overrode its decisions: they are replayed too.
+    overrides: ?*tape.Overrides,
 ) !*const Snapshot {
     try moment_after_snapshot(from, vtime_ns);
     var probe = options.*;
@@ -1332,6 +1449,7 @@ fn node_make(
     probe.until = null;
     probe.events_fd = null;
     try vm.init_from_snapshot(&probe, from);
+    vm.overrides = overrides;
     const outcome = try vm.run_until_exit();
     if (outcome != .moment_reached) {
         vm.deinit();

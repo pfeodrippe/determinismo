@@ -985,7 +985,49 @@ fn check_tree(context: *Context) !void {
     const count = parse_branches(one, &sequential);
     const same = count == 40 and parse_branches(many, &parallel) == count and
         same_timelines(sequential[0..count], parallel[0..count]);
-    // The deepest timeline, from the record.
+    const deep = try deepest_replays(context, program, record, tapes, sequential[0..count]);
+    expect(context, same and deep.depth >= 1 and deep.replays, "tree: {d} timelines, up to " ++
+        "{d} deep, the same with one worker or four; #{?d} replays alone from its tape", .{
+        count, deep.depth, deep.index,
+    });
+    // With a strategy (overriding decisions): nodes replay their parents with their tapes, and
+    // a deep timeline still replays alone, without the strategy.
+    const strategy_tapes = try std.fmt.allocPrint(arena, "{s}/tree-strategy-tapes", .{
+        context.scratch,
+    });
+    const strategy_record = try std.fmt.allocPrint(arena, "{s}/tree-strategy.jsonl", .{
+        context.scratch,
+    });
+    const steered = try explore(context, &(common ++ [_][]const u8{
+        "--jobs",     "2",            "--strategy", "python3 plugins/python/extremes.py",
+        "--tape-dir", strategy_tapes, "--record",   strategy_record,
+    }));
+    var steered_branches: [branches_max]Branch = undefined;
+    const steered_count = parse_branches(steered, &steered_branches);
+    const steered_deep = try deepest_replays(
+        context,
+        program,
+        strategy_record,
+        strategy_tapes,
+        steered_branches[0..steered_count],
+    );
+    const steered_ok = steered_count == 40 and steered_deep.depth >= 1 and steered_deep.replays;
+    expect(context, steered_ok, "tree with a strategy: {d} timelines, up to {d} deep; #{?d} " ++
+        "replays from its tape (its ancestors' decisions from theirs)", .{
+        steered_count, steered_deep.depth, steered_deep.index,
+    });
+}
+
+/// The deepest timeline of a tree exploration (from its record), and whether it replays alone
+/// from its tape with the events it had.
+fn deepest_replays(
+    context: *Context,
+    program: []const u8,
+    record: []const u8,
+    tapes: []const u8,
+    explored: []const Branch,
+) !struct { index: ?u32, depth: usize, replays: bool } {
+    const arena = context.arena;
     const cwd = std.Io.Dir.cwd();
     const lines = cwd.readFileAlloc(context.io, record, arena, .limited(1 << 24)) catch "";
     var deepest: ?u32 = null;
@@ -993,7 +1035,8 @@ fn check_tree(context: *Context) !void {
     var records = std.mem.tokenizeScalar(u8, lines, '\n');
     while (records.next()) |line| {
         if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
-        const Line = struct { branch: struct { index: u32, path: []const struct { branch: u32 } } };
+        const Step = struct { branch: u32 };
+        const Line = struct { branch: struct { index: u32, path: []const Step } };
         const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{
             .ignore_unknown_fields = true,
         }) catch continue;
@@ -1001,23 +1044,18 @@ fn check_tree(context: *Context) !void {
         depth_max = parsed.branch.path.len;
         deepest = parsed.branch.index;
     }
-    var replays = false;
-    if (deepest) |index| {
-        const tape = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index });
-        const replay = try explore(context, &.{
-            "--program", program, "--scenario", "bank", "--tape", tape,
-        });
-        var replayed: [1]Branch = undefined;
-        const original = for (sequential[0..count]) |branch| {
-            if (branch.index == index) break branch;
-        } else null;
-        replays = original != null and parse_branches(replay, &replayed) == 1 and
-            std.mem.eql(u8, replayed[0].events_hash, original.?.events_hash);
-    }
-    expect(context, same and depth_max >= 1 and replays, "tree: {d} timelines, up to {d} deep, " ++
-        "the same with one worker or four; #{?d} replays alone from its tape", .{
-        count, depth_max, deepest,
+    const index = deepest orelse return .{ .index = null, .depth = 0, .replays = false };
+    const tape = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index });
+    const replay = try explore(context, &.{
+        "--program", program, "--scenario", "bank", "--tape", tape,
     });
+    var replayed: [1]Branch = undefined;
+    const original = for (explored) |branch| {
+        if (branch.index == index) break branch;
+    } else null;
+    const replays = original != null and parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, original.?.events_hash);
+    return .{ .index = index, .depth = depth_max, .replays = replays };
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

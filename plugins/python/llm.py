@@ -76,6 +76,36 @@ class Llm:
         return f"{self.model} favored this: {reason}" if reason else f"{self.model} favored this"
 
 
+    def returns(self, generation, candidates, count):
+        """After a generation of the tree explorer: which moments of its timelines to branch from
+        again (the model's choice and why), from what each reached first."""
+        offered = [{"branch": c["branch"], "from_s": round(c["start_ns"] / 1e9, 3),
+                    "to_s": round(c["end_ns"] / 1e9, 3), "new_behaviors": c["novel"],
+                    "last_new_at_s": c["moment_ns"] and round(c["moment_ns"] / 1e9, 3),
+                    "last_new": c["label"]} for c in candidates]
+        prompt = (
+            "You steer a deterministic simulation test of a distributed system. Timelines branch: "
+            "from a moment of a timeline, new timelines continue with other decisions. Choose up "
+            f"to {count} moments to branch from, where you expect bugs to be closest (a fault "
+            "just landed, a failover started, a new error appeared).\n"
+            f"Timelines of this generation:\n{json.dumps(offered)}\n"
+            f"Recent branches (faults favored, properties that failed):\n"
+            f"{json.dumps(self.history[-16:])}\n"
+            "Answer with JSON only: [{\"branch\": N, \"at_s\": seconds within its from_s..to_s, "
+            "\"why\": \"<one sentence>\"}, ...]")
+        try:
+            result = subprocess.run(["claude", "-p", "--model", self.model, prompt],
+                                    capture_output=True, text=True, timeout=120)
+            text = result.stdout.strip()
+            chosen = json.loads(text[text.find("["):text.rfind("]") + 1])
+            answer = [(int(c["branch"]), int(float(c["at_s"]) * 1e9),
+                       f"{self.model}: {c.get('why', '')}") for c in chosen[:count]]
+            print(f"[llm] returns: {answer}", file=sys.stderr)
+            return answer
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+            print(f"[llm] no returns this time: {error}", file=sys.stderr)
+            return None
+
     def event(self, event, source, moment):
         guidance = event.get("guidance")
         if guidance:

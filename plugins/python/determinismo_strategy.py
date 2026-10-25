@@ -39,8 +39,21 @@ def _dispatch(strategy, name, request):
         return {"name": name}
     if method == "branch":
         if hasattr(strategy, "branch"):
-            strategy.branch(request["index"], int(request["seed"], 16))
+            arguments = [request["index"], int(request["seed"], 16)]
+            # Where it starts, when the tree explorer branched it from another: {"branch", "vtime_ns"}.
+            if "start" in inspect.signature(strategy.branch).parameters:
+                arguments.append(request.get("from"))
+            strategy.branch(*arguments)
         return {}
+    if method == "returns":
+        # The tree explorer's generation ended: which moments to return to (branch, vtime_ns,
+        # reason), at most "count"; None leaves it to the explorer.
+        if not hasattr(strategy, "returns"):
+            return {}
+        chosen = strategy.returns(request["generation"], request["candidates"], request["count"])
+        if not chosen:
+            return {}
+        return {"returns": [{"branch": b, "vtime_ns": t, "reason": r} for b, t, r in chosen]}
     if method == "random":
         if not hasattr(strategy, "random"):
             return {}

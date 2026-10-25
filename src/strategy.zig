@@ -144,11 +144,70 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64) !void {
     std.debug.print("[determinismo] strategy: {s}\n", .{name.string});
 }
 
-pub fn branch(strategy: *Strategy, index: u32, seed: u64) !void {
+/// Where a branch starts when not at the setup snapshot: a moment of another (the tree's).
+pub const From = struct { branch: u32, vtime_ns: u64 };
+
+pub fn branch(strategy: *Strategy, index: u32, seed: u64, from: ?From) !void {
     var writer: std.Io.Writer = .fixed(&strategy.request);
-    const format = "{{\"method\":\"branch\",\"index\":{d},\"seed\":\"{x:0>16}\"}}";
+    const format = "{{\"method\":\"branch\",\"index\":{d},\"seed\":\"{x:0>16}\"";
     try writer.print(format, .{ index, seed });
+    if (from) |parent| {
+        try writer.print(",\"from\":{{\"branch\":{d},\"vtime_ns\":{d}}}", .{
+            parent.branch, parent.vtime_ns,
+        });
+    }
+    try writer.writeAll("}");
     _ = try strategy.call(writer.buffered());
+}
+
+/// A branch of the generation that just ended, as the tree explorer saw it: `novel` behaviors no
+/// branch before it had, the last of them (`moment_ns`, `label`) where it would return.
+pub const Candidate = struct {
+    branch: u32,
+    start_ns: u64,
+    end_ns: u64,
+    novel: u32,
+    moment_ns: ?u64,
+    label: []const u8,
+};
+
+/// A moment of a branch to return to, and why.
+pub const Return = struct { branch: u32, vtime_ns: u64, reason: []const u8 };
+
+/// The tree explorer asks where to return after a generation: the plugin answers
+/// `{"returns": [{"branch": B, "vtime_ns": T, "reason": "..."}, ...]}` (at most `count`), or
+/// `{}` to leave it to the explorer. Reasons are copied into `arena`.
+pub fn returns(
+    strategy: *Strategy,
+    arena: std.mem.Allocator,
+    generation: u32,
+    candidates: []const Candidate,
+    count: u32,
+) ![]const Return {
+    var writer: std.Io.Writer = .fixed(&strategy.request);
+    try writer.print("{{\"method\":\"returns\",\"generation\":{d},\"count\":{d}," ++
+        "\"candidates\":{f}}}", .{ generation, count, std.json.fmt(candidates, .{}) });
+    const reply = try strategy.call(writer.buffered());
+    const list = reply.get("returns") orelse return &.{};
+    if (list != .array) return error.BadPluginReply;
+    var chosen: std.ArrayList(Return) = .empty;
+    for (list.array.items) |item| {
+        if (chosen.items.len == count) break;
+        if (item != .object) return error.BadPluginReply;
+        const index = item.object.get("branch") orelse return error.BadPluginReply;
+        const vtime = item.object.get("vtime_ns") orelse return error.BadPluginReply;
+        if (index != .integer or vtime != .integer) return error.BadPluginReply;
+        const reason = if (item.object.get("reason")) |text| switch (text) {
+            .string => |string| try arena.dupe(u8, string[0..@min(string.len, reason_size_max)]),
+            else => "",
+        } else "";
+        try chosen.append(arena, .{
+            .branch = std.math.cast(u32, index.integer) orelse return error.BadPluginReply,
+            .vtime_ns = std.math.cast(u64, vtime.integer) orelse return error.BadPluginReply,
+            .reason = reason,
+        });
+    }
+    return chosen.items;
 }
 
 /// Offers the plugin a decision. Returns true when it overrode `value` (which on entry holds

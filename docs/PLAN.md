@@ -10,10 +10,10 @@ build e2e` tests it.
    REPL patch's timing) and K3s with three nodes (a property failed in 4 branches: ours or
    K3s's, to find out). Then a tree-exploration check: the same tree with one worker or many,
    and a deep timeline replaying alone from its tape.
-2. **The tree explorer by default.** `--branching tree` (Go-Explore over snapshots: generations,
-   returns just after new behaviors, paths in tapes and records) is opt-in, default in the UI.
-   Make it the CLI's default once e2e runs green with it; `--branch N` then replays first-
-   generation timelines only (others by their tapes). Next steps for it:
+2. **The tree explorer** (Go-Explore over snapshots: generations, returns just after new
+   behaviors, paths in tapes and records) is the default; `--branch N` replays first-generation
+   timelines (others by their tapes; MCP explore keeps tapes). Behaviors: assertion outcomes,
+   categorical events, guidance distances, and new kinds of output lines. Next steps for it:
    - Snapshot during the run when a timeline first reaches something new, instead of replaying
      to the moment after the generation (no replay; the same tree).
    - Behaviors from code coverage too (edges and lines, where the SDK instruments), and rarity
@@ -35,13 +35,11 @@ build e2e` tests it.
    per-run nREPL server, fork from a moment, time budgets. Left: zoom and pan in the tree (and
    a minimap for runs of thousands of timelines), a timeline's logs showing its parents'
    events before it branched, live updates of the tree while a run goes.
-5. **clojure-cli.repl** (github.com/clojure/clojure-cli.repl, the Clojure CLI's enhanced REPL:
-   an nREPL server with its own middleware, a JLine client in a second JVM): a workload that
-   runs it and plain nREPL side by side under the same clients and faults, with properties of
-   both (evaluations, sessions, `*1`, interrupts, output capture, middleware data on
-   responses, the editor-evaluation echo) and where they differ, as properties too; then stress
-   (many sessions, long evaluations, interrupts racing completions) to find where concurrency
-   breaks.
+5. **clojure-cli.repl**: examples/clojure-cli-repl, its server beside plain nREPL 1.7.0. Found
+   (README): an editor evaluation hangs while a watching terminal does not read (over ~100 KB
+   of output); closed sessions are kept; one inspector view for all terminals. Left: rerun the
+   editors scenario with the warm-up fix; interrupts and long evaluations racing watchers; ask
+   before reporting upstream (an issue is drafted).
 6. **Blind exploration of the real targets**: nREPL, the Clojure libraries, Raft (pinned commit,
    with restarts), with the tree explorer and the strategies; findings reported upstream.
 
