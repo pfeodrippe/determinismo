@@ -1,17 +1,25 @@
 # SPDX-License-Identifier: MIT
-# Two replicas of a tiny web server behind a Service.
+# Three replicas of a tiny web server behind a Service, one per Kubernetes node where there are
+# several.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: web
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels: {app: web}
   template:
     metadata:
       labels: {app: web}
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: web}
+          matchLabelKeys: [pod-template-hash] # Only this revision's pods count.
       containers:
         - name: web
           image: docker.io/rancher/mirrored-library-busybox:1.37.0

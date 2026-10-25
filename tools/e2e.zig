@@ -253,16 +253,25 @@ fn check_python_strategy(context: *Context) !void {
     expect(context, same, "python strategy: its branch replays from the tape without it", .{});
 }
 
-/// Kubernetes (K3s) as the system under test: the cluster comes up in a privileged node, its
-/// workload survives faults on the node, and a branch replays exactly.
+/// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
+/// spread over them): the workload survives faults, and a branch replays exactly.
 fn check_k3s(context: *Context) !void {
+    try check_k3s_compose(context, "examples/k3s/compose.yaml", "4096", "one node");
+    try check_k3s_compose(context, "examples/k3s/cluster.yaml", "8192", "three nodes");
+}
+
+fn check_k3s_compose(
+    context: *Context,
+    compose: []const u8,
+    memory_mib: []const u8,
+    label: []const u8,
+) !void {
     const common = [_][]const u8{
-        "--compose", "examples/k3s/compose.yaml", "--scenario", "cluster", "--seed", "1",
-        "--memory-mib", "4096",
+        "--compose", compose, "--scenario", "cluster", "--seed", "1", "--memory-mib", memory_mib,
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4" }));
     const passes = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
-    expect(context, passes, "k3s: the workload survives faults in 4 branches", .{});
+    expect(context, passes, "k3s ({s}): the workload survives faults in 4 branches", .{label});
     var branches: [4]Branch = undefined;
     const count = parse_branches(report, &branches);
     if (count == 0) return;
@@ -271,7 +280,7 @@ fn check_k3s(context: *Context) !void {
     var replayed: [1]Branch = undefined;
     const same = parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
-    expect(context, same, "k3s: branch {d} replays exactly", .{branches[0].index});
+    expect(context, same, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
 }
 
 /// The built-in properties pass on a steady system and catch a node that exits by itself and an

@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# A three-node Kubernetes cluster: a K3s server and two agents, each in its own node, so faults
+# can partition Kubernetes nodes from each other. Pods on different nodes talk over flannel's
+# vxlan, carried by determinismo's links. Give the machine room: --memory-mib 8192.
+#   determinismo explore ... --compose examples/k3s/cluster.yaml --scenario cluster
+services:
+  server:
+    privileged: true
+    build:
+      context: ../..
+      dockerfile: examples/k3s/Dockerfile
+    environment:
+      K3S_TOKEN: determinismo
+      CLUSTER_NODES: "3"
+    command: >-
+      server --snapshotter=native --disable=traefik,servicelb,metrics-server,local-storage
+      --disable-cloud-controller --disable-helm-controller --write-kubeconfig-mode=644
+    ports:
+      - "6443"
+  agent-a:
+    privileged: true
+    build:
+      context: ../..
+      dockerfile: examples/k3s/Dockerfile.agent
+    environment:
+      K3S_TOKEN: determinismo
+      K3S_URL: https://server:6443
+    command: agent --snapshotter=native
+    depends_on: [server]
+    ports:
+      - "10250"
+  agent-b:
+    privileged: true
+    build:
+      context: ../..
+      dockerfile: examples/k3s/Dockerfile.agent
+    environment:
+      K3S_TOKEN: determinismo
+      K3S_URL: https://server:6443
+    command: agent --snapshotter=native
+    depends_on: [server]
+    ports:
+      - "10250"
