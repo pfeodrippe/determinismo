@@ -159,6 +159,13 @@ fn check_builtin_properties(context: *Context) !void {
     });
     const passes = std.mem.indexOf(u8, steady, "2 branches, 0 with failing properties") != null;
     expect(context, passes, "built-in properties pass on a steady system", .{});
+    const both = try explore(context, &.{
+        "--program", program, "--profile", "default,mutant", "--scenario", "steady",
+        "--seed",    "1",     "--branches", "2",
+    });
+    const killed = std.mem.indexOf(u8, both, "PASS default") != null and
+        std.mem.indexOf(u8, both, "FAIL mutant") != null;
+    expect(context, killed, "mutation: the tests pass on the system and catch its mutant", .{});
     const crash = try explore(context, &.{
         "--program", program, "--scenario", "node_exit", "--seed", "1", "--branches", "1",
     });

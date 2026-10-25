@@ -211,6 +211,15 @@ fn image_disk(
     return disk;
 }
 
+/// The names of the program's (or Compose file's) profiles.
+pub fn profile_names(arena: std.mem.Allocator, io: std.Io, options: Options) ![]const []const u8 {
+    const context = Context{ .arena = arena, .io = io, .cache = options.cache_directory };
+    const description = try describe(context, options);
+    const names = try arena.alloc([]const u8, description.profiles.len);
+    for (description.profiles, names) |profile, *name| name.* = profile.name;
+    return names;
+}
+
 fn describe(context: Context, options: Options) !schema.Description {
     if (options.compose) |path| {
         const profiles = try context.arena.alloc(schema.Profile, 1);
@@ -270,7 +279,9 @@ fn profile_remember(
             std.debug.print("[determinismo] profile {s} changed since the last run:\n", .{
                 system.profile,
             });
+            differences = 0;
             try profile_diff(context.arena, &previous, system);
+            if (differences == 0) std.debug.print("  (in its encoding only)\n", .{});
         }
     } else |_| {}
     try cwd.writeFile(context.io, .{ .sub_path = path, .data = system_json });
@@ -282,15 +293,20 @@ fn profile_diff(
     new: *const schema.System,
 ) !void {
     for (old.nodes) |node| {
-        if (new.node(node.name) == null) std.debug.print("  - node {s}\n", .{node.name});
+        if (new.node(node.name) == null) {
+            differences += 1;
+            std.debug.print("  - node {s}\n", .{node.name});
+        }
     }
     for (new.nodes) |node| {
         const before = old.node(node.name) orelse {
+            differences += 1;
             std.debug.print("  + node {s}\n", .{node.name});
             continue;
         };
         try changed(arena, node.name, "digest", before.digest, node.digest);
         try changed(arena, node.name, "address", before.address, node.address);
+        try changed(arena, node.name, "disk", before.disk, node.disk);
         try changed(arena, node.name, "command", before.command, node.command);
         try changed(arena, node.name, "env", before.env, node.env);
         try changed(arena, node.name, "workdir", before.workdir, node.workdir);
@@ -301,17 +317,21 @@ fn profile_diff(
     }
     for (old.scenarios) |scenario| {
         if (new.scenario(scenario.name) == null) {
+            differences += 1;
             std.debug.print("  - scenario {s}\n", .{scenario.name});
         }
     }
     for (new.scenarios) |scenario| {
         const before = old.scenario(scenario.name) orelse {
+            differences += 1;
             std.debug.print("  + scenario {s}\n", .{scenario.name});
             continue;
         };
         try changed(arena, "scenario", scenario.name, before.*, scenario);
     }
 }
+
+var differences: u32 = 0;
 
 /// Prints `owner.field: old -> new` when the two differ (compared as JSON).
 fn changed(
@@ -324,6 +344,7 @@ fn changed(
     const old_json = try json(arena, old);
     const new_json = try json(arena, new);
     if (std.mem.eql(u8, old_json, new_json)) return;
+    differences += 1;
     std.debug.print("  ~ {s}.{s}: {s} -> {s}\n", .{ owner, field, old_json, new_json });
 }
 

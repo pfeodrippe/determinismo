@@ -126,6 +126,10 @@ determinismo explore ... --program zig-out/bin/shop-test --seed 3 --branch 37 --
   --exec "det-nodes exec postgres psql -U postgres -c 'select * from price'"
 ```
 
+Mutation testing: give mutants as profiles (`--profile default,mutant` or `--profile all`) and
+see which ones the tests catch; or apply a runtime mutant after setup with `--from-exec`, so
+every mutant shares one snapshot.
+
 "What if": `--exec "<cmd>" --continue` makes a change at a moment and lets the branch run on;
 `--from-branch B --from-vtime-ms T --from-exec "<cmd>"` explores many futures of the changed system.
 

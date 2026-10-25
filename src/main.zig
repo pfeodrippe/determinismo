@@ -32,7 +32,7 @@ const usage =
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
-    \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>]
+    \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>]
     \\
     \\machine options:
@@ -115,10 +115,52 @@ pub fn main(init: std.process.Init) !void {
         if (failing > 0) std.process.exit(3);
         return;
     }
-    var arguments = parse_arguments(arena, argv) catch {
+    const arguments = parse_arguments(arena, argv) catch {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
+    const vm = try arena.create(VM); // Large (port statistics): never on the stack.
+    const profile = arguments.profile orelse "";
+    const all = std.mem.eql(u8, profile, "all");
+    const several = std.mem.indexOfScalar(u8, profile, ',') != null;
+    if (!all and !several) {
+        if (try system_run(init, vm, arguments) > 0) std.process.exit(3);
+        return;
+    }
+    // Several profiles (e.g. a system and its mutants): their own disks, snapshot and verdict.
+    const names = if (all) try prepare.profile_names(arena, init.io, .{
+        .program = arguments.program_path,
+        .compose = arguments.compose_path,
+        .cache_directory = arguments.cache_directory,
+    }) else try list_split(arena, profile);
+    const verdicts = try arena.alloc(u32, names.len);
+    for (names, verdicts) |name, *failing| {
+        std.debug.print("[determinismo] profile {s}\n", .{name});
+        var copy = arguments;
+        copy.profile = name;
+        failing.* = try system_run(init, vm, copy);
+    }
+    std.debug.print("[determinismo] profiles:\n", .{});
+    for (names, verdicts) |name, failing| {
+        const status = if (failing > 0) "FAIL" else "PASS";
+        const line = "  {s} {s} ({d} scenarios with failing properties)\n";
+        std.debug.print(line, .{ status, name, failing });
+    }
+    for (verdicts) |failing| if (failing > 0) std.process.exit(3);
+}
+
+fn list_split(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.tokenizeScalar(u8, text, ',');
+    while (parts.next()) |name| try names.append(arena, name);
+    return names.items;
+}
+
+/// Prepares the system (if any), then runs or explores its scenarios. Returns the number of
+/// scenarios with failing properties.
+fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 {
+    const arena = init.arena.allocator();
+    var arguments = arguments_given;
     const has_system = arguments.program_path != null or arguments.compose_path != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
@@ -127,8 +169,6 @@ pub fn main(init: std.process.Init) !void {
         try cwd.readFileAlloc(init.io, path, arena, .unlimited)
     else
         null;
-    // Everything the machines need is reserved here, once.
-    const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     var options = VM.Options{
         .memory_size = @as(u64, arguments.memory_mib) << 20,
         .kernel = kernel,
@@ -161,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
             },
         }
     }
-    if (failing_scenarios > 0) std.process.exit(3);
+    return failing_scenarios;
 }
 
 /// `determinismo serve [--listen <address:port>] [--data <dir>] <machine options>`: the HTTP

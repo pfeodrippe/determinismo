@@ -2,7 +2,8 @@
 //! det-selftest: determinismo testing itself through a real system (ARCHITECTURE.md §14).
 //!
 //! One node, det-selftest-node, from a `binary` source. Scenarios:
-//!   steady     the node answers; every property passes
+//!   steady     the node answers; every property passes (and fails on profile "mutant", whose
+//!              echo node answers in uppercase: the tests catch the mutant)
 //!   node_exit  a driver makes the node exit: the built-in property
 //!              "nodes do not exit unexpectedly" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report
@@ -18,6 +19,15 @@ const sdk = @import("determinismo");
 const Nodes = struct { echo: ?sdk.Node, csdk: ?sdk.Node, controller: ?sdk.Node };
 pub const System = sdk.System(Nodes);
 const port = 7000;
+/// No faults: these nodes check the platform, not resilience.
+const quiet = sdk.schema.Faults{
+    .pause = false,
+    .isolate = false,
+    .partition = false,
+    .degrade = false,
+    .throttle = false,
+    .process_pause = false,
+};
 
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
@@ -36,14 +46,15 @@ fn describe(d: *System.Describe) !void {
     default.node(.echo, .{
         .binary = "zig-out/bin/det-selftest-node",
         .ready = .{ .tcp = port },
-        .faults = .{
-            .pause = false,
-            .isolate = false,
-            .partition = false,
-            .degrade = false,
-            .throttle = false,
-            .process_pause = false,
-        },
+        .faults = quiet,
+    });
+    // The same system with a mutant echo node: "steady" must catch it.
+    const mutant = try d.profile("mutant");
+    mutant.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_MUTANT=1"},
+        .ready = .{ .tcp = port },
+        .faults = quiet,
     });
     const controller = try d.profile("controller");
     controller.node(.controller, .{
@@ -58,14 +69,7 @@ fn describe(d: *System.Describe) !void {
     // A node in C reporting through the C SDK; no faults (its properties are about the SDK).
     default.node(.csdk, .{
         .binary = "zig-out/bin/det-selftest-c",
-        .faults = .{
-            .pause = false,
-            .isolate = false,
-            .partition = false,
-            .degrade = false,
-            .throttle = false,
-            .process_pause = false,
-        },
+        .faults = quiet,
     });
 }
 
