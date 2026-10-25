@@ -74,7 +74,10 @@ use them in other repositories.
   unless asked for a tree (`--branching tree --strategy ... --tape-dir ...`).
 - Disk faults: a node that allows `crash` gets an ext4 disk of its own; a crash is a power loss
   (what it synced survives, the rest is lost; the journal keeps the filesystem consistent), a
-  `wipe` starts it fresh from its image. `--faults +restart,+crash` adds kinds to every node,
+  `wipe` starts it fresh from its image. `disk` makes its disk fail for a while (I/O errors,
+  write errors, lost writes, corrupted reads, slowness); an exit then is expected, and a node
+  that exited or whose filesystem went read-only starts again at the fault's end.
+  `--faults +restart,+crash,+disk` adds kinds to every node,
   `--no-faults client,monitor` takes them all from some (an Antithesis launch's
   `exclude_faults`).
 - Mutation testing: `determinismo mutate <explore options> --mutants mutants.jsonl` explores the
@@ -83,6 +86,8 @@ use them in other repositories.
   (coverage shows its lines never ran), or unnoticed (a gap in the properties).
 - A run's notebook is Clojure (babashka on the server: `query`, `events`, `run`, `replay`,
   `stacks`, ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
+- `POST /runs/<id>/stop` stops a run (its timelines so far stay; state `stopped`). A restarted
+  `serve` adopts the runs still going (each run's `pid` file).
 
 - A branch is identified by (inputs, seed, branch index[, fork point]). Inputs are the kernel,
   initramfs, command line (scenario included), timer slack and disks; `explore` prints their hash.

@@ -69,6 +69,11 @@ const Run = struct {
     status: ?u32 = null,
     /// Its babashka nREPL server, once started (notebook.clj's names, over this API).
     nrepl_port: ?u16 = null,
+    /// Stopped on request (POST /runs/<id>/stop).
+    stopped: bool = false,
+    /// Started by an earlier server and still running: not its child, so watched with kill(0)
+    /// and judged by its record once gone.
+    adopted: bool = false,
 };
 
 const nrepl_port_base = 17000;
@@ -206,6 +211,9 @@ fn run_route(
     if (eql(u8, action, "replay") and eql(u8, request.method, "POST")) {
         return run_replay(server, run, request.body, out);
     }
+    if (eql(u8, action, "stop") and eql(u8, request.method, "POST")) {
+        return run_stop(server, @constCast(run), out);
+    }
     if (eql(u8, action, "extract") and eql(u8, request.method, "POST")) {
         return run_extract(server, run, request.body, out);
     }
@@ -338,6 +346,10 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     }
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     const pid = try spawn(server.arena, argv.items, output, &.{});
+    // For a restarted server to find it still running (runs_load).
+    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
+    const pid_text = try print(server, "{d}\n", .{pid});
+    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = pid_text });
     server.runs[server.run_count] = .{ .id = id, .pid = pid };
     server.run_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{id});
@@ -781,26 +793,78 @@ fn run_find(server: *Server, id: u32) ?*Run {
     return null;
 }
 
+/// Stops a running run: SIGTERM to its process group (the explorer and its workers; each run
+/// leads its own session). Marked stopped, on disk too.
+fn run_stop(server: *Server, run: *Run, out: *std.Io.Writer) !u16 {
+    if (run.status != null) return error.NotRunning;
+    if (linux.errno(linux.kill(-run.pid, .TERM)) != .SUCCESS) return error.NotRunning;
+    run.stopped = true;
+    const directory = try run_directory(server, run.id);
+    const path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
+    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = "" });
+    try out.print("{{\"id\":{d},\"state\":\"stopped\"}}\n", .{run.id});
+    return 200;
+}
+
 /// Runs of an earlier server (before a restart). A run whose record has its summary finished:
-/// it passed or failed by that summary; one without was interrupted (an error).
+/// it passed or failed by that summary. One without whose explorer still runs (its pid file
+/// names a live process that writes this run's events) is adopted: running. Others were
+/// interrupted (an error), or stopped on request.
 fn runs_load(server: *Server) !void {
     var id: u32 = 1;
     while (id < runs_max) : (id += 1) {
         const directory = try run_directory(server, id);
         std.Io.Dir.cwd().access(server.io, directory, .{}) catch break;
         const record = run_file(server, id, "record.jsonl") catch "";
-        server.runs[server.run_count] = .{ .id = id, .pid = 0, .status = recorded_status(record) };
+        const stopped = if (run_file(server, id, "stopped")) |_| true else |_| false;
+        var run = Run{ .id = id, .pid = 0, .status = recorded_status(record), .stopped = stopped };
+        if (run.status == status_interrupted and !stopped) {
+            if (run_alive(server, id)) |pid| {
+                run.pid = pid;
+                run.status = null;
+                run.adopted = true;
+            }
+        }
+        server.runs[server.run_count] = run;
         server.run_count += 1;
     }
 }
 
+const status_interrupted = 255;
+
+/// The run's explorer, if its pid file names a live process working for this run.
+fn run_alive(server: *Server, id: u32) ?linux.pid_t {
+    const text = run_file(server, id, "pid") catch return null;
+    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return null;
+    const arena = server.arena;
+    const cmdline_path = std.fmt.allocPrintSentinel(arena, "/proc/{d}/cmdline", .{pid}, 0) catch
+        return null;
+    // Read until the end: procfs files report no size.
+    const fd = linux.open(cmdline_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var cmdline_buffer: [1 << 16]u8 = undefined;
+    var size: usize = 0;
+    while (size < cmdline_buffer.len) {
+        const free = cmdline_buffer[size..];
+        const result = linux.read(@intCast(fd), free.ptr, free.len);
+        if (linux.errno(result) != .SUCCESS or result == 0) break;
+        size += result;
+    }
+    const cmdline = cmdline_buffer[0..size];
+    const directory = run_directory(server, id) catch return null;
+    const events = print(server, "{s}/events", .{directory}) catch return null;
+    return if (std.mem.indexOf(u8, cmdline, events) != null) pid else null;
+}
+
 fn recorded_status(record: []const u8) u32 {
     const key = "{\"summary\":";
-    const start = std.mem.lastIndexOf(u8, record, key) orelse return 255;
+    const start = std.mem.lastIndexOf(u8, record, key) orelse return status_interrupted;
     const failing_key = "\"failing_branches\":";
-    const failing = std.mem.indexOfPos(u8, record, start, failing_key) orelse return 255;
+    const failing = std.mem.indexOfPos(u8, record, start, failing_key) orelse
+        return status_interrupted;
     const digit = failing + failing_key.len;
-    if (digit >= record.len) return 255;
+    if (digit >= record.len) return status_interrupted;
     return if (record[digit] == '0') 0 else 3; // As explore exits.
 }
 
@@ -813,6 +877,12 @@ fn runs_reap(server: *Server) void {
     }
     for (server.runs[0..server.run_count]) |*run| {
         if (run.status != null) continue;
+        if (run.adopted) {
+            if (linux.errno(linux.kill(run.pid, @enumFromInt(0))) != .SRCH) continue;
+            const record = run_file(server, run.id, "record.jsonl") catch "";
+            run.status = recorded_status(record);
+            continue;
+        }
         var status: i32 = 0;
         const result = linux.wait4(run.pid, &status, linux.W.NOHANG, null);
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
@@ -838,6 +908,7 @@ fn archive(server: *Server, run: *const Run) !void {
 }
 
 fn state(run: *const Run) []const u8 {
+    if (run.stopped) return "stopped";
     const status = run.status orelse return "running";
     return switch (status) {
         0 => "passed",

@@ -37,6 +37,7 @@ h2 { font-size: 20px; margin: 0; }
 .badge.fail { color: var(--fail); border-color: var(--fail); }
 .badge.running { color: var(--info); border-color: var(--info); }
 .badge.error { color: var(--warn); border-color: var(--warn); }
+.badge.stopped { color: var(--muted); border-color: var(--muted); }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; }
 section > header { display: flex; align-items: baseline; gap: 12px; padding: 12px 16px; cursor: pointer; }
 section > header h3 { margin: 0; font-size: 17px; color: #c9cbd3; }
@@ -250,7 +251,7 @@ async function runsRefresh() {
     item.addEventListener("click", () => runOpen(Number(item.dataset.id))));
 }
 function stateBadge(name) {
-  const kind = { passed: "pass", failed: "fail", running: "running" }[name] || "error";
+  const kind = { passed: "pass", failed: "fail", running: "running", stopped: "stopped" }[name] || "error";
   return `<span class="badge ${kind}">${escape(name)}</span>`;
 }
 
@@ -356,7 +357,8 @@ function render() {
       ${info.profile ? "· profile " + escape(info.profile) : ""} · seed ${escape(info.seed || "")} · inputs ${escape(info.inputs || "")}
       ${info.strategy ? "· strategy " + escape(info.strategy) : ""}
       ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
-    ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>` : ""}
+    ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>
+      <button id="run-stop" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Stop this run: the timelines it explored so far stay">Stop run</button>` : ""}
     <div class="tabs view-tabs"><button data-view="report" class="${state.view === "report" ? "on" : ""}">Report</button>
       <button data-view="notebook" class="${state.view === "notebook" ? "on" : ""}">Notebook</button></div>`;
   if (state.view === "notebook") {
@@ -400,6 +402,13 @@ function viewTabsWire() {
     state.view = button.dataset.view;
     render();
   }));
+  const stop = document.getElementById("run-stop");
+  if (stop) stop.addEventListener("click", async () => {
+    stop.disabled = true;
+    await api(`/runs/${state.runId}/stop`, {}).catch(() => {});
+    await runRefresh();
+    runsRefresh();
+  });
 }
 
 function sectionHtml(id, title, summary, body, open) {
