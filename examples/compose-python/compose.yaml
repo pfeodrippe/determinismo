@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# The bank again, with a Python client using determinismo's Python SDK: its random choices are
+# platform decisions (steerable, replayable). The client's build context is the repository root
+# so that its image can include sdk/python.
+services:
+  redis:
+    image: docker.io/library/redis:7.4-alpine
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379"
+  client:
+    build:
+      context: ../..
+      dockerfile: examples/compose-python/client/Dockerfile
+    command: [sleep, infinity]
+    depends_on:
+      - redis
