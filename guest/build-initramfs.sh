@@ -27,7 +27,10 @@ ln -s opt/determinismo/bin/det-init "$stage/init"
 install -m 644 "$module" "$stage/opt/determinismo/modules/det_guest.ko"
 echo "root:x:0:0:root:/root:/bin/sh" > "$stage/etc/passwd"
 echo "root:x:0:" > "$stage/etc/group"
-# Reproducible: fixed order and timestamps, so the same inputs give the same initramfs.
+# Reproducible: fixed order, owners and timestamps, so the same inputs give the same bytes. This
+# matters for replay: the guest decompresses and unpacks this archive, so its exact bytes are
+# part of every timeline.
+find "$stage" -exec touch -h -d @0 {} +
 (cd "$stage" && find . -print0 | LC_ALL=C sort -z | \
   cpio -o -0 -H newc --quiet --reproducible --owner=0:0 | zstd -q -T0 -19) > "$out"
 ls -la "$out"

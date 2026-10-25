@@ -130,6 +130,8 @@ fn node_resolve(
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|
         try image_disk(context, reference, &image, &target.digest)
+    else if (node.source.build) |build|
+        try image_disk(context, try image_build(context, build), &image, &target.digest)
     else if (node.source.directory) |directory|
         try directory_disk(context, node.name, directory, &target.digest)
     else
@@ -187,6 +189,18 @@ fn image_disk(
     return disk;
 }
 
+/// Builds the image (podman reuses its layer cache) and returns its ID.
+fn image_build(context: Context, build: schema.Build) ![]const u8 {
+    const dockerfile = try path_join(context, &.{ build.context, build.dockerfile });
+    std.debug.print("[determinismo] building {s}\n", .{dockerfile});
+    const output = try tool(context, &.{
+        "podman", "build", "--quiet", "--file", dockerfile, build.context,
+    });
+    const id = std.mem.trim(u8, output, " \n");
+    if (id.len == 0) return error.ImageBuild;
+    return id[if (std.mem.lastIndexOfScalar(u8, id, '\n')) |index| index + 1 else 0..];
+}
+
 fn directory_disk(
     context: Context,
     name: []const u8,
@@ -199,7 +213,7 @@ fn directory_disk(
         "directory-{s}.erofs",
         .{name},
     ) });
-    try erofs_build(context, disk, &.{directory});
+    try erofs_build(context, disk, &.{ "--ignore-mtime", directory });
     return disk;
 }
 
@@ -233,7 +247,7 @@ fn binary_disk(
         "binary-{s}.erofs",
         .{name},
     ) });
-    try erofs_build(context, disk, &.{ "--all-root", staging });
+    try erofs_build(context, disk, &.{ "--all-root", "--ignore-mtime", staging });
     return disk;
 }
 
@@ -257,11 +271,12 @@ fn system_disk(
         .sub_path = try path_join(context, &.{ staging, "system.json" }),
         .data = system_json,
     });
-    try erofs_build(context, disk, &.{ "--all-root", staging });
+    try erofs_build(context, disk, &.{ "--all-root", "--ignore-mtime", staging });
     return disk;
 }
 
-/// Builds `disk` atomically (via a temporary name), reproducibly (fixed time and UUID).
+/// Builds `disk` atomically (via a temporary name), reproducibly (fixed time and UUID): disks are
+/// read by the guest, so their exact bytes are part of every timeline.
 fn erofs_build(context: Context, disk: []const u8, source: []const []const u8) !void {
     const temporary = try std.fmt.allocPrint(context.arena, "{s}.partial", .{disk});
     var argv: std.ArrayList([]const u8) = .empty;

@@ -84,6 +84,69 @@ pub fn start(
     sdk.event("node_start", .{ .node = node.name, .pid = pid });
 }
 
+/// Runs `argv` inside a running node (its namespaces, root, environment and user), like
+/// `docker exec`, with this process's standard streams. Returns the command's exit status.
+pub fn exec(
+    arena: std.mem.Allocator,
+    node: *const schema.Resolved,
+    argv: []const []const u8,
+) !u8 {
+    if (argv.len == 0) return error.NoCommand;
+    const pid = pid_read(node.name) orelse return error.NotRunning;
+    var root_buffer: [64]u8 = undefined;
+    const root = try print_z(&root_buffer, "/proc/{d}/root", .{pid});
+    const exec_node = schema.Resolved{
+        .name = node.name,
+        .address = node.address,
+        .disk = node.disk,
+        .digest = node.digest,
+        .command = argv,
+        .env = node.env,
+        .workdir = node.workdir,
+        .user = node.user,
+    };
+    var paths: Paths = undefined;
+    try paths.init(node.name);
+    paths.root = root; // The node's root as this namespace sees it.
+    const launch = try Launch.init(arena, &exec_node, &paths);
+    // Namespace files first: after joining the mount namespace, /proc is the node's.
+    var namespace_fds: [namespaces.len]linux.fd_t = undefined;
+    for (namespaces, &namespace_fds) |namespace, *fd| {
+        var buffer: [64]u8 = undefined;
+        const path = try print_z(&buffer, "/proc/{d}/ns/{s}", .{ pid, namespace.name });
+        const result = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(result) != .SUCCESS) return error.NoSuchNamespace;
+        fd.* = @intCast(result);
+    }
+    const directory: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const root_fd = linux.open(root, directory, 0);
+    if (linux.errno(root_fd) != .SUCCESS) return error.NoSuchRoot;
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) return error.Fork;
+    if (child == 0) {
+        for (namespaces, namespace_fds) |namespace, fd| {
+            if (linux.errno(linux.setns(fd, namespace.flag)) != .SUCCESS) die("setns", error.Setns);
+        }
+        if (linux.errno(linux.fchdir(@intCast(root_fd))) != .SUCCESS) die("root", error.Chdir);
+        if (linux.errno(linux.chroot(".")) != .SUCCESS) die("chroot", error.Chroot);
+        launch.exec_in_root(); // Never returns.
+    }
+    var status: i32 = 0;
+    _ = linux.wait4(@intCast(child), &status, 0, null);
+    const bits: u32 = @bitCast(status);
+    return if (bits & 0x7f == 0) @intCast((bits >> 8) & 0xff) else @intCast(128 + (bits & 0x7f));
+}
+
+const Namespace = struct { name: []const u8, flag: u32 };
+/// The PID namespace applies to children: exec forks after joining.
+const namespaces = [_]Namespace{
+    .{ .name = "ipc", .flag = linux.CLONE.NEWIPC },
+    .{ .name = "uts", .flag = linux.CLONE.NEWUTS },
+    .{ .name = "net", .flag = linux.CLONE.NEWNET },
+    .{ .name = "pid", .flag = linux.CLONE.NEWPID },
+    .{ .name = "mnt", .flag = linux.CLONE.NEWNS },
+};
+
 /// Kills every process of the node and waits until they are gone.
 pub fn kill(name: []const u8) !void {
     var paths: Paths = undefined;
@@ -292,10 +355,10 @@ fn link_create(a: Endpoint, b: Endpoint) !void {
         .{ .name = interface_b, .mac = mac(b.address, a.address), .pid = b.pid },
     };
     // After a restart, the dead namespace's links disappear asynchronously: wait for them.
+    // Created from inside a's namespace: one end local, the peer moved to b's.
     for (0..link_attempts_max) |_| {
-        var socket = try netlink.Socket.open();
-        defer socket.close();
-        socket.veth_create(ends) catch |err| switch (err) {
+        const create = netlink.Socket.veth_create;
+        netlink.in_namespace_of(a.pid, create, .{ends}) catch |err| switch (err) {
             error.Exists => {
                 sleep_ns(poll_interval_ns);
                 continue;
@@ -416,6 +479,11 @@ const Launch = struct {
         if (linux.errno(null_input) == .SUCCESS) _ = linux.dup2(@intCast(null_input), 0);
         launch.mounts() catch |err| die("mounts", err);
         _ = linux.syscall2(.sethostname, @intFromPtr(launch.hostname.ptr), launch.hostname.len);
+        launch.exec_in_root();
+    }
+
+    /// In the node's root: drop to its user, enter its working directory, run the command.
+    fn exec_in_root(launch: *const Launch) noreturn {
         if (launch.gid) |gid| {
             _ = linux.syscall2(.setgroups, 0, 0);
             if (linux.errno(linux.setgid(gid)) != .SUCCESS) die("setgid", error.Setgid);
@@ -451,6 +519,20 @@ const Launch = struct {
             try mkdir_all(path);
             const data: ?[*:0]const u8 = if (target.data) |d| d.ptr else null;
             try mount(target.fs, path, target.fs, target.flags, data);
+        }
+        // What container runtimes add to /dev (bash process substitution needs /dev/fd).
+        const links = [_]struct { path: []const u8, target: [:0]const u8 }{
+            .{ .path = "dev/fd", .target = "/proc/self/fd" },
+            .{ .path = "dev/stdin", .target = "/proc/self/fd/0" },
+            .{ .path = "dev/stdout", .target = "/proc/self/fd/1" },
+            .{ .path = "dev/stderr", .target = "/proc/self/fd/2" },
+        };
+        for (links) |link| {
+            const path = try print_z(&buffer, "{s}/{s}", .{ launch.root, link.path });
+            switch (linux.errno(linux.symlink(link.target, path))) {
+                .SUCCESS, .EXIST => {},
+                else => return error.Symlink,
+            }
         }
         // The guest's root is the initramfs, where pivot_root is not allowed: move the node's
         // root over it and chroot, as switch_root does. The mount namespace is the node's own.

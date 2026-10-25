@@ -55,11 +55,20 @@ pub const Source = struct {
     directory: ?[]const u8 = null,
     /// A static executable on the host, alone in an otherwise empty root filesystem.
     binary: ?[]const u8 = null,
+    /// An image built on the host from a Dockerfile, then used like `image`.
+    build: ?Build = null,
 
     pub fn kind_count(source: Source) u32 {
         return @as(u32, @intFromBool(source.image != null)) +
-            @intFromBool(source.directory != null) + @intFromBool(source.binary != null);
+            @intFromBool(source.directory != null) + @intFromBool(source.binary != null) +
+            @intFromBool(source.build != null);
     }
+};
+
+/// A build context directory and the Dockerfile in it (relative to the context).
+pub const Build = struct {
+    context: []const u8,
+    dockerfile: []const u8 = "Dockerfile",
 };
 
 /// The node is ready once this succeeds (from the runner).

@@ -16,7 +16,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const sdk = @import("determinismo");
-const Connection = @import("resp.zig");
+const Connection = @import("resp");
 
 const Nodes = struct { redis: sdk.Node };
 const System = sdk.System(Nodes);

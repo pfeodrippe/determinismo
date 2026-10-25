@@ -32,11 +32,13 @@ Every answer a plugin overrides is written to the branch's tape, so a branch rep
 plugin, which may not be deterministic itself (ARCHITECTURE.md §7):
 
 ```
-{"tape":1,"exploration_seed":"<hex>","branch":I,"branch_seed":"<hex>"}
+{"tape":2,"inputs":"<hex>","exploration_seed":"<hex>","branch":I,"branch_seed":"<hex>"}
 {"pull":P,"hex":"..."}
 ```
 
-`determinismo explore ... --tape <file>` replays one branch from its tape.
+`determinismo explore ... --tape <file>` replays one branch from its tape. `inputs` identifies what
+the machine booted (kernel and initramfs bytes, command line, disks): a replay with different
+inputs is refused, since it would be a different universe.
 
 ## Limits
 

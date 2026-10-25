@@ -25,9 +25,9 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
 | Moment | `(tape hash, vtime)` — an immutable instant in the multiverse. |
 | Branch | A timeline that forks from a moment and continues with different inputs. |
 | Decision point | A point where an input may enter: a pull (guest request) or a push (exact branch count). |
-| Profile | A complete, typed description of a system under test (nodes, artifacts, dependencies, networks, faults, test templates), returned by a test program's `describe` phase (§10). |
+| Profile | A complete, typed description of a system under test (nodes, artifacts, dependencies, networks, faults, scenarios), returned by a test program's `describe` phase (§10). |
 | Node | One service instance in the guest: a root filesystem, a command, an identity on the guest network. Unit of fault scoping. |
-| Test template | A set of test commands (`first_`, `parallel_driver_`, ...) forming one scenario family. |
+| Scenario | A function listing test commands (setup, first, parallel drivers, ..., finally) that together form one family of timelines (Antithesis's test template). |
 
 ---
 
@@ -80,7 +80,8 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
 | D16 | **Open source, MIT.** Exceptions, marked per file with SPDX headers: patches to Linux files (KVM hook patch, guest-kernel patches) are `GPL-2.0-only`; `determinismo.ko` is our own code under `GPL-2.0-only OR MIT` with `MODULE_LICENSE("Dual MIT/GPL")`. Userspace talks to the kernel only via syscalls/ioctls (UAPI headers carry the Linux-syscall-note). No code copied from GPL userspace projects (e.g. QEMU); Apache-2.0/BSD code (Firecracker, Cloud Hypervisor, rust-vmm) may be reused with its notices. | Patches to GPL files can't be relicensed; everything we author can be MIT. Users, including companies, can use and embed the MIT parts freely. |
 | D17 | **Systems are described by profiles.** A test program's `describe` phase runs on the host (it may be impure: read files, query registries, use the git commit) and returns one or more **profiles**: services, their artifacts, dependencies, networks, faults, test templates. Artifacts are typed sources (`image` = OCI ref, later `nix`, `directory`, `binary`); determinismo converts them into what it needs (flattened root filesystems on a guest disk, nodes run by crun with our own bridge networking). Compose is an importer into a profile; a plain profile file is allowed too. The resolved profile (image tags pinned to digests) is frozen into the run record; replay never re-runs `describe`. A timeline is profile + template + seed (+ tape overrides); snapshots are keyed by profile hash. The profile schema is versioned. | One source of truth for system shape, faults and tests, typed variants, any language (JSON schema), and exact replay despite an impure describe. |
 | D18 | **Tests run inside the guest**; services never define drivers. Test commands (drivers, checks, setup) are ordinary programs in a client node; services may embed SDK assertions (`always`, `sometimes`, `reachable`, ...) and SDK randomness; third-party services stay unmodified and are judged black-box (test assertions plus built-in properties). | Only what is inside the VM is deterministic, snapshotted and branchable; a test's progress is part of every snapshot. |
-| D19 | **No Docker in the guest.** Images are flattened on the host into a read-only guest disk (virtio-blk); inside, a small node runtime runs each node with crun and our own bridge/veth networking. podman (or our own namespaces code) can replace crun behind the same node-runtime interface. | Fast boot, no daemon, and the bridge we own is where network faults are applied. |
+| D19 | **No Docker in the guest; our own node runtime.** Images are flattened on the host into read-only erofs disks (virtio-blk); inside, `det-nodes` runs each node in its own namespaces (mount, PID, network, UTS, IPC) on an overlay of its disk and tmpfs, with one cgroup per node and a veth mesh (one link per pair of nodes). It is what crun or bwrap do, in a few hundred lines with direct syscalls. A real runtime (crun, containerd for K3s) can sit behind the same interface (start, kill, pause, resume, link up/down, exec). | Fast boot, no daemon, every fault primitive under our control (freeze, kill, per-link cuts); the VM, not the namespaces, is the isolation boundary. |
+| D20 | **Our own guest kernel build**: the host kernel's version from source, `x86_64_defconfig` plus `guest/kernel/determinismo.config`, everything built in (virtio-mmio with command-line devices, erofs, overlay, veth, netem); only `det_guest.ko` is a module. | Distribution kernels lack virtio-mmio command-line devices (we have no ACPI or device tree); built-ins mean no module loading at boot; one pinned config for every run. |
 
 ---
 
@@ -140,24 +141,28 @@ vCPU threads pinned; `isolcpus`/`nohz_full` for VM cores; `mitigations=` and
 
 ## 5. Guest
 
-- **Kernel**: Linux LTS, our config: virtio-mmio, no ACPI/PCI, io_uring on. Small patches for
+- **Kernel** (implemented, D20): Linux 6.12 LTS, our config (`guest/kernel/`): virtio-mmio disks
+  announced on the command line, no ACPI/PCI, no paravirtual clocks. Later, small patches for
   *steerability only* (determinism must never depend on them):
   - kernel RNG and vDSO `getrandom` pull from the platform;
   - scheduler hooks for thread-starvation faults;
   - `CLOCK_REALTIME` offsets for clock-skip faults (RDTSC is unaffected, as in Antithesis).
 - **Guest runtime** (implemented in Zig, `guest/runtime/`):
-  - `/init` (PID 1): mounts, loads the `det_guest` module (`/dev/determinismo`), starts `det-agent`,
-    then the scenario;
-  - `det-composer`: runs one timeline of a test template, following Antithesis's test-command
-    rules (one `first_`, parallel/serial/singleton/anytime drivers, `eventually_`/`finally_`);
-    every choice is a decision;
-  - `det-faults`: in-guest fault injector (pause, restart, clock skip; network faults next), active
-    during the driver phase only;
-  - `det-agent`: runs commands pushed at a moment (multiverse debugging), woken by IRQ 5;
-  - next: the **node runtime** (crun + bridge/veth, nodes started in dependency order, health
-    checks, `/etc/hosts`), driven by the frozen profile.
-- **Network simulation** inside the guest: per-container network namespaces on a controlled
-  bridge; latency/drop/partition/clog per link and per direction, driven by platform inputs.
+  - `det-init` (PID 1): mounts, loads `det_guest.ko` (`/dev/determinismo`), mounts the system disk
+    (`/det`: the program and `system.json`), starts the nodes, runs the scenario named by
+    `det.scenario=`, reaps orphans, reboots at the end;
+  - `det-nodes` (D19): starts nodes in profile order, waits for readiness (TCP), writes
+    `/etc/hosts`; also the operations faults and tests use (pause, resume, kill, start, link);
+  - `det-composer`: runs one timeline of a scenario, following Antithesis's test-command rules
+    (setup, then `first`, parallel/serial/singleton/anytime drivers, `eventually`/`finally`);
+    every choice is a decision; it signals `setup_complete` after the setup command;
+  - `det-faults`: pauses (cgroup freeze), isolates, partitions single links, restarts nodes, as each
+    node's profile allows, and skips the clock if the scenario asks; active during the driver
+    phase only, and undoes each fault before the next;
+  - `det-agent`: runs commands pushed at a moment (multiverse debugging), woken by IRQ 5.
+- **Network simulation** inside the guest: a full mesh of veth pairs (nodes and the runner, where
+  tests run); every link of a node carries its one /32 address. Implemented: link cuts (partition,
+  isolation). Next: latency and loss per link and direction with netem.
 - **CPUID (implemented in `src/cpuid.zig`)**: KVM's supported set minus everything that leaks host
   time, randomness or topology. Hidden: KVM paravirt leaves (kvmclock, async PF, steal time, PV
   EOI), RDRAND/RDSEED/RDTSCP/RDPID, TSC-deadline timer, TSC_ADJUST, APERF/MPERF, WAITPKG, TSX, the
@@ -290,7 +295,7 @@ A profile describes *what* the system is; determinismo decides *how* to material
   | `nix` (later) | build the closure and copy it in |
 
 - **Dependencies and health checks** (start order), **networks**, **faults** allowed per node,
-  **test templates**, and which node runs the tests (the client node).
+  **scenarios**; tests run in the runner (the guest's root namespace), linked to every node.
 - **Variants** are more profiles (`three-replicas`, `no-faults`): `--profile <name>`.
 - **Compose is an importer** into a profile; a plain profile file (JSON/TOML) is allowed for
   projects that want no code.
@@ -304,7 +309,7 @@ A profile describes *what* the system is; determinismo decides *how* to material
 
 ### 10.3 Run record and caching
 
-- A timeline is **profile + template + seed (+ tape overrides)**; the resolved profile (image tags
+- A timeline is **profile + scenario + seed (+ tape overrides)**; the resolved profile (image tags
   pinned to digests) is stored with the run.
 - Snapshots are keyed by profile hash: one `setup_complete` snapshot per profile, reused until the
   profile changes; when it changes, determinismo prints a diff of the profiles.
@@ -330,7 +335,7 @@ A profile describes *what* the system is; determinismo decides *how* to material
 my-system/
   tests/                 # the test program: describe + handlers (or several programs)
   compose.yaml           # optional: imported by describe
-determinismo explore --program zig-out/bin/my-tests --profile default --template bank --branches 64
+determinismo explore --program zig-out/bin/my-tests --profile default --scenario bank --branches 64
 ```
 
 ---
@@ -446,7 +451,7 @@ determinism makes state recomputable.
 | M3 | Guest channel (`/dev/determinismo`, doorbell port) ✅, Zig SDK + composer ✅, events + properties ✅, decision trace ✅; tape v1 (seed + overrides + checkpoints), replay command, C SDK. | Record → replay matches all checkpoints. |
 | M4 | Snapshot at `setup_complete` ✅ (vCPU, LAPIC, PIC/IOAPIC, MSRs, XSAVE, devices, decisions; frozen memfd), copy-on-write branches ✅, `determinismo explore` multiverse report ✅, single-branch replay (`--branch`) ✅; still to do: branch from arbitrary moments, nested branching, delta snapshots. | Branches replay exactly ✅ (bank example: 40 branches from one snapshot in 38 s, 11 find the bug, each replays bit-identically). |
 | M5 | Plugin protocol v1 ✅ (`docs/PLUGINS.md`: JSON lines over stdio, decisions + events + branch lifecycle), reference plugins ✅ (`random`, `mutate`: greybox mutation over decision tapes), tapes of overrides ✅ (replay without the plugin); in-guest fault injector ✅ (`det-faults`: process pause, process restart, clock skip; configured per template in `faults.conf`; every choice is a decision, so strategies steer faults and tapes replay them; runs only during the driver phase); network faults: next. | A known-bug sample is found by exploration ✅ (bank lost update; `mutate` concentrates on it: 9 of 12 mutants of a failing timeline fail). |
-| M6 | **Profiles and nodes (next)**: virtio-blk guest disk (flattened root filesystems; replaces the large initramfs); node runtime in the guest (crun + bridge/veth, dependency order, health checks, `/etc/hosts`); profile JSON schema v1 + `describe` in the Zig SDK with typed nodes; OCI `image`/`build`/`directory`/`binary` sources; Compose importer; runtime node actions (pause, restart, partition); network faults (partition, latency, drop per link and direction); `--program`/`--profile`/`--template`; run record with the frozen profile; profile diff on change. | The bank example runs as Redis + client nodes from a typed profile; network partitions between them are injected by `det-faults` and replay exactly. |
+| M6 | ✅ **Profiles and nodes**: read-only virtio-blk disks; our guest kernel; `det-nodes` (namespaces, overlay, cgroups, veth mesh); schema v1, `describe` and scenarios in the Zig SDK with typed nodes; `image`/`directory`/`binary` sources; node faults (pause, isolate, partition, restart); `--program`/`--profile`/`--scenario` (or `all`); the frozen profile on the system disk. Remaining: `build` sources, `exec` into nodes, netem latency/loss, Compose importer, profile diff on change, nix sources. | Done: the bank example (Redis from `redis:7.4-alpine`) explores 40 branches in 18.6 s, finds the lost update in 11, and every branch replays with identical event hashes, faults included. |
 | M7 | Worker protocol, controller, HTTP API + CLI + MCP server, multi-VM per host, storage tiers. | Multi-host run; tapes and events in object storage; an agent can launch and triage a run. |
 | M8 | Interactive branches (exec, nREPL: commands at a moment ✅ via `--at-vtime-ms`/`--exec`, delivered by IRQ to an in-guest agent, deterministic output), scenarios across commits, mutation testing (rebuilt + runtime mutants), more SDKs (JVM/Clojure, Go, Rust, Python). | A Compose app runs; a debug session patches a Clojure fn in a branch; a found bug re-runs as a scenario on the next commit. |
 | M9 | Performance (RDTSC via direct PMC read in-kernel, measured skid to shrink the MTF margin), determinism gate in CI, host tooling moved from Bash to Zig, self-tests level 1 and 2. | Deterministic mode within 1.3× of plain KVM on the reference workloads; gates run on every commit. |

@@ -5,6 +5,7 @@
 //!   det-nodes start|kill <node>       start a node, or kill all its processes
 //!   det-nodes pause|resume <node>     freeze or thaw all its processes
 //!   det-nodes link <a> <b> up|down    the link between two nodes (or a node and "runner")
+//!   det-nodes exec <node> <command>...   run a command inside a node; exits with its status
 const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
@@ -13,6 +14,7 @@ const usage =
     \\usage: det-nodes up
     \\       det-nodes start|kill|pause|resume <node>
     \\       det-nodes link <a> <b> up|down
+    \\       det-nodes exec <node> <command>...
     \\
 ;
 
@@ -30,6 +32,13 @@ pub fn main(init: std.process.Init) !void {
         return nodes.link_set(&system, arguments[2], arguments[3], if (up) .up else .down);
     }
     if (eql(u8, command, "up")) return nodes.up(arena, &system);
+    if (eql(u8, command, "exec")) {
+        if (arguments.len < 4) return usage_exit();
+        const node = system.node(arguments[2]) orelse return error.UnknownNode;
+        const argv = try arena.alloc([]const u8, arguments.len - 3);
+        for (arguments[3..], argv) |argument, *target| target.* = argument;
+        std.process.exit(try nodes.exec(arena, node, argv));
+    }
     if (arguments.len != 3) return usage_exit();
     const name = arguments[2];
     if (eql(u8, command, "start")) {

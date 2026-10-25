@@ -7,9 +7,15 @@ const linux = std.os.linux;
 const Strategy = @import("strategy.zig");
 
 pub const override_count_max = 1 << 16;
-const tape_version = 1;
+const tape_version = 2;
 
-pub const Header = struct { exploration_seed: u64, branch: u32, branch_seed: u64 };
+pub const Header = struct {
+    /// What the machine booted (see `inputs_hash` in main.zig): a tape replays only on the same.
+    inputs: u64,
+    exploration_seed: u64,
+    branch: u32,
+    branch_seed: u64,
+};
 
 pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
 
@@ -35,11 +41,12 @@ pub const Overrides = struct {
 
 pub fn write_header(fd: linux.fd_t, header: Header) void {
     assert(fd >= 0);
-    var buffer: [160]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{{\"tape\":{d},\"exploration_seed\":\"{x:0>16}\"," ++
-        "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"}}\n", .{
-        tape_version, header.exploration_seed, header.branch, header.branch_seed,
-    }) catch unreachable; // 160 bytes fit the keys and two 16-digit seeds.
+    var buffer: [192]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{{\"tape\":{d},\"inputs\":\"{x:0>16}\"," ++
+        "\"exploration_seed\":\"{x:0>16}\",\"branch\":{d},\"branch_seed\":\"{x:0>16}\"}}\n", .{
+        tape_version,  header.inputs,      header.exploration_seed,
+        header.branch, header.branch_seed,
+    }) catch unreachable; // 192 bytes fit the keys and three 16-digit hashes.
     write_all(fd, line);
 }
 
@@ -69,6 +76,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
         return error.UnsupportedTape;
     }
     const result = Header{
+        .inputs = try hex_field(header.object, "inputs"),
         .exploration_seed = try hex_field(header.object, "exploration_seed"),
         .branch = @intCast((header.object.get("branch") orelse return error.BadTape).integer),
         .branch_seed = try hex_field(header.object, "branch_seed"),
@@ -113,7 +121,8 @@ test "a written tape parses back" {
     defer allocator.destroy(overrides);
     const scratch = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(scratch);
-    const source = "{\"tape\":1,\"exploration_seed\":\"0000000000000007\",\"branch\":3," ++
+    const source = "{\"tape\":2,\"inputs\":\"00000000000000aa\"," ++
+        "\"exploration_seed\":\"0000000000000007\",\"branch\":3," ++
         "\"branch_seed\":\"00000000000000ff\"}\n" ++
         "{\"pull\":10,\"hex\":\"0102\"}\n" ++
         "{\"pull\":12,\"hex\":\"ff\"}\n";

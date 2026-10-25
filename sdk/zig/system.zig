@@ -37,6 +37,18 @@ pub const Node = struct {
         return nodes_command(&.{ "start", node.name });
     }
 
+    /// Runs `argv` inside the node (like `docker exec`); returns its exit status. Its output goes
+    /// to this command's output.
+    pub fn exec(node: *const Node, argv: []const []const u8) !u8 {
+        assert(argv.len > 0);
+        assert(argv.len + 3 <= exec_arguments_max);
+        var arguments: [exec_arguments_max][]const u8 = undefined;
+        arguments[0] = "exec";
+        arguments[1] = node.name;
+        for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
+        return nodes_run(arguments[0 .. argv.len + 2]);
+    }
+
     /// Cuts (or restores) the link between this node and `peer` (a node name or "runner").
     pub fn link(node: *const Node, peer: []const u8, state: enum { up, down }) !void {
         return nodes_command(&.{ "link", node.name, peer, @tagName(state) });
@@ -49,6 +61,7 @@ pub fn NodeSpec(comptime Name: type) type {
         image: ?[]const u8 = null,
         directory: ?[]const u8 = null,
         binary: ?[]const u8 = null,
+        build: ?schema.Build = null,
         command: ?[]const []const u8 = null,
         env: []const []const u8 = &.{},
         workdir: ?[]const u8 = null,
@@ -280,6 +293,7 @@ pub fn System(comptime Nodes: type) type {
                             .image = spec.image,
                             .directory = spec.directory,
                             .binary = spec.binary,
+                            .build = spec.build,
                         },
                         .command = spec.command,
                         .env = spec.env,
@@ -325,12 +339,18 @@ fn address_parse(text: []const u8) ![4]u8 {
     return address;
 }
 
-const nodes_arguments_max = 5;
+const exec_arguments_max = 32;
+const argument_size_max = 1024;
 
 fn nodes_command(arguments: []const []const u8) !void {
-    assert(arguments.len + 1 <= nodes_arguments_max);
-    var storage: [nodes_arguments_max][64]u8 = undefined;
-    var argv: [nodes_arguments_max:null]?[*:0]const u8 = @splat(null);
+    if (try nodes_run(arguments) != 0) return error.NodeCommandFailed;
+}
+
+/// Runs det-nodes with `arguments`; returns its exit status.
+fn nodes_run(arguments: []const []const u8) !u8 {
+    assert(arguments.len + 1 <= exec_arguments_max);
+    var storage: [exec_arguments_max][argument_size_max]u8 = undefined;
+    var argv: [exec_arguments_max:null]?[*:0]const u8 = @splat(null);
     argv[0] = nodes_binary;
     for (arguments, 1..) |argument, index| {
         argv[index] = try std.fmt.bufPrintSentinel(&storage[index], "{s}", .{argument}, 0);
@@ -344,7 +364,8 @@ fn nodes_command(arguments: []const []const u8) !void {
     }
     var status: i32 = 0;
     _ = linux.wait4(@intCast(pid), &status, 0, null);
-    if (status != 0) return error.NodeCommandFailed;
+    const bits: u32 = @bitCast(status);
+    return if (bits & 0x7f == 0) @intCast((bits >> 8) & 0xff) else @intCast(128 + (bits & 0x7f));
 }
 
 test "scenarios and profiles are typed" {

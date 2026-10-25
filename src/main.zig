@@ -215,6 +215,8 @@ const Context = struct { arena: std.mem.Allocator, io: std.Io };
 
 /// What drives the branches of one exploration besides the seed.
 const Exploration = struct {
+    /// Identifies what the machine boots; recorded in tapes.
+    inputs: u64 = 0,
     exploration_seed: u64,
     strategy: ?*Strategy = null,
     tape_directory: ?[]const u8 = null,
@@ -235,12 +237,24 @@ fn command_explore(
         .exploration_seed = arguments.seed,
         .tape_directory = arguments.tape_directory,
     };
+    if (arguments.tape_directory) |directory| {
+        try std.Io.Dir.cwd().createDirPath(context.io, directory);
+    }
+    exploration.inputs = inputs_hash(options, arguments);
+    std.debug.print("[determinismo] inputs {x:0>16}\n", .{exploration.inputs});
     if (arguments.tape_path) |path| {
         const overrides = try context.arena.create(tape.Overrides);
         const cwd = std.Io.Dir.cwd();
         const source = try cwd.readFileAlloc(context.io, path, context.arena, .unlimited);
         const scratch = try context.arena.alloc(u8, 64 * 1024);
         const header = try tape.parse(source, scratch, overrides);
+        if (header.inputs != exploration.inputs) {
+            std.debug.print("[determinismo] the tape was recorded with inputs {x:0>16}; " ++
+                "these are {x:0>16} (kernel, initramfs, command line or disks differ)\n", .{
+                header.inputs, exploration.inputs,
+            });
+            return error.TapeInputsDiffer;
+        }
         exploration.exploration_seed = header.exploration_seed;
         exploration.replay = .{ .header = header, .overrides = overrides };
     }
@@ -316,6 +330,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (exploration.tape_directory) |directory| {
             vm.tape_fd = try open_tape(context.arena, directory, index);
             tape.write_header(vm.tape_fd.?, .{
+                .inputs = exploration.inputs,
                 .exploration_seed = exploration.exploration_seed,
                 .branch = index,
                 .branch_seed = options.seed,
@@ -366,6 +381,20 @@ fn open_tape(arena: std.mem.Allocator, directory: []const u8, index: u32) !linux
 fn close(fd: linux.fd_t) void {
     assert(fd >= 0);
     _ = linux.close(fd);
+}
+
+/// What a timeline depends on besides its decisions: the kernel and initramfs bytes, the
+/// command line (scenario included) and the disks. Disks are named by their content (image IDs,
+/// system hashes), so their names stand for their bytes; other disks are hashed by path.
+fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
+    var hasher = std.hash.Wyhash.init(0x696e70757473);
+    hasher.update(options.kernel);
+    if (options.initrd) |initrd| hasher.update(initrd);
+    hasher.update(options.cmdline);
+    for (arguments.disk_paths[0..arguments.disk_count]) |path| {
+        hasher.update(std.fs.path.basename(path));
+    }
+    return hasher.final();
 }
 
 /// Each branch's decisions derive from the exploration seed and the branch index only, so any

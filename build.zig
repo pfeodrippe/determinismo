@@ -25,6 +25,13 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // A small Redis client, shared by the examples and the plain workload.
+    const resp = b.createModule(.{
+        .root_source_file = b.path("examples/bank/resp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Guest side: the in-guest runtime and example tests, static binaries that run in the VM.
     const guest_programs = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "det-init", .path = "guest/runtime/init.zig" },
@@ -33,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-faults", .path = "guest/runtime/faults.zig" },
         .{ .name = "det-agent", .path = "guest/runtime/agent.zig" },
         .{ .name = "bank-test", .path = "examples/bank/bank_test.zig" },
+        .{ .name = "shop-test", .path = "examples/shop/shop_test.zig" },
     };
     for (guest_programs) |program| {
         const guest_exe = b.addExecutable(.{
@@ -41,7 +49,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(program.path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "determinismo", .module = sdk }},
+                .imports = &.{
+                    .{ .name = "determinismo", .module = sdk },
+                    .{ .name = "resp", .module = resp },
+                },
             }),
         });
         b.installArtifact(guest_exe);
@@ -61,11 +72,6 @@ pub fn build(b: *std.Build) void {
     }
 
     // A plain workload with no SDK: tests can be any program, in any language.
-    const resp = b.createModule(.{
-        .root_source_file = b.path("examples/bank/resp.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const redis_workload = b.addExecutable(.{
         .name = "det-workload-redis",
         .root_module = b.createModule(.{
@@ -100,6 +106,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/netlink.zig",
         "guest/runtime/faults.zig",
         "guest/runtime/composer.zig",
+        "examples/shop/pg.zig",
     };
     for (test_roots) |root| {
         const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
