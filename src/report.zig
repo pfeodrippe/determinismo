@@ -213,6 +213,7 @@ pub const Multiverse = struct {
         /// Its path from the setup snapshot (the tree explorer's; empty: it starts there).
         path: []const tape.Segment = &.{},
         generation: u32 = 0,
+        why: []const u8 = "",
     };
 
     const Aggregate = struct {
@@ -297,6 +298,7 @@ pub const Multiverse = struct {
             .failing = failing_names[0..failing_count],
             .path = branch.path,
             .generation = branch.generation,
+            .why = branch.why,
         } });
         line.writeAll("\n") catch {
             line.end = line_buffer.len - 1;

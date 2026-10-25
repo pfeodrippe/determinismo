@@ -933,13 +933,36 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
     assert(vm.decisions.pulls == pull + 1);
     if (vm.overrides) |overrides| {
         assert(vm.strategy == null); // A replay never consults the strategy.
-        _ = try overrides.apply(pull, value);
+        if (try overrides.apply(pull, value)) {
+            if (overrides.reason(pull)) |reason| try vm.decision_event(pull, source, label, reason);
+        }
     } else if (vm.strategy) |strategy| {
         if (value.len > Strategy.override_size_max) return; // Too large to override.
         if (try strategy.random(pull, try vm.moment(), source, label, value)) {
-            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value);
+            const reason = strategy.reason[0..strategy.reason_size];
+            if (vm.tape_fd) |fd| tape.write_override(fd, pull, value, reason);
+            if (reason.len > 0) try vm.decision_event(pull, source, label, reason);
         }
     }
+}
+
+/// A strategy's decision and why, in the timeline (its replay from the tape has it too).
+fn decision_event(
+    vm: *VM,
+    pull: u64,
+    source: []const u8,
+    label: ?[]const u8,
+    reason: []const u8,
+) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("{{\"event\":\"decision\",\"details\":{{\"pull\":{d},\"source\":{f}," ++
+        "\"by\":\"strategy\",\"reason\":{f}", .{
+        pull, std.json.fmt(source, .{}), std.json.fmt(reason, .{}),
+    }) catch return;
+    if (label) |decision| writer.print(",\"decision\":{s}", .{decision}) catch return;
+    writer.writeAll("}}") catch return;
+    try vm.events.emit(try vm.moment(), writer.buffered());
 }
 
 fn trace(vm: *VM, comptime kind: []const u8, value: u64) !void {

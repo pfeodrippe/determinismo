@@ -37,6 +37,10 @@ pub const Fork = struct {
 
 pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
 
+/// A strategy's reason for an override, replayed with it (a `decision` event in the timeline).
+pub const Reason = struct { pull: u64, size: u8, text: [Strategy.reason_size_max]u8 };
+pub const reason_count_max = 1024;
+
 /// Overrides of one branch, ordered by pull. A replay consumes them in order.
 /// The state of a branch at an event count: a replay that differs there has diverged.
 pub const Checkpoint = struct { events: u64, branches: u64, events_hash: u64 };
@@ -50,6 +54,20 @@ pub const Overrides = struct {
     checkpoints: [checkpoint_count_max]Checkpoint = undefined,
     checkpoint_count: u32 = 0,
     checkpoint_cursor: u32 = 0,
+    reasons: [reason_count_max]Reason = undefined,
+    reason_count: u32 = 0,
+    reason_cursor: u32 = 0,
+
+    /// The reason recorded for pull `pull`, if any. Pulls arrive in increasing order.
+    pub fn reason(overrides: *Overrides, pull: u64) ?[]const u8 {
+        while (overrides.reason_cursor < overrides.reason_count) {
+            const entry = &overrides.reasons[overrides.reason_cursor];
+            if (entry.pull > pull) return null;
+            overrides.reason_cursor += 1;
+            if (entry.pull == pull) return entry.text[0..entry.size];
+        }
+        return null;
+    }
 
     /// Compares the replay with the tape's checkpoint at this event count, if there is one.
     pub fn check(overrides: *Overrides, now: Checkpoint) !void {
@@ -109,14 +127,20 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
     write_all(fd, writer.buffered());
 }
 
-pub fn write_override(fd: linux.fd_t, pull: u64, value: []const u8) void {
+pub fn write_override(fd: linux.fd_t, pull: u64, value: []const u8, reason: []const u8) void {
     assert(fd >= 0);
     assert(value.len <= Strategy.override_size_max);
-    var buffer: [64 + 2 * Strategy.override_size_max]u8 = undefined;
+    assert(reason.len <= Strategy.reason_size_max);
+    var buffer: [96 + 2 * Strategy.override_size_max + 6 * Strategy.reason_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.print("{{\"pull\":{d},\"hex\":\"", .{pull}) catch unreachable;
     for (value) |byte| writer.print("{x:0>2}", .{byte}) catch unreachable;
-    writer.writeAll("\"}\n") catch unreachable;
+    writer.writeAll("\"") catch unreachable;
+    if (reason.len > 0) {
+        writer.writeAll(",\"reason\":") catch unreachable;
+        std.json.Stringify.value(reason, .{}, &writer) catch unreachable;
+    }
+    writer.writeAll("}\n") catch unreachable;
     write_all(fd, writer.buffered());
 }
 
@@ -125,6 +149,8 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     assert(scratch.len > 0);
     overrides.count = 0;
     overrides.cursor = 0;
+    overrides.reason_count = 0;
+    overrides.reason_cursor = 0;
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     const header_line = lines.next() orelse return error.EmptyTape;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
@@ -171,18 +197,30 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
             try checkpoint_parse(overrides, checkpoint);
             continue;
         }
-        if (overrides.count == override_count_max) return error.TapeTooLong;
-        const entry = &overrides.entries[overrides.count];
-        entry.pull = @intCast((value.object.get("pull") orelse return error.BadTape).integer);
-        const hex = (value.object.get("hex") orelse return error.BadTape).string;
-        if (hex.len > 2 * Strategy.override_size_max) return error.BadTape;
-        entry.size = @intCast((try std.fmt.hexToBytes(&entry.bytes, hex)).len);
-        if (overrides.count > 0) {
-            if (overrides.entries[overrides.count - 1].pull >= entry.pull) return error.BadTape;
-        }
-        overrides.count += 1;
+        try override_parse(overrides, value);
     }
     return result;
+}
+
+fn override_parse(overrides: *Overrides, value: std.json.Value) !void {
+    if (overrides.count == override_count_max) return error.TapeTooLong;
+    const entry = &overrides.entries[overrides.count];
+    entry.pull = @intCast((value.object.get("pull") orelse return error.BadTape).integer);
+    const hex = (value.object.get("hex") orelse return error.BadTape).string;
+    if (hex.len > 2 * Strategy.override_size_max) return error.BadTape;
+    entry.size = @intCast((try std.fmt.hexToBytes(&entry.bytes, hex)).len);
+    if (value.object.get("reason")) |reason| if (reason == .string) {
+        if (overrides.reason_count == reason_count_max) return error.TapeTooLong;
+        const kept = &overrides.reasons[overrides.reason_count];
+        kept.pull = entry.pull;
+        kept.size = @intCast(@min(reason.string.len, Strategy.reason_size_max));
+        @memcpy(kept.text[0..kept.size], reason.string[0..kept.size]);
+        overrides.reason_count += 1;
+    };
+    if (overrides.count > 0) {
+        if (overrides.entries[overrides.count - 1].pull >= entry.pull) return error.BadTape;
+    }
+    overrides.count += 1;
 }
 
 fn checkpoint_parse(overrides: *Overrides, value: std.json.Value) !void {

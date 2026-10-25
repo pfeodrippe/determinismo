@@ -1029,6 +1029,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .start_tsc = place.snapshot.tsc,
             .path = place.path,
             .generation = place.generation,
+            .why = place.why,
         });
         if (branches.summaries) |summaries| summaries.note(vm, place);
         if (exploration.strategy) |strategy| {
@@ -1071,6 +1072,8 @@ const Planned = struct {
     /// From the setup snapshot to `snapshot`: the ancestors and the moments they branched.
     path: []const tape.Segment = &.{},
     generation: u32 = 0,
+    /// Why it starts there, for people (the tree explorer's reason).
+    why: []const u8 = "",
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
@@ -1166,6 +1169,7 @@ fn explore_tree(
         for (done) |*summary| {
             var novel: u32 = 0;
             var moment: ?u64 = null;
+            var label: []const u8 = "";
             // The frontier (Go-Explore): its latest new behavior that leaves room to go on (in
             // its first four fifths); the branches return just after it.
             const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
@@ -1173,9 +1177,17 @@ fn explore_tree(
                 const known = try seen.getOrPut(arena, behavior.hash);
                 if (known.found_existing) continue;
                 novel += 1;
-                if (behavior.vtime_ns <= room_end) moment = behavior.vtime_ns;
+                if (behavior.vtime_ns <= room_end) {
+                    moment = behavior.vtime_ns;
+                    label = behavior.name();
+                }
             }
-            candidates[candidate_count] = .{ .summary = summary, .novel = novel, .moment = moment };
+            candidates[candidate_count] = .{
+                .summary = summary,
+                .novel = novel,
+                .moment = moment,
+                .label = label,
+            };
             candidate_count += 1;
         }
         const chosen = candidates[0..candidate_count];
@@ -1206,6 +1218,16 @@ fn explore_tree(
                 continue;
             };
             made += 1;
+            const why = if (candidate.moment != null)
+                try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
+                    "{s} ({d} behaviors no timeline before it had): its frontier.", .{
+                    parent.index, candidate.label, candidate.novel,
+                })
+            else
+                try std.fmt.allocPrint(arena, "A random moment of #{d}: no timeline of this " ++
+                    "generation reached anything new, so a moment is chosen at random.", .{
+                    parent.index,
+                });
             const path = try arena.alloc(tape.Segment, parent.path.len + 1);
             @memcpy(path[0..parent.path.len], parent.path);
             path[parent.path.len] = .{
@@ -1221,6 +1243,7 @@ fn explore_tree(
                     .snapshot = snapshot,
                     .path = path,
                     .generation = generation + 1,
+                    .why = why,
                 });
                 next_index += 1;
             }
@@ -1234,6 +1257,8 @@ fn explore_tree(
                 .seed = branch_seed(base, next_index),
                 .snapshot = branches.snapshot,
                 .generation = generation + 1,
+                .why = "From the setup snapshot: some timelines of every generation start " ++
+                    "over, so the tree does not only deepen.",
             });
         }
         std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
@@ -1245,7 +1270,7 @@ fn explore_tree(
     for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
 }
 
-const Candidate = struct { summary: *const Summary, novel: u32, moment: ?u64 };
+const Candidate = struct { summary: *const Summary, novel: u32, moment: ?u64, label: []const u8 };
 
 fn candidate_before(_: void, a: Candidate, b: Candidate) bool {
     if (a.novel != b.novel) return a.novel > b.novel;

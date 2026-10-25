@@ -51,8 +51,12 @@ def _dispatch(strategy, name, request):
         answer = strategy.random(*arguments)
         if answer is None:
             return {}
+        # An answer may come with why, (bytes, "reason"): shown with the decision, kept in tapes.
+        reason = None
+        if isinstance(answer, tuple):
+            answer, reason = answer
         assert len(answer) == len(default), "an override has the default's size"
-        return {"hex": answer.hex()}
+        return {"hex": answer.hex(), "reason": reason} if reason else {"hex": answer.hex()}
     if method == "event":
         if hasattr(strategy, "event"):
             strategy.event(request["event"], request.get("source", ""), moment)

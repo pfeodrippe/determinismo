@@ -28,7 +28,9 @@ class Llm:
     def __init__(self, every, model):
         self.every = every
         self.model = model
-        self.plan = {}  # Decision name -> {"favor": [option names]} or {"scale": "short"|"long"}
+        # Decision name -> {"favor": [option names]} or {"scale": "short"|"long"}, each with
+        # the model's "why".
+        self.plan = {}
         self.options = {}  # Decision name -> its options (or its range), as last seen.
         self.history = []  # One summary per finished branch.
         self.branch_faults = []
@@ -56,7 +58,7 @@ class Llm:
                 index = self.prng.choice(favored)
                 if name == "fault":
                     self.branch_faults.append(options[index])
-                return index.to_bytes(8, "little")[:size].ljust(size, b"\0")
+                return index.to_bytes(8, "little")[:size].ljust(size, b"\0"), self.why(name)
             return None
         if "range" in decision:
             count = int(decision["range"])
@@ -66,8 +68,13 @@ class Llm:
                 return None
             low, high = (0, count // 4) if scale == "short" else (3 * count // 4, count)
             value = self.prng.randrange(low, max(high, low + 1))
-            return value.to_bytes(8, "little")[:size].ljust(size, b"\0")
+            return value.to_bytes(8, "little")[:size].ljust(size, b"\0"), self.why(name)
         return None
+
+    def why(self, name):
+        reason = self.plan.get(name, {}).get("why", "")
+        return f"{self.model} favored this: {reason}" if reason else f"{self.model} favored this"
+
 
     def event(self, event, source, moment):
         guidance = event.get("guidance")
@@ -94,9 +101,10 @@ class Llm:
             f"{json.dumps(self.history[-16:])}\n"
             f"Assertions' closest distance to failing (lower is closer):\n"
             f"{json.dumps(self.near)}\n"
-            "Answer with JSON only, no prose: {\"<decision name>\": {\"favor\": [<option names>]} "
-            "or {\"scale\": \"short\"|\"long\"}, ...}. Favor what you expect to break things, and "
-            "try something different when recent branches found nothing.")
+            "Answer with JSON only, no prose: {\"<decision name>\": {\"favor\": [<option names>], "
+            "\"why\": \"<one sentence>\"} or {\"scale\": \"short\"|\"long\", \"why\": \"...\"}, ...}. "
+            "Favor what you expect to break things, and try something different when recent "
+            "branches found nothing; `why` says what you expect it to break, and from what.")
         try:
             result = subprocess.run(["claude", "-p", "--model", self.model, prompt],
                                     capture_output=True, text=True, timeout=120)

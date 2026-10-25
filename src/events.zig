@@ -78,7 +78,18 @@ behavior_slots: [behavior_slot_count]u64 = @splat(0),
 
 const Events = @This();
 
-pub const Behavior = struct { hash: u64, vtime_ns: u64 };
+pub const Behavior = struct {
+    hash: u64,
+    vtime_ns: u64,
+    /// What it is, for people: `always "balance is conserved": false`, `fault partition`.
+    label: [behavior_label_size]u8 = undefined,
+    label_size: u8 = 0,
+
+    pub fn name(behavior: *const Behavior) []const u8 {
+        return behavior.label[0..behavior.label_size];
+    }
+};
+pub const behavior_label_size = 72;
 pub const behavior_count_max = 512;
 const behavior_slot_count = 2 * behavior_count_max; // Open addressing, at most half full.
 
@@ -138,8 +149,38 @@ fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
         if (events.behavior_slots[slot] == key) return;
     }
     events.behavior_slots[slot] = key;
-    events.behaviors[events.behavior_count] = .{ .hash = key, .vtime_ns = moment.vtime_ns };
+    const behavior = &events.behaviors[events.behavior_count];
+    behavior.* = .{ .hash = key, .vtime_ns = moment.vtime_ns };
+    var writer: std.Io.Writer = .fixed(&behavior.label);
+    behavior_label(&writer, value);
+    behavior.label_size = @intCast(writer.end);
     events.behavior_count += 1;
+}
+
+/// A behavior's label, cut where the label ends.
+fn behavior_label(writer: *std.Io.Writer, value: std.json.Value) void {
+    if (value.object.get("assert")) |assertion| if (assertion == .object) {
+        const kind = string_field(assertion.object, "type") orelse "assert";
+        const message = string_field(assertion.object, "message") orelse "";
+        const condition = assertion.object.get("condition") orelse std.json.Value{ .bool = true };
+        const holds = condition != .bool or condition.bool;
+        writer.print("{s} \"{s}\": {}", .{ kind, message, holds }) catch {};
+        return;
+    };
+    if (value.object.get("guidance")) |guidance| if (guidance == .object) {
+        const message = string_field(guidance.object, "message") orelse "";
+        writer.print("closer to \"{s}\"", .{message}) catch {};
+        return;
+    };
+    const name_value = value.object.get("event") orelse return;
+    if (name_value != .string) return;
+    writer.writeAll(name_value.string) catch return;
+    const details = value.object.get("details") orelse return;
+    if (details != .object) return;
+    for ([_][]const u8{ "kind", "flavor", "node", "peer", "state", "name" }) |key| {
+        const text = string_field(details.object, key) orelse continue;
+        writer.print(" {s}", .{text}) catch return;
+    }
 }
 
 /// A guidance assertion's distance by power of two (0 or less: there): a timeline that came
@@ -175,6 +216,7 @@ test behavior_note {
     try std.testing.expectEqual(@as(u32, 2), events.behavior_count);
     try std.testing.expectEqual(@as(u64, 10), events.behaviors[0].vtime_ns);
     try std.testing.expectEqual(@as(u64, 30), events.behaviors[1].vtime_ns);
+    try std.testing.expectEqualStrings("closer to \"sum\"", events.behaviors[1].name());
 }
 
 /// Language properties, from what processes print (Antithesis's "No panics (Go)" and others):

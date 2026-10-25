@@ -6,25 +6,40 @@ build e2e` tests it.
 
 ## Now
 
-1. **Tests are Zig programs, everywhere.** Every example in `examples/` is a test program
-   (typed `describe`, scenarios as functions) using the SDK's common pieces (`sdk.tcp`,
-   `sdk.retry`, `sdk.sleep_ms`, `node.exec_output`): bank, shop, clojure-bank and k3s done;
-   the Antithesis-format projects moved to `tests/antithesis-compat` (they test the Compose
-   importer). Left: run the clojure, tla, k3s, compose and coverage e2e checks on the new
-   programs and paths.
-2. **The assertion catalog, automatic in every SDK** (Antithesis's): built in Zig, C, the JVM
-   (Java agent over bytecode), Clojure (macros) and Python (syntax trees as modules run); a
-   test program's catalog is judged over all its scenarios. Left: the e2e checks
-   (`check_catalog` and the rest) green on the server, then commit.
-3. **Audit of ANTITHESIS.md**: done (rows judged by what a user gets; six marked partial and
-   seven missing rows added). Its ❌ and 🟡 rows are the work in the sections below.
-4. **A Raft workload, explored blind.** The Raft implementations of Antithesis's article
-   (antithesis.com/blog/2026/finding-bugs-in-raft-implementations), explored without reading
-   the article's findings first, then compared with what it reports. HashiCorp Raft first
-   (examples/raft: a Go service with the article's "chain of blocks" state machine, written
-   here, and a Zig test program checking agreement, progress and convergence); then OpenRaft
-   (Rust), MicroRaft and Aeron Cluster (Java). More real systems after (etcd, a Jepsen-tested
-   store).
+1. **e2e green on everything.** The last full run passed all but two checks: `clojure` (the
+   REPL patch's timing) and K3s with three nodes (a property failed in 4 branches: ours or
+   K3s's, to find out). Then a tree-exploration check: the same tree with one worker or many,
+   and a deep timeline replaying alone from its tape.
+2. **The tree explorer by default.** `--branching tree` (Go-Explore over snapshots: generations,
+   returns just after new behaviors, paths in tapes and records) is opt-in, default in the UI.
+   Make it the CLI's default once e2e runs green with it; `--branch N` then replays first-
+   generation timelines only (others by their tapes). Next steps for it:
+   - Snapshot during the run when a timeline first reaches something new, instead of replaying
+     to the moment after the generation (no replay; the same tree).
+   - Behaviors from code coverage too (edges and lines, where the SDK instruments), and rarity
+     weighting (Go-Explore's cell selection), and a budget split between depth and fresh starts
+     learned from what found new behaviors.
+   - Strategies choose the moments to return to (`{"return": [moment, ...]}`), so mutate and
+     the LLM steer the tree, not only the decisions within a timeline.
+3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
+   `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
+   strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
+   when it is guided (`fault after "leader elected": partition the leader`), the mutate
+   strategy's (which parent, which mutation), and reasons in the logs and the notebook.
+4. **The UI.** Done: stat cards, discovery and failing-property charts, the multiverse tree with
+   shared prefixes, branch points and forks, styled tooltips, Clojure notebooks (babashka) with a
+   per-run nREPL server, fork from a moment, time budgets. Left: zoom and pan in the tree (and
+   a minimap for runs of thousands of timelines), a timeline's logs showing its parents'
+   events before it branched, live updates of the tree while a run goes.
+5. **clojure-cli.repl** (github.com/clojure/clojure-cli.repl, the Clojure CLI's enhanced REPL:
+   an nREPL server with its own middleware, a JLine client in a second JVM): a workload that
+   runs it and plain nREPL side by side under the same clients and faults, with properties of
+   both (evaluations, sessions, `*1`, interrupts, output capture, middleware data on
+   responses, the editor-evaluation echo) and where they differ, as properties too; then stress
+   (many sessions, long evaluations, interrupts racing completions) to find where concurrency
+   breaks.
+6. **Blind exploration of the real targets**: nREPL, the Clojure libraries, Raft (pinned commit,
+   with restarts), with the tree explorer and the strategies; findings reported upstream.
 
 ## Antithesis parity found missing
 
@@ -33,9 +48,9 @@ in ANTITHESIS.md yet.
 
 1. **Guidance assertions**: done in every SDK, used by det-strategy-mutate and the LLM strategy.
    Left: guidance-aware Go-Explore cells (see "Strategy guidance").
-2. **Assertion locations**: done for C, Python, the JVM and Clojure (report, record, UI). Left:
-   Zig, through the return address and the binary's debug info (the same symbolization as
-   coverage edges, below).
+2. **Assertion locations**: done in every SDK (Zig through the return address and its debug
+   info). Left: past the SDK's own helpers (`sdk.retry` reports itself, not its caller) and
+   det-init's built-ins (which have no place in user code).
 3. **First pass, first failure**: done in every SDK (opt-in; guidance only when it improves).
 4. **Disk faults** (faults): Antithesis's mutation campaign turned on disk faults; find their
    documented forms (I/O errors, latency, lost unsynced writes at a crash, torn writes) and add
@@ -65,10 +80,8 @@ as hints of where bugs hide. To get there:
 1. **Labeled decisions**: done (`decide` and `random_below_named` in every SDK; det-faults names
    its faults, waits and durations; strategies get the label with the pull). An LLM strategy
    uses them (plugins/python/llm.py, Claude Haiku 5.5 through the `claude` CLI; remote over TCP).
-2. **Branching mid-timeline from the strategy.** Today the outer loop forks a branch at a moment
-   (`fork`, replaying to it). Let a plugin answer an event with `{"branch_here": k}`: the VMM
-   snapshots there (copy-on-write, as the setup snapshot) and runs k continuations from it. This
-   is Go-Explore's "return": cells are feature sets, the strategy picks the cell to return to.
+2. **Branching mid-timeline**: done in the explorer itself (`--branching tree`, see "Now").
+   Left: strategies choosing the moments to return to.
 3. **Reference strategies with real guidance:**
    - Go-Explore: an archive of cells (the features reached, with the moment that reached them),
      pick by rarity, return by snapshot, explore with labeled decisions.

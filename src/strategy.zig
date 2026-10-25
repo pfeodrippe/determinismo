@@ -8,6 +8,8 @@ const linux = std.os.linux;
 const Events = @import("events.zig");
 
 pub const override_size_max = 64;
+/// Why a plugin chose an answer (its `reason`), kept with the decision; longer is cut.
+pub const reason_size_max = 240;
 const line_size_max = 16 * 1024;
 const parse_buffer_size = 64 * 1024;
 const argument_count_max = 16;
@@ -21,6 +23,9 @@ response: [line_size_max]u8,
 response_start: u32,
 response_end: u32,
 parse_buffer: [parse_buffer_size]u8,
+/// The reason the last overriding answer gave, if any.
+reason: [reason_size_max]u8 = undefined,
+reason_size: u8 = 0,
 
 const Strategy = @This();
 
@@ -169,7 +174,13 @@ pub fn random(
     if (label) |decision| try writer.print(",\"decision\":{s}", .{decision});
     try writer.writeAll("}");
     const reply = try strategy.call(writer.buffered());
+    strategy.reason_size = 0;
     const hex = reply.get("hex") orelse return false;
+    if (reply.get("reason")) |reason| if (reason == .string) {
+        const size = @min(reason.string.len, reason_size_max);
+        @memcpy(strategy.reason[0..size], reason.string[0..size]);
+        strategy.reason_size = @intCast(size);
+    };
     if (hex != .string) return error.BadPluginReply;
     if (hex.string.len != value.len * 2) return error.BadPluginReply;
     if (value.len > override_size_max) return error.OverrideTooLarge;

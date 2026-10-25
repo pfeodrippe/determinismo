@@ -123,6 +123,20 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
 .bars .bar .count { text-align: right; font-variant-numeric: tabular-nums; }
 .tree svg .timeline:hover path, .tree svg .timeline:hover line { stroke-opacity: 1; stroke-width: 2.2; }
 .empty svg { display: block; margin: 40px auto 18px; }
+.tip { position: fixed; z-index: 50; pointer-events: none; max-width: 420px; background: #23252d; color: var(--text);
+  border: 1px solid #3a3d48; border-radius: 10px; padding: 10px 12px; font-size: 12.5px; line-height: 1.45;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45); opacity: 0; transform: translateY(4px); transition: opacity .08s, transform .08s; }
+.tip.on { opacity: 1; transform: none; }
+.tip .t-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.tip .t-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.tip .t-path { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0; font-family: var(--mono); font-size: 11.5px; }
+.tip .t-chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+.tip .t-kv { display: grid; grid-template-columns: max-content 1fr; gap: 1px 10px; margin: 4px 0; }
+.tip .t-kv dt { color: var(--muted); } .tip .t-kv dd { margin: 0; font-family: var(--mono); font-size: 11.5px; word-break: break-word; }
+.tip .t-why { margin-top: 6px; padding: 6px 8px; border-left: 2px solid var(--accent); background: rgba(143,124,247,.08); border-radius: 0 6px 6px 0; }
+.tip .t-why b { color: var(--accent); font-weight: 600; }
+.tip .t-foot { margin-top: 6px; color: var(--muted); font-size: 11px; }
+.tip .t-fail { color: var(--fail); }
 @media (max-width: 1100px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .charts { grid-template-columns: 1fr; } }
 </style>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='7' cy='16' r='5' fill='%238f7cf7'/%3E%3Cpath d='M11 16C18 16 18 6 26 6M11 16H26M11 16C18 16 18 26 26 26' stroke='%238f7cf7' stroke-width='3' fill='none'/%3E%3Ccircle cx='27' cy='6' r='3.5' fill='%233fbf7f'/%3E%3Ccircle cx='27' cy='16' r='3.5' fill='%233fbf7f'/%3E%3Ccircle cx='27' cy='26' r='3.5' fill='%23f0506e'/%3E%3C/svg%3E">
@@ -156,6 +170,7 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
     Every timeline branches from one moment, and replays exactly.<br>Choose a run, or start one.</div></main>
 </div>
 
+<div class="tip" id="tip"></div>
 <dialog id="run-dialog">
   <form method="dialog" id="run-form">
     <h3 style="margin:0">New run</h3>
@@ -583,15 +598,98 @@ function causalityChart(branch, points, done) {
   const width = 520, height = 140, left = 36, bottom = 22, step = (width - left) / points.length;
   const bars = points.map((point, i) => {
     const h = (height - bottom - 8) * point.probability;
-    return `<g data-vtime="${point.vtime_ms * 1e6}" style="cursor:pointer"><rect x="${left + i * step + 2}" y="${height - bottom - h}"
-      width="${step - 4}" height="${Math.max(h, 1)}" fill="${point.probability >= 0.99 ? "#f0506e" : "#8f7cf7"}">
-      <title>${point.vtime_ms}ms: ${(point.probability * 100).toFixed(0)}% (${point.failing}/${point.futures}) — click for the logs up to here</title></rect>
+    const html = `<div class="t-title">${point.vtime_ms} ms: ${(point.probability * 100).toFixed(0)}% likely to fail</div>
+      ${point.failing} of ${point.futures} futures forked here fail.<div class="t-foot">Click for the logs up to here</div>`;
+    return `<g data-vtime="${point.vtime_ms * 1e6}" style="cursor:pointer" ${tipAttr(html)}><rect x="${left + i * step + 2}" y="${height - bottom - h}"
+      width="${step - 4}" height="${Math.max(h, 1)}" fill="${point.probability >= 0.99 ? "#f0506e" : "#8f7cf7"}"></rect>
       <text x="${left + i * step + step / 2}" y="${height - 6}" fill="#9a9eab" font-size="9" text-anchor="middle">${point.vtime_ms}</text></g>`;
   }).join("");
   const axis = [0, 0.5, 1].map((p) => `<text x="${left - 6}" y="${height - bottom - (height - bottom - 8) * p + 3}" fill="#9a9eab" font-size="9" text-anchor="end">${p * 100}%</text>`).join("");
   return `<div class="group-title">Causality of branch ${branch}${done ? "" : " (running)"}: probability of the failure, by moment (ms)</div>
     <svg width="${width}" height="${height}">${axis}${bars}</svg>
     <div class="muted">A jump means the timeline made the bug likely just before: click the bar after it for the logs up to there.</div>`;
+}
+
+// Tooltips: any element with data-tip (HTML) shows it in one styled tooltip near the pointer.
+(() => {
+  const tip = document.getElementById("tip");
+  let shown = null;
+  const place = (event) => {
+    const pad = 14, width = tip.offsetWidth, height = tip.offsetHeight;
+    let left = event.clientX + pad, top = event.clientY + pad;
+    if (left + width > innerWidth - 8) left = event.clientX - width - pad;
+    if (top + height > innerHeight - 8) top = event.clientY - height - pad;
+    tip.style.left = Math.max(8, left) + "px";
+    tip.style.top = Math.max(8, top) + "px";
+  };
+  document.addEventListener("mouseover", (event) => {
+    const target = event.target.closest && event.target.closest("[data-tip]");
+    if (target === shown) return;
+    shown = target;
+    if (!target) { tip.classList.remove("on"); return; }
+    tip.innerHTML = target.dataset.tip;
+    tip.classList.add("on");
+    place(event);
+  });
+  document.addEventListener("mousemove", (event) => { if (shown) place(event); });
+})();
+const tipAttr = (html) => `data-tip="${escape(html)}"`;
+const ms = (ns) => ns >= 1e9 ? `${(ns / 1e9).toFixed(2)} s` : ns >= 1e6 ? `${(ns / 1e6).toFixed(1)} ms` : `${(ns / 1e3).toFixed(0)} µs`;
+const humanize = (key) => key.replace(/_ns$/, "").replace(/_ppm$/, "").replace(/_/g, " ");
+function kvHtml(pairs) {
+  const rows = pairs.filter(([, value]) => value !== undefined && value !== null && value !== "");
+  return rows.length ? `<dl class="t-kv">${rows.map(([key, value]) => `<dt>${escape(key)}</dt><dd>${escape(value)}</dd>`).join("")}</dl>` : "";
+}
+function pathHtml(branch) {
+  const steps = (branch.path || []).map((step) => `<span class="t-chip">#${step.branch} @ ${(step.vtime_ns / 1e9).toFixed(2)}s</span><span class="muted">→</span>`);
+  return `<div class="t-path"><span class="t-chip">snapshot</span><span class="muted">→</span>${steps.join("")}<span class="t-chip" style="border-color:var(--accent)">#${branch.index}</span></div>`;
+}
+function timelineTip(branch, run) {
+  const failing = branch.failing.length;
+  const why = branch.why || ((branch.path || []).length ? "" : "From the setup snapshot: the first generation, or a flat exploration.");
+  return `<div class="t-title"><span class="t-dot" style="background:${failing ? "var(--fail)" : "var(--pass)"}"></span>
+      ${run ? `Run ${run} · ` : ""}Timeline #${branch.index}</div>
+    ${pathHtml(branch)}
+    ${kvHtml([["ended", `${branch.outcome} at ${(branch.vtime_ns / 1e9).toFixed(3)}s`], ["events", branch.events],
+      ["generation", branch.generation || undefined]])}
+    ${failing ? `<div class="t-fail">${branch.failing.map((name) => "✗ " + escape(name)).join("<br>")}</div>` : `<div class="pass-text">✓ every property passes</div>`}
+    ${why ? `<div class="t-why"><b>Why it starts here</b><br>${escape(why)}</div>` : ""}
+    <div class="t-foot">Click for its logs</div>`;
+}
+// A fault in words: what it does, to what, for how long.
+function faultTip(event, decision) {
+  const d = (event.event && event.event.details) || {};
+  const kind = [d.kind, d.flavor].filter(Boolean).join(" · ");
+  const between = d.node ? (d.peer ? `${d.node} ↔ ${d.peer}` : d.node) : "";
+  const netem = d.netem || {};
+  const groups = Array.isArray(d.groups) && d.groups.some((g) => g !== 255) ? d.groups.filter((g) => g !== 255).join(" | ") : undefined;
+  const pairs = [["between", between || undefined], ["for", d.duration_ns ? ms(d.duration_ns) : undefined],
+    ["delay", netem.delay_ns ? `${ms(netem.delay_ns)}${netem.jitter_ns ? " ± " + ms(netem.jitter_ns) : ""}` : undefined],
+    ["loss", netem.loss_ppm ? `${(netem.loss_ppm / 1e4).toFixed(1)}%` : undefined],
+    ["duplicates", netem.duplicate_percent ? netem.duplicate_percent + "%" : undefined],
+    ["corruption", netem.corrupt_percent ? netem.corrupt_percent + "%" : undefined],
+    ["reordering", netem.reorder_percent ? netem.reorder_percent + "%" : undefined],
+    ["rate", netem.rate_bytes_per_second ? `${netem.rate_bytes_per_second} B/s` : undefined],
+    ["cpu", d.cpu_percent ? d.cpu_percent + "%" : undefined], ["clock skip", d.skip_ns ? ms(d.skip_ns) : undefined],
+    ["groups", groups], ["permanent", d.permanent ? "yes" : undefined], ["program", d.program || undefined]];
+  const why = decision ? `<div class="t-why"><b>Why this fault</b><br>${escape(decision.event.details.reason)}</div>`
+    : `<div class="t-why"><b>Why this fault</b><br>Chosen at random from this timeline's seed (a replay chooses the same). A strategy (mutate, the LLM) gives its reasons here.</div>`;
+  return `<div class="t-title"><span class="t-dot" style="background:var(--warn);border-radius:2px"></span>Fault: ${escape(kind || "fault")}</div>
+    ${kvHtml(pairs)}${kvHtml([["timeline", `#${event.branch} at ${(event.vtime_ns / 1e9).toFixed(3)}s`]])}${why}
+    <div class="t-foot">Click for the logs here</div>`;
+}
+function failureTip(event) {
+  const a = event.event.assert || event.event.antithesis_assert || {};
+  const details = a.details && typeof a.details === "object" ? Object.entries(a.details).slice(0, 8).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)]) : [];
+  const where = a.location ? `${(a.location.file || "").split("/").pop()}:${a.location.line} ${a.location.function || ""}` : undefined;
+  return `<div class="t-title"><span class="t-dot" style="background:var(--fail)"></span>${escape(a.type || "assertion")} failed</div>
+    <div>${escape(a.message || "")}</div>${kvHtml(details)}${kvHtml([["where", where], ["timeline", `#${event.branch} at ${(event.vtime_ns / 1e9).toFixed(3)}s`]])}
+    <div class="t-foot">The first failure of this timeline · click for the logs here</div>`;
+}
+function branchPointTip(point, why) {
+  return `<div class="t-title"><span class="t-dot" style="background:#15161a;border:1.5px solid #e6e7eb"></span>Branch point</div>
+    <div>${point.count} timelines continue #${point.from} from ${(point.vtime / 1e9).toFixed(3)}s: everything before is shared, each goes on with its own decisions.</div>
+    ${why ? `<div class="t-why"><b>Why here</b><br>${escape(why)}</div>` : ""}`;
 }
 
 // Multiverse tree: boot to the setup snapshot is the trunk; every timeline branches from the
@@ -604,11 +702,26 @@ async function mapDraw() {
   const run = state.run, info = run.run || {};
   const branches = run.branches.slice().sort((a, b) => a.index - b.index);
   if (!branches.length) { body.textContent = "No timelines yet."; return; }
-  let failures = [], faults = [];
+  let failures = [], faults = [], decisions = [];
   try {
     failures = await query({ condition: "assert.condition=false or antithesis_assert.condition=false", limit: 20000 });
     faults = await query({ condition: "event=fault", limit: 20000 });
+    decisions = await query({ condition: "event=decision", limit: 20000 });
   } catch { /* The tree still shows the timelines. */ }
+  // A strategy's reason for a fault: its last decision for the fault injector before it.
+  const decisionsOf = new Map();
+  for (const d of decisions) {
+    if (!decisionsOf.has(d.branch)) decisionsOf.set(d.branch, []);
+    decisionsOf.get(d.branch).push(d);
+  }
+  const decisionFor = (fault) => {
+    let found = null;
+    for (const d of decisionsOf.get(fault.branch) || []) {
+      if (d.vtime_ns > fault.vtime_ns) break;
+      if ((d.event.details || {}).source === "det-faults") found = d;
+    }
+    return found;
+  };
   const forkedHere = info.from_branch != null;
   const children = [...details.values()].filter((other) => other.id !== run.id && other.run && !forkedHere
     && other.run.from_branch != null && other.run.inputs === info.inputs && other.run.seed === info.seed
@@ -661,27 +774,26 @@ async function mapDraw() {
   const rowOf = new Map(rows.filter((r) => !r.child).map((r) => [r.branch.index, rows.indexOf(r)]));
   const pathText = (b) => (b.path || []).map((s) => `#${s.branch}@${(s.vtime_ns / 1e9).toFixed(2)}s`).concat(`#${b.index}`).join(" / ");
   const color = (branch) => branch.failing.length ? "#f0506e" : "#3fbf7f";
-  const tip = (branch, run) => escape(`${run ? `run ${run} · ` : ""}${pathText(branch)} · ${branch.outcome} at ${seconds(branch.vtime_ns)}`
-    + (branch.failing.length ? ` · failing: ${branch.failing.join("; ")}` : " · every property passes") + " — click for its logs");
+  const tip = (branch, run) => tipAttr(timelineTip(branch, run));
   const stroke = Math.max(1, Math.min(1.6, rowHeight / 5));
   const lines = rows.map((row, i) => {
     const b = row.branch, yy = y(i);
     if (!row.child && row.parentRow != null) {
       // Left its parent's line at the moment it diverged: everything before is shared.
       const fx = x(row.parent.vtime_ns), fy = y(row.parentRow);
-      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer"><title>${tip(b)}</title>
+      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip(b)}>
         <path d="M${fx},${fy} C${fx + 18},${fy} ${fx + 10},${yy} ${fx + 30},${yy} L${Math.max(fx + 30, x(b.vtime_ns))},${yy}"
           fill="none" stroke="${color(b)}" stroke-opacity=".7" stroke-width="${stroke}"/>
         <line x1="${fx}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${rowHeight}"/></g>`;
     }
     if (!row.child) {
-      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer"><title>${tip(b)}</title>
+      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip(b)}>
         <path d="M${rootX},${rootY} C${rootX + fan * 0.6},${rootY} ${rootX + fan * 0.4},${yy} ${x0},${yy} L${Math.max(x0, x(b.vtime_ns))},${yy}"
           fill="none" stroke="${color(b)}" stroke-opacity=".6" stroke-width="${stroke}"/>
         <line x1="${x0}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${rowHeight}"/></g>`;
     }
     const fx = x(row.child.run.from_vtime_ms * 1e6), fy = y(row.parentRow);
-    return `<g class="timeline" data-run="${row.child.id}" style="cursor:pointer"><title>${tip(b, row.child.id)}</title>
+    return `<g class="timeline" data-run="${row.child.id}" style="cursor:pointer" ${tip(b, row.child.id)}>
       <path d="M${fx},${fy} C${fx + 24},${fy} ${fx + 16},${yy} ${fx + 40},${yy} L${Math.max(fx + 40, x(b.vtime_ns))},${yy}"
         fill="none" stroke="#8f7cf7" stroke-opacity=".75" stroke-width="${stroke}"/></g>`;
   }).join("");
@@ -691,21 +803,26 @@ async function mapDraw() {
     if (!points.has(key)) points.set(key, { row: row.parentRow, vtime: row.parent.vtime_ns, count: 0, from: rows[row.parentRow].branch.index });
     points.get(key).count += 1;
   }
-  const branchPoints = [...points.values()].map((point) => `<circle cx="${x(point.vtime)}" cy="${y(point.row)}" r="${Math.max(2.5, Math.min(5, rowHeight / 2))}"
-      fill="#15161a" stroke="#e6e7eb" stroke-width="1.5"><title>${point.count} timelines branched from #${point.from} at ${seconds(point.vtime)}</title></circle>`).join("");
+  const whyAt = new Map();
+  for (const row of rows) if (!row.child && row.parentRow != null && row.branch.why) whyAt.set(`${row.parentRow}:${row.parent.vtime_ns}`, row.branch.why);
+  const branchPoints = [...points.entries()].map(([key, point]) => `<circle cx="${x(point.vtime)}" cy="${y(point.row)}" r="${Math.max(3, Math.min(5.5, rowHeight / 2))}"
+      fill="#15161a" stroke="#e6e7eb" stroke-width="1.5" ${tipAttr(branchPointTip(point, whyAt.get(key)))}></circle>`).join("");
   const forkPoints = children.map((child) => {
     const fx = x(child.run.from_vtime_ms * 1e6), fy = y(rowOf.get(child.run.from_branch) ?? 0);
-    return `<g class="fork" data-run="${child.id}" style="cursor:pointer"><title>Run ${child.id}: ${child.branches.length} timelines forked from #${child.run.from_branch} at ${child.run.from_vtime_ms}ms — click to open</title>
+    const forkTip = `<div class="t-title"><span class="t-dot" style="background:var(--accent)"></span>Fork · run ${child.id}</div>
+      <div>${child.branches.length} timelines from #${child.run.from_branch} at ${child.run.from_vtime_ms} ms, explored as their own run.</div>
+      <div class="t-why"><b>Why here</b><br>Someone forked this moment (from the logs, the API or MCP).</div><div class="t-foot">Click to open the run</div>`;
+    return `<g class="fork" data-run="${child.id}" style="cursor:pointer" ${tipAttr(forkTip)}>
       <circle cx="${fx}" cy="${fy}" r="5" fill="#8f7cf7"/>
       <text x="${fx - 8}" y="${fy - 7}" fill="#8f7cf7" font-size="10.5" text-anchor="end">run ${child.id} · #${child.run.from_branch} at ${(child.run.from_vtime_ms / 1000).toFixed(2)}s</text></g>`;
   }).join("");
   const mark = (e, kind) => {
     if (!rowOf.has(e.branch)) return "";
     const xx = x(e.vtime_ns), yy = y(rowOf.get(e.branch)), size = Math.max(3, rowHeight * 0.75);
-    const title = `<title>${escape(describe(e.event).text)} @ ${seconds(e.vtime_ns)} — click for the logs here</title>`;
+    const html = kind === "fault" ? faultTip(e, decisionFor(e)) : failureTip(e);
     return kind === "fault"
-      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer">${title}</rect>`
-      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2, size / 2)}" fill="#f0506e" style="cursor:pointer">${title}</circle>`;
+      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(html)}></rect>`
+      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2, size / 2)}" fill="#f0506e" style="cursor:pointer" ${tipAttr(html)}></circle>`;
   };
   const firstFailures = new Map();
   for (const e of failures) if (!firstFailures.has(e.branch) || firstFailures.get(e.branch).vtime_ns > e.vtime_ns) firstFailures.set(e.branch, e);
@@ -720,7 +837,7 @@ async function mapDraw() {
       <text x="${(snapshotX + rootX) / 2}" y="${rootY - 9}" fill="#8f7cf7" font-size="10.5" text-anchor="middle">#${info.from_branch}</text>
       <circle cx="${rootX}" cy="${rootY}" r="6" fill="#8f7cf7"/>
       <text x="${rootX}" y="${rootY + 22}" fill="#8f7cf7" font-size="11" text-anchor="middle">fork · ${(info.from_vtime_ms / 1000).toFixed(2)}s</text>` : ""}
-    <circle cx="${snapshotX}" cy="${rootY}" r="7" fill="#15161a" stroke="#e6e7eb" stroke-width="2.5"><title>The setup snapshot: the system is ready (setup_complete). Every timeline starts here.</title></circle>
+    <circle cx="${snapshotX}" cy="${rootY}" r="7" fill="#15161a" stroke="#e6e7eb" stroke-width="2.5" ${tipAttr(`<div class="t-title">The setup snapshot</div>The system booted and is ready (setup_complete) at ${(snapshotNs / 1e9).toFixed(3)}s. Every timeline starts here, or from a moment of one that did.`)}></circle>
     <text x="${snapshotX}" y="${rootY + (forkedHere ? -14 : 24)}" fill="#e6e7eb" font-size="11" text-anchor="middle">setup snapshot</text>
     ${forkedHere ? "" : `<text x="${snapshotX}" y="${rootY + 38}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(snapshotNs / 1e9).toFixed(2)}s</text>`}`;
   body.innerHTML = `<div class="muted" style="margin-bottom:6px">${depthMax
@@ -949,7 +1066,7 @@ function notebookDraw() {
 clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.8.0"}}}' -M -m nrepl.cmdline --connect --host 127.0.0.1 --port ${port}</pre>`;
     } catch (error) { $("#nrepl-help").hidden = false; $("#nrepl-help").textContent = error.message; }
   });
-  document.querySelectorAll("#notebook .cell").forEach((cell) => {
+  document.querySelectorAll("#notebook .cell[data-index]").forEach((cell) => {
     const index = Number(cell.dataset.index);
     $("textarea", cell).addEventListener("input", (event) => {
       book.cells[index] = event.target.value;
@@ -984,7 +1101,7 @@ async function notebookSave() {
 async function notebookEvaluate() {
   const book = state.notebook;
   const generation = ++book.generation;
-  const outputs = [...document.querySelectorAll("#notebook .cell .out")];
+  const outputs = [...document.querySelectorAll("#notebook .cell[data-index] .out")];
   outputs.forEach((out) => { out.innerHTML = `<span class="muted">…</span>`; });
   let answer;
   try {
