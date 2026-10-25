@@ -1,0 +1,40 @@
+# Using determinismo from an agent
+
+determinismo is built to be driven by programs as much as by people: every timeline replays
+exactly, results are JSON, and a Model Context Protocol server exposes the main operations.
+
+## Connect
+
+```
+determinismo mcp --kernel <vmlinuz> --initrd <base.cpio.zst> --memory-mib 2048 --cache <dir>
+```
+
+Tools: `describe`, `explore`, `replay`, `fork` (schemas in `src/mcp_tools.json`). Without MCP, use
+`explore --record results.jsonl` and read the JSON lines, or the HTTP API (`determinismo serve`).
+
+## A debugging loop that works
+
+1. **Describe** the program: its profiles (nodes, faults allowed) and scenarios (test commands).
+2. **Explore** a scenario with enough branches (32 to 128) and a fixed seed. Read the summary:
+   which properties failed, in how many branches, and an example branch for each.
+3. **Replay** a failing branch: same seed, `branch` = the example. It is the same timeline,
+   every time, so its events (with virtual times) are evidence, not noise.
+4. **Look at a moment**: replay with `at_vtime_ms` just before the first failure and an `exec`
+   command, e.g. `det-nodes exec postgres psql -U postgres -c 'select ...'` or
+   `det-nodes exec redis redis-cli get key`. The output is identical on every replay.
+5. **Narrow down**: `fork` from a moment of the failing branch and explore its futures. If all
+   futures fail, the bug happened before that moment; if none do, it is still ahead.
+6. **Fix and verify**: change the code, explore again with the same seed and more branches; the
+   property should pass in all of them. A replay of an old failing branch is not proof (the
+   inputs changed, so it is a different timeline); exploration is.
+
+## Facts worth knowing
+
+- A branch is identified by (inputs, seed, branch index[, fork point]). Inputs are the kernel,
+  initramfs, command line (scenario included), timer slack and disks; `explore` prints their hash.
+- Tapes (`--tape-dir`) record strategy overrides; `--tape` replays a branch without its strategy
+  and refuses to run on different inputs.
+- Virtual time is not wall time: idle time is skipped, so timeouts and sleeps cost nothing.
+- Faults happen only during the driver phase; `finally` and `eventually` commands see a system
+  without faults, which is where recovery is checked.
+- Exit status of explore: 0 every property passed, 3 some failed, anything else an error.
