@@ -294,5 +294,45 @@
         "property"
       ]
     }
+  },
+  {
+    "name": "mutate",
+    "description": "A mutation testing campaign: explore the system as it is, then once per mutant (a patch to one node's build context) with the same seed and options. Each mutant is judged caught (a property fails that passes without it), never_ran (its lines never ran in any timeline) or unnoticed (it ran and no property noticed: a gap in the properties). The result ends with out: results.jsonl and each exploration's events, for the query tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "compose": {
+          "type": "string",
+          "description": "A Compose file instead of a test program"
+        },
+        "scenario": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "branches": {
+          "type": "integer",
+          "description": "Timelines per exploration (default 16)"
+        },
+        "time_budget": {
+          "type": "string",
+          "description": "Wall time per exploration: 90s, 10m"
+        },
+        "mutants": {
+          "type": "string",
+          "description": "A JSON lines file: {\"name\", \"node\", \"patch\"} per mutant, patch a unified diff relative to the node's build context"
+        }
+      },
+      "required": [
+        "mutants"
+      ]
+    }
   }
 ]

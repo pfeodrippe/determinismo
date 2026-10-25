@@ -46,6 +46,8 @@ const Arguments = struct {
     property: ?[]const u8 = null,
     points: u32 = 8,
     futures: u32 = 16,
+    /// mutate: a JSON lines file of mutants, {"name", "node", "patch"} each.
+    mutants: ?[]const u8 = null,
 };
 
 pub fn serve(arena_parent: std.mem.Allocator, io: std.Io, options: Options) !void {
@@ -131,7 +133,9 @@ fn tool_call(
         return result.stdout;
     }
     var argv: std.ArrayList([]const u8) = .empty;
-    const command = if (eql(u8, name, "causality")) "causality" else "explore";
+    const command = if (eql(u8, name, "causality"))
+        "causality"
+    else if (eql(u8, name, "mutate")) "mutate" else "explore";
     try argv.appendSlice(arena, &.{ options.self, command });
     try argv.appendSlice(arena, options.machine);
     if ((arguments.program == null) == (arguments.compose == null)) return error.ProgramOrCompose;
@@ -176,11 +180,25 @@ fn tool_call(
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return result.stdout;
     }
-    if (!eql(u8, name, "explore") and !eql(u8, name, "fork")) return error.UnknownTool;
+    const known = eql(u8, name, "explore") or eql(u8, name, "fork") or eql(u8, name, "mutate");
+    if (!known) return error.UnknownTool;
     if (arguments.time_budget) |budget| try argv.appendSlice(arena, &.{ "--time-budget", budget });
     if (arguments.branches != null or arguments.time_budget == null) {
         const branches = try number(arena, arguments.branches orelse 16);
         try argv.appendSlice(arena, &.{ "--branches", branches });
+    }
+    if (eql(u8, name, "mutate")) {
+        const mutants = arguments.mutants orelse return error.MissingMutants;
+        explorations += 1;
+        const out = try std.fmt.allocPrint(arena, "{s}/mutation-{d}-{d}", .{
+            options.scratch_directory, linux.getpid(), explorations,
+        });
+        try argv.appendSlice(arena, &.{ "--mutants", mutants, "--out", out });
+        const result = try std.process.run(arena, io, .{ .argv = argv.items });
+        // Each mutant's exploration (events, record) is under out, for the query tool.
+        return std.fmt.allocPrint(arena, "{s}{{\"out\":{f}}}\n", .{
+            result.stdout, std.json.fmt(out, .{}),
+        });
     }
     if (eql(u8, name, "fork")) {
         const branch = arguments.from_branch orelse return error.MissingBranch;

@@ -9,7 +9,7 @@ exactly, results are JSON, and a Model Context Protocol server exposes the main 
 determinismo mcp --kernel <vmlinuz> --initrd <base.cpio> --memory-mib 2048 --cache <dir>
 ```
 
-Tools: `describe`, `explore`, `replay`, `fork`, `query`, `events`, `causality` (schemas in
+Tools: `describe`, `explore`, `replay`, `fork`, `query`, `events`, `causality`, `mutate` (schemas in
 `src/mcp_tools.json`). `explore ... --serve <host:port>` runs the exploration in a `determinismo
 serve` instead, so people can follow it in the web UI (it prints the run's address). Without MCP, use `explore --record results.jsonl --events-dir events/`
 with `determinismo query` and `determinismo events`, or the HTTP API (`determinismo serve`).

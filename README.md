@@ -201,7 +201,7 @@ determinismo serve --listen 127.0.0.1:7878 --data ~/runs --kernel ... --initrd .
 curl -X POST localhost:7878/runs -d '{"program":"zig-out/bin/bank-test","scenario":"bank","branches":40}'
 curl localhost:7878/runs/1                       # state, branches, properties
 curl -X POST localhost:7878/runs/1/replay -d '{"branch":3}'
-determinismo mcp --kernel ... --initrd ... --cache ~/cache   # tools: describe, explore, replay, fork
+determinismo mcp --kernel ... --initrd ... --cache ~/cache   # tools: describe, explore, replay, fork, query, events, causality, mutate
 ```
 
 Multiverse debugging: stop a branch at a moment and run a command there (output streams back,

@@ -71,8 +71,8 @@ in ANTITHESIS.md yet.
    patch each; determinismo explores each mutant and reports per property whether it was
    falsified, with why not when it was not: the mutated code never ran (coverage), or it ran and
    no property noticed (a gap in the properties). `determinismo mutate` (patches to a node's
-   build, caught / never ran / unnoticed), its e2e check and the determinismo-mutants skill are
-   done. Left: an MCP tool.
+   build, caught / never ran / unnoticed), its e2e check, the MCP tool and the
+   determinismo-mutants skill are done.
 
 ## Strategy guidance (next)
 
