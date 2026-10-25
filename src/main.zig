@@ -23,6 +23,7 @@ const query = @import("query.zig");
 const causality = @import("causality.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
+const profiler = @import("profile.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -37,6 +38,7 @@ const usage =
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
+    \\                            [--cpu-modulation]   (branches run at varying speeds)
     \\                            [--events-dir <dir>]   (every branch's events, for query)
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
@@ -49,6 +51,9 @@ const usage =
     \\       determinismo inject  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --from <local file> [--mode <octal>]
     \\                            [--then '<command>'] [--continue]
+    \\       determinismo profile <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
+    \\                            --node <node> [--ms <duration>] [--interval-us <us>] [--all]
+    \\                            [--pid <pid>] [--svg <flame graph.svg>] [--folded <file>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -111,6 +116,7 @@ const Arguments = struct {
     from_exec: ?[]const u8 = null,
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    cpu_modulation: bool = false,
     /// This host runs the branches whose index modulo `shard_count` is `shard_index`
     /// (`--shard k/n`); `determinismo merge` combines the shards' records.
     shard_index: u32 = 0,
@@ -202,6 +208,8 @@ fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8
         extract.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "inject"))
         extract.inject_run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "profile"))
+        profiler.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "query"))
         query.run(arena, io, rest)
     else if (eql(u8, name, "events"))
@@ -258,6 +266,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .until = arguments.until,
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
         .builtin_properties = has_system,
+        .cpu_modulation = arguments.cpu_modulation,
     };
     const context = Context{
         .arena = arena,
@@ -934,6 +943,7 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     hasher.update(options.cmdline);
     hasher.update(std.mem.asBytes(&options.timer_slack_ns)); // Where timer interrupts land.
     hasher.update(std.mem.asBytes(&options.branch_event)); // What time is made of.
+    if (options.cpu_modulation) hasher.update("cpu-modulation"); // And how fast it runs.
     for (arguments.disk_paths[0..arguments.disk_count]) |path| {
         hasher.update(std.fs.path.basename(path));
     }
@@ -999,6 +1009,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         }
         if (std.mem.eql(u8, argv[index], "--continue")) {
             arguments.moment_continue = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--cpu-modulation")) {
+            arguments.cpu_modulation = true;
             continue;
         }
         if (index + 1 == argv.len) return error.Usage;
@@ -1229,6 +1243,7 @@ test {
     _ = @import("causality.zig");
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
+    _ = @import("profile.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

@@ -148,7 +148,7 @@ pub const Socket = struct {
     /// Delays and drops what leaves through the interface (one direction of a link), with
     /// netem's own randomness seeded by the caller so that it is a platform decision too.
     pub fn netem_set(socket: *Socket, name: []const u8, netem: Netem) !void {
-        assert(netem.loss_percent <= 100);
+        assert(netem.loss_ppm <= Netem.ppm);
         var message: Message = .init(rtm_newqdisc, flag_create | flag_replace);
         message.append_bytes(&try socket.tcmsg(name));
         message.attribute(tca_kind, "netem\x00");
@@ -157,7 +157,7 @@ pub const Socket = struct {
         // in the legacy unit are superseded by the 64-bit nanosecond attributes below).
         var qopt: [24]u8 = @splat(0);
         std.mem.writeInt(u32, qopt[4..8], netem_limit_packets, .little);
-        std.mem.writeInt(u32, qopt[8..12], probability(netem.loss_percent), .little);
+        std.mem.writeInt(u32, qopt[8..12], probability_ppm(netem.loss_ppm), .little);
         std.mem.writeInt(u32, qopt[16..20], probability(netem.duplicate_percent), .little);
         message.append_bytes(&qopt);
         // struct tc_netem_reorder and tc_netem_corrupt: probability, correlation.
@@ -251,9 +251,12 @@ pub const Socket = struct {
 };
 
 pub const Netem = struct {
+    pub const ppm = 1_000_000;
+
     delay_ns: u64,
     jitter_ns: u64 = 0,
-    loss_percent: u8 = 0,
+    /// Packets dropped, in parts per million (a baseline drops a few in ten thousand).
+    loss_ppm: u32 = 0,
     duplicate_percent: u8 = 0,
     corrupt_percent: u8 = 0,
     /// Packets sent at once instead of delayed (needs a delay to reorder against).
@@ -266,7 +269,12 @@ pub const Netem = struct {
 /// netem's probabilities are fractions of 2^32 - 1.
 fn probability(percent: u8) u32 {
     assert(percent <= 100);
-    const scaled = @as(u64, std.math.maxInt(u32)) * percent / 100;
+    return probability_ppm(@as(u32, percent) * (Netem.ppm / 100));
+}
+
+fn probability_ppm(parts: u32) u32 {
+    assert(parts <= Netem.ppm);
+    const scaled = @as(u64, std.math.maxInt(u32)) * parts / Netem.ppm;
     return @intCast(scaled);
 }
 

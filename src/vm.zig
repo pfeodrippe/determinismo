@@ -65,6 +65,8 @@ target_is_moment: bool,
 deterministic: bool,
 builtin_properties: bool,
 tsc_per_branch: u32,
+/// CPU modulation, in branches only (Options.cpu_modulation).
+modulation: ?Modulation,
 timer_slack_tsc: u64,
 serial: Serial,
 rtc: RTC,
@@ -125,7 +127,26 @@ pub const Options = struct {
     disks: []const Disk = &.{},
     /// The guest runs determinismo's runtime: check the built-in properties when a timeline ends.
     builtin_properties: bool = false,
+    /// Antithesis's CPU modulation: branches run slower for stretches of virtual time, each
+    /// stretch's speed a decision, so preemption lands at other points of the code.
+    cpu_modulation: bool = false,
 };
+
+/// The machine runs `slowdown_permille` thousandths slower than its base rate (each branch
+/// takes that much more virtual time) until `change_tsc`, when the next speed is drawn. The extra
+/// time is added at exits the guest's execution decides (I/O, stops, halts), never at a host
+/// interrupt, so that the guest reads the same clock on every replay.
+const Modulation = struct {
+    slowdown_permille: u32 = 0,
+    /// Branches whose extra time is added.
+    branches: u64 = 0,
+    /// Extra time not yet added, in thousandths of a tick.
+    remainder: u64 = 0,
+    change_tsc: u64 = 0,
+};
+const modulation_permille_max = 1000; // Twice as slow at most.
+const modulation_stretch_ns_min = 10 * std.time.ns_per_ms;
+const modulation_stretch_ns_max = 200 * std.time.ns_per_ms;
 
 /// A read-only disk image, open for the whole process (branches share it).
 pub const Disk = struct { fd: linux.fd_t, size: u64 };
@@ -198,6 +219,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     try vm.init_vcpu();
     try snapshot.restore(vm);
     try vm.det_enable(options, .{ .tsc_base = snapshot.tsc });
+    if (options.cpu_modulation) vm.modulation = .{};
     vm.events.log_fd = options.events_fd;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
     assert(vm.branches_offset == snapshot.branches);
@@ -244,6 +266,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
         .tsc_per_branch = options.tsc_per_branch,
+        .modulation = null,
         .timer_slack_tsc = options.timer_slack_ns * tsc_per_ns,
         .serial = .{},
         .rtc = .{ .epoch_seconds = options.epoch_seconds },
@@ -419,6 +442,10 @@ fn run_loop(vm: *VM) !Outcome {
             else => return err,
         };
         switch (vm.run.exit_reason) {
+            .io, .mmio, .det_target, .hlt => try vm.modulate(),
+            else => {},
+        }
+        switch (vm.run.exit_reason) {
             .io => {
                 if (try vm.handle_io()) |outcome| return outcome;
                 try vm.timer_due();
@@ -506,12 +533,47 @@ fn timer_arm(vm: *VM) !void {
     }
     const slack_tsc = if (deadline.is_moment) 0 else vm.timer_slack_tsc;
     const hard_tsc = deadline.tsc + slack_tsc;
-    const branches_left = std.math.divCeil(u64, hard_tsc - state.tsc, vm.tsc_per_branch) catch
+    // With CPU modulation a branch takes more virtual time than the guest's clock shows until
+    // the next exit adds it: count branches at the modulated rate, and place the soft stop
+    // where the clock reads the deadline once the extra time is added.
+    const permille: u64 = 1000 + if (vm.modulation) |m| m.slowdown_permille else 0;
+    const per_branch = @as(u64, vm.tsc_per_branch) * permille;
+    const branches_left = std.math.divCeil(u64, (hard_tsc - state.tsc) * 1000, per_branch) catch
         unreachable;
     assert(branches_left > 0);
     vm.target_is_moment = deadline.is_moment;
     try vm.target_set(state.branches + branches_left);
-    if (!deadline.is_moment and slack_tsc > 0) try vm.soft_set(deadline.tsc);
+    if (!deadline.is_moment and slack_tsc > 0) {
+        try vm.soft_set(state.tsc + (deadline.tsc - state.tsc) * 1000 / permille);
+    }
+}
+
+/// Adds the extra virtual time of the branches run since the last exit, and at the end of a
+/// stretch draws the next speed (a stop armed at the old speed is re-armed).
+fn modulate(vm: *VM) !void {
+    const modulation = if (vm.modulation) |*m| m else return;
+    const state = try vm.det_state();
+    assert(state.branches >= modulation.branches);
+    const owed = (state.branches - modulation.branches) * vm.tsc_per_branch *
+        modulation.slowdown_permille + modulation.remainder;
+    modulation.branches = state.branches;
+    modulation.remainder = owed % 1000;
+    var extra_tsc = owed / 1000;
+    if (extra_tsc > 0) _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&extra_tsc));
+    const tsc = state.tsc + extra_tsc;
+    if (tsc < modulation.change_tsc) return;
+    var draw: [8]u8 = undefined;
+    try vm.decide_random(&draw, "cpu-modulation");
+    const value = std.mem.readInt(u64, &draw, .little);
+    // A quarter of the stretches at full speed.
+    modulation.slowdown_permille = if (value % 4 == 0)
+        0
+    else
+        @intCast((value >> 2) % (modulation_permille_max + 1));
+    const stretch_ns = modulation_stretch_ns_min +
+        (value >> 16) % (modulation_stretch_ns_max - modulation_stretch_ns_min);
+    modulation.change_tsc = tsc + stretch_ns * tsc_per_ns;
+    if (vm.target_branches != 0) try vm.target_set(0);
 }
 
 /// The moment arrived: end the run there, or push the command to the guest agent and keep

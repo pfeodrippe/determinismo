@@ -238,6 +238,8 @@ const RunRequest = struct {
     strategy: ?[]const u8 = null,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
+    /// Branches at varying CPU speeds (and so their replays too).
+    cpu_modulation: bool = false,
 };
 
 fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
@@ -584,6 +586,7 @@ fn system_arguments(
     if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
     if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
+    if (asked.cpu_modulation) try argv.append(arena, "--cpu-modulation");
 }
 
 fn run_find(server: *Server, id: u32) ?*Run {

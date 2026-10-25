@@ -6,15 +6,18 @@
 //!   det-nodes pause|resume <node>     freeze or thaw all its processes
 //!   det-nodes link <a> <b> up|down    the link between two nodes (or a node and "runner")
 //!   det-nodes exec <node> <command>...   run a command inside a node; exits with its status
+//!   det-nodes list                    the nodes now: name, state, pid, address, image (JSON lines)
 const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
+const schema = @import("determinismo").schema;
 
 const usage =
     \\usage: det-nodes up
     \\       det-nodes start|kill|pause|resume <node>
     \\       det-nodes link <a> <b> up|down
     \\       det-nodes exec <node> <command>...
+    \\       det-nodes list
     \\
 ;
 
@@ -32,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
         return nodes.link_set(&system, arguments[2], arguments[3], if (up) .up else .down);
     }
     if (eql(u8, command, "up")) return nodes.up(arena, &system);
+    if (eql(u8, command, "list")) return list(arena, &system);
     if (eql(u8, command, "exec")) {
         if (arguments.len < 4) return usage_exit();
         const node = system.node(arguments[2]) orelse return error.UnknownNode;
@@ -49,6 +53,29 @@ pub fn main(init: std.process.Init) !void {
     if (eql(u8, command, "pause")) return nodes.freeze(name, .frozen);
     if (eql(u8, command, "resume")) return nodes.freeze(name, .thawed);
     return usage_exit();
+}
+
+/// Antithesis's containers.list, at the moment it runs.
+fn list(arena: std.mem.Allocator, system: *const schema.System) !void {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (system.nodes) |node| {
+        const pid = nodes.pid_recorded(node.name);
+        try std.json.Stringify.value(.{
+            .name = node.name,
+            .state = @tagName(nodes.state_of(node.name)),
+            .pid = pid,
+            .address = node.address,
+            .image = node.digest,
+        }, .{}, &out.writer);
+        try out.writer.writeByte('\n');
+    }
+    const text = out.written();
+    var written: usize = 0;
+    while (written < text.len) {
+        const result = std.os.linux.write(1, text[written..].ptr, text.len - written);
+        if (std.os.linux.errno(result) != .SUCCESS) return error.Write;
+        written += result;
+    }
 }
 
 fn usage_exit() noreturn {

@@ -66,6 +66,13 @@ const threads_max = 1024;
 const Degradation = enum { delay_loss, duplicate, corrupt, reorder, congestion };
 const degrade_delay_ns_max = 200 * std.time.ns_per_ms;
 const degrade_loss_percent_max = 30;
+/// The network's normal variation, on every link that allows degradation, for the whole run
+/// (Antithesis's baseline latency): a small delay with jitter and a rare drop.
+const baseline_delay_ns_min = 100 * std.time.ns_per_us;
+const baseline_delay_ns_max = 2 * std.time.ns_per_ms;
+const baseline_loss_ppm_max = 1000;
+/// Drawn once per timeline; links return to it when a fault on them ends.
+var baseline: ?nodes.Netem = null;
 
 const Fault = struct {
     kind: Kind,
@@ -110,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
 
     control_open();
     sdk.event("faults_start", .{ .faults = count });
+    baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
     var injections: u32 = 0;
     while (injections < injections_max) : (injections += 1) {
@@ -341,7 +349,9 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
             nodes.start(arena, system, node) catch |err| {
                 const details = .{ .node = applied.node, .err = @errorName(err) };
                 sdk.event("fault_restart_failed", details);
+                return;
             };
+            baseline_links(system, applied.node); // Its links are new.
         },
         .throttle => {
             nodes.cpu_limit(applied.node, applied.cpu_percent) catch return;
@@ -407,7 +417,7 @@ fn apply_thread_pause(applied: *const Applied) void {
     if (count == 0) return;
     const pid = pids[applied.process_index % count];
     var tids: [threads_max]linux.pid_t = undefined;
-    const threads = threads_list(pid, &tids);
+    const threads = nodes.threads(pid, &tids);
     if (threads == 0) return;
     const tid = tids[applied.thread_index % threads];
     if (linux.errno(linux.ptrace(linux.PTRACE.SEIZE, tid, 0, 0, 0)) != .SUCCESS) return;
@@ -417,33 +427,6 @@ fn apply_thread_pause(applied: *const Applied) void {
     _ = linux.wait4(tid, &status, wait_all, null); // Stopped.
     sdk.event("fault", applied.*);
     sleep_ns(applied.duration_ns);
-}
-
-/// The threads of a process, in /proc's order (by id).
-fn threads_list(pid: linux.pid_t, tids: *[threads_max]linux.pid_t) u32 {
-    var path_buffer: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/task", .{pid}, 0) catch return 0;
-    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
-    const fd = linux.open(path, flags, 0);
-    if (linux.errno(fd) != .SUCCESS) return 0;
-    defer _ = linux.close(@intCast(fd));
-    var count: u32 = 0;
-    var entries: [4096]u8 align(8) = undefined;
-    while (true) {
-        const size = linux.getdents64(@intCast(fd), &entries, entries.len);
-        if (linux.errno(size) != .SUCCESS or size == 0) return count;
-        var offset: usize = 0;
-        while (offset < size) {
-            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[offset]);
-            const name_offset = offset + @offsetOf(linux.dirent64, "name");
-            offset += entry.reclen;
-            const name: [*:0]const u8 = @ptrCast(&entries[name_offset]);
-            const tid = std.fmt.parseInt(linux.pid_t, std.mem.span(name), 10) catch continue;
-            if (count == threads_max) return count;
-            tids[count] = tid;
-            count += 1;
-        }
-    }
 }
 
 /// A crash: one of the node's processes other than its main one (a worker, a pod's process)
@@ -514,7 +497,7 @@ fn apply_disruption(system: *const schema.System, applied: *const Applied) void 
     };
     const netem = nodes.Netem{
         .delay_ns = delay_ns,
-        .loss_percent = if (applied.disruption.? == .stopped) 100 else 0,
+        .loss_ppm = if (applied.disruption.? == .stopped) nodes.Netem.ppm else 0,
         .seed = applied.duration_ns,
     };
     for (links[0..count]) |link| nodes.link_degrade(link.from, link.to, netem) catch {};
@@ -527,7 +510,7 @@ fn apply_disruption(system: *const schema.System, applied: *const Applied) void 
         for (links[0..count]) |link| nodes.link_degrade(link.from, link.to, release) catch {};
         sleep_through_ns(10 * std.time.ns_per_ms);
     }
-    for (links[0..count]) |link| nodes.link_degrade(link.from, link.to, null) catch {};
+    for (links[0..count]) |link| link_rest(system, link.from, link.to);
 }
 
 fn apply_link(system: *const schema.System, applied: *const Applied) void {
@@ -549,10 +532,56 @@ fn apply_link(system: *const schema.System, applied: *const Applied) void {
             nodes.link_degrade(applied.node, applied.peer, netem) catch return;
             sdk.event("fault", applied.*);
             sleep_ns(applied.duration_ns);
-            nodes.link_degrade(applied.node, applied.peer, null) catch {};
+            link_rest(system, applied.node, applied.peer);
         },
         else => unreachable,
     }
+}
+
+/// Draws the baseline and puts it on every link whose ends allow degradation (none: no
+/// baseline).
+fn baseline_start(system: *const schema.System) void {
+    var any = false;
+    for (system.nodes) |node| any = any or node.faults.degrade;
+    if (!any) return;
+    const delay_ns = baseline_delay_ns_min +
+        sdk.random_below(baseline_delay_ns_max - baseline_delay_ns_min);
+    baseline = .{
+        .delay_ns = delay_ns,
+        .jitter_ns = sdk.random_below(delay_ns / 2),
+        .loss_ppm = @intCast(sdk.random_below(baseline_loss_ppm_max + 1)),
+        .seed = sdk.random_u64(),
+    };
+    for (system.nodes) |node| baseline_links(system, node.name);
+    sdk.event("network_baseline", .{
+        .delay_ns = baseline.?.delay_ns,
+        .jitter_ns = baseline.?.jitter_ns,
+        .loss_ppm = baseline.?.loss_ppm,
+    });
+}
+
+/// The baseline on both directions of every link of the node (to the runner and the others).
+fn baseline_links(system: *const schema.System, name: []const u8) void {
+    if (baseline == null) return;
+    link_rest(system, name, schema.runner_name);
+    link_rest(system, schema.runner_name, name);
+    for (system.nodes) |peer| {
+        if (std.mem.eql(u8, peer.name, name)) continue;
+        link_rest(system, name, peer.name);
+        link_rest(system, peer.name, name);
+    }
+}
+
+/// A link with no fault on it: the baseline where both ends allow degradation, else nothing.
+fn link_rest(system: *const schema.System, from: []const u8, to: []const u8) void {
+    const settings = if (degradable(system, from) and degradable(system, to)) baseline else null;
+    nodes.link_degrade(from, to, settings) catch {};
+}
+
+fn degradable(system: *const schema.System, name: []const u8) bool {
+    if (std.mem.eql(u8, name, schema.runner_name)) return true;
+    const node = system.node(name) orelse return false;
+    return node.faults.degrade;
 }
 
 /// netem settings for one flavor of degradation, every parameter a platform decision.
@@ -564,7 +593,8 @@ fn degradation(flavor: Degradation) nodes.Netem {
     switch (flavor) {
         .delay_loss => {
             netem.jitter_ns = sdk.random_below(degrade_delay_ns_max / 4);
-            netem.loss_percent = @intCast(sdk.random_below(degrade_loss_percent_max + 1));
+            const percent = sdk.random_below(degrade_loss_percent_max + 1);
+            netem.loss_ppm = @intCast(percent * (nodes.Netem.ppm / 100));
         },
         .duplicate => netem.duplicate_percent = @intCast(1 + sdk.random_below(30)),
         .corrupt => netem.corrupt_percent = @intCast(1 + sdk.random_below(10)),
@@ -652,13 +682,16 @@ fn requests_read() u32 {
     if (linux.errno(size) != .SUCCESS) return 0;
     const count: u32 = @intCast(size / @sizeOf(u64));
     const now_ns = monotonic_ns();
-    var longest_ns: u64 = 0;
     for (requests[0..count]) |request| {
-        longest_ns = @max(longest_ns, std.mem.littleToNative(u64, request));
-    }
-    if (count > 0) {
-        quiet_until_ns = @max(quiet_until_ns, now_ns + longest_ns);
-        sdk.event("faults_quiet", .{ .duration_ns = longest_ns, .until_ns = quiet_until_ns });
+        const duration_ns = std.mem.littleToNative(u64, request);
+        if (duration_ns == 0) {
+            // A zero-length request ends the quiet period (Antithesis's unpause).
+            quiet_until_ns = 0;
+            sdk.event("faults_resume", .{});
+            continue;
+        }
+        quiet_until_ns = @max(quiet_until_ns, now_ns + duration_ns);
+        sdk.event("faults_quiet", .{ .duration_ns = duration_ns, .until_ns = quiet_until_ns });
     }
     return count;
 }

@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     assert(linux.getpid() == 1);
     const arena = init.arena.allocator();
     system_mount();
+    cores_setup();
     var cmdline_buffer: [cmdline_size_max]u8 = undefined;
     const cmdline = read_cmdline(&cmdline_buffer);
     for (modules) |module| module_load(module, cmdline);
@@ -111,6 +112,16 @@ fn system_mount() void {
     defer socket.close();
     socket.link_set("lo", .up) catch {};
     _ = linux.syscall2(.sethostname, @intFromPtr("runner"), "runner".len);
+}
+
+/// Core dumps of any process, in any node, go to det-core (cores.zig), which keeps them in
+/// /run/det/cores for `determinismo extract --file runner:/run/det/cores/...`.
+fn cores_setup() void {
+    nodes.mkdir_all("/run/det/cores") catch {};
+    const pattern = "|" ++ bin ++ "det-core %P %e %s";
+    nodes.file_write("/proc/sys/kernel/core_pattern", pattern) catch |err| {
+        std.debug.print("[guest] core_pattern: {s}\n", .{@errorName(err)});
+    };
 }
 
 /// Loads a module with its `<module>.<parameter>=` words from the kernel command line (what

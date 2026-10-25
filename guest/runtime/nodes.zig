@@ -22,7 +22,7 @@ pub const system_path = "/det/system.json";
 const state_root = "/run/det/nodes";
 const cgroup_root = "/sys/fs/cgroup/nodes";
 const system_size_max = 1 << 20;
-const path_size_max = 256;
+pub const path_size_max = 256;
 const arguments_max = 64;
 const environment_max = 128;
 /// The quiet-period command (det-stop-faults), at the same path in the runner and every node,
@@ -231,6 +231,33 @@ pub fn processes(name: []const u8, pids: []linux.pid_t) !u32 {
     return count;
 }
 
+/// The threads of a process, in /proc's order (by id), as many as fit.
+pub fn threads(pid: linux.pid_t, tids: []linux.pid_t) u32 {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/task", .{pid}, 0) catch return 0;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0;
+    defer _ = linux.close(@intCast(fd));
+    var count: u32 = 0;
+    var entries: [4096]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(@intCast(fd), &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) return count;
+        var offset: usize = 0;
+        while (offset < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[offset]);
+            const name_offset = offset + @offsetOf(linux.dirent64, "name");
+            offset += entry.reclen;
+            const name: [*:0]const u8 = @ptrCast(&entries[name_offset]);
+            const tid = std.fmt.parseInt(linux.pid_t, std.mem.span(name), 10) catch continue;
+            if (count == tids.len) return count;
+            tids[count] = tid;
+            count += 1;
+        }
+    }
+}
+
 /// Nodes that run containers (K3s) put their processes in cgroups of their own, under the
 /// node's: the whole subtree, depth first.
 const cgroup_depth_max = 8;
@@ -276,6 +303,18 @@ pub fn freeze(name: []const u8, state: enum { frozen, thawed }) !void {
     var paths: Paths = undefined;
     try paths.init(name);
     try file_write(paths.cgroup_freeze, if (state == .frozen) "1" else "0");
+}
+
+pub const State = enum { running, paused, stopped };
+
+/// Whether the node runs, is frozen, or has no live main process.
+pub fn state_of(name: []const u8) State {
+    if (pid_read(name) == null) return .stopped;
+    var paths: Paths = undefined;
+    paths.init(name) catch return .stopped;
+    var buffer: [8]u8 = undefined;
+    const frozen = read_small(paths.cgroup_freeze, &buffer) orelse "0";
+    return if (std.mem.startsWith(u8, frozen, "1")) .paused else .running;
 }
 
 /// The link between `a` and `b` (either may be the runner) goes up or down on both ends.

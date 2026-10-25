@@ -90,7 +90,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "compose", check_compose },               .{ "shards", check_shards },
         .{ "stress", check_stress },                 .{ "controller", check_controller },
         .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
-        .{ "script", check_script },
+        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -469,6 +470,42 @@ fn check_until_and_causality(context: *Context) !void {
     try check_rewind(context, &system, violation);
 }
 
+/// The profiler at a moment of the self-test's echo node (a static Zig binary, with symbols):
+/// samples, named functions, and the same profile twice.
+fn check_profile(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "steady", "--seed", "1" };
+    var folded: [2][]const u8 = undefined;
+    for (&folded, 0..) |*text, run| {
+        const name = try std.fmt.allocPrint(arena, "profile-{d}.folded", .{run});
+        const path = try std.fs.path.join(arena, &.{ context.scratch, name });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ context.determinismo, "profile" });
+        try argv.appendSlice(arena, context.machine);
+        try argv.appendSlice(arena, &system);
+        try argv.appendSlice(arena, &.{ "--branch", "0", "--at-vtime-ms", "1050" });
+        try argv.appendSlice(arena, &.{ "--node", "echo", "--ms", "100", "--all" });
+        try argv.appendSlice(arena, &.{ "--folded", path });
+        _ = try std.process.run(arena, context.io, .{ .argv = argv.items });
+        const cwd = std.Io.Dir.cwd();
+        text.* = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 22)) catch "";
+    }
+    const samples = number_after(folded[0], "# det-profile: ") orelse 0;
+    // Some stack ends in a named function, not an address.
+    var named = false;
+    var lines = std.mem.tokenizeScalar(u8, folded[0], '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        const end = std.mem.lastIndexOfScalar(u8, line, ' ') orelse continue;
+        const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ';') orelse continue) + 1;
+        named = named or std.mem.indexOf(u8, line[start..end], "0x") == null;
+    }
+    const same = std.mem.eql(u8, folded[0], folded[1]);
+    expect(context, samples > 0 and named and same, "profile: {d} samples of a node at a " ++
+        "moment, functions named, the same twice", .{samples});
+}
+
 /// Rewind: 5 ms of virtual time before the first violation, where it has not happened yet.
 fn check_rewind(context: *Context, system: []const []const u8, violation: []const u8) !void {
     var extra: std.ArrayList([]const u8) = .empty;
@@ -562,6 +599,7 @@ fn check_network_faults(context: *Context) !void {
     const groups = try query_count(context, &.{ events, partition });
     const clogs = try query_count(context, &.{ events, "event=fault details.kind=clog" });
     const threads = try query_count(context, &.{ events, "event=fault details.kind=thread_pause" });
+    const baselines = try query_count(context, &.{ events, "event=network_baseline" });
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{
         context.determinismo, "query",  events, "event=fault details.kind=partition_groups",
@@ -584,9 +622,11 @@ fn check_network_faults(context: *Context) !void {
         }
         same = std.mem.eql(u8, hashes[0].events_hash, hashes[1].events_hash);
     }
-    const all = groups > 0 and clogs > 0 and threads > 0 and same;
-    expect(context, all, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses; a " ++
-        "branch with a partition replays exactly", .{ groups, clogs, threads });
+    const all = groups > 0 and clogs > 0 and threads > 0 and baselines == 64 and same;
+    expect(context, all, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses, " ++
+        "{d} network baselines; a branch with a partition replays exactly", .{
+        groups, clogs, threads, baselines,
+    });
 }
 
 /// How many events `determinismo query` finds (its --count line).
@@ -702,6 +742,83 @@ fn check_builtin_properties(context: *Context) !void {
     });
     const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
     expect(context, crash_caught, "built-in properties catch a crash (SIGSEGV) in a node", .{});
+    try check_core_dump(context, program);
+}
+
+/// The crash leaves a core dump, which `extract` takes out of the runner at a later moment.
+fn check_core_dump(context: *Context, program: []const u8) !void {
+    const arena = context.arena;
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "crash.jsonl" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "crash", "--seed", "1" };
+    _ = try explore(context, &(system ++ [_][]const u8{ "--branch", "0", "--events", events }));
+    const cwd = std.Io.Dir.cwd();
+    const log = cwd.readFileAlloc(context.io, events, arena, .limited(1 << 24)) catch "";
+    const key = "\"event\":\"core_dump\"";
+    const at = std.mem.indexOf(u8, log, key) orelse {
+        expect(context, false, "core dump: a crash leaves one", .{});
+        return;
+    };
+    const path_key = "\"path\":\"";
+    const path_start = (std.mem.indexOfPos(u8, log, at, path_key) orelse at) + path_key.len;
+    const path_end = std.mem.indexOfScalarPos(u8, log, path_start, '"') orelse path_start;
+    const core_path = log[path_start..path_end];
+    const local = try std.fs.path.join(arena, &.{ context.scratch, "core" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "extract" });
+    try argv.appendSlice(arena, context.machine);
+    try argv.appendSlice(arena, &system);
+    const file = try std.fmt.allocPrint(arena, "runner:{s}", .{core_path});
+    try argv.appendSlice(arena, &.{ "--branch", "0", "--until", "event=core_dump" });
+    try argv.appendSlice(arena, &.{ "--file", file, "--to", local });
+    _ = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const core = cwd.readFileAlloc(context.io, local, arena, .limited(1 << 28)) catch "";
+    const elf = core.len > 4 and std.mem.eql(u8, core[0..4], "\x7fELF");
+    expect(context, elf, "core dump: {s}, {d} bytes, an ELF core, extracted at a moment", .{
+        core_path, core.len,
+    });
+}
+
+/// CPU modulation: the same seed's timelines change (preemption lands elsewhere), the bug is
+/// still found, and a modulated branch replays exactly.
+fn check_cpu_modulation(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "7" };
+    const plain = try explore(context, &(system ++ [_][]const u8{ "--branches", "8" }));
+    const modulated = try explore(context, &(system ++ [_][]const u8{
+        "--branches", "8", "--cpu-modulation",
+    }));
+    var before: [8]Branch = undefined;
+    var after: [8]Branch = undefined;
+    const count = parse_branches(plain, &before);
+    const count_modulated = parse_branches(modulated, &after);
+    // Workers finish in any order: branches pair by index.
+    var changed: u32 = 0;
+    var third: []const u8 = "";
+    for (after[0..count_modulated]) |b| {
+        if (b.index == 3) third = b.events_hash;
+        for (before[0..count]) |a| {
+            if (a.index != b.index) continue;
+            changed += @intFromBool(!std.mem.eql(u8, a.events_hash, b.events_hash));
+        }
+    }
+    const failing = std.mem.indexOf(u8, modulated, "failing=1") != null;
+    var replays: [2]Branch = undefined;
+    for (&replays) |*replay| {
+        const report = try explore(context, &(system ++ [_][]const u8{
+            "--branch", "3", "--cpu-modulation",
+        }));
+        var one: [1]Branch = undefined;
+        replay.* = if (parse_branches(report, &one) == 1) one[0] else .{
+            .index = 0,
+            .events_hash = "",
+            .failing = false,
+        };
+    }
+    const exact = count_modulated == 8 and third.len > 0 and
+        std.mem.eql(u8, replays[0].events_hash, third) and
+        std.mem.eql(u8, replays[1].events_hash, third);
+    expect(context, changed > 0 and failing and exact, "cpu modulation: {d} of {d} timelines " ++
+        "change, the bug is found, branch 3 replays exactly", .{ changed, count });
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

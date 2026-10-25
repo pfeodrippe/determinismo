@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! det-stop-faults <seconds>: a quiet period, as Antithesis's ANTITHESIS_STOP_FAULTS. Faults
 //! stop (the one under way is undone) for that long, except clock skips; overlapping requests
-//! merge into the longest. Every node and command finds it in $DETERMINISMO_STOP_FAULTS (and
-//! $ANTITHESIS_STOP_FAULTS). Without a running fault injector it does nothing.
+//! merge into the longest, and 0 ends the quiet period now. Every node and command finds it in
+//! $DETERMINISMO_STOP_FAULTS (and $ANTITHESIS_STOP_FAULTS). Without a running fault injector
+//! it does nothing.
 const std = @import("std");
 const linux = std.os.linux;
 

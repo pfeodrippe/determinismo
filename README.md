@@ -36,9 +36,11 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   jammed) and restart nodes; delay, loss, duplication,
   corruption, reordering and congestion per link direction; CPU throttling; process and thread
   pauses; process kills (a crash for a supervisor or kubelet to recover from); clock skips, some
-  permanent; custom faults (your programs, run in a node at random times); quiet periods
-  requested from any node or command (`$DETERMINISMO_STOP_FAULTS <seconds>`, or the Antithesis
-  name `$ANTITHESIS_STOP_FAULTS`).
+  permanent; custom faults (your programs, run in a node at random times); a baseline of
+  latency, jitter and rare drops on every link, always on; CPU modulation (`--cpu-modulation`:
+  stretches of a slower machine, so preemption lands elsewhere); quiet periods requested from
+  any node or command (`$DETERMINISMO_STOP_FAULTS <seconds>`, or the Antithesis name
+  `$ANTITHESIS_STOP_FAULTS`; 0 ends one).
 - **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
   that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
   scripts that carry a failure's shape to new seeds and new builds.
@@ -49,7 +51,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   inside a node at an exact moment;
   let the branch continue after a change (`--continue`), or explore futures of a changed system
   (`--from-exec`), e.g. a function redefined through a service's REPL; take a node's file out at
-  any moment (`determinismo extract`) or put one in (`determinismo inject`).
+  any moment (`determinismo extract`) or put one in (`determinismo inject`); profile a node from
+  a moment on (`determinismo profile`: the functions with the most samples and a flame graph,
+  the same on every replay); list the nodes there (`det-nodes list`); a crash's core dump is
+  kept (`core_dump` event) for `extract --file runner:/run/det/cores/...` and gdb.
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
   event and decision) and code coverage (C and Zig edges, Python and JVM lines); `mutate` keeps
   timelines that reach something new and changes the decisions of the process that got there

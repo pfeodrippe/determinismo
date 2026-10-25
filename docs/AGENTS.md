@@ -43,7 +43,11 @@ with `determinismo query` and `determinismo events`, or the HTTP API (`determini
    setting, a function redefined through a REPL) and lets the branch play out; `fork` with
    `exec` explores many futures of the changed system. `determinismo extract` takes a node's
    file out at a moment (a data file, a core dump); `determinismo inject` puts a local file in
-   (a patched binary, a config), then `--then` and `--continue`.
+   (a patched binary, a config), then `--then` and `--continue`. `determinismo profile --node
+   <node> --ms <duration>` samples where the node spends its CPU from the moment on (`--all`
+   for waiting threads too, `--svg` for a flame graph); `det-nodes list` at a moment lists the
+   nodes, their state and pid. A crashed process leaves a `core_dump` event whose `path`
+   `determinismo extract --file runner:<path>` takes out (for gdb with the binary).
 7. **Fix and verify**: change the code, explore again with the same seed and more branches; the
    property should pass in all of them. A replay of an old failing branch is not proof (the
    inputs changed, so it is a different timeline); exploration is.
@@ -58,7 +62,11 @@ with `determinismo query` and `determinismo events`, or the HTTP API (`determini
 - Faults happen only during the driver phase; `finally` and `eventually` commands see a system
   without faults, which is where recovery is checked. Within it, any node or command can ask for
   a quiet period: `"$DETERMINISMO_STOP_FAULTS" 5` (also `$ANTITHESIS_STOP_FAULTS`): the fault
-  under way ends and none but clock skips start for 5 seconds.
+  under way ends and none but clock skips start for 5 seconds (`0` ends a quiet period). Every
+  link that allows degradation carries a baseline (a small delay with jitter, rare drops) for
+  the whole run, as Antithesis's baseline latency; faults end by returning links to it.
+  `--cpu-modulation` (MCP and HTTP `cpu_modulation`) makes branches run at varying speeds: other
+  interleavings of the same seed; pass it to replays of such a run too (tapes refuse without).
 - Exit status of explore: 0 every property passed, 3 some failed, anything else an error.
 - Built-in properties come with every system (Antithesis's defaults): nodes do not exit
   unexpectedly (0, SIGKILL and SIGTERM are expected), the guest finishes its scenario, no process

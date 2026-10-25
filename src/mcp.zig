@@ -29,6 +29,7 @@ const Arguments = struct {
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
+    cpu_modulation: bool = false,
     branches: u32 = 16,
     branch: ?u32 = null,
     at_vtime_ms: ?u64 = null,
@@ -133,6 +134,7 @@ fn tool_call(
     if (arguments.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (arguments.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
     try argv.appendSlice(arena, &.{ "--seed", try number(arena, arguments.seed) });
+    if (arguments.cpu_modulation) try argv.append(arena, "--cpu-modulation");
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     if (arguments.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
     if (eql(u8, name, "replay")) {

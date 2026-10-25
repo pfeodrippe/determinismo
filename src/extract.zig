@@ -131,6 +131,16 @@ fn target_parse(file: []const u8) !Target {
     return target;
 }
 
+/// The target as the runner's shell names it: through the node's root (what the node sees), or
+/// the runner's own file for "runner" (core dumps are in /run/det/cores).
+fn target_shell(arena: std.mem.Allocator, target: Target) ![]const u8 {
+    if (std.mem.eql(u8, target.node, "runner")) {
+        return std.fmt.allocPrint(arena, "'{s}'", .{target.path});
+    }
+    const format = "'/proc/'$(cat /run/det/nodes/{s}/pid)'/root{s}'";
+    return std.fmt.allocPrint(arena, format, .{ target.node, target.path });
+}
+
 /// The moment's commands, one per line: staging, the chunks, the decode, then `then`.
 fn inject_script(
     arena: std.mem.Allocator,
@@ -149,10 +159,10 @@ fn inject_script(
         const chunk = encoded[offset..@min(encoded.len, offset + inject_chunk_size)];
         try script.print(arena, "printf %s '{s}' >> {s}\n", .{ chunk, inject_staging });
     }
-    const root = "'/proc/'$(cat /run/det/nodes/{s}/pid)'/root{s}'";
-    try script.print(arena, "base64 -d {s} > " ++ root ++ " && chmod {s} " ++ root ++
-        " && rm {s} && echo '[injected]'\n", .{
-        inject_staging, target.node, target.path, mode, target.node, target.path, inject_staging,
+    const path = try target_shell(arena, target);
+    const decode = "base64 -d {s} > {s} && chmod {s} {s} && rm {s} && echo '[injected]'\n";
+    try script.print(arena, decode, .{
+        inject_staging, path, mode, path, inject_staging,
     });
     if (then) |command| {
         if (std.mem.indexOfAny(u8, command, "\n\x00") != null) return error.BadCommand;
@@ -171,25 +181,36 @@ pub fn read(
     file: []const u8,
 ) ![]const u8 {
     const target = try target_parse(file);
-    const format = "base64 -w 0 '/proc/'$(cat /run/det/nodes/{s}/pid)'/root{s}' && echo";
-    const command = try std.fmt.allocPrint(arena, format, .{ target.node, target.path });
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ self, "explore" });
-    try argv.appendSlice(arena, explore_arguments);
-    try argv.appendSlice(arena, &.{ "--exec", command });
-    const result = try std.process.run(arena, io, .{ .argv = argv.items });
-    if (std.mem.indexOf(u8, result.stderr, "{\"event\":\"exec_done\"") == null) {
-        const message = "[determinismo] extract: the command did not finish:\n{s}\n";
-        std.debug.print(message, .{lines_determinismo(arena, result.stderr) catch ""});
-        return error.CommandUnfinished;
-    }
-    const encoded = try exec_output(arena, result.stderr);
+    const path = try target_shell(arena, target);
+    const command = try std.fmt.allocPrint(arena, "base64 -w 0 {s} && echo", .{path});
+    const encoded = try exec_run(arena, io, self, explore_arguments, command);
     const text = std.mem.trim(u8, encoded, " \n");
     if (text.len == 0) return error.NoSuchFile;
     const decoder = std.base64.standard.Decoder;
     const bytes = try arena.alloc(u8, try decoder.calcSizeForSlice(text));
     try decoder.decode(bytes, text);
     return bytes;
+}
+
+/// What `command` prints when run at the moment `explore_arguments` reach.
+pub fn exec_run(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    self: []const u8,
+    explore_arguments: []const []const u8,
+    command: []const u8,
+) ![]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ self, "explore" });
+    try argv.appendSlice(arena, explore_arguments);
+    try argv.appendSlice(arena, &.{ "--exec", command });
+    const result = try std.process.run(arena, io, .{ .argv = argv.items });
+    if (std.mem.indexOf(u8, result.stderr, "{\"event\":\"exec_done\"") == null) {
+        const message = "[determinismo] the command did not finish:\n{s}\n";
+        std.debug.print(message, .{lines_determinismo(arena, result.stderr) catch ""});
+        return error.CommandUnfinished;
+    }
+    return exec_output(arena, result.stderr);
 }
 
 /// determinismo's own lines of an output (why a run ended where it did).

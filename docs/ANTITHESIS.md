@@ -33,11 +33,11 @@ change that moves it.
 |---|---|---|
 | Partitions (stopped, slowed, jammed; groups; asymmetric) | `partition_groups`: the runner and nodes split into 2-3 groups, stopped, slowed or jammed (held, then delivered); single links too, either direction | ✅ |
 | Clogs (a node's inbound/outbound) | `clog`: a node's inbound, outbound or both, stopped, slowed or jammed; isolate (links down) | ✅ |
-| Baseline latency, restore | degrade flavors | 🟡 no always-on baseline, no explicit restore |
+| Baseline latency, restore | `network_baseline`: delay, jitter and drops (ppm) drawn per timeline, on every link that allows degradation, all run long; a fault's end restores the baseline | 🟡 faults do not overlap, so no separate restore event |
 | Node throttling, pause, kill/stop and restart | throttle, pause, restart, process_kill | ✅ |
 | Clock skips | clock_skip, forward or back; a quarter permanent, so they stack | ✅ |
 | Thread pausing | `thread_pause`: one thread stopped (ptrace), the rest of its process running; process_pause too | ✅ |
-| CPU modulation | ❌ | ❌ |
+| CPU modulation | `--cpu-modulation` (CLI, MCP, HTTP): branches run up to twice as slow for stretches of 10-200 ms of virtual time, each speed a decision (a strategy can steer it, tapes replay it), so timer interrupts and preemption land at other points | ✅ (opt-in) |
 | Custom faults | `Faults.custom`: commands in a node the injector runs at random times (they can draw randomness); quiet periods hold them too | ✅ |
 | Pausing faults (quiet periods) | `$DETERMINISMO_STOP_FAULTS <seconds>` (also `$ANTITHESIS_STOP_FAULTS`) in every node and command: the fault under way ends, none but clock skips start, overlapping requests merge to the longest; faults only in the driver phase | ✅ |
 
@@ -80,7 +80,10 @@ change that moves it.
 | Counterfactuals (change something, see if the bug recurs) | `--from-exec` explores futures of a changed system | ✅ |
 | `extract_file` | `determinismo extract` (and HTTP, the UI's "Extract the file" at any moment): a node's file at a moment, exact bytes | ✅ |
 | `inject_file` | `determinismo inject`: a local file into a node at a moment, any size (`--exec-script` runs a moment's commands in order), then `--then` and `--continue` | ✅ |
-| Profiler, core dumps, debuggers (gdb, delve, jdb) | possible through `--exec` with the tools in the image | 🟡 no helpers |
+| Profiler (`profiler.start/stop/report`, flame graph) | `determinismo profile`: det-profile samples a node's threads every interval of virtual time (ptrace, frame pointers, ELF symbols): top functions, folded stacks, an SVG flame graph; the same twice | ✅ |
+| `containers.list`, `fault_injector.pause/unpause` | `det-nodes list` at a moment (name, state, pid, address, image); `det-stop-faults <seconds>` and `det-stop-faults 0` | ✅ |
+| Core dumps | det-core (the kernel's core_pattern) keeps every crashed process's core in `/run/det/cores`, with a `core_dump` event; `extract --file runner:<path>` takes it out | ✅ |
+| Debuggers (gdb, delve, jdb) | through `--exec` with the tools in the image, at any moment | 🟡 no helpers |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
 | Notebook | web UI (logs, search, run a command at a moment), MCP tools, HTTP API, CLI | 🟡 no scripting notebook |
 | Snouty CLI for agents (runs, properties, search, exec, debug) | CLI, MCP (`describe`, `explore`, `replay`, `fork`, `query`) | ✅ |
