@@ -5,6 +5,7 @@
 ;; Protocol (one line per connection): "transfer FROM TO AMOUNT" -> "ok", "total" -> "N".
 (ns bank
   (:require [clojure.string :as string])
+  ;; Determinismo (sdk/java) is in the default package: named directly, not imported.
   (:import [java.net ServerSocket]
            [java.io BufferedReader InputStreamReader PrintWriter]))
 
@@ -16,7 +17,10 @@
     (when (>= from-balance amount)
       (Thread/sleep 2) ; Work between the reads and the writes (a lookup, a log): the window.
       (swap! accounts assoc from (- from-balance amount))
-      (swap! accounts assoc to (+ to-balance amount)))))
+      (swap! accounts assoc to (+ to-balance amount))
+      ;; An invariant the service itself checks (it holds even with the bug: no overdraft).
+      (Determinismo/always (every? #(>= % 0) (vals @accounts))
+                           "balances never go negative" nil))))
 
 (defn total [] (reduce + (vals @accounts)))
 

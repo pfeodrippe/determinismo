@@ -1,0 +1,7 @@
+# Builds that use the repository as their context need only sources.
+.git
+.zig-cache
+zig-out
+.determinismo-cache
+.determinismo-data
+kernel

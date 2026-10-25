@@ -60,8 +60,9 @@ Full examples: [examples/bank](examples/bank) (Redis, a lost update),
 [examples/clojure-bank](examples/clojure-bank) (a JVM service, debugged by redefining a function
 through its REPL at a moment). Other languages: the Python
 SDK ([sdk/python](sdk/python), one file) in [examples/compose-python](examples/compose-python),
-the C SDK ([sdk/c](sdk/c), one header, for C, C++ and any FFI), or any Antithesis SDK (see
-below).
+the C SDK ([sdk/c](sdk/c), one header, for C, C++ and any FFI), the JVM SDK
+([sdk/java](sdk/java), one file, used from Clojure in examples/clojure-bank), or any Antithesis
+SDK (see below).
 
 ## Coming from Antithesis
 

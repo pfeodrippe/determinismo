@@ -6,6 +6,8 @@
 #     --exec "det-nodes exec bank /app/patch.sh"
 services:
   bank:
-    build: ./app
+    build:
+      context: ../..
+      dockerfile: examples/clojure-bank/app/Dockerfile
     ports:
       - "7000"
