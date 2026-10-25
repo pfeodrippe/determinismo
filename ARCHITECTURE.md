@@ -127,6 +127,15 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
 - Known hardware limits (from Antithesis): ~1 in 10¹² instructions miscounted; PMI skid of dozens
   of instructions, variable. Mitigations: early overflow + MTF stepping; state-hash checkpoints
   in the tape to detect divergence on replay.
+- **Measured skid** (KVM reports the largest per VM): at most 54 branches over hundreds of
+  branches and full boots of Redis and Postgres. The margin defaults to 128 branches; every run
+  reports its largest skid, and any overshoot (a stop past its target) is reported as a run that
+  may not replay. Margins of 256, 128 and 64 gave identical timelines; 32 did not.
+- **Two kinds of stops.** Moments (multiverse debugging) stop at their exact branch count. Timer
+  interrupts are **soft**: KVM exits at the first RDTSC at or past the deadline (a free, exact
+  point), with a hard stop at the deadline plus `--timer-slack-us` (100 µs) as a backstop for
+  code that reads no clock. Interrupts are at most that late in virtual time; the slack is part of
+  a timeline's inputs. This halved wall time on the examples (bank: 40 branches 15.9 s → 9.3 s).
 - `vtime = f(instruction count, per-event charges, modulation parameters)`. The parameters are
   inputs too, which gives **CPU modulation** as a fault (clock-speed strobing, per-operation cost
   changes) for free.
@@ -462,9 +471,12 @@ determinism makes state recomputable.
 ## 16. Open questions
 
 - CPUID baseline across CPU models (only one model tested so far).
-- Skid: a 256-branch margin gave 0 overshoots, at about 2,400 MTF steps per stop. Measure the real
-  skid distribution to shrink the margin (fewer steps, faster runs).
-- RDTSC exits cost about 1 µs (`perf_event_read_value`); read the PMC directly in-kernel instead.
+- Hard stops still single-step `margin - skid` branches (about 500 VM exits, ~1.5 µs each).
+  Candidates: count taken branches and step with branch trapping (TF + DEBUGCTL.BTF, one exit per
+  counted branch instead of per instruction); more soft stop points than RDTSC (the VMM's own
+  port and MMIO exits).
+- The counter is read through the event's PMU callback, as `perf_event_read_local` does (not
+  exported to modules); the VM exit itself dominates RDTSC and MTF costs.
 - Thread-pausing design: compiler-instrumentation callbacks as yield points vs guest-scheduler-only.
 - vtime defaults: ns per instruction, per-event charges, idle skip rules.
 - How much of the control plane needs a database vs. object storage + indexes.

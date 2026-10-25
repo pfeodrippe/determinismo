@@ -21,13 +21,16 @@ pub fn run(vm: *VM, result: struct { outcome: VM.Outcome, wall_ns: u64 }) !void 
     if (vm.deterministic) {
         const state = try vm.det_state();
         print("[determinismo] vtime={d:.3}s branches={d} rdtsc_exits={d} timer_fires={d} " ++
-            "idle_skips={d} idle_vtime={d:.3}s mtf_steps={d} overflows={d} overshoots={d}\n", .{
+            "idle_skips={d} idle_vtime={d:.3}s mtf_steps={d} overflows={d} overshoots={d} " ++
+            "skid_max={d} soft_exits={d}\n", .{
             seconds(state.tsc / tsc_per_ns), state.branches,
             state.rdtsc_exits,               vm.stats.timer_fires,
             vm.stats.idle_skips,             seconds(vm.stats.idle_tsc / tsc_per_ns),
             state.mtf_steps,                 state.overflows,
-            state.overshoots,
+            state.overshoots,                state.skid_max,
+            state.soft_exits,
         });
+        overshoot_warn(state.overshoots);
     }
     print("[determinismo] events={d} events_hash={x:0>16} random_pulls={d}\n", .{
         vm.events.count, vm.events.hash.final(), vm.decisions.pulls,
@@ -79,6 +82,9 @@ pub const Multiverse = struct {
     failing_branches: u32 = 0,
     aggregates: [Events.property_count_max]Aggregate = undefined,
     aggregate_count: u32 = 0,
+    /// Exactness of the stops at branch-count targets, over all branches.
+    skid_max: u64 = 0,
+    overshoots: u64 = 0,
 
     pub const Branch = struct { index: u32, seed: u64, outcome: VM.Outcome, wall_ns: u64 };
 
@@ -96,6 +102,8 @@ pub const Multiverse = struct {
         multiverse.branches += 1;
         if (failing > 0) multiverse.failing_branches += 1;
         const state = try vm.det_state();
+        multiverse.skid_max = @max(multiverse.skid_max, state.skid_max);
+        multiverse.overshoots += state.overshoots;
         print("[branch {d:>4}] seed={x:0>16} {s:<8} vtime={d:.3}s wall={d:.3}s events={d} " ++
             "events_hash={x:0>16} failing={d}", .{
             branch.index,                    branch.seed,             @tagName(branch.outcome),
@@ -149,8 +157,20 @@ pub const Multiverse = struct {
             }
             print("\n", .{});
         }
+        print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots\n", .{
+            multiverse.skid_max, multiverse.overshoots,
+        });
+        overshoot_warn(multiverse.overshoots);
     }
 };
+
+/// An overshoot means a timer or moment landed later than its branch count: such a timeline
+/// may not replay. It only happens if the margin is below the PMU's interrupt skid.
+fn overshoot_warn(overshoots: u64) void {
+    if (overshoots == 0) return;
+    print("[determinismo] WARNING: {d} overshoots: these timelines may not replay exactly; " ++
+        "raise --margin-branches above the largest skid\n", .{overshoots});
+}
 
 fn seconds(ns: u64) f64 {
     assert(ns < 1 << 53); // Exact in an f64.

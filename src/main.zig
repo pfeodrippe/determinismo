@@ -28,7 +28,7 @@ const usage =
     \\machine options:
     \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
     \\  [--cmdline <text> | --append <text>] [--deterministic] [--seed <n>]
-    \\  [--margin-branches <n>]
+    \\  [--margin-branches <n>] [--timer-slack-us <n>]
     \\
     \\--deterministic needs the determinismo-patched KVM; explore implies it.
     \\
@@ -51,7 +51,8 @@ const Arguments = struct {
     cmdline: []const u8 = cmdline_default,
     deterministic: bool = false,
     seed: u64 = 0,
-    margin_branches: u32 = 256,
+    margin_branches: u32 = 128,
+    timer_slack_us: u64 = 100,
     events_path: ?[]const u8 = null,
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
@@ -102,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
         .deterministic = arguments.deterministic,
         .seed = arguments.seed,
         .margin_branches = arguments.margin_branches,
+        .timer_slack_ns = arguments.timer_slack_us * std.time.ns_per_us,
         .events_fd = if (arguments.events_path) |path| try open_for_writing(arena, path) else null,
         .events_parse_buffer = try arena.alloc(u8, Events.parse_buffer_size),
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
@@ -391,6 +393,7 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     hasher.update(options.kernel);
     if (options.initrd) |initrd| hasher.update(initrd);
     hasher.update(options.cmdline);
+    hasher.update(std.mem.asBytes(&options.timer_slack_ns)); // Where timer interrupts land.
     for (arguments.disk_paths[0..arguments.disk_count]) |path| {
         hasher.update(std.fs.path.basename(path));
     }
@@ -469,6 +472,8 @@ fn parse_option(
         arguments.seed = try std.fmt.parseInt(u64, value, 0);
     } else if (eql(u8, flag, "--margin-branches")) {
         arguments.margin_branches = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--timer-slack-us")) {
+        arguments.timer_slack_us = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--events")) {
         arguments.events_path = value;
     } else if (eql(u8, flag, "--trace")) {

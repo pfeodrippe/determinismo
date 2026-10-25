@@ -50,6 +50,7 @@ pub const DET_ENABLE = ioctl_number(.write, 0xf0, @sizeOf(DetConfig));
 pub const DET_SET_TARGET = ioctl_number(.write, 0xf1, 8);
 pub const DET_GET_STATE = ioctl_number(.read, 0xf2, @sizeOf(DetState));
 pub const DET_ADD_TSC = ioctl_number(.write, 0xf3, 8);
+pub const DET_SET_SOFT_TSC = ioctl_number(.write, 0xf4, 8);
 
 pub const Exit = enum(u32) {
     unknown = 0,
@@ -221,7 +222,11 @@ pub const DetState = extern struct {
     mtf_steps: u64,
     overflows: u64,
     overshoots: u64,
-    reserved: [8]u64,
+    /// Most branches the guest ran between a counter overflow and KVM handling it.
+    skid_max: u64,
+    /// Exits at an RDTSC past the soft deadline (see DET_SET_SOFT_TSC).
+    soft_exits: u64,
+    reserved: [6]u64,
 };
 
 comptime {

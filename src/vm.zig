@@ -47,6 +47,7 @@ action_pending: ?[]const u8,
 target_is_moment: bool,
 deterministic: bool,
 tsc_per_branch: u32,
+timer_slack_tsc: u64,
 serial: Serial,
 rtc: RTC,
 pit: PIT,
@@ -82,7 +83,11 @@ pub const Options = struct {
     /// 8 TSC ticks per branch at 4 GHz: one branch is 2 ns of virtual time.
     tsc_per_branch: u32 = 8,
     /// Branches before a stop target where KVM starts single-stepping (must exceed PMI skid).
-    margin_branches: u32 = 256,
+    margin_branches: u32 = 128,
+    /// How late a timer interrupt may be: it is delivered at the first RDTSC at or past its
+    /// deadline (free), or exactly this much later (single-stepping) if the guest reads no
+    /// clock meanwhile. Part of a timeline's inputs.
+    timer_slack_ns: u64 = 100 * std.time.ns_per_us,
     /// Root of all guest randomness: seeds the guest kernel's RNG at boot and answers every
     /// randomness pull from /dev/determinismo.
     seed: u64,
@@ -200,6 +205,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .target_is_moment = false,
         .deterministic = options.deterministic,
         .tsc_per_branch = options.tsc_per_branch,
+        .timer_slack_tsc = options.timer_slack_ns * tsc_per_ns,
         .serial = .{},
         .rtc = .{ .epoch_seconds = options.epoch_seconds },
         .pit = .{ .tsc_hz = cpuid.tsc_hz },
@@ -354,10 +360,11 @@ pub fn run_until_exit(vm: *VM) !Outcome {
             .det_target => {
                 assert(vm.deterministic);
                 vm.stats.exits.getPtr(.det_target).* += 1;
-                vm.target_branches = 0;
                 if (vm.target_is_moment) {
+                    vm.target_branches = 0;
                     if (try vm.moment_arrive()) |outcome| return outcome;
                 } else {
+                    try vm.target_set(0); // A soft stop leaves the hard one armed.
                     try vm.timer_fire();
                 }
             },
@@ -410,7 +417,10 @@ fn deadline_next(vm: *const VM) ?Deadline {
     return if (stop.?.tsc <= timer.?.tsc) stop else timer;
 }
 
-/// Asks KVM to stop the vCPU at the branch count where the next deadline falls.
+/// Asks KVM to stop the vCPU at the next deadline. A moment stops at its exact branch count. A
+/// timer stops at the first RDTSC at or past its deadline (a soft stop, free), or at most
+/// `timer_slack` later at an exact branch count (a hard stop, which costs single-stepping):
+/// both are exact points of the guest's execution, so replays deliver it at the same place.
 fn timer_arm(vm: *VM) !void {
     assert(vm.deterministic);
     if (vm.target_branches != 0) return;
@@ -424,11 +434,14 @@ fn timer_arm(vm: *VM) !void {
         }
         return vm.timer_fire();
     }
-    const branches_left = std.math.divCeil(u64, deadline.tsc - state.tsc, vm.tsc_per_branch) catch
+    const slack_tsc = if (deadline.is_moment) 0 else vm.timer_slack_tsc;
+    const hard_tsc = deadline.tsc + slack_tsc;
+    const branches_left = std.math.divCeil(u64, hard_tsc - state.tsc, vm.tsc_per_branch) catch
         unreachable;
     assert(branches_left > 0);
     vm.target_is_moment = deadline.is_moment;
     try vm.target_set(state.branches + branches_left);
+    if (!deadline.is_moment and slack_tsc > 0) try vm.soft_set(deadline.tsc);
 }
 
 /// The moment arrived: end the run there, or push the command to the guest agent and keep
@@ -447,11 +460,18 @@ fn moment_arrive(vm: *VM) !?Outcome {
     return null;
 }
 
+/// Arms (or with 0 cancels, together with any soft deadline) the exact branch-count stop.
 pub fn target_set(vm: *VM, target_branches: u64) !void {
     assert(vm.deterministic);
     var target = target_branches;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_SET_TARGET, @intFromPtr(&target));
+    if (target_branches == 0) try vm.soft_set(0);
     vm.target_branches = target_branches;
+}
+
+fn soft_set(vm: *VM, soft_tsc: u64) !void {
+    var soft = soft_tsc;
+    _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_SET_SOFT_TSC, @intFromPtr(&soft));
 }
 
 fn timer_fire(vm: *VM) !void {
