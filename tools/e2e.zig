@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
     try check_stress(&context);
     try check_controller(&context);
     try check_clojure(&context);
+    try check_k3s(&context);
     try check_script(&context);
     try check_tla(&context, try std.fs.path.join(arena, &.{ home, "opt", "tla", "tla2tools.jar" }));
     if (context.failures > 0) {
@@ -250,6 +251,27 @@ fn check_python_strategy(context: *Context) !void {
     const same = parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash);
     expect(context, same, "python strategy: its branch replays from the tape without it", .{});
+}
+
+/// Kubernetes (K3s) as the system under test: the cluster comes up in a privileged node, its
+/// workload survives faults on the node, and a branch replays exactly.
+fn check_k3s(context: *Context) !void {
+    const common = [_][]const u8{
+        "--compose", "examples/k3s/compose.yaml", "--scenario", "cluster", "--seed", "1",
+        "--memory-mib", "3072",
+    };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4" }));
+    const passes = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
+    expect(context, passes, "k3s: the workload survives faults in 4 branches", .{});
+    var branches: [4]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    if (count == 0) return;
+    const index = try std.fmt.allocPrint(context.arena, "{d}", .{branches[0].index});
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+    var replayed: [1]Branch = undefined;
+    const same = parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
+    expect(context, same, "k3s: branch {d} replays exactly", .{branches[0].index});
 }
 
 /// The built-in properties pass on a steady system and catch a node that exits by itself and an

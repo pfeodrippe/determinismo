@@ -3,7 +3,8 @@
 //!
 //! Each service becomes a node: `image` or `build` as its source, `entrypoint` and `command`
 //! (lists, or strings split like a shell), `environment` (list or map), `working_dir`, `user`,
-//! `depends_on` (dependencies start first), `mem_limit`, and the first container port of `ports`
+//! `depends_on` (dependencies start first), `mem_limit`, `privileged`, and the first container
+//! port of `ports`
 //! or `expose` as its readiness check. Every node gets
 //! ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo, so
 //! services and tests using an Antithesis SDK report to determinismo. Fields with no meaning in
@@ -18,7 +19,7 @@ pub const sdk_output_variable = "ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo";
 
 const ignored_fields = [_][]const u8{
     "volumes",   "networks",       "restart", "deploy", "logging", "container_name", "hostname",
-    "env_file",  "cap_add",        "cap_drop", "privileged", "ulimits", "labels", "init",
+    "env_file",  "cap_add",        "cap_drop", "ulimits", "labels", "init",
     "stop_signal", "healthcheck", "platform", "tty", "stdin_open", "security_opt",
 };
 
@@ -69,6 +70,9 @@ fn node_from_service(
     node.after = try dependencies(arena, fields.get("depends_on"));
     if (try first_port(fields)) |port| node.ready = .{ .tcp = port };
     if (fields.get("mem_limit")) |value| node.memory_max_mib = try memory_mib(try scalar(value));
+    if (fields.get("privileged")) |value| {
+        node.privileged = std.mem.eql(u8, try scalar(value), "true");
+    }
     return node;
 }
 
@@ -283,6 +287,9 @@ pub fn templates(
 
 fn command_kind(name: []const u8) ?schema.Kind {
     const prefixes = [_]struct { []const u8, schema.Kind }{
+        // Not Antithesis's: runs before setup_complete, so branches start after it (a cluster
+        // that is ready, rather than one still starting).
+        .{ "setup_", .setup },
         .{ "first_", .first },
         .{ "parallel_driver_", .parallel_driver },
         .{ "serial_driver_", .serial_driver },

@@ -50,6 +50,9 @@ pub const Node = struct {
     /// The memory its processes may use (cgroup memory.max); past it, the kernel reclaims and
     /// then kills one of them. Null: no limit beyond the VM's memory.
     memory_max_mib: ?u32 = null,
+    /// /sys and the node's cgroups writable, as for a privileged container: for nodes that run
+    /// containers themselves (K3s, Docker in Docker).
+    privileged: bool = false,
 };
 
 /// Where a node's root filesystem comes from: exactly one field is set.
@@ -166,6 +169,7 @@ pub const Resolved = struct {
     after: []const []const u8 = &.{},
     faults: Faults = .{},
     memory_max_mib: ?u32 = null,
+    privileged: bool = false,
 };
 
 pub fn node_address(index: u32) [4]u8 {

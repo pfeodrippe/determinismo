@@ -42,9 +42,17 @@ pub fn system_load(arena: std.mem.Allocator) !schema.System {
 pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
     try mkdir_all(state_root);
     try mkdir_all(cgroup_root);
-    // The cpu controller in node cgroups, for CPU throttling faults; memory, for their limits.
-    try file_write("/sys/fs/cgroup/cgroup.subtree_control", "+cpu +memory");
-    try file_write(cgroup_root ++ "/cgroup.subtree_control", "+cpu +memory");
+    // Controllers in node cgroups: cpu for throttling faults, memory for limits, and all of
+    // them for nodes that run containers (kubelet wants cpuset, io and pids too).
+    const controls = [_][:0]const u8{
+        "/sys/fs/cgroup/cgroup.subtree_control", cgroup_root ++ "/cgroup.subtree_control",
+    };
+    for (controls) |control| {
+        try file_write(control, "+cpu +memory");
+        for ([_][]const u8{ "+cpuset", "+io", "+pids", "+hugetlb" }) |controller| {
+            file_write(control, controller) catch {}; // Optional: not every kernel has them.
+        }
+    }
     try hosts_write("/etc/hosts", system);
     for (system.nodes) |*node| {
         try start(arena, system, node);
@@ -76,6 +84,11 @@ pub fn start(
         _ = linux.close(sync[1]);
         var byte: [1]u8 = undefined;
         _ = linux.read(sync[0], &byte, 1); // The parent has set up cgroup and network.
+        // Its own cgroup namespace, rooted at its cgroup (as containers have): what it creates
+        // there (kubelet's pods) stays under the node, within reach of its faults.
+        if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
+            die("unshare", error.Unshare);
+        }
         launch.exec(); // Never returns.
     }
     const pid: linux.pid_t = @intCast(result);
@@ -129,7 +142,7 @@ pub fn exec(
     if (linux.errno(child) != .SUCCESS) return error.Fork;
     if (child == 0) {
         // Like the node's own processes: its CPU and memory limits, its freezes and kills.
-        file_write(paths.cgroup_procs, "0") catch |err| die("cgroup", err);
+        cgroup_join_self(&paths) catch |err| die("cgroup", err);
         for (namespaces, namespace_fds) |namespace, fd| {
             if (linux.errno(linux.setns(fd, namespace.flag)) != .SUCCESS) die("setns", error.Setns);
         }
@@ -159,6 +172,7 @@ const namespaces = [_]Namespace{
     .{ .name = "ipc", .flag = linux.CLONE.NEWIPC },
     .{ .name = "uts", .flag = linux.CLONE.NEWUTS },
     .{ .name = "net", .flag = linux.CLONE.NEWNET },
+    .{ .name = "cgroup", .flag = linux.CLONE.NEWCGROUP },
     .{ .name = "pid", .flag = linux.CLONE.NEWPID },
     .{ .name = "mnt", .flag = linux.CLONE.NEWNS },
 };
@@ -197,16 +211,51 @@ pub fn cpu_limit(name: []const u8, percent: ?u8) !void {
 pub fn processes(name: []const u8, pids: []linux.pid_t) !u32 {
     var paths: Paths = undefined;
     try paths.init(name);
-    var buffer: [16 * 1024]u8 = undefined;
-    const text = read_small(paths.cgroup_procs, &buffer) orelse return error.NoCgroup;
+    if (!exists(paths.cgroup_procs)) return error.NoCgroup;
     var count: u32 = 0;
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (count == pids.len) break;
-        pids[count] = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
-        count += 1;
-    }
+    try processes_collect(paths.cgroup, pids, &count, 0);
     return count;
+}
+
+/// Nodes that run containers (K3s) put their processes in cgroups of their own, under the
+/// node's: the whole subtree, depth first.
+const cgroup_depth_max = 8;
+
+fn processes_collect(directory: [:0]const u8, pids: []linux.pid_t, count: *u32, depth: u32) !void {
+    var path_buffer: [path_size_max]u8 = undefined;
+    var text_buffer: [16 * 1024]u8 = undefined;
+    const procs = try print_z(&path_buffer, "{s}/cgroup.procs", .{directory});
+    if (read_small(procs, &text_buffer)) |text| {
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (count.* == pids.len) return;
+            pids[count.*] = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
+            count.* += 1;
+        }
+    }
+    if (depth == cgroup_depth_max) return;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const fd = linux.open(directory, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var entries: [4096]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(@intCast(fd), &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) return;
+        var offset: usize = 0;
+        while (offset < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[offset]);
+            offset += entry.reclen;
+            if (entry.type != linux.DT.DIR) continue;
+            const name_offset = offset - entry.reclen + @offsetOf(linux.dirent64, "name");
+            const child_name: [*:0]const u8 = @ptrCast(&entries[name_offset]);
+            const child = std.mem.span(child_name);
+            if (std.mem.eql(u8, child, ".") or std.mem.eql(u8, child, "..")) continue;
+            var child_buffer: [path_size_max]u8 = undefined;
+            const child_path = try print_z(&child_buffer, "{s}/{s}", .{ directory, child });
+            try processes_collect(child_path, pids, count, depth + 1);
+        }
+    }
 }
 
 pub fn freeze(name: []const u8, state: enum { frozen, thawed }) !void {
@@ -245,6 +294,12 @@ fn link_change(
     try socket.link_set(interface, state);
     if (state == .down) return;
     socket.route_add(interface, peer) catch |err| switch (err) {
+        error.Exists => {},
+        else => return err,
+    };
+    // A node's link to the runner also carries its default route.
+    if (!std.mem.eql(u8, &peer, &schema.runner_address)) return;
+    socket.route_default(interface, peer) catch |err| switch (err) {
         error.Exists => {},
         else => return err,
     };
@@ -384,6 +439,25 @@ fn cgroup_join(paths: *const Paths, pid: linux.pid_t) !void {
     try file_write(paths.cgroup_procs, try std.fmt.bufPrint(&buffer, "{d}\n", .{pid}));
 }
 
+/// Moves the calling process into the node's cgroup or, when the node delegates controllers to
+/// cgroups of its own (a container runtime in the node), into a leaf under it: cgroup v2 keeps
+/// processes out of cgroups that have controllers enabled for their children.
+fn cgroup_join_self(paths: *const Paths) !void {
+    const enabled = blk: {
+        var buffer: [256]u8 = undefined;
+        var path_buffer: [path_size_max]u8 = undefined;
+        const control = try print_z(&path_buffer, "{s}/cgroup.subtree_control", .{paths.cgroup});
+        const text = read_small(control, &buffer) orelse break :blk false;
+        break :blk std.mem.trim(u8, text, " \n").len > 0;
+    };
+    if (!enabled) return file_write(paths.cgroup_procs, "0");
+    var leaf_buffer: [path_size_max]u8 = undefined;
+    const leaf = try print_z(&leaf_buffer, "{s}/det-exec", .{paths.cgroup});
+    try mkdir_all(leaf);
+    var procs_buffer: [path_size_max]u8 = undefined;
+    try file_write(try print_z(&procs_buffer, "{s}/cgroup.procs", .{leaf}), "0");
+}
+
 fn memory_limit(paths: *const Paths, memory_max_mib: ?u32) !void {
     var path_buffer: [path_size_max]u8 = undefined;
     const path = try print_z(&path_buffer, "{s}/memory.max", .{paths.cgroup});
@@ -415,6 +489,12 @@ fn network_connect(
         .address = schema.runner_address,
         .pid = 1,
     });
+    // A default route through the runner, as containers have one: some software (K3s, etcd)
+    // looks for it to choose its address. Nothing lies beyond the runner.
+    var name: [netlink.interface_name_size_max]u8 = undefined;
+    const runner_interface = interface_name(&name, schema.runner_name);
+    const route_default = netlink.Socket.route_default;
+    try netlink.in_namespace_of(pid, route_default, .{ runner_interface, schema.runner_address });
     for (system.nodes) |*peer| {
         if (std.mem.eql(u8, peer.name, node.name)) continue;
         const peer_pid = pid_read(peer.name) orelse continue;
@@ -524,6 +604,7 @@ const Launch = struct {
     executables: []const [:0]const u8,
     uid: ?u32,
     gid: ?u32,
+    privileged: bool,
 
     fn init(arena: std.mem.Allocator, node: *const schema.Resolved, paths: *const Paths) !Launch {
         if (node.command.len == 0 or node.command.len >= arguments_max) return error.BadCommand;
@@ -547,6 +628,7 @@ const Launch = struct {
             .executables = try executables(arena, node.command[0], path_value),
             .uid = if (ids) |i| i.uid else null,
             .gid = if (ids) |i| i.gid else null,
+            .privileged = node.privileged,
         };
     }
 
@@ -590,9 +672,11 @@ const Launch = struct {
             flags: u32,
             data: ?[:0]const u8,
         };
+        const read_only: u32 = if (launch.privileged) 0 else linux.MS.RDONLY;
         const targets = [_]Target{
             .{ .path = "proc", .fs = "proc", .flags = 0, .data = null },
-            .{ .path = "sys", .fs = "sysfs", .flags = linux.MS.RDONLY, .data = null },
+            .{ .path = "sys", .fs = "sysfs", .flags = read_only, .data = null },
+            .{ .path = "sys/fs/cgroup", .fs = "cgroup2", .flags = read_only, .data = null },
             .{ .path = "dev", .fs = "devtmpfs", .flags = 0, .data = null },
             .{ .path = "dev/pts", .fs = "devpts", .flags = 0, .data = "newinstance,ptmxmode=0666" },
             .{ .path = "dev/shm", .fs = "tmpfs", .flags = 0, .data = null },

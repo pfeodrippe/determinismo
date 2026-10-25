@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Kubernetes (K3s) as the system under test: one privileged node runs a K3s server, which runs
+# the workload (manifests/) in pods. Images come from K3s's air-gap bundle: the guest has no
+# network. Give the machine room: --memory-mib 4096.
+#   determinismo explore ... --compose examples/k3s/compose.yaml --scenario cluster
+services:
+  k3s:
+    build:
+      context: ../..
+      dockerfile: examples/k3s/Dockerfile
+    privileged: true
+    command: >-
+      server --snapshotter=native --disable=traefik,servicelb,metrics-server,local-storage
+      --disable-cloud-controller --disable-helm-controller --write-kubeconfig-mode=644
+    ports:
+      - "6443"

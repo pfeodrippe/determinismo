@@ -154,6 +154,7 @@ fn node_resolve(
         .after = node.after,
         .faults = node.faults,
         .memory_max_mib = node.memory_max_mib,
+        .privileged = node.privileged,
     };
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|

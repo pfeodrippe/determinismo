@@ -18,7 +18,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 - **Systems described in code or Compose**: typed profiles whose nodes come from OCI images,
   Dockerfiles, directories or binaries, run in the guest by our own node runtime (namespaces, a
   read-only disk with a tmpfs overlay, a veth mesh, a cgroup per node with optional memory
-  limits); or a Compose file with Antithesis test templates.
+  limits); or a Compose file with Antithesis test templates. Kubernetes too: K3s runs in a
+  privileged node with its pods (`examples/k3s`), under the same faults, replayed exactly.
 - **Tests as scenarios**: functions listing test commands (Antithesis's rules), assertions and
   steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK;
   built-in properties (nodes do not exit unexpectedly, the guest finishes its scenario, the

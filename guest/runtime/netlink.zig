@@ -41,6 +41,7 @@ const ifa_address: u16 = 1;
 const ifa_local: u16 = 2;
 const rta_destination: u16 = 1;
 const rta_output_interface: u16 = 4;
+const rta_gateway: u16 = 5;
 const iff_up: u32 = 1;
 const ifinfo_size = 16;
 const header_size = 16;
@@ -119,6 +120,25 @@ pub const Socket = struct {
         };
         message.append_bytes(&info);
         message.attribute(rta_destination, &destination);
+        var index_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &index_bytes, @intCast(try socket.index(name)), .little);
+        message.attribute(rta_output_interface, &index_bytes);
+        try socket.send(&message);
+    }
+
+    /// The default route, through `gateway` on the interface (whose host route reaches it).
+    pub fn route_default(socket: *Socket, name: []const u8, gateway: Address) !void {
+        var message: Message = .init(rtm_newroute, flag_create | flag_exclusive);
+        const table_main = 254;
+        const protocol_boot = 3;
+        const scope_universe = 0;
+        const type_unicast = 1;
+        const info = [12]u8{
+            linux.AF.INET,  0,            0, 0, table_main, protocol_boot,
+            scope_universe, type_unicast, 0, 0, 0,          0,
+        };
+        message.append_bytes(&info);
+        message.attribute(rta_gateway, &gateway);
         var index_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &index_bytes, @intCast(try socket.index(name)), .little);
         message.attribute(rta_output_interface, &index_bytes);

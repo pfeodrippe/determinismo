@@ -71,6 +71,7 @@ pub fn NodeSpec(comptime Name: type) type {
         after: []const Name = &.{},
         faults: schema.Faults = .{},
         memory_max_mib: ?u32 = null,
+        privileged: bool = false,
     };
 }
 
@@ -306,6 +307,7 @@ pub fn System(comptime Nodes: type) type {
                         .after = after,
                         .faults = spec.faults,
                         .memory_max_mib = spec.memory_max_mib,
+                        .privileged = spec.privileged,
                     });
                 } else if (Field == Node) {
                     const message = "profile {s}: node {s} is not optional\n";
