@@ -332,8 +332,10 @@ A profile describes *what* the system is; determinismo decides *how* to material
   rare paths such as retries or elections, `reachable`/`unreachable`) and SDK randomness for
   internal choices (backoff jitter), which makes those choices steerable. They never define drivers.
 - **Third-party services** (Postgres, Redis, Kafka) stay unmodified, judged by test assertions and
-  built-in properties (planned: no unexpected node exit, no kernel panic or OOM kill; implemented:
-  test commands exit successfully).
+  built-in properties: test commands exit successfully, nodes do not exit unexpectedly, the
+  guest finishes its scenario (no panic, hang or crash), the kernel kills no process for lack of
+  memory (nodes may have memory limits) and reports no warnings, BUGs or hung tasks (det-init
+  reads the whole kernel log at the end of each timeline).
 - The SDK works outside determinismo too (OS randomness, events to stderr), so a test can be run
   locally against local services.
 

@@ -17,11 +17,12 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   A whole system (boot, Postgres, tests) runs at 1.31x plain KVM.
 - **Systems described in code or Compose**: typed profiles whose nodes come from OCI images,
   Dockerfiles, directories or binaries, run in the guest by our own node runtime (namespaces, a
-  read-only disk with a tmpfs overlay, a veth mesh, a cgroup per node); or a Compose file with
-  Antithesis test templates.
+  read-only disk with a tmpfs overlay, a veth mesh, a cgroup per node with optional memory
+  limits); or a Compose file with Antithesis test templates.
 - **Tests as scenarios**: functions listing test commands (Antithesis's rules), assertions and
   steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK;
-  built-in properties (nodes do not exit unexpectedly, the guest finishes its scenario).
+  built-in properties (nodes do not exit unexpectedly, the guest finishes its scenario, the
+  kernel kills nothing for lack of memory and reports no warnings, BUGs or hung tasks).
 - **Exploration**: snapshot at `setup_complete`, copy-on-write branches on every CPU, shards across
   hosts, branching from any moment of a branch, strategy plugins in any language (decisions and
   events) and outer-loop control through MCP or HTTP.

@@ -6,6 +6,8 @@
 //!              echo node answers in uppercase: the tests catch the mutant)
 //!   node_exit  a driver makes the node exit: the built-in property
 //!              "nodes do not exit unexpectedly" must fail
+//!   oom        (profile "memory") a command in the echo node exceeds its memory limit: the
+//!              built-in property "the kernel kills no process for lack of memory" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report
 //!              what they observe as events: any nondeterminism changes the event hash
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
@@ -35,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
         .scenarios = .{
             .steady = steady,
             .node_exit = node_exit,
+            .oom = oom,
             .stress = stress,
             .controller = @import("controller.zig").scenario,
             .maze = maze,
@@ -56,6 +59,13 @@ fn describe(d: *System.Describe) !void {
         .env = &.{"DET_MUTANT=1"},
         .ready = .{ .tcp = port },
         .faults = quiet,
+    });
+    const memory = try d.profile("memory");
+    memory.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = quiet,
+        .memory_max_mib = 32,
     });
     const maze_profile = try d.profile("maze");
     maze_profile.node(.maze, .{
@@ -87,6 +97,16 @@ fn steady(s: *System.Scenario) void {
 
 fn node_exit(s: *System.Scenario) void {
     s.singleton_driver("kill_echo", tell_die);
+}
+
+fn oom(s: *System.Scenario) void {
+    s.singleton_driver("hog", hog);
+}
+
+fn hog(context: *System.Context) !void {
+    const node = context.nodes.echo orelse return error.NoEchoNode;
+    const status = try node.exec(&.{ "/bin/det-selftest-node", "hog" });
+    sdk.always(status == 128 + 9, "the hog is killed", .{ .status = status });
 }
 
 fn stress(s: *System.Scenario) void {

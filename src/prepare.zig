@@ -153,6 +153,7 @@ fn node_resolve(
         .ready = node.ready,
         .after = node.after,
         .faults = node.faults,
+        .memory_max_mib = node.memory_max_mib,
     };
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|

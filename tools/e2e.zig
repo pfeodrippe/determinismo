@@ -183,7 +183,8 @@ fn check_coverage(context: *Context) !void {
     });
 }
 
-/// The built-in properties pass on a steady system and catch a node that exits by itself.
+/// The built-in properties pass on a steady system and catch a node that exits by itself and an
+/// OOM kill.
 fn check_builtin_properties(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const steady = try explore(context, &.{
@@ -203,6 +204,14 @@ fn check_builtin_properties(context: *Context) !void {
     });
     const caught = std.mem.indexOf(u8, crash, "FAIL \"nodes do not exit unexpectedly\"") != null;
     expect(context, caught, "built-in properties catch a node that exits", .{});
+    const hog = try explore(context, &.{
+        "--program", program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
+        "--branches", "1",
+    });
+    const oom = "FAIL \"the kernel kills no process for lack of memory\"";
+    const oom_caught = std.mem.indexOf(u8, hog, oom) != null and
+        std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null;
+    expect(context, oom_caught, "built-in properties catch an OOM kill in a node", .{});
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

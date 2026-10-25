@@ -2,16 +2,22 @@
 //! det-selftest-node: a tiny TCP service for determinismo's self-tests (a `binary` node).
 //! Answers each line with the same line; on "die" it exits with status 3, as a crashing
 //! service would. With DET_MUTANT set it answers in uppercase: a mutant the tests must catch.
+//! `det-selftest-node hog` instead touches memory until the kernel kills it (the node's memory
+//! limit makes that an OOM kill).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
 const port = 7000;
 const connections_max = 1_000_000;
+const hog_chunk_size = 1 << 20;
+const hog_chunks_max = 4096;
 
 var mutant = false;
 
 pub fn main(init: std.process.Init) !void {
+    const arguments = try init.minimal.args.toSlice(init.arena.allocator());
+    if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
     mutant = init.environ_map.get("DET_MUTANT") != null;
     const listener = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(listener) != .SUCCESS) return error.Socket;
@@ -29,6 +35,19 @@ pub fn main(init: std.process.Init) !void {
         defer _ = linux.close(@intCast(client));
         serve(@intCast(client));
     }
+}
+
+fn hog() !void {
+    for (0..hog_chunks_max) |_| {
+        const protection: linux.PROT = .{ .READ = true, .WRITE = true };
+        const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+        const address = linux.mmap(null, hog_chunk_size, protection, flags, -1, 0);
+        if (linux.errno(address) != .SUCCESS) return error.Mmap;
+        const memory: [*]u8 = @ptrFromInt(address);
+        var offset: usize = 0;
+        while (offset < hog_chunk_size) : (offset += 4096) memory[offset] = 1;
+    }
+    return error.NotKilled; // 4 GiB touched and still alive: no limit applied.
 }
 
 fn serve(client: linux.fd_t) void {

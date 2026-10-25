@@ -42,9 +42,9 @@ pub fn system_load(arena: std.mem.Allocator) !schema.System {
 pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
     try mkdir_all(state_root);
     try mkdir_all(cgroup_root);
-    // The cpu controller in node cgroups, for CPU throttling faults.
-    try file_write("/sys/fs/cgroup/cgroup.subtree_control", "+cpu");
-    try file_write(cgroup_root ++ "/cgroup.subtree_control", "+cpu");
+    // The cpu controller in node cgroups, for CPU throttling faults; memory, for their limits.
+    try file_write("/sys/fs/cgroup/cgroup.subtree_control", "+cpu +memory");
+    try file_write(cgroup_root ++ "/cgroup.subtree_control", "+cpu +memory");
     try hosts_write("/etc/hosts", system);
     for (system.nodes) |*node| {
         try start(arena, system, node);
@@ -64,6 +64,7 @@ pub fn start(
     var paths: Paths = undefined;
     try paths.init(node.name);
     try root_prepare(&paths, system, node);
+    try memory_limit(&paths, node.memory_max_mib);
     const launch = try Launch.init(arena, node, &paths);
     var sync: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&sync, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
@@ -127,6 +128,8 @@ pub fn exec(
     const child = linux.fork();
     if (linux.errno(child) != .SUCCESS) return error.Fork;
     if (child == 0) {
+        // Like the node's own processes: its CPU and memory limits, its freezes and kills.
+        file_write(paths.cgroup_procs, "0") catch |err| die("cgroup", err);
         for (namespaces, namespace_fds) |namespace, fd| {
             if (linux.errno(linux.setns(fd, namespace.flag)) != .SUCCESS) die("setns", error.Setns);
         }
@@ -369,6 +372,17 @@ fn hosts_write(path: [:0]const u8, system: *const schema.System) !void {
 fn cgroup_join(paths: *const Paths, pid: linux.pid_t) !void {
     var buffer: [32]u8 = undefined;
     try file_write(paths.cgroup_procs, try std.fmt.bufPrint(&buffer, "{d}\n", .{pid}));
+}
+
+fn memory_limit(paths: *const Paths, memory_max_mib: ?u32) !void {
+    var path_buffer: [path_size_max]u8 = undefined;
+    const path = try print_z(&path_buffer, "{s}/memory.max", .{paths.cgroup});
+    var value_buffer: [32]u8 = undefined;
+    const value = if (memory_max_mib) |mib|
+        try std.fmt.bufPrint(&value_buffer, "{d}\n", .{@as(u64, mib) * 1024 * 1024})
+    else
+        "max\n";
+    try file_write(path, value);
 }
 
 fn cgroup_populated(paths: *const Paths) !bool {

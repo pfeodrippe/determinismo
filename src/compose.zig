@@ -3,8 +3,9 @@
 //!
 //! Each service becomes a node: `image` or `build` as its source, `entrypoint` and `command`
 //! (lists, or strings split like a shell), `environment` (list or map), `working_dir`, `user`,
-//! `depends_on` (dependencies start first), and the first container port of `ports` or `expose`
-//! as its readiness check. Every node gets ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo, so
+//! `depends_on` (dependencies start first), `mem_limit`, and the first container port of `ports`
+//! or `expose` as its readiness check. Every node gets
+//! ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo, so
 //! services and tests using an Antithesis SDK report to determinismo. Fields with no meaning in
 //! one deterministic machine (volumes, networks, restart policies, ...) are reported, not
 //! silently dropped.
@@ -67,7 +68,28 @@ fn node_from_service(
     node.env = try environment(arena, fields.get("environment"));
     node.after = try dependencies(arena, fields.get("depends_on"));
     if (try first_port(fields)) |port| node.ready = .{ .tcp = port };
+    if (fields.get("mem_limit")) |value| node.memory_max_mib = try memory_mib(try scalar(value));
     return node;
+}
+
+/// A Compose byte value ("64m", "1g", "512mb", "1048576") in MiB, rounded up.
+fn memory_mib(text: []const u8) !u32 {
+    const digits = for (text, 0..) |byte, index| {
+        if (!std.ascii.isDigit(byte)) break index;
+    } else text.len;
+    const number = try std.fmt.parseInt(u64, text[0..digits], 10);
+    const suffix = text[digits..];
+    const shifts = [_]struct { []const u8, u6 }{
+        .{ "", 0 },   .{ "b", 0 },   .{ "k", 10 }, .{ "kb", 10 },
+        .{ "m", 20 }, .{ "mb", 20 }, .{ "g", 30 }, .{ "gb", 30 },
+    };
+    for (shifts) |entry| {
+        if (!std.ascii.eqlIgnoreCase(suffix, entry[0])) continue;
+        const bytes = std.math.shlExact(u64, number, entry[1]) catch return error.BadMemLimit;
+        const mib = std.math.divCeil(u64, bytes, 1 << 20) catch unreachable;
+        return std.math.cast(u32, mib) orelse error.BadMemLimit;
+    }
+    return error.BadMemLimit;
 }
 
 fn build_source(arena: std.mem.Allocator, directory: []const u8, value: yaml.Value) !schema.Build {
@@ -273,6 +295,14 @@ fn command_kind(name: []const u8) ?schema.Kind {
         if (std.mem.startsWith(u8, name, prefix[0])) return prefix[1];
     }
     return null;
+}
+
+test memory_mib {
+    try std.testing.expectEqual(@as(u32, 64), try memory_mib("64m"));
+    try std.testing.expectEqual(@as(u32, 1024), try memory_mib("1G"));
+    try std.testing.expectEqual(@as(u32, 512), try memory_mib("512mb"));
+    try std.testing.expectEqual(@as(u32, 1), try memory_mib("1000"));
+    try std.testing.expectError(error.BadMemLimit, memory_mib("5x"));
 }
 
 test split_shell {

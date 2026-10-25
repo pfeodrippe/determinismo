@@ -41,3 +41,7 @@ Tools: `describe`, `explore`, `replay`, `fork` (schemas in `src/mcp_tools.json`)
 - Faults happen only during the driver phase; `finally` and `eventually` commands see a system
   without faults, which is where recovery is checked.
 - Exit status of explore: 0 every property passed, 3 some failed, anything else an error.
+- Built-in properties come with every system: nodes do not exit unexpectedly, the guest
+  finishes its scenario, the kernel kills no process for lack of memory, and the kernel reports
+  no warnings, BUGs or hung tasks. A kernel property's failure carries the log line and the
+  kernel's timestamp (`kernel_us`, virtual time) in its details.

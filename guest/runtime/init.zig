@@ -39,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
     for (node_names) |name| {
         if (nodes.pid_of(name) != null) sdk.always(true, node_exit_property, .{ .node = name });
     }
+    kernel_check();
     sdk.lifecycle("guest_done", .{ .status = status });
     reap_all();
     _ = linux.sync();
@@ -230,6 +231,66 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
     }
 }
 
+/// Built-in properties from the kernel's log (all of it, whatever the console shows), read
+/// once when the timeline ends: no OOM kills, and no warnings, BUGs, oopses or hung tasks.
+const oom_property = "the kernel kills no process for lack of memory";
+const kernel_property = "the kernel reports no warnings, BUGs or hung tasks";
+const kmsg_records_max = 1 << 16;
+
+const KernelProblem = enum { oom_kill, kernel };
+
+fn kernel_check() void {
+    var seen = std.EnumArray(KernelProblem, bool).initFill(false);
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open("/dev/kmsg", flags, 0);
+    if (linux.errno(fd) == .SUCCESS) {
+        defer _ = linux.close(@intCast(fd));
+        var buffer: [8192]u8 = undefined;
+        for (0..kmsg_records_max) |_| {
+            const size = linux.read(@intCast(fd), &buffer, buffer.len);
+            switch (linux.errno(size)) {
+                .SUCCESS => {},
+                .PIPE => continue, // Overwritten while reading: the next record follows.
+                else => break, // AGAIN: the whole log has been read.
+            }
+            const record = kmsg_record(buffer[0..size]) orelse continue;
+            const problem = kernel_problem(record.text) orelse continue;
+            seen.set(problem, true);
+            const property = if (problem == .oom_kill) oom_property else kernel_property;
+            sdk.always(false, property, .{ .kernel_us = record.time_us, .line = record.text });
+        }
+    }
+    if (!seen.get(.oom_kill)) sdk.always(true, oom_property, .{});
+    if (!seen.get(.kernel)) sdk.always(true, kernel_property, .{});
+}
+
+const KmsgRecord = struct { time_us: u64, text: []const u8 };
+
+/// "<priority>,<sequence>,<microseconds>,<flags>;<text>\n" and continuation lines.
+fn kmsg_record(record: []const u8) ?KmsgRecord {
+    const separator = std.mem.indexOfScalar(u8, record, ';') orelse return null;
+    var fields = std.mem.splitScalar(u8, record[0..separator], ',');
+    _ = fields.next() orelse return null;
+    _ = fields.next() orelse return null;
+    const time_us = std.fmt.parseInt(u64, fields.next() orelse return null, 10) catch return null;
+    const rest = record[separator + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return .{ .time_us = time_us, .text = rest[0..end] };
+}
+
+fn kernel_problem(text: []const u8) ?KernelProblem {
+    // "Out of memory: Killed process ..." and "Memory cgroup out of memory: Killed process ...".
+    if (std.mem.indexOf(u8, text, "of memory: Killed process") != null) return .oom_kill;
+    const signs = [_][]const u8{
+        "WARNING: CPU:",            "BUG: ",                 "kernel BUG at", "Oops: ",
+        "general protection fault", "blocked for more than", "UBSAN:",        "Kernel panic",
+    };
+    for (signs) |sign| {
+        if (std.mem.indexOf(u8, text, sign) != null) return .kernel;
+    }
+    return null;
+}
+
 fn reap_all() void {
     while (true) {
         var status: i32 = 0;
@@ -244,6 +305,18 @@ test module_parameters {
         "virtio_mmio.device=4K@0xd0001000:6";
     const parameters = module_parameters(&buffer, "virtio_mmio", cmdline);
     try std.testing.expectEqualStrings("device=4K@0xd0000000:6 device=4K@0xd0001000:6", parameters);
+}
+
+test kernel_problem {
+    const oom = "6,812,2203117,-;Memory cgroup out of memory: Killed process 301 " ++
+        "(det-selftest-no) total-vm:70000kB\n SUBSYSTEM=memory";
+    const record = kmsg_record(oom).?;
+    try std.testing.expectEqual(@as(u64, 2203117), record.time_us);
+    try std.testing.expectEqual(KernelProblem.oom_kill, kernel_problem(record.text).?);
+    const warning = kmsg_record("4,90,1000,-;WARNING: CPU: 0 PID: 1 at mm/slub.c:42 f+0x1/0x2").?;
+    try std.testing.expectEqual(KernelProblem.kernel, kernel_problem(warning.text).?);
+    const fine = kmsg_record("6,1,0,-;Linux version 6.12.113").?;
+    try std.testing.expect(kernel_problem(fine.text) == null);
 }
 
 test parameter {

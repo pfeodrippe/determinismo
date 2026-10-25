@@ -47,6 +47,9 @@ pub const Node = struct {
     /// Nodes that must be ready before this one starts.
     after: []const []const u8 = &.{},
     faults: Faults = .{},
+    /// The memory its processes may use (cgroup memory.max); past it, the kernel reclaims and
+    /// then kills one of them. Null: no limit beyond the VM's memory.
+    memory_max_mib: ?u32 = null,
 };
 
 /// Where a node's root filesystem comes from: exactly one field is set.
@@ -162,6 +165,7 @@ pub const Resolved = struct {
     ready: ?Ready = null,
     after: []const []const u8 = &.{},
     faults: Faults = .{},
+    memory_max_mib: ?u32 = null,
 };
 
 pub fn node_address(index: u32) [4]u8 {
