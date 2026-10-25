@@ -17,8 +17,9 @@
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
-//!              survives a crash, what it did not is lost, a wipe loses both; then disk faults
-//!              asked for: lost writes, failing writes, a slow disk, and the disk afterwards
+//!              survives a crash, what it did not is lost, a wipe loses both (with a second
+//!              durable node beside it); then disk faults asked for: lost writes, failing
+//!              writes, a slow disk, and the disk afterwards
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -34,6 +35,9 @@ const Nodes = struct {
     maze: ?sdk.Node,
     zigmaze: ?sdk.Node,
     summaze: ?sdk.Node,
+    /// A second durable node: its mount namespace must not keep the echo node's disk (nor the
+    /// echo node's keep its own) alive across a crash.
+    witness: ?sdk.Node,
 };
 pub const System = sdk.System(Nodes);
 const port = 7000;
@@ -130,6 +134,12 @@ fn describe_faulted(d: *System.Describe) !void {
         .ready = .{ .tcp = port },
         .faults = crashes,
     });
+    durable.node(.witness, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_DURABLE=1"},
+        .ready = .{ .tcp = port },
+        .faults = crashes,
+    });
     // Faults the scenario asks for: the injector runs (it may pause or stop the node).
     const injectable = try d.profile("injectable");
     var asked = quiet;
@@ -206,7 +216,11 @@ fn disk(s: *System.Scenario) void {
 
 fn disk_faults(context: *System.Context) !void {
     const echo = context.nodes.echo.?;
+    const witness = context.nodes.witness.?;
     sdk.stop_faults(600 * std.time.ns_per_s);
+    // Whichever started first, the other's mount namespace began with its disk in it.
+    try witness.crash();
+    try sdk.retry(100, 100, answers, .{witness.address});
     try crash_and_wipe(&echo);
     try disk_failures(&echo);
     sdk.stop_faults(0);

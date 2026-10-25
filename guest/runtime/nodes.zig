@@ -1193,6 +1193,10 @@ const Launch = struct {
                 else => return error.Symlink,
             }
         }
+        // The namespace began as a copy of the guest's mounts, other nodes' disks and roots
+        // among them: a copy held here would keep another node's disk alive after its crash
+        // (its remount would get the old, shut down filesystem back).
+        try mounts_detach_others(launch.root);
         // The guest's root is the initramfs, where pivot_root is not allowed: move the node's
         // root over it and chroot, as switch_root does. The mount namespace is the node's own.
         if (linux.errno(linux.chdir(launch.root)) != .SUCCESS) return error.Chdir;
@@ -1201,6 +1205,63 @@ const Launch = struct {
         if (linux.errno(linux.chdir("/")) != .SUCCESS) return error.Chdir;
     }
 };
+
+const mounts_max = 4096;
+var mountinfo_buffer: [1 << 20]u8 = undefined;
+
+/// Detaches every mount of this (new, private) namespace other than `root`, what is under it
+/// and its ancestors (which hold it until it moves over `/`).
+fn mounts_detach_others(root: []const u8) !void {
+    const fd = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.NoMountinfo;
+    defer _ = linux.close(@intCast(fd));
+    var size: usize = 0;
+    while (size < mountinfo_buffer.len) {
+        const free = mountinfo_buffer[size..];
+        const result = linux.read(@intCast(fd), free.ptr, free.len);
+        if (linux.errno(result) != .SUCCESS) return error.ReadFailed;
+        if (result == 0) break;
+        size += result;
+    } else return error.TooManyMounts;
+    var points: [mounts_max][]const u8 = undefined;
+    var count: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, mountinfo_buffer[0..size], '\n');
+    while (lines.next()) |line| {
+        // id, parent id, major:minor, root, then the mount point.
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        for (0..4) |_| _ = fields.next();
+        const point = fields.next() orelse continue;
+        if (count == mounts_max) return error.TooManyMounts;
+        points[count] = point;
+        count += 1;
+    }
+    var index = count;
+    while (index > 0) { // Children first.
+        index -= 1;
+        const point = points[index];
+        if (std.mem.eql(u8, point, root) or path_under(point, root) or path_under(root, point)) {
+            continue;
+        }
+        var buffer: [path_size_max]u8 = undefined;
+        const path = print_z(&buffer, "{s}", .{point}) catch continue;
+        _ = linux.umount2(path, linux.MNT.DETACH); // Gone already with a detached parent.
+    }
+}
+
+/// Whether `path` is strictly under `directory` ("/" is above every other path).
+fn path_under(path: []const u8, directory: []const u8) bool {
+    if (std.mem.eql(u8, directory, "/")) return !std.mem.eql(u8, path, "/");
+    return path.len > directory.len and std.mem.startsWith(u8, path, directory) and
+        path[directory.len] == '/';
+}
+
+test path_under {
+    try std.testing.expect(path_under("/run/det/nodes/a/root/proc", "/run/det/nodes/a/root"));
+    try std.testing.expect(path_under("/run", "/"));
+    try std.testing.expect(!path_under("/", "/"));
+    try std.testing.expect(!path_under("/run/det/nodes/ab", "/run/det/nodes/a"));
+    try std.testing.expect(!path_under("/run/det/nodes/a/root", "/run/det/nodes/a/root"));
+}
 
 const Ids = struct { uid: u32, gid: u32 };
 
