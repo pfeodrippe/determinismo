@@ -357,6 +357,7 @@ function render() {
     <div class="muted" style="margin-top:4px">${escape(info.program || info.compose || "")}
       ${info.profile ? "· profile " + escape(info.profile) : ""} · seed ${escape(info.seed || "")} · inputs ${escape(info.inputs || "")}
       ${info.strategy ? "· strategy " + escape(info.strategy) : ""}
+      ${info.timeline_ms ? "· timelines of " + duration(info.timeline_ms / 1000) : ""}
       ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
     ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>
       <button id="run-stop" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Stop this run: the timelines it explored so far stay">Stop run</button>` : ""}
