@@ -29,7 +29,8 @@ const usage =
     \\                            [--record <results.jsonl>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
-    \\  --program <test program> [--profile <name>] [--scenario <name>|all] [--cache <dir>]
+    \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>]
+    \\  [--scenario <name>|all] [--cache <dir>]
     \\
     \\machine options:
     \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
@@ -84,6 +85,8 @@ const Arguments = struct {
     disk_count: u32 = 0,
     /// A test program: its system becomes the disks, its scenario the guest's work.
     program_path: ?[]const u8 = null,
+    /// Or a Compose file: services become nodes, Antithesis test templates scenarios.
+    compose_path: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     cache_directory: []const u8 = ".determinismo-cache",
@@ -98,12 +101,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
-    const prepared = if (arguments.program_path) |program| try system_prepare(
-        arena,
-        init.io,
-        &arguments,
-        program,
-    ) else null;
+    const has_system = arguments.program_path != null or arguments.compose_path != null;
+    const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
     const kernel = try cwd.readFileAlloc(init.io, arguments.kernel_path, arena, .unlimited);
     const initrd = if (arguments.initrd_path) |path|
@@ -127,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
-        .builtin_properties = arguments.program_path != null,
+        .builtin_properties = has_system,
     };
     const context = Context{ .arena = arena, .io = init.io };
     const base_cmdline = arguments.cmdline;
@@ -198,11 +197,12 @@ fn system_prepare(
     arena: std.mem.Allocator,
     io: std.Io,
     arguments: *Arguments,
-    program: []const u8,
 ) !prepare.Prepared {
     if (arguments.disk_count > 0) return error.DisksAndProgram;
+    if (arguments.program_path != null and arguments.compose_path != null) return error.Usage;
     const prepared = try prepare.prepare(arena, io, .{
-        .program = program,
+        .program = arguments.program_path,
+        .compose = arguments.compose_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
     });
@@ -749,6 +749,8 @@ fn parse_option(
         arguments.disk_count += 1;
     } else if (eql(u8, flag, "--program")) {
         arguments.program_path = value;
+    } else if (eql(u8, flag, "--compose")) {
+        arguments.compose_path = value;
     } else if (eql(u8, flag, "--profile")) {
         arguments.profile = value;
     } else if (eql(u8, flag, "--scenario")) {
@@ -877,4 +879,6 @@ test {
     _ = @import("prepare.zig");
     _ = @import("serve.zig");
     _ = @import("mcp.zig");
+    _ = @import("compose.zig");
+    _ = @import("yaml.zig");
 }

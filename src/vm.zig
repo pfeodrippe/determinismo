@@ -649,11 +649,15 @@ fn handle_request(vm: *VM, address: u32) !void {
     try vm.trace("request", @as(u64, operation) << 32 | size);
     switch (operation) {
         request_operation_emit => {
+            // One event per line: SDKs that buffer may write several lines at once.
             const moment_now = try vm.moment();
-            try vm.events.emit(moment_now, data);
-            if (vm.strategy) |strategy| try strategy.event(moment_now, data);
-            if (vm.moment_reached) {
-                std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, data });
+            var lines = std.mem.tokenizeScalar(u8, data, '\n');
+            while (lines.next()) |line| {
+                try vm.events.emit(moment_now, line);
+                if (vm.strategy) |strategy| try strategy.event(moment_now, line);
+                if (vm.moment_reached) {
+                    std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });
+                }
             }
         },
         request_operation_action => {

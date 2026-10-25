@@ -58,6 +58,18 @@ pub fn main(init: std.process.Init) !void {
 Full examples: [examples/bank](examples/bank) (Redis, a lost update) and
 [examples/shop](examples/shop) (Postgres and Redis, a stale cache).
 
+## Coming from Antithesis
+
+Bring the same project: a Compose file, and test commands in an image under
+`/opt/antithesis/test/v1/<template>/` (`first_*`, `parallel_driver_*`, `finally_*`, ...). Each
+template becomes a scenario whose commands run inside that service; assertions in the Antithesis
+SDK's format (written to `$ANTITHESIS_SDK_LOCAL_OUTPUT`, which points to determinismo) count as
+properties. Example: [examples/compose-bank](examples/compose-bank).
+
+```
+determinismo explore ... --compose examples/compose-bank/compose.yaml --scenario bank --branches 40
+```
+
 ## Quickstart (on the host)
 
 ```

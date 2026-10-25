@@ -34,7 +34,9 @@ pub const Profile = struct {
 pub const Node = struct {
     name: []const u8,
     source: Source,
-    /// The command to run; null runs the image's entrypoint and command.
+    /// Replaces the image's entrypoint (null keeps it).
+    entrypoint: ?[]const []const u8 = null,
+    /// The command to run, after the entrypoint; null keeps the image's.
     command: ?[]const []const u8 = null,
     /// `NAME=value` entries, added to (and overriding) the image's environment.
     env: []const []const u8 = &.{},
@@ -96,12 +98,20 @@ pub const Faults = struct {
 pub const Scenario = struct {
     name: []const u8,
     commands: []const Command,
+    /// Where the commands run: null for the test program in the runner, or a node whose
+    /// filesystem holds them (`Command.path`), as with Antithesis test templates.
+    node: ?[]const u8 = null,
     /// Whether the fault injector runs during the driver phase.
     faults: bool = true,
     clock_skip: bool = false,
 };
 
-pub const Command = struct { kind: Kind, name: []const u8 };
+pub const Command = struct {
+    kind: Kind,
+    name: []const u8,
+    /// The executable inside `Scenario.node`, for scenarios that run in a node.
+    path: ?[]const u8 = null,
+};
 
 pub const Kind = enum {
     setup,

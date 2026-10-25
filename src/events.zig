@@ -90,6 +90,15 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     }
     if (parsed.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
     if (parsed.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
+    if (parsed.object.get("antithesis_assert")) |assertion| {
+        try events.on_antithesis_assert(moment, assertion);
+    }
+    if (parsed.object.get("antithesis_setup")) |setup| {
+        const status = if (setup == .object) string_field(setup.object, "status") else null;
+        if (status != null and std.mem.eql(u8, status.?, "complete")) {
+            events.on_lifecycle(moment, .{ .string = "setup_complete" });
+        }
+    }
 }
 
 fn on_lifecycle(events: *Events, moment: Moment, lifecycle: std.json.Value) void {
@@ -106,8 +115,36 @@ fn on_assert(events: *Events, moment: Moment, assertion: std.json.Value) !void {
     assert(events.count > 0);
     if (assertion != .object) return error.BadAssertion;
     const kind_name = string_field(assertion.object, "type") orelse return error.BadAssertion;
-    const message = string_field(assertion.object, "message") orelse return error.BadAssertion;
     const kind = std.meta.stringToEnum(Kind, kind_name) orelse return error.BadAssertion;
+    return events.assertion_record(moment, kind, assertion);
+}
+
+/// An assertion from an Antithesis SDK (`{"antithesis_assert": {...}}`): its `display_type`
+/// names the property kind; entries with `hit: false` only declare the assertion.
+fn on_antithesis_assert(events: *Events, moment: Moment, assertion: std.json.Value) !void {
+    if (assertion != .object) return error.BadAssertion;
+    if (assertion.object.get("hit")) |hit| {
+        if (hit == .bool and !hit.bool) return;
+    }
+    const display = string_field(assertion.object, "display_type") orelse
+        return error.BadAssertion;
+    const kinds = [_]struct { []const u8, Kind }{
+        .{ "Always", .always },
+        .{ "AlwaysOrUnreachable", .always_or_unreachable },
+        .{ "Sometimes", .sometimes },
+        .{ "Reachable", .reachable },
+        .{ "Unreachable", .@"unreachable" },
+    };
+    for (kinds) |entry| {
+        if (std.mem.eql(u8, display, entry[0])) {
+            return events.assertion_record(moment, entry[1], assertion);
+        }
+    }
+    return error.BadAssertion;
+}
+
+fn assertion_record(events: *Events, moment: Moment, kind: Kind, assertion: std.json.Value) !void {
+    const message = string_field(assertion.object, "message") orelse return error.BadAssertion;
     const condition_value = assertion.object.get("condition") orelse std.json.Value{ .bool = true };
     if (condition_value != .bool) return error.BadAssertion;
     const condition = condition_value.bool;

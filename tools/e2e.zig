@@ -65,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
     try check_builtin_properties(&context);
     try check_parallel(&context);
     try check_fork(&context);
+    try check_compose(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -175,6 +176,30 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// An Antithesis-style project (Compose file, test templates in an image, SDK-format
+/// assertions) explores, finds its bug, and replays.
+fn check_compose(context: *Context) !void {
+    const common = [_][]const u8{
+        "--compose", "examples/compose-bank/compose.yaml", "--scenario", "bank", "--seed", "3",
+    };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "8" }));
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    expect(context, count == 8, "compose: explored {d} branches", .{count});
+    const failing = for (branches[0..count]) |branch| {
+        if (branch.failing) break branch;
+    } else null;
+    const found = failing != null;
+    expect(context, found, "compose: finds the lost update via SDK-format assertions", .{});
+    const branch = failing orelse return;
+    const index = try std.fmt.allocPrint(context.arena, "{d}", .{branch.index});
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+    var replayed: [1]Branch = undefined;
+    const same = parse_branches(replay, &replayed) == 1 and
+        same_timelines(&replayed, branches[0..count]);
+    expect(context, same, "compose: branch {d} replays", .{branch.index});
 }
 
 /// Branches from a moment of another branch (a nested snapshot) replay alone.

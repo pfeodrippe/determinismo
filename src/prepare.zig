@@ -12,9 +12,13 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const schema = @import("determinismo").schema;
+const compose = @import("compose.zig");
 
 pub const Options = struct {
-    program: []const u8,
+    /// The test program (its `--describe`), or else a Compose file whose services become the
+    /// nodes and whose images' Antithesis test templates become the scenarios.
+    program: ?[]const u8 = null,
+    compose: ?[]const u8 = null,
     /// The profile to resolve; null takes the first one.
     profile: ?[]const u8 = null,
     cache_directory: []const u8,
@@ -41,32 +45,42 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     for ([_][]const u8{ "images", "systems", "staging", "profiles" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ context.cache, directory }));
     }
-    const output = try tool(context, &.{ options.program, "--describe" });
-    const description = try schema.parse(schema.Description, arena, output);
+    const description = try describe(context, options);
     if (description.schema != schema.version) return error.SchemaVersion;
     const profile = try profile_find(&description, options.profile);
     try profile_check(profile);
 
     const resolved = try arena.alloc(schema.Resolved, profile.nodes.len);
     const disk_paths = try arena.alloc([]const u8, profile.nodes.len + 1);
+    var scenarios: std.ArrayList(schema.Scenario) = .empty;
+    try scenarios.appendSlice(arena, description.scenarios);
     for (profile.nodes, resolved, disk_paths[1..], 0..) |*node, *target, *disk, index| {
         disk.* = try node_resolve(context, node, @intCast(index), target);
+        if (options.compose != null) {
+            const tests = try tests_listing(context, disk.*);
+            try compose.templates(arena, node.name, tests, &scenarios);
+        }
     }
+    if (scenarios.items.len == 0) return error.NoScenarios;
     const system = schema.System{
         .profile = profile.name,
         .nodes = resolved,
-        .scenarios = description.scenarios,
+        .scenarios = scenarios.items,
     };
     var writer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(system, .{ .emit_null_optional_fields = false }, &writer.writer);
     const system_json = writer.written();
-    const program = try cwd.readFileAlloc(io, options.program, arena, .unlimited);
+    const program = if (options.program) |path|
+        try cwd.readFileAlloc(io, path, arena, .unlimited)
+    else
+        "";
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(system_json);
     hasher.update(program);
     const hash = hasher.final();
     disk_paths[0] = try system_disk(context, system_json, options.program, hash);
-    try profile_remember(context, options.program, &system, system_json);
+    const source = options.program orelse options.compose.?;
+    try profile_remember(context, source, &system, system_json);
     return .{
         .disk_paths = disk_paths,
         .system = system,
@@ -137,7 +151,7 @@ fn node_resolve(
         try directory_disk(context, node.name, directory, &target.digest)
     else
         try binary_disk(context, node.name, node.source.binary.?, &image, &target.digest);
-    target.command = try command_merge(arena, &image, node.command);
+    target.command = try command_merge(arena, &image, node.entrypoint, node.command);
     if (target.command.len == 0) return error.NodeHasNoCommand;
     target.env = try environment_merge(arena, image.Env orelse &.{}, node.env);
     target.workdir = node.workdir orelse if (image.WorkingDir.len > 0) image.WorkingDir else "/";
@@ -177,7 +191,8 @@ fn image_disk(
         "{s}.erofs",
         .{id},
     ) });
-    if (exists(context, disk)) return disk;
+    const tests = try std.fmt.allocPrint(context.arena, "{s}.tests", .{disk});
+    if (exists(context, disk) and exists(context, tests)) return disk;
     std.debug.print("[determinismo] flattening {s} into {s}\n", .{ reference, disk });
     const container = std.mem.trim(u8, try tool(context, &.{
         "podman", "create", "--quiet", reference,
@@ -186,8 +201,54 @@ fn image_disk(
     const tar = try std.fmt.allocPrint(context.arena, "{s}.tar", .{disk});
     _ = try tool(context, &.{ "podman", "export", "--output", tar, container });
     defer std.Io.Dir.cwd().deleteFile(context.io, tar) catch {};
-    try erofs_build(context, disk, &.{ "--tar=f", tar });
+    // Its executables, for test templates (written before the disk: a disk implies them).
+    const listing = try tool(context, &.{ "tar", "-tvf", tar });
+    try std.Io.Dir.cwd().writeFile(context.io, .{
+        .sub_path = tests,
+        .data = try executables_of(context.arena, listing),
+    });
+    if (!exists(context, disk)) try erofs_build(context, disk, &.{ "--tar=f", tar });
     return disk;
+}
+
+fn describe(context: Context, options: Options) !schema.Description {
+    if (options.compose) |path| {
+        const profiles = try context.arena.alloc(schema.Profile, 1);
+        profiles[0] = try compose.profile(context.arena, context.io, path);
+        return .{ .profiles = profiles, .scenarios = &.{} };
+    }
+    const program = options.program orelse return error.NoProgram;
+    const output = try tool(context, &.{ program, "--describe" });
+    return schema.parse(schema.Description, context.arena, output);
+}
+
+/// The image's executables, recorded next to its disk when it was flattened.
+fn tests_listing(context: Context, disk: []const u8) ![]const []const u8 {
+    const path = try std.fmt.allocPrint(context.arena, "{s}.tests", .{disk});
+    const limit: std.Io.Limit = .limited(1 << 22);
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, limit) catch
+        return &.{}; // Not an image (a directory or a binary): no templates.
+    var list: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| try list.append(context.arena, line);
+    return list.items;
+}
+
+/// From `tar -tv` output: the regular files executable by their owner.
+fn executables_of(arena: std.mem.Allocator, listing: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 10 or line[0] != '-' or line[3] != 'x') continue;
+        // "-rwxr-xr-x owner/group size date time path": the path is the sixth field on.
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        for (0..5) |_| _ = fields.next();
+        const path = fields.rest();
+        if (path.len == 0) continue;
+        try out.appendSlice(arena, path);
+        try out.append(arena, '\n');
+    }
+    return out.items;
 }
 
 /// Keeps the resolved system of each program and profile, and reports what changed since the
@@ -338,7 +399,7 @@ fn binary_disk(
 fn system_disk(
     context: Context,
     system_json: []const u8,
-    program: []const u8,
+    program: ?[]const u8,
     hash: u64,
 ) ![]const u8 {
     const io = context.io;
@@ -349,7 +410,9 @@ fn system_disk(
     const staging = try path_join(context, &.{ context.cache, "staging", "system" });
     cwd.deleteTree(io, staging) catch {};
     try cwd.createDirPath(io, staging);
-    try cwd.copyFile(program, cwd, try path_join(context, &.{ staging, "program" }), io, .{});
+    if (program) |path| {
+        try cwd.copyFile(path, cwd, try path_join(context, &.{ staging, "program" }), io, .{});
+    }
     try cwd.writeFile(io, .{
         .sub_path = try path_join(context, &.{ staging, "system.json" }),
         .data = system_json,
@@ -373,15 +436,18 @@ fn erofs_build(context: Context, disk: []const u8, source: []const []const u8) !
     try cwd.rename(temporary, cwd, disk, context.io);
 }
 
-/// Like `docker run`: the image's entrypoint, then our command or else the image's.
+/// Like `docker run`: the entrypoint (ours, else the image's), then the command (ours, else
+/// the image's, unless we replaced the entrypoint, which drops the image's command too).
 fn command_merge(
     arena: std.mem.Allocator,
     image: *const ImageConfig,
+    entrypoint: ?[]const []const u8,
     command: ?[]const []const u8,
 ) ![]const []const u8 {
-    const entrypoint = image.Entrypoint orelse &.{};
-    const arguments = command orelse image.Cmd orelse &.{};
-    return std.mem.concat(arena, []const u8, &.{ entrypoint, arguments });
+    const entry = entrypoint orelse image.Entrypoint orelse &.{};
+    const image_command = if (entrypoint != null) null else image.Cmd;
+    const arguments = command orelse image_command orelse &.{};
+    return std.mem.concat(arena, []const u8, &.{ entry, arguments });
 }
 
 /// The image's environment with ours on top (same name: ours wins), PATH always present.
@@ -454,8 +520,10 @@ test command_merge {
     var arena = arena_state;
     defer arena.deinit();
     const image = ImageConfig{ .Entrypoint = &.{"entry.sh"}, .Cmd = &.{"serve"} };
-    const ours = try command_merge(arena.allocator(), &image, &.{ "redis-server", "--x" });
+    const ours = try command_merge(arena.allocator(), &image, null, &.{ "redis-server", "--x" });
     try std.testing.expectEqual(@as(usize, 3), ours.len);
-    const theirs = try command_merge(arena.allocator(), &image, null);
+    const theirs = try command_merge(arena.allocator(), &image, null, null);
     try std.testing.expectEqualStrings("serve", theirs[1]);
+    const replaced = try command_merge(arena.allocator(), &image, &.{"sh"}, null);
+    try std.testing.expectEqual(@as(usize, 1), replaced.len);
 }

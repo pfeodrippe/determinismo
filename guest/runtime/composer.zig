@@ -21,11 +21,17 @@ const parallelism_max = 4;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
 const program_path = "/det/program";
+const nodes_path = "/opt/determinismo/bin/det-nodes";
 const nodes = @import("nodes.zig");
 const schema = sdk.schema;
 const Kind = schema.Kind;
 
-const Command = struct { name: [:0]const u8, kind: Kind };
+const Command = struct {
+    name: [:0]const u8,
+    kind: Kind,
+    /// For scenarios in a node: the executable there (run with det-nodes exec).
+    path: ?[:0]const u8 = null,
+};
 
 const Running = struct { pid: linux.pid_t, command: *const Command };
 
@@ -36,6 +42,8 @@ const Composer = struct {
     running_count: u32 = 0,
     started_count: u32 = 0,
     scenario: [:0]const u8 = "",
+    /// The node the scenario's commands run in, if not the runner.
+    node: ?[:0]const u8 = null,
     /// Whether the scenario uses the fault injector, and its process while it runs.
     faults: bool = false,
     faults_pid: ?linux.pid_t = null,
@@ -65,7 +73,10 @@ const Composer = struct {
     fn start(composer: *Composer, command: *const Command) void {
         assert(composer.running_count < running_max);
         assert(composer.started_count < starts_max * 2);
-        const pid = spawn(&.{ program_path, "run", composer.scenario, command.name });
+        const pid = if (composer.node) |node|
+            spawn(&.{ nodes_path, "exec", node, command.path.? })
+        else
+            spawn(&.{ program_path, "run", composer.scenario, command.name });
         composer.running[composer.running_count] = .{ .pid = pid, .command = command };
         composer.running_count += 1;
         composer.started_count += 1;
@@ -130,16 +141,23 @@ pub fn main(init: std.process.Init) !void {
     const system = try nodes.system_load(arena);
     const scenario = system.scenario(arguments[2]) orelse return error.UnknownScenario;
     var composer: Composer = .{ .scenario = arguments[2], .faults = scenario.faults };
+    if (scenario.node) |node| composer.node = try arena.dupeSentinel(u8, node, 0);
     var setup: ?Command = null;
     for (scenario.commands) |command| {
         const name = try arena.dupeSentinel(u8, command.name, 0);
+        const path = if (command.path) |path| try arena.dupeSentinel(u8, path, 0) else null;
+        if (composer.node != null and path == null) return error.CommandWithoutPath;
         if (command.kind == .setup) {
             if (setup != null) return error.SeveralSetupCommands;
-            setup = .{ .name = name, .kind = .setup };
+            setup = .{ .name = name, .kind = .setup, .path = path };
             continue;
         }
         if (composer.command_count == commands_max) return error.TooManyCommands;
-        composer.commands[composer.command_count] = .{ .name = name, .kind = command.kind };
+        composer.commands[composer.command_count] = .{
+            .name = name,
+            .kind = command.kind,
+            .path = path,
+        };
         composer.command_count += 1;
     }
     if (setup) |*command| composer.run_to_completion(command);
