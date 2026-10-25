@@ -390,7 +390,9 @@ fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
         .exited => |code| code,
         else => 255,
     };
-    const refusal = std.mem.indexOf(u8, result.stderr, "recorded with") != null;
+    // Refusals some checks expect (a tape on other inputs, a moment before the snapshot).
+    const refusal = std.mem.indexOf(u8, result.stderr, "recorded with") != null or
+        std.mem.indexOf(u8, result.stderr, "is not after the snapshot") != null;
     if (status != 0 and status != 3 and !refusal) {
         std.debug.print("e2e: determinismo exited with {d}:\n{s}\n", .{ status, result.stderr });
     }
