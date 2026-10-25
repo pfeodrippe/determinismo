@@ -343,23 +343,73 @@ pub fn timelines_read(
         try branches.append(arena, branch);
     }
     std.mem.sort(u32, branches.items, {}, std.sort.asc(u32));
+    var own: Own = .{ .arena = arena, .io = io, .directory = directory };
     const timelines = try arena.alloc(Timeline, branches.items.len);
     for (branches.items, timelines) |branch, *timeline| {
-        const name = try std.fmt.allocPrint(arena, "branch-{d}.jsonl", .{branch});
-        const path = try std.fs.path.join(arena, &.{ directory, name });
-        const source = try cwd.readFileAlloc(io, path, arena, .unlimited);
+        const mine = try own.get(branch);
         var events: std.ArrayList(Event) = .empty;
-        try events.ensureTotalCapacity(arena, prefix.items.len);
+        try events.ensureTotalCapacity(arena, prefix.items.len + mine.events.len);
         for (prefix.items) |event| {
             var shared = event;
             shared.branch = branch;
             events.appendAssumeCapacity(shared);
         }
-        try events_parse(arena, source, branch, &events);
+        // A tree explorer's timeline: each ancestor's own events from where it began to where
+        // the next one branched from it, then its own.
+        var from: u64 = 0;
+        for (mine.path) |step| {
+            const ancestor = try own.get(step.branch);
+            for (ancestor.events) |event| {
+                if (event.vtime_ns < from or event.vtime_ns > step.vtime_ns) continue;
+                var shared = event;
+                shared.branch = branch;
+                try events.append(arena, shared);
+            }
+            from = step.vtime_ns;
+        }
+        try events.appendSlice(arena, mine.events);
         timeline.* = .{ .branch = branch, .events = events.items };
     }
     return timelines;
 }
+
+/// Each branch's own events (its file), and its path when it began inside others; read once.
+const Own = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+    read: std.AutoHashMapUnmanaged(u32, Branch) = .empty,
+
+    const Step = struct { branch: u32, vtime_ns: u64 };
+    const Branch = struct { path: []const Step, events: []const Event };
+
+    fn get(own: *Own, branch: u32) !Branch {
+        if (own.read.get(branch)) |known| return known;
+        const name = try std.fmt.allocPrint(own.arena, "branch-{d}.jsonl", .{branch});
+        const path = try std.fs.path.join(own.arena, &.{ own.directory, name });
+        const cwd = std.Io.Dir.cwd();
+        const source = cwd.readFileAlloc(own.io, path, own.arena, .unlimited) catch |err|
+            switch (err) {
+                error.FileNotFound => "", // An ancestor not recorded: its part is missing.
+                else => return err,
+            };
+        var events: std.ArrayList(Event) = .empty;
+        try events_parse(own.arena, source, branch, &events);
+        var steps: []const Step = &.{};
+        const first_end = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
+        if (std.mem.startsWith(u8, source, "{\"path\":")) {
+            const Header = struct { path: []const Step };
+            const line = source[0..first_end];
+            const header = try std.json.parseFromSliceLeaky(Header, own.arena, line, .{
+                .ignore_unknown_fields = true,
+            });
+            steps = header.path;
+        }
+        const known = Branch{ .path = steps, .events = events.items };
+        try own.read.put(own.arena, branch, known);
+        return known;
+    }
+};
 
 const Line = struct { seq: u64, vtime_ns: u64, event: std.json.Value };
 

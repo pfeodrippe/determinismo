@@ -55,9 +55,9 @@ in ANTITHESIS.md yet.
    info). Left: past the SDK's own helpers (`sdk.retry` reports itself, not its caller) and
    det-init's built-ins (which have no place in user code).
 3. **First pass, first failure**: done in every SDK (opt-in; guidance only when it improves).
-4. **Disk faults** (faults): Antithesis's mutation campaign turned on disk faults; find their
-   documented forms (I/O errors, latency, lost unsynced writes at a crash, torn writes) and add
-   them to det-faults through the nodes' disks.
+4. **Disk faults**: Antithesis documents restarts that keep durably synced changes or lose all
+   of them: `crash` (an ext4 disk per node, shut down without flushing) and `wipe`, with an e2e
+   check. Left: I/O errors and latency on a node's disk (device-mapper or the VMM's virtio).
 5. **Retroactive logging**: verbose output (lines matching a regex, or whole nodes) goes to a
    black hole during exploration, not stored; replaying a branch regenerates it for the Logs
    view, a query, or a file. Antithesis measured virtual time per wall time going from 0.16 to
@@ -68,8 +68,9 @@ in ANTITHESIS.md yet.
    code and writes subtle mutants (races, wrong ordering; not syntax that only panics), one
    patch each; determinismo explores each mutant and reports per property whether it was
    falsified, with why not when it was not: the mutated code never ran (coverage), or it ran and
-   no property noticed (a gap in the properties). `determinismo mutate` with an MCP tool, and the
-   skill above to write the mutants. The e2e's single mutation check is the seed of this.
+   no property noticed (a gap in the properties). `determinismo mutate` is written (patches to a
+   node's build, caught / never ran / unnoticed). Left: an e2e check, an MCP tool, and the
+   determinismo-mutants skill that writes the mutants.
 
 ## Strategy guidance (next)
 

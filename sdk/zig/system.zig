@@ -40,6 +40,17 @@ pub const Node = struct {
         return nodes_command(&.{ "start", node.name });
     }
 
+    /// A power loss, then it starts again: its disk keeps what was synced and loses the rest
+    /// (the node needs crash faults allowed, which give it a disk of its own).
+    pub fn crash(node: *const Node) !void {
+        return nodes_command(&.{ "crash", node.name });
+    }
+
+    /// It starts again fresh from its image: everything it wrote is gone.
+    pub fn wipe(node: *const Node) !void {
+        return nodes_command(&.{ "wipe", node.name });
+    }
+
     /// Runs `argv` inside the node (like `docker exec`); returns its exit status. Its output goes
     /// to this command's output.
     pub fn exec(node: *const Node, argv: []const []const u8) !u8 {

@@ -13,6 +13,8 @@
 //!   quiet      (profile "workers") a driver asks for a 2 second quiet period from inside the
 //!              echo node (det-stop-faults, as Antithesis's ANTITHESIS_STOP_FAULTS): no fault
 //!              but clock skips may start during it
+//!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
+//!              survives a crash, what it did not is lost, a wipe loses both
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -49,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
             .node_exit = node_exit,
             .oom = oom,
             .crash = crash,
+            .disk = disk,
             .stress = stress,
             .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
@@ -90,6 +93,36 @@ fn describe(d: *System.Describe) !void {
         .ready = .{ .tcp = port },
         .faults = kills,
     });
+    // A disk of its own (crash faults allowed), for the "disk" scenario.
+    const durable = try d.profile("durable");
+    var crashes = quiet;
+    crashes.crash = true;
+    durable.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_DURABLE=1"},
+        .ready = .{ .tcp = port },
+        .faults = crashes,
+    });
+    try describe_mazes(d);
+    const controller = try d.profile("controller");
+    controller.node(.controller, .{
+        .directory = "zig-out/bin", // determinismo and det-fake-explore.
+        .command = &.{
+            "/determinismo", "serve",      "--listen",           "0.0.0.0:7878",
+            "--data",        "/var/runs", "--explorer", "/det-fake-explore",
+        },
+        .ready = .{ .tcp = 7878 },
+        .faults = .{ .restart = true },
+    });
+    // A node in C reporting through the C SDK; no faults (its properties are about the SDK).
+    default.node(.csdk, .{
+        .binary = "zig-out/bin/det-selftest-c",
+        .faults = quiet,
+    });
+}
+
+/// The mazes coverage-guided strategies must solve (C, the sum, Zig).
+fn describe_mazes(d: *System.Describe) !void {
     const maze_profile = try d.profile("maze");
     maze_profile.node(.maze, .{
         .binary = "zig-out/bin/det-maze",
@@ -107,21 +140,6 @@ fn describe(d: *System.Describe) !void {
     maze_zig.node(.zigmaze, .{
         .binary = "zig-out/bin/det-maze-zig",
         .command = &.{ "/bin/det-maze-zig", "idle" },
-        .faults = quiet,
-    });
-    const controller = try d.profile("controller");
-    controller.node(.controller, .{
-        .directory = "zig-out/bin", // determinismo and det-fake-explore.
-        .command = &.{
-            "/determinismo", "serve",      "--listen",           "0.0.0.0:7878",
-            "--data",        "/var/runs", "--explorer", "/det-fake-explore",
-        },
-        .ready = .{ .tcp = 7878 },
-        .faults = .{ .restart = true },
-    });
-    // A node in C reporting through the C SDK; no faults (its properties are about the SDK).
-    default.node(.csdk, .{
-        .binary = "zig-out/bin/det-selftest-c",
         .faults = quiet,
     });
 }
@@ -159,6 +177,42 @@ fn crash(s: *System.Scenario) void {
 fn segfault(context: *System.Context) !void {
     const node = context.nodes.echo orelse return error.NoEchoNode;
     _ = try node.exec(&.{ "/bin/det-selftest-node", "crash" });
+}
+
+fn disk(s: *System.Scenario) void {
+    s.singleton_driver("crash_and_wipe", crash_and_wipe);
+}
+
+/// The echo node wrote one file synced and one not (DET_DURABLE). After a crash the first is
+/// there and the second is not; after a wipe neither is. In a quiet period: only these.
+fn crash_and_wipe(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    try echo.crash();
+    try sdk.retry(100, 100, answers, .{echo.address});
+    const synced = file_present(&echo, "/data/synced");
+    const unsynced = file_present(&echo, "/data/unsynced");
+    sdk.event("disk_after_crash", .{ .synced = synced, .unsynced = unsynced });
+    sdk.always(synced and !unsynced, "a crash keeps what was synced and loses the rest", .{
+        .synced = synced,
+        .unsynced = unsynced,
+    });
+    try echo.wipe();
+    try sdk.retry(100, 100, answers, .{echo.address});
+    // The node wrote both again on its fresh start: the wipe lost what the crash kept.
+    sdk.always(file_present(&echo, "/data/unsynced"), "a wipe starts the node fresh", .{});
+    sdk.stop_faults(0);
+}
+
+fn file_present(node: *const sdk.Node, path: []const u8) bool {
+    const status = node.exec(&.{ "/bin/det-selftest-node", "exists", path }) catch return false;
+    return status == 0;
+}
+
+fn answers(address: [4]u8) !void {
+    var reply: [16]u8 = undefined;
+    const answer = try request(address, "ping\n", &reply);
+    if (!std.mem.eql(u8, answer, "ping\n")) return error.WrongAnswer;
 }
 
 fn oom(s: *System.Scenario) void {

@@ -785,7 +785,12 @@ async function mapDraw() {
   const endNs = longest - rootNs > 1.6 * (typical - rootNs) ? rootNs + 1.15 * (typical - rootNs) : longest;
   const rowOf = new Map(rows.filter((r) => !r.child).map((r) => [r.branch.index, rows.indexOf(r)]));
   const firstFailures = new Map();
-  for (const e of failures) if (!firstFailures.has(e.branch) || firstFailures.get(e.branch).vtime_ns > e.vtime_ns) firstFailures.set(e.branch, e);
+  for (const e of failures) {
+    // Its own first failure: what came before its branch point is its ancestors'.
+    const branch = byIndex.get(e.branch), parent = branch && parentOf(branch);
+    if (parent && e.vtime_ns <= parent.vtime_ns) continue;
+    if (!firstFailures.has(e.branch) || firstFailures.get(e.branch).vtime_ns > e.vtime_ns) firstFailures.set(e.branch, e);
+  }
   const points = new Map();
   for (const row of rows) if (!row.child && row.parentRow != null) {
     const key = `${row.parentRow}:${row.parent.vtime_ns}`;
@@ -911,6 +916,9 @@ function treeSvg(model, view, width) {
   const mark = (e, kind) => {
     const row = rowOf.get(e.branch);
     if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) return "";
+    // Before its branch point, an event is its ancestors': drawn on their lines.
+    const parent = rows[row].parent;
+    if (parent && e.vtime_ns <= parent.vtime_ns) return "";
     const xx = x(e.vtime_ns), yy = y(row);
     const html = kind === "fault" ? faultTip(e, model.decisionFor(e)) : failureTip(e);
     return kind === "fault"
@@ -1022,22 +1030,22 @@ async function logsLoad() {
   const logs = state.logs;
   const condition = logs.filter || "seq>=0";
   try {
-    // A tree explorer's timeline begins inside its ancestors: their events up to where each
-    // branched (the shared prefix), then its own.
+    // A tree explorer's timeline begins inside its ancestors (queries give its whole history):
+    // each event before its last branch point is marked with the ancestor it shares, and each
+    // branch point with a divider.
     const record = state.run.branches.find((b) => b.index === logs.branch);
     const path = (record && record.path) || [];
-    // Every query has the shared setup (boot to the snapshot) first: each stretch keeps its
-    // events from where it began, the setup once.
-    const inherited = [];
-    let from = 0;
-    for (const step of path) {
-      const part = await query({ condition, branch: step.branch, up_to_vtime: step.vtime_ns / 1e9, limit: 5000 });
-      for (const event of part) if (event.vtime_ns >= from) inherited.push({ ...event, inherited: step.branch });
-      inherited.push({ divider: true, branch: step.branch, vtime_ns: step.vtime_ns });
-      from = step.vtime_ns;
+    const events = await query({ condition, branch: logs.branch, up_to_vtime: logs.vtime_ns / 1e9 + 2, limit: 5000 });
+    const marked = [];
+    let step = 0;
+    for (const event of events) {
+      while (step < path.length && event.vtime_ns > path[step].vtime_ns) {
+        marked.push({ divider: true, branch: path[step].branch, vtime_ns: path[step].vtime_ns });
+        step += 1;
+      }
+      marked.push(step < path.length ? { ...event, inherited: path[step].branch } : event);
     }
-    const own = await query({ condition, branch: logs.branch, up_to_vtime: logs.vtime_ns / 1e9 + 2, limit: 5000 });
-    logs.events = inherited.concat(own.filter((event) => event.vtime_ns >= from));
+    logs.events = marked;
   } catch (error) { logs.error = error.message; }
   const body = $("#logs .body");
   if (body) { body.innerHTML = logsBody(); logsWire(); }

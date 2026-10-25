@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-selftest-node", .path = "tests/selftest/node.zig" },
         .{ .name = "det-selftest-catalog", .path = "tests/selftest/catalog_test.zig" },
         .{ .name = "det-maze-sum", .path = "tests/selftest/maze_sum.zig" },
+        .{ .name = "det-selftest-sum", .path = "tests/mutate/sum_test.zig" },
         .{ .name = "det-fake-explore", .path = "tests/selftest/fake_explore.zig" },
     };
     for (guest_programs) |program| {

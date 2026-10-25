@@ -35,6 +35,10 @@ const Kind = enum {
     partition,
     degrade,
     restart,
+    /// A power loss: the node's disk keeps what was synced, then it starts again.
+    crash,
+    /// It starts again fresh from its image, everything it wrote gone.
+    wipe,
     throttle,
     process_pause,
     /// One thread of one of its processes stopped (ptrace), the others running: interleavings
@@ -304,6 +308,8 @@ fn faults_collect(
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
         if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
         if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
+        if (allowed.crash) faults_add(faults, &count, .{ .kind = .crash, .node = node.name });
+        if (allowed.wipe) faults_add(faults, &count, .{ .kind = .wipe, .node = node.name });
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
@@ -383,8 +389,16 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
             sleep_ns(applied.duration_ns);
             nodes.freeze(applied.node, .thawed) catch {};
         },
-        .restart => {
-            nodes.kill(applied.node) catch return;
+        .restart, .crash, .wipe => {
+            const stopped = switch (applied.kind) {
+                .crash => nodes.crash(applied.node),
+                .wipe => nodes.wipe(applied.node),
+                else => nodes.kill(applied.node),
+            };
+            stopped catch |err| {
+                sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+                return;
+            };
             sdk.event("fault", applied.*);
             sleep_ns(applied.duration_ns);
             const node = system.node(applied.node) orelse return;

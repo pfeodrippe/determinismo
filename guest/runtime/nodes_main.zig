@@ -3,6 +3,8 @@
 //!
 //!   det-nodes up                      start every node of /det/system.json, in order
 //!   det-nodes start|kill <node>       start a node, or kill all its processes
+//!   det-nodes crash|wipe <node>       a power loss (its disk keeps what was synced), or a start
+//!                                     fresh from its image; then it starts again
 //!   det-nodes pause|resume <node>     freeze or thaw all its processes
 //!   det-nodes link <a> <b> up|down    the link between two nodes (or a node and "runner")
 //!   det-nodes exec <node> <command>...   run a command inside a node; exits with its status
@@ -14,7 +16,7 @@ const schema = @import("determinismo").schema;
 
 const usage =
     \\usage: det-nodes up
-    \\       det-nodes start|kill|pause|resume <node>
+    \\       det-nodes start|kill|crash|wipe|pause|resume <node>
     \\       det-nodes link <a> <b> up|down
     \\       det-nodes exec <node> <command>...
     \\       det-nodes list
@@ -50,6 +52,11 @@ pub fn main(init: std.process.Init) !void {
         return nodes.start(arena, &system, node);
     }
     if (eql(u8, command, "kill")) return nodes.kill(name);
+    if (eql(u8, command, "crash") or eql(u8, command, "wipe")) {
+        const node = system.node(name) orelse return error.UnknownNode;
+        try if (eql(u8, command, "crash")) nodes.crash(name) else nodes.wipe(name);
+        return nodes.start(arena, &system, node);
+    }
     if (eql(u8, command, "pause")) return nodes.freeze(name, .frozen);
     if (eql(u8, command, "resume")) return nodes.freeze(name, .thawed);
     return usage_exit();

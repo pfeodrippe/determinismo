@@ -3,10 +3,12 @@
 //! (/det/system.json) as a container we build ourselves.
 //!
 //! A node gets its own mount, PID, network, UTS and IPC namespaces; its root filesystem is an
-//! overlay of its read-only disk and a tmpfs upper layer (so its writes live in guest memory and
-//! are part of every snapshot); its processes share one cgroup, which pauses (freeze) and kills
-//! them as a unit. The guest network is a full mesh: one veth pair between every two running
-//! nodes and between each node and the runner (the guest's root namespace, where tests run), so a
+//! overlay of its read-only disk and a writable layer of its own (so its writes live in guest
+//! memory and are part of every snapshot): a tmpfs, or with crash faults an ext4 disk on a loop
+//! device, which a crash shuts down without flushing (what was not synced is lost); its
+//! processes share one cgroup, which pauses (freeze) and kills them as a unit. The guest network
+//! is a full mesh: one veth pair between every two running nodes and between each node and the
+//! runner (the guest's root namespace, where tests run), so a
 //! partition is one link going down. Every link of a node carries the node's one /32 address,
 //! with a host route per peer.
 const std = @import("std");
@@ -204,6 +206,165 @@ pub fn kill(name: []const u8) !void {
         sleep_ns(poll_interval_ns);
     } else return error.NodeDidNotStop;
     sdk.event("node_kill", .{ .node = name });
+}
+
+/// A power loss: the node's disk keeps what reached it (synced, or written back already) and
+/// loses the rest; its processes are gone. The next start mounts the disk again (ext4 replays
+/// its journal: consistent, as after a real crash).
+pub fn crash(name: []const u8) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    const fd = linux.open(paths.layer, directory_flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
+    var flags: u32 = ext4_going_flags_nologflush;
+    const shutdown = linux.ioctl(@intCast(fd), ext4_ioc_shutdown, @intFromPtr(&flags));
+    _ = linux.close(@intCast(fd));
+    if (linux.errno(shutdown) != .SUCCESS) return error.NotADurableDisk; // Not ext4: no crash.
+    try kill(name);
+    try layer_unmount(&paths);
+    sdk.event("node_crash", .{ .node = name });
+}
+
+/// The node starts fresh from its image: its writable layer is gone (with its disk, if any).
+pub fn wipe(name: []const u8) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    try kill(name);
+    if (exists(paths.mounted)) try layer_unmount(&paths);
+    var text_buffer: [16]u8 = undefined;
+    if (read_small(paths.loop, &text_buffer)) |text| {
+        const number = std.fmt.parseInt(u32, text, 10) catch return error.BadLoop;
+        var device_buffer: [32]u8 = undefined;
+        const device = try print_z(&device_buffer, "/dev/loop{d}", .{number});
+        const loop_fd = linux.open(device, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(loop_fd) == .SUCCESS) {
+            _ = linux.ioctl(@intCast(loop_fd), loop_clr_fd, 0);
+            _ = linux.close(@intCast(loop_fd));
+        }
+        _ = linux.unlink(paths.loop);
+    }
+    _ = linux.unlink(paths.image);
+    sdk.event("node_wipe", .{ .node = name });
+}
+
+const directory_flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+const ext4_ioc_shutdown = 0x8004587d; // _IOR('X', 125, __u32)
+const ext4_going_flags_nologflush = 2; // Neither the journal nor data are flushed.
+const ext4_ioc_resize_fs = 0x40086610; // _IOW('f', 16, __u64)
+const loop_ctl_get_free = 0x4c82;
+const loop_set_fd = 0x4c00;
+const loop_clr_fd = 0x4c01;
+/// A durable disk's size (sparse: guest memory holds what is written).
+const durable_size = 4 << 30;
+const durable_template_path = "/opt/determinismo/durable.blocks"; // initramfs.zig's.
+
+/// The node's writable layer: a tmpfs of its own, or (crash faults) its ext4 disk.
+fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
+    if (!node.faults.crash) return mount("tmpfs", paths.layer, "tmpfs", 0, null);
+    if (!exists(paths.image)) try durable_image_create(paths.image);
+    const loop = try loop_attach(paths);
+    var device_buffer: [32]u8 = undefined;
+    const device = try print_z(&device_buffer, "/dev/loop{d}", .{loop});
+    // noinit_itable: no background zeroing of inode tables (it would fill guest memory).
+    try mount(device, paths.layer, "ext4", 0, "data=ordered,noinit_itable");
+    // The template is small; grown in place to the disk's size (nothing to do the next time).
+    const fd = linux.open(paths.layer, directory_flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
+    defer _ = linux.close(@intCast(fd));
+    var blocks: u64 = durable_size / 4096;
+    const resized = linux.ioctl(@intCast(fd), ext4_ioc_resize_fs, @intFromPtr(&blocks));
+    if (linux.errno(resized) != .SUCCESS) return error.ResizeFailed;
+    writeback_relax();
+}
+
+/// Dirty data stays dirty until a program syncs it (no periodic writeback): what a crash loses
+/// is what was not synced, as on a machine whose power fails before the flusher ran.
+fn writeback_relax() void {
+    const settings = [_][2][:0]const u8{
+        .{ "/proc/sys/vm/dirty_writeback_centisecs", "0" },
+        .{ "/proc/sys/vm/dirty_expire_centisecs", "8640000" },
+        .{ "/proc/sys/vm/dirty_background_ratio", "50" },
+        .{ "/proc/sys/vm/dirty_ratio", "80" },
+    };
+    for (settings) |setting| file_write(setting[0], setting[1]) catch {};
+}
+
+fn layer_unmount(paths: *const Paths) !void {
+    _ = linux.unlink(paths.mounted);
+    for ([_][:0]const u8{ paths.root, paths.layer }) |path| {
+        for (0..stop_attempts_max) |_| {
+            const result = linux.umount2(path, 0);
+            if (linux.errno(result) == .SUCCESS or linux.errno(result) == .INVAL) break;
+            sleep_ns(poll_interval_ns); // Busy until the killed processes are reaped.
+        } else return error.UnmountFailed;
+    }
+}
+
+/// The empty ext4 filesystem of the initramfs, written as a sparse image of `durable_size`.
+fn durable_image_create(path: [:0]const u8) !void {
+    const template = linux.open(durable_template_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(template) != .SUCCESS) return error.NoDurableTemplate;
+    defer _ = linux.close(@intCast(template));
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
+    const image = linux.open(path, flags, 0o600);
+    if (linux.errno(image) != .SUCCESS) return error.OpenFailed;
+    defer _ = linux.close(@intCast(image));
+    var size_bytes: [8]u8 = undefined;
+    try read_exact(@intCast(template), &size_bytes);
+    var record: [4 + 4096]u8 = undefined;
+    while (read_exact(@intCast(template), &record)) {
+        const index = std.mem.readInt(u32, record[0..4], .little);
+        const offset = @as(i64, index) * 4096;
+        const written = linux.pwrite(@intCast(image), record[4..].ptr, 4096, offset);
+        if (linux.errno(written) != .SUCCESS or written != 4096) return error.WriteFailed;
+    } else |err| if (err != error.EndOfFile) return err;
+    if (linux.errno(linux.ftruncate(@intCast(image), durable_size)) != .SUCCESS) {
+        return error.TruncateFailed;
+    }
+}
+
+fn read_exact(fd: linux.fd_t, buffer: []u8) !void {
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const result = linux.read(fd, buffer[done..].ptr, buffer.len - done);
+        if (linux.errno(result) != .SUCCESS) return error.ReadFailed;
+        if (result == 0) return if (done == 0) error.EndOfFile else error.ShortRead;
+        done += result;
+    }
+}
+
+/// The node's loop device over its image: attached once, its number kept beside the image.
+fn loop_attach(paths: *const Paths) !u32 {
+    var text_buffer: [16]u8 = undefined;
+    if (read_small(paths.loop, &text_buffer)) |text| {
+        return std.fmt.parseInt(u32, text, 10) catch error.BadLoop;
+    }
+    const control = linux.open("/dev/loop-control", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(control) != .SUCCESS) return error.NoLoopControl;
+    defer _ = linux.close(@intCast(control));
+    const free = linux.ioctl(@intCast(control), loop_ctl_get_free, 0);
+    if (linux.errno(free) != .SUCCESS) return error.NoFreeLoop;
+    const number: u32 = @intCast(free);
+    var device_buffer: [32]u8 = undefined;
+    const device = try print_z(&device_buffer, "/dev/loop{d}", .{number});
+    // devtmpfs creates the device node as the device appears.
+    var loop_fd: linux.fd_t = -1;
+    for (0..stop_attempts_max) |_| {
+        const result = linux.open(device, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(result) == .SUCCESS) {
+            loop_fd = @intCast(result);
+            break;
+        }
+        sleep_ns(poll_interval_ns);
+    } else return error.NoLoopDevice;
+    defer _ = linux.close(loop_fd);
+    const image = linux.open(paths.image, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(image) != .SUCCESS) return error.OpenFailed;
+    defer _ = linux.close(@intCast(image));
+    if (linux.errno(linux.ioctl(loop_fd, loop_set_fd, image)) != .SUCCESS) return error.LoopSetFd;
+    var number_buffer: [16]u8 = undefined;
+    try file_write(paths.loop, try std.fmt.bufPrint(&number_buffer, "{d}", .{number}));
+    return number;
 }
 
 /// Caps the node's CPU to `percent` of one CPU, or with null lifts the cap.
@@ -405,9 +566,15 @@ fn pid_read(name: []const u8) ?linux.pid_t {
 }
 
 const Paths = struct {
-    buffers: [8][path_size_max]u8 = undefined,
+    buffers: [12][path_size_max]u8 = undefined,
     directory: [:0]const u8 = "",
     lower: [:0]const u8 = "",
+    /// The writable layer's mount (upper and work are in it), its disk image and loop device
+    /// (crash faults), and a mark that layer and root are mounted.
+    layer: [:0]const u8 = "",
+    image: [:0]const u8 = "",
+    loop: [:0]const u8 = "",
+    mounted: [:0]const u8 = "",
     upper: [:0]const u8 = "",
     work: [:0]const u8 = "",
     root: [:0]const u8 = "",
@@ -427,8 +594,12 @@ const Paths = struct {
         const b = &paths.buffers;
         paths.directory = try print_z(&b[0], state_root ++ "/{s}", .{name});
         paths.lower = try print_z(&b[1], state_root ++ "/{s}/lower", .{name});
-        paths.upper = try print_z(&b[2], state_root ++ "/{s}/upper", .{name});
-        paths.work = try print_z(&b[3], state_root ++ "/{s}/work", .{name});
+        paths.upper = try print_z(&b[2], state_root ++ "/{s}/layer/upper", .{name});
+        paths.work = try print_z(&b[3], state_root ++ "/{s}/layer/work", .{name});
+        paths.layer = try print_z(&b[8], state_root ++ "/{s}/layer", .{name});
+        paths.image = try print_z(&b[9], state_root ++ "/{s}/disk.img", .{name});
+        paths.loop = try print_z(&b[10], state_root ++ "/{s}/loop", .{name});
+        paths.mounted = try print_z(&b[11], state_root ++ "/{s}/mounted", .{name});
         paths.root = try print_z(&b[4], state_root ++ "/{s}/root", .{name});
         paths.pid = try print_z(&b[5], state_root ++ "/{s}/pid", .{name});
         paths.output = try print_z(&b[6], state_root ++ "/{s}/output.log", .{name});
@@ -449,17 +620,21 @@ fn root_prepare(
 ) !void {
     if (!exists(paths.root)) {
         try mkdir_all(paths.directory);
-        for ([_][:0]const u8{ paths.lower, paths.upper, paths.work, paths.root }) |path| {
-            try mkdir_all(path);
-        }
+        for ([_][:0]const u8{ paths.lower, paths.layer, paths.root }) |path| try mkdir_all(path);
         var device_buffer: [32]u8 = undefined;
         const device = try print_z(&device_buffer, "/dev/{s}", .{node.disk});
         try mount(device, paths.lower, "erofs", linux.MS.RDONLY, null);
+    }
+    // Once, and again after a crash or a wipe unmounted them.
+    if (!exists(paths.mounted)) {
+        try layer_mount(paths, node);
+        for ([_][:0]const u8{ paths.upper, paths.work }) |path| try mkdir_all(path);
         var options_buffer: [3 * path_size_max]u8 = undefined;
         const options = try print_z(&options_buffer, "lowerdir={s},upperdir={s},workdir={s}", .{
             paths.lower, paths.upper, paths.work,
         });
         try mount("overlay", paths.root, "overlay", 0, options);
+        try file_write(paths.mounted, "");
     }
     try mkdir_all(paths.cgroup);
     var path_buffer: [path_size_max]u8 = undefined;

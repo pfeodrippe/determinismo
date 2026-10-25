@@ -4,8 +4,10 @@
 //!   det-initramfs --bin <dir> --module <det_guest.ko> --busybox <static busybox> --out <file>
 //!
 //! Contents: det-init as /init, the guest runtime in /opt/determinismo/bin, busybox (with a
-//! link per applet in /bin) for shells in debugging and the exec agent, det_guest.ko, and a
-//! minimal /etc. Nothing about the system under test: that comes on disks.
+//! link per applet in /bin) for shells in debugging and the exec agent, det_guest.ko, a minimal
+//! /etc, and (when the host has mkfs.ext4) an empty ext4 filesystem for nodes whose disks can
+//! crash (/opt/determinismo/durable.blocks, see `durable_template`). Nothing about the system
+//! under test: that comes on disks.
 //!
 //! Reproducible by construction: entries sorted by path, inode numbers in order, owner 0 and
 //! modification time 0. The guest unpacks this archive at boot, so its bytes are part of every
@@ -107,12 +109,69 @@ fn entries_collect(arena: std.mem.Allocator, io: std.Io, inputs: Inputs) ![]Entr
     const passwd = "root:x:0:0:root:/root:/bin/sh\n";
     try entries.append(arena, .{ .path = "etc/passwd", .mode = mode_file, .data = passwd });
     try entries.append(arena, .{ .path = "etc/group", .mode = mode_file, .data = "root:x:0:\n" });
+    if (try durable_template(arena, io)) |blocks| {
+        try entries.append(arena, .{
+            .path = "opt/determinismo/durable.blocks",
+            .mode = mode_file,
+            .data = blocks,
+        });
+    } else {
+        std.debug.print("det-initramfs: no mkfs.ext4: nodes cannot have crash faults\n", .{});
+    }
     std.mem.sort(Entry, entries.items, {}, struct {
         fn less(_: void, a: Entry, b: Entry) bool {
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.less);
     return entries.items;
+}
+
+pub const durable_block_size = 4096;
+const durable_size = 64 << 20;
+
+/// An empty ext4 filesystem (64 MiB, grown in the guest; with a journal, so a node's disk is
+/// consistent after a crash, as databases expect), made by the host's mkfs.ext4 with a fixed
+/// UUID and time (the same bytes on every build), kept as its non-zero blocks: a u64 size, then
+/// each such block as a u32 index and its bytes (little endian). guest/runtime/nodes.zig unpacks
+/// it. Null without mkfs.ext4.
+fn durable_template(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
+    const path = "/tmp/det-initramfs-durable.ext4";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, path) catch {};
+    var environment = std.process.Environ.Map.init(arena);
+    try environment.put("E2FSPROGS_FAKE_TIME", "1");
+    try environment.put("PATH", "/usr/sbin:/sbin:/usr/bin:/bin");
+    const uuid = "6465746d-696e-6973-6d6f-647572616265";
+    const size = try std.fmt.allocPrint(arena, "{d}k", .{durable_size / 1024});
+    const extended = "lazy_itable_init=1,lazy_journal_init=1,root_owner=0:0,hash_seed=" ++ uuid;
+    // Often in sbin, which a user's PATH lacks.
+    const mkfs = for ([_][]const u8{ "/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4" }) |candidate| {
+        cwd.access(io, candidate, .{}) catch continue;
+        break candidate;
+    } else "mkfs.ext4";
+    const result = std.process.run(arena, io, .{
+        .argv = &.{
+            mkfs,     "-q", "-F", "-b", "4096", "-U", uuid, "-J", "size=4", "-i", "65536", "-E",
+            extended, path, size,
+        },
+        .environ_map = &environment,
+    }) catch return null;
+    if (!result.term.success()) {
+        std.debug.print("det-initramfs: mkfs.ext4: {s}\n", .{result.stderr});
+        return null;
+    }
+    defer cwd.deleteFile(io, path) catch {};
+    const image = try cwd.readFileAlloc(io, path, arena, .limited(durable_size + 1));
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u64, image.len)));
+    var index: u32 = 0;
+    while (index * durable_block_size < image.len) : (index += 1) {
+        const block = image[index * durable_block_size ..][0..durable_block_size];
+        if (std.mem.allEqual(u8, block, 0)) continue;
+        try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, index)));
+        try out.appendSlice(arena, block);
+    }
+    return out.items;
 }
 
 /// A link /bin/<applet> -> busybox for each applet busybox lists (except busybox itself).

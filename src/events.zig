@@ -90,7 +90,7 @@ pub const Behavior = struct {
     }
 };
 pub const behavior_label_size = 72;
-pub const behavior_count_max = 512;
+pub const behavior_count_max = 2048;
 const behavior_slot_count = 2 * behavior_count_max; // Open addressing, at most half full.
 
 pub const InitOptions = struct { log_fd: ?linux.fd_t };

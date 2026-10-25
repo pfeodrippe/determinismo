@@ -6,6 +6,8 @@
 //! limit makes that an OOM kill). With DET_WORKERS=<n> it also supervises n worker processes,
 //! replacing any that dies (what process_kill faults test). `det-selftest-node custom-fault` is
 //! a custom fault: it draws a number and reports it, with where the node finds det-stop-faults.
+//! With DET_DURABLE set, a first start writes /data/synced (synced: the file and its directory)
+//! and /data/unsynced (not synced): what crashes and wipes must keep and lose.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -21,6 +23,11 @@ var mutant = false;
 pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
+    // `exists <path>`: exits 0 if the file is there (the node has no shell to ask).
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "exists")) {
+        const found = linux.errno(linux.access(arguments[2], linux.F_OK)) == .SUCCESS;
+        linux.exit_group(if (found) 0 else 1);
+    }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "custom-fault")) {
         const stop_faults = init.environ_map.get("ANTITHESIS_STOP_FAULTS") orelse "";
@@ -29,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     mutant = init.environ_map.get("DET_MUTANT") != null;
+    if (init.environ_map.get("DET_DURABLE") != null) try durable_write();
     if (init.environ_map.get("DET_WORKERS")) |text| {
         const workers = try std.fmt.parseInt(u32, text, 10);
         for (0..workers) |_| worker_start();
@@ -50,6 +58,30 @@ pub fn main(init: std.process.Init) !void {
         defer _ = linux.close(@intCast(client));
         serve(@intCast(client));
     }
+}
+
+/// On a first start (no /data/synced yet): one file synced, one not. Restarts leave them be.
+fn durable_write() !void {
+    if (linux.errno(linux.access("/data/synced", linux.F_OK)) == .SUCCESS) return;
+    _ = linux.mkdir("/data", 0o755);
+    const synced = try file_create("/data/synced", "kept\n");
+    defer _ = linux.close(synced);
+    if (linux.errno(linux.fsync(synced)) != .SUCCESS) return error.Fsync;
+    const directory = linux.open("/data", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(directory) != .SUCCESS) return error.Open;
+    defer _ = linux.close(@intCast(directory));
+    if (linux.errno(linux.fsync(@intCast(directory))) != .SUCCESS) return error.Fsync;
+    const unsynced = try file_create("/data/unsynced", "lost in a crash\n");
+    _ = linux.close(unsynced);
+}
+
+fn file_create(path: [*:0]const u8, content: []const u8) !linux.fd_t {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = linux.open(path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return error.Open;
+    const written = linux.write(@intCast(fd), content.ptr, content.len);
+    if (linux.errno(written) != .SUCCESS or written != content.len) return error.Write;
+    return @intCast(fd);
 }
 
 fn worker_start() void {

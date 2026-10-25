@@ -1,0 +1,2 @@
+{"name": "sum subtracts", "node": "app", "patch": "tests/mutate/minus.diff"}
+{"name": "an unused function changes", "node": "app", "patch": "tests/mutate/dead.diff"}

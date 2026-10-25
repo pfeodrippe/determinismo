@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Plain nREPL (plain/deps.edn), the reference for clojure-cli.repl's answers.
-FROM docker.io/library/clojure:temurin-21-tools-deps-alpine
+# Plain nREPL (plain/deps.edn), the reference for clojure-cli.repl's answers, with the JVM SDK's
+# coverage agent on nREPL's code, as clojure-cli.repl's server has it.
+FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
 WORKDIR /app
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/
+RUN mkdir -p /sdk/classes && javac -d /sdk/classes /sdk/*.java && \
+    printf 'Premain-Class: DeterminismoCoverage\n' > /sdk/manifest && \
+    jar cfm /sdk/determinismo-coverage.jar /sdk/manifest -C /sdk/classes .
 COPY examples/clojure-cli-repl/plain/deps.edn /app/
 RUN clojure -P -M:server
-ENTRYPOINT ["clojure", "-M:server"]
+ENTRYPOINT ["clojure", "-J-javaagent:/sdk/determinismo-coverage.jar=nrepl", "-M:server"]

@@ -21,6 +21,7 @@ const script = @import("script.zig");
 const tla = @import("tla.zig");
 const query = @import("query.zig");
 const causality = @import("causality.zig");
+const mutate = @import("mutate.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
 const profiler = @import("profile.zig");
@@ -30,6 +31,9 @@ const usage =
     \\       determinismo serve   [--listen <address:port>] [--data <dir>] [--archive "<cmd>"]
     \\                            <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
+    \\       determinismo mutate  <explore options> --mutants <mutants.jsonl> [--out <dir>]
+    \\                            (each mutant a patch to a node's build: caught, never ran, or
+    \\                            unnoticed)
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--time-budget <duration>]   (e.g. 90s, 10m, 2h: timelines until
     \\                            then, --branches at most)
@@ -67,6 +71,8 @@ const usage =
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
+    \\  [--faults +restart,+crash,...]   (fault kinds every node also allows)
+    \\  [--no-faults <node>,...]   (nodes that get no faults: a client, a monitor)
     \\
     \\machine options:
     \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
@@ -112,6 +118,11 @@ const Arguments = struct {
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
     branches_given: bool = false,
+    /// `<node>=<patch>`: that node built from a patched copy of its build context (a mutant).
+    mutant: ?[]const u8 = null,
+    /// Fault kinds every node also allows, and nodes that allow none (prepare.zig).
+    faults_added: ?[]const u8 = null,
+    faults_none: ?[]const u8 = null,
     /// flat: every branch from the setup snapshot; tree (the default when nothing else plans
     /// the branches): from moments of earlier branches too.
     branching: enum { flat, tree } = .tree,
@@ -226,6 +237,8 @@ fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8
     const rest = argv[2..];
     const result = if (eql(u8, name, "causality"))
         causality.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "mutate"))
+        mutate.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "extract"))
         extract.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "inject"))
@@ -454,6 +467,9 @@ fn system_prepare(
         .script = arguments.script_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
+        .mutant = arguments.mutant,
+        .faults_added = arguments.faults_added,
+        .faults_none = arguments.faults_none,
     });
     if (prepared.disk_paths.len > VM.disks_max) return error.TooManyDisks;
     const system_json = prepared.system_json;
@@ -1049,6 +1065,13 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (branches.arguments.events_directory) |directory| {
             const name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{index});
             vm.events.log_fd = try events_file(context.arena, directory, name);
+            // A tree's timeline begins inside its ancestors: queries assemble it (query.zig).
+            if (place.path.len > 0) {
+                const header = try std.fmt.allocPrint(context.arena, "{f}\n", .{
+                    std.json.fmt(.{ .path = place.path }, .{}),
+                });
+                _ = linux.write(vm.events.log_fd.?, header.ptr, header.len);
+            }
         }
         defer if (branches.arguments.events_directory != null) close(vm.events.log_fd.?);
         vm.strategy = exploration.strategy;
@@ -1703,6 +1726,12 @@ fn parse_option(
     } else if (eql(u8, flag, "--branches")) {
         arguments.branches = try std.fmt.parseInt(u32, value, 10);
         arguments.branches_given = true;
+    } else if (eql(u8, flag, "--mutant")) {
+        arguments.mutant = value;
+    } else if (eql(u8, flag, "--faults")) {
+        arguments.faults_added = value;
+    } else if (eql(u8, flag, "--no-faults")) {
+        arguments.faults_none = value;
     } else if (eql(u8, flag, "--branching")) {
         arguments.branching = std.meta.stringToEnum(@TypeOf(arguments.branching), value) orelse
             return error.Usage;
@@ -1859,6 +1888,7 @@ test {
     _ = @import("guest_memory.zig");
     _ = @import("query.zig");
     _ = @import("causality.zig");
+    _ = @import("mutate.zig");
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
     _ = @import("profile.zig");

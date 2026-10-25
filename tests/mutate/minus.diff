@@ -1,0 +1,8 @@
+--- a/sum.sh
++++ b/sum.sh
+@@ -4,4 +4,4 @@
+ difference() {
+   echo $(($1 - $2))
+ }
+-echo $(($1 + $2))
++echo $(($1 - $2))

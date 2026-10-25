@@ -92,6 +92,13 @@ pub const Faults = struct {
     partition: bool = true,
     /// Kill it and start it again (its files survive, its memory does not).
     restart: bool = false,
+    /// Kill it as a power loss would and start it again: its disk keeps what was synced
+    /// (fsync, sync, O_SYNC) and loses the rest (Antithesis's restarts that keep "durably synced
+    /// filesystem changes"). The node's writable layer is then an ext4 disk of its own.
+    crash: bool = false,
+    /// Kill it and start it fresh from its image: everything it wrote is gone (Antithesis's
+    /// restarts that "lose all of their modified data").
+    wipe: bool = false,
     /// Degrade single links, in one direction, for a while: delay and loss, duplication,
     /// corruption, reordering or congestion.
     degrade: bool = true,

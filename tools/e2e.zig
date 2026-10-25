@@ -90,7 +90,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "network", check_network_faults },        .{ "serve", check_serve },
         .{ "until", check_until_and_causality },     .{ "coverage", check_coverage },
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
-        .{ "tree", check_tree },                     .{ "compose", check_compose },
+        .{ "tree", check_tree },                     .{ "disk", check_disk },
+        .{ "mutate", check_mutate },                 .{ "compose", check_compose },
         .{ "shards", check_shards },                 .{ "stress", check_stress },
         .{ "controller", check_controller },         .{ "clojure", check_clojure },
         .{ "k3s", check_k3s },                       .{ "script", check_script },
@@ -602,15 +603,21 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     const before = std.mem.indexOf(u8, report, "failing=0") != null;
     expect(context, exact and ran and before, "rewind: 5 ms before the violation " ++
         "({d}ns, then {d}ns), not failing yet", .{ holds, reached });
-    // wait_until's timeout: the condition, or this time at the latest (here, before it holds).
+    // wait_until's timeout: the condition, or this time at the latest (here, before it holds:
+    // just after the setup snapshot, wherever the guest's setup put it).
+    const snapshot_ms = snapshot_vtime_ms(report) orelse 0;
+    const deadline = try std.fmt.allocPrint(context.arena, "{d}", .{snapshot_ms + 20});
     var timeout: std.ArrayList([]const u8) = .empty;
     try timeout.appendSlice(context.arena, system);
     try timeout.appendSlice(context.arena, &.{
-        "--branch", "4", "--until", violation, "--at-vtime-ms", "1020", "--exec", "echo late",
+        "--branch", "4", "--until", violation, "--at-vtime-ms", deadline, "--exec", "echo late",
     });
     const timed = try explore(context, timeout.items);
+    const expected = try std.fmt.allocPrint(context.arena, "at moment vtime={d}", .{
+        snapshot_ms + 20,
+    });
     const late = std.mem.indexOf(u8, timed, "until: timed out") != null and
-        std.mem.indexOf(u8, timed, "at moment vtime=1020") != null;
+        std.mem.indexOf(u8, timed, expected) != null;
     expect(context, late, "until: with a timeout, the moment is the timeout when the " ++
         "condition has not held", .{});
 }
@@ -681,8 +688,9 @@ fn check_network_faults(context: *Context) !void {
     const program = try std.fs.path.join(arena, &.{ context.bin, "shop-test" });
     const events = try std.fs.path.join(arena, &.{ context.scratch, "fault-events" });
     const system = [_][]const u8{ "--program", program, "--scenario", "prices", "--seed", "2" };
+    // Flat: one baseline per timeline, and any of them replays by its index.
     _ = try explore(context, &(system ++ [_][]const u8{
-        "--branches", "64", "--events-dir", events,
+        "--branches", "64", "--events-dir", events, "--branching", "flat",
     }));
     const partition = "event=fault details.kind=partition_groups";
     const groups = try query_count(context, &.{ events, partition });
@@ -707,7 +715,9 @@ fn check_network_faults(context: *Context) !void {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branch_found.branch});
         var hashes: [2]Branch = undefined;
         for (&hashes) |*hash| {
-            const report = try explore(context, &(system ++ [_][]const u8{ "--branch", index }));
+            const report = try explore(context, &(system ++ [_][]const u8{
+                "--branch", index, "--branching", "flat",
+            }));
             var one: [1]Branch = undefined;
             if (parse_branches(report, &one) == 1) hash.* = one[0];
         }
@@ -1056,6 +1066,58 @@ fn deepest_replays(
     const replays = original != null and parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, original.?.events_hash);
     return .{ .index = index, .depth = depth_max, .replays = replays };
+}
+
+/// A mutation campaign (determinismo mutate): of two mutants, the one that breaks the sums is
+/// caught, the one in code nothing runs is not (shell has no line coverage: unnoticed).
+fn check_mutate(context: *Context) !void {
+    const arena = context.arena;
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "mutate" });
+    try argv.appendSlice(arena, context.machine);
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest-sum" });
+    const out = try std.fmt.allocPrint(arena, "{s}/mutate", .{context.scratch});
+    try argv.appendSlice(arena, &.{
+        "--program",  program, "--scenario", "sum",                        "--seed", "1",
+        "--branches", "4",     "--mutants",  "tests/mutate/mutants.jsonl", "--out",  out,
+    });
+    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const caught = std.mem.indexOf(u8, result.stdout, "caught     sum subtracts") != null;
+    const unnoticed = std.mem.indexOf(u8, result.stdout, "unnoticed  an unused function") != null;
+    const counted = std.mem.indexOf(u8, result.stdout, "1 of 2 mutants caught") != null;
+    expect(context, caught and unnoticed and counted, "mutate: the mutant that breaks the " ++
+        "sums is caught, the one in unused code is not", .{});
+    if (!(caught and unnoticed and counted)) {
+        std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
+    }
+}
+
+/// Disk faults (Antithesis's restarts that keep synced changes, or lose all): a node writes
+/// one file synced and one not; a crash keeps the first and loses the second, a wipe loses
+/// both, in every timeline (and the timeline replays exactly).
+fn check_disk(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{
+        "--program", program, "--profile", "durable", "--scenario", "disk", "--seed", "1",
+    };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "3" }));
+    const passes = std.mem.indexOf(u8, report, "3 branches, 0 with failing properties") != null and
+        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
+            "failing in    0  a crash keeps what was synced and loses the rest") != null;
+    var branches: [3]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var same = false;
+    if (count > 0) {
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            same_timelines(&replayed, branches[0..count]);
+    }
+    expect(context, passes and same, "disk: a crash keeps what was synced and loses the " ++
+        "rest, a wipe loses both; a timeline replays exactly", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "fault_failed", "det-nodes",
+    }) catch ""});
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

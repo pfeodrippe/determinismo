@@ -40,7 +40,7 @@ change that moves it.
 | Clock skips | clock_skip, forward or back; a quarter permanent, so they stack | ✅ |
 | Thread pausing | `thread_pause`: one thread stopped (ptrace), the rest of its process running; process_pause too | ✅ |
 | CPU modulation | `--cpu-modulation` (CLI, MCP, HTTP): branches run up to twice as slow for stretches of 10-200 ms of virtual time, each speed a decision (a strategy can steer it, tapes replay it), so timer interrupts and preemption land at other points | 🟡 opt-in; Antithesis turns it on with faults |
-| Disk faults (the mutation campaign's) | none | ❌ |
+| Disk faults (restarts that keep durably synced changes, or lose all) | `crash` (an ext4 disk per node, shut down without flushing: what was synced survives) and `wipe` (fresh from the image); `--faults +crash` | 🟡 no I/O errors or disk latency |
 | Custom faults | `Faults.custom`: commands in a node the injector runs at random times (they can draw randomness); quiet periods hold them too | ✅ |
 | Pausing faults (quiet periods) | `$DETERMINISMO_STOP_FAULTS <seconds>` (also `$ANTITHESIS_STOP_FAULTS`) in every node and command: the fault under way ends, none but clock skips start, overlapping requests merge to the longest; faults only in the driver phase | ✅ |
 
@@ -48,7 +48,7 @@ change that moves it.
 
 | Antithesis | determinismo | Status |
 |---|---|---|
-| Branching from interesting states (every event a potential branch point; guidance toward new behavior) | `--branching tree` (default in the UI): generations of timelines; those that reached behaviors no timeline had are returned to just after them (a snapshot there) and branched with new seeds, Go-Explore style; every timeline's path in its record and tape (it replays alone); why each branch point was chosen, shown in the UI | 🟡 opt-in on the CLI; moments from coverage not yet; strategies cannot choose the moments yet |
+| Branching from interesting states (every event a potential branch point; guidance toward new behavior) | `--branching tree` (the default): generations of timelines; those that reached behaviors no timeline had are returned to just after them (a snapshot there) and branched with new seeds, Go-Explore style; every timeline's path in its record and tape (it replays alone); why each branch point was chosen, shown in the UI | ✅ behaviors include code coverage where the SDK instruments (C, Zig, Python, JVM lines) and new kinds of output lines; strategies may choose the moments (`returns`) |
 | Pluggable guidance | strategies over a JSON protocol, any language, local (`--strategy`), remote (`tcp://`) or uploaded to serve (`@name`): random, mutate (coverage and guidance), extremes (a bandit), an LLM (Claude Haiku 5.5); a strategy's reasons go with its decisions | ✅ |
 | Run duration | `--time-budget` (CLI, serve, MCP): timelines until then, `--branches` at most | ✅ |
 
@@ -98,7 +98,7 @@ change that moves it.
 | Debuggers (gdb, delve, jdb) | `determinismo stacks`: every thread's named stack at a moment (`thread apply all bt`, jstack); gdb and the like through `--exec` with the tools in the image, on the process or a core dump | ✅ |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
 | Notebook | the UI's Notebook view of a run: Clojure cells evaluated in order by babashka on the server (`serve --bb`), with shared names: `run`, `query`, `events`, `md`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`); kept with the run (`/runs/<id>/notebook`). A babashka nREPL server per run (`POST /runs/<id>/nrepl`) with the same names, for editors; there actions run at once | 🟡 no process objects, `run_in_background` or containers API in cells |
-| Agent skills (research, workload, debug, mutation testing) | docs/AGENTS.md only | ❌ |
-| Mutation testing campaigns (agents write subtle mutants; caught, never ran, or ran unnoticed) | one hand-made mutant in the e2e | ❌ |
+| Agent skills (research, workload, debug, mutation testing) | Claude Code skills in `.claude/skills/`: determinismo-properties, determinismo-workload, determinismo-debug, determinismo-mutants | ✅ |
+| Mutation testing campaigns (agents write subtle mutants; caught, never ran, or ran unnoticed) | `determinismo mutate --mutants mutants.jsonl`: each mutant a patch to a node's build context, explored with the system's seed; caught, never ran (line coverage), or unnoticed; the determinismo-mutants skill writes them | 🟡 no e2e check or MCP tool yet |
 | Targeted runs (a change's code, from a diff) | none | ❌ |
 | Snouty CLI for agents (runs, properties, search, exec, debug) | CLI, MCP (`describe`, `explore`, `replay`, `fork`, `query`) | ✅ |

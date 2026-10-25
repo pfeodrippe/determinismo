@@ -24,6 +24,13 @@ pub const Options = struct {
     /// The profile to resolve; null takes the first one.
     profile: ?[]const u8 = null,
     cache_directory: []const u8,
+    /// A mutant (`determinismo mutate`): this node is built from its build context with a patch
+    /// applied ("<node>=<patch file>").
+    mutant: ?[]const u8 = null,
+    /// Fault kinds every node also allows ("restart,crash"), and nodes that allow none
+    /// ("client,monitor"): what an Antithesis launch says outside its Compose file.
+    faults_added: ?[]const u8 = null,
+    faults_none: ?[]const u8 = null,
 };
 
 pub const Prepared = struct {
@@ -35,16 +42,26 @@ pub const Prepared = struct {
     hash: u64,
 };
 
-const Context = struct { arena: std.mem.Allocator, io: std.Io, cache: []const u8 };
+const Context = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    cache: []const u8,
+    mutant: ?[]const u8 = null,
+};
 
 const description_size_max = 1 << 20;
 const filesystem_uuid = "64657465-726d-696e-6973-6d6f00000000";
 const path_default = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared {
-    const context = Context{ .arena = arena, .io = io, .cache = options.cache_directory };
+    const context = Context{
+        .arena = arena,
+        .io = io,
+        .cache = options.cache_directory,
+        .mutant = options.mutant,
+    };
     const cwd = std.Io.Dir.cwd();
-    for ([_][]const u8{ "images", "systems", "staging", "profiles" }) |directory| {
+    for ([_][]const u8{ "images", "systems", "staging", "profiles", "mutants" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ context.cache, directory }));
     }
     const description = try describe(context, options);
@@ -58,6 +75,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     try scenarios.appendSlice(arena, description.scenarios);
     for (profile.nodes, resolved, disk_paths[1..], 0..) |*node, *target, *disk, index| {
         disk.* = try node_resolve(context, node, @intCast(index), target);
+        try faults_adjust(&target.faults, node.name, options);
         if (options.compose != null) {
             const tests = try tests_listing(context, disk.*);
             try compose.templates(arena, node.name, tests, &scenarios);
@@ -159,8 +177,10 @@ fn node_resolve(
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|
         try image_disk(context, reference, &image, &target.digest)
-    else if (node.source.build) |build|
-        try image_disk(context, try image_build(context, build), &image, &target.digest)
+    else if (node.source.build) |build| disk: {
+        const built = try image_build(context, try mutant_build(context, node, build));
+        break :disk try image_disk(context, built, &image, &target.digest);
+    }
     else if (node.source.directory) |directory|
         try directory_disk(context, node.name, directory, &target.digest)
     else
@@ -369,6 +389,68 @@ fn json(arena: std.mem.Allocator, value: anytype) ![]const u8 {
 }
 
 /// Builds the image (podman reuses its layer cache) and returns its ID.
+/// Fault kinds added to every node (by field name: restart, crash, wipe, process_kill, ...),
+/// then none at all for the nodes named in `faults_none`.
+fn faults_adjust(faults: *schema.Faults, name: []const u8, options: Options) !void {
+    if (options.faults_added) |list| {
+        var kinds = std.mem.tokenizeScalar(u8, list, ',');
+        kinds: while (kinds.next()) |kind_text| {
+            const kind = std.mem.trimStart(u8, kind_text, "+");
+            const info = @typeInfo(schema.Faults).@"struct";
+            inline for (info.field_names, info.field_types) |field, Type| {
+                if (Type == bool and std.mem.eql(u8, field, kind)) {
+                    @field(faults, field) = true;
+                    continue :kinds;
+                }
+            }
+            std.debug.print("[determinismo] --faults: no fault kind {s}\n", .{kind});
+            return error.UnknownFaultKind;
+        }
+    }
+    if (options.faults_none) |list| {
+        var names = std.mem.tokenizeScalar(u8, list, ',');
+        while (names.next()) |none| {
+            if (!std.mem.eql(u8, none, name)) continue;
+            const info = @typeInfo(schema.Faults).@"struct";
+            inline for (info.field_names, info.field_types) |field, Type| {
+                if (Type == bool) @field(faults, field) = false;
+            }
+            faults.custom = &.{};
+        }
+    }
+}
+
+/// The build of a node, or for a mutant's node the same build from a patched copy of its
+/// context (in the cache, by the patch's content: built once).
+fn mutant_build(context: Context, node: *const schema.Node, build: schema.Build) !schema.Build {
+    const mutant = context.mutant orelse return build;
+    const equals = std.mem.indexOfScalar(u8, mutant, '=') orelse return error.BadMutant;
+    if (!std.mem.eql(u8, mutant[0..equals], node.name)) return build;
+    const patch_path = mutant[equals + 1 ..];
+    const cwd = std.Io.Dir.cwd();
+    const patch = try cwd.readFileAlloc(context.io, patch_path, context.arena, .limited(1 << 24));
+    var hasher = std.hash.Wyhash.init(0x6d7574616e74);
+    hasher.update(build.context);
+    hasher.update(patch);
+    const name = try std.fmt.allocPrint(context.arena, "{x:0>16}", .{hasher.final()});
+    const copy = try path_join(context, &.{ context.cache, "mutants", name });
+    if (!exists(context, copy)) {
+        const staging = try std.fmt.allocPrint(context.arena, "{s}.staging", .{copy});
+        _ = tool(context, &.{ "rm", "-rf", staging }) catch {};
+        const source = try std.fmt.allocPrint(context.arena, "{s}/", .{build.context});
+        _ = try tool(context, &.{
+            "rsync",     "-a",                "--exclude", ".git",                    "--exclude",
+            "zig-out",   "--exclude",         ".zig-cache", "--exclude", ".determinismo-cache",
+            source,      staging,
+        });
+        const absolute = try cwd.realPathFileAlloc(context.io, patch_path, context.arena);
+        _ = try tool(context, &.{ "git", "-C", staging, "apply", "--unsafe-paths", absolute });
+        _ = try tool(context, &.{ "mv", staging, copy });
+    }
+    std.debug.print("[determinismo] mutant: {s} built with {s}\n", .{ node.name, patch_path });
+    return .{ .context = copy, .dockerfile = build.dockerfile };
+}
+
 fn image_build(context: Context, build: schema.Build) ![]const u8 {
     const dockerfile = try path_join(context, &.{ build.context, build.dockerfile });
     std.debug.print("[determinismo] building {s}\n", .{dockerfile});

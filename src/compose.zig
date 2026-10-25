@@ -36,6 +36,18 @@ pub fn profile(arena: std.mem.Allocator, io: std.Io, path: []const u8) !schema.P
     for (services.mapping) |service| {
         try nodes.append(arena, try node_from_service(arena, directory, service));
     }
+    // A service may use, by name, the image another one builds (several nodes of one image):
+    // it is that build, not an image to pull.
+    for (nodes.items) |*node| {
+        const image = node.source.image orelse continue;
+        for (nodes.items, services.mapping) |builder, service| {
+            const build = builder.source.build orelse continue;
+            const built = service.value.get("image") orelse continue;
+            if (!std.mem.eql(u8, scalar(built) catch continue, image)) continue;
+            node.source = .{ .build = build };
+            break;
+        }
+    }
     return .{ .name = "default", .nodes = try dependency_order(arena, nodes.items) };
 }
 

@@ -72,6 +72,15 @@ use them in other repositories.
   it, and new timelines branch from there. Each timeline's `why` says why it starts where it
   does. `--branching flat` starts every timeline at the setup snapshot; strategies plan flat
   unless asked for a tree (`--branching tree --strategy ... --tape-dir ...`).
+- Disk faults: a node that allows `crash` gets an ext4 disk of its own; a crash is a power loss
+  (what it synced survives, the rest is lost; the journal keeps the filesystem consistent), a
+  `wipe` starts it fresh from its image. `--faults +restart,+crash` adds kinds to every node,
+  `--no-faults client,monitor` takes them all from some (an Antithesis launch's
+  `exclude_faults`).
+- Mutation testing: `determinismo mutate <explore options> --mutants mutants.jsonl` explores the
+  system and each mutant (a patch to a node's build context, `{"name","node","patch"}` per
+  line) with the same seed: each is caught (a property fails that passes without it), never ran
+  (coverage shows its lines never ran), or unnoticed (a gap in the properties).
 - A run's notebook is Clojure (babashka on the server: `query`, `events`, `run`, `replay`,
   `stacks`, ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
 
