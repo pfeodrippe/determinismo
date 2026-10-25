@@ -84,8 +84,13 @@ pub const Faults = struct {
     partition: bool = true,
     /// Kill it and start it again (its files survive, its memory does not).
     restart: bool = false,
-    /// Delay and drop packets on single links, in one direction, for a while.
+    /// Degrade single links, in one direction, for a while: delay and loss, duplication,
+    /// corruption, reordering or congestion.
     degrade: bool = true,
+    /// Limit its CPU (a share of one CPU) for a while.
+    throttle: bool = true,
+    /// Stop one of its processes (SIGSTOP) for a while.
+    process_pause: bool = true,
 };
 
 pub const Scenario = struct {

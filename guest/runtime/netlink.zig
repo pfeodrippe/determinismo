@@ -20,6 +20,9 @@ const rtm_delqdisc: u16 = 37;
 const flag_replace: u16 = 0x100;
 const tca_kind: u16 = 1;
 const tca_options: u16 = 2;
+const tca_netem_reorder: u16 = 3;
+const tca_netem_corrupt: u16 = 4;
+const tca_netem_rate: u16 = 6;
 const tca_netem_latency64: u16 = 10;
 const tca_netem_jitter64: u16 = 11;
 const tca_netem_prng_seed: u16 = 14;
@@ -134,9 +137,25 @@ pub const Socket = struct {
         // in the legacy unit are superseded by the 64-bit nanosecond attributes below).
         var qopt: [24]u8 = @splat(0);
         std.mem.writeInt(u32, qopt[4..8], netem_limit_packets, .little);
-        const loss: u64 = @as(u64, std.math.maxInt(u32)) * netem.loss_percent / 100;
-        std.mem.writeInt(u32, qopt[8..12], @intCast(loss), .little);
+        std.mem.writeInt(u32, qopt[8..12], probability(netem.loss_percent), .little);
+        std.mem.writeInt(u32, qopt[16..20], probability(netem.duplicate_percent), .little);
         message.append_bytes(&qopt);
+        // struct tc_netem_reorder and tc_netem_corrupt: probability, correlation.
+        var pair: [8]u8 = @splat(0);
+        if (netem.reorder_percent > 0) {
+            std.mem.writeInt(u32, pair[0..4], probability(netem.reorder_percent), .little);
+            message.attribute(tca_netem_reorder, &pair);
+        }
+        if (netem.corrupt_percent > 0) {
+            std.mem.writeInt(u32, pair[0..4], probability(netem.corrupt_percent), .little);
+            message.attribute(tca_netem_corrupt, &pair);
+        }
+        if (netem.rate_bytes_per_second > 0) {
+            // struct tc_netem_rate: rate, packet overhead, cell size, cell overhead.
+            var rate: [16]u8 = @splat(0);
+            std.mem.writeInt(u32, rate[0..4], netem.rate_bytes_per_second, .little);
+            message.attribute(tca_netem_rate, &rate);
+        }
         var value: [8]u8 = undefined;
         std.mem.writeInt(u64, &value, netem.delay_ns, .little);
         message.attribute(tca_netem_latency64, &value);
@@ -215,8 +234,21 @@ pub const Netem = struct {
     delay_ns: u64,
     jitter_ns: u64 = 0,
     loss_percent: u8 = 0,
+    duplicate_percent: u8 = 0,
+    corrupt_percent: u8 = 0,
+    /// Packets sent at once instead of delayed (needs a delay to reorder against).
+    reorder_percent: u8 = 0,
+    /// Bandwidth limit (0: none).
+    rate_bytes_per_second: u32 = 0,
     seed: u64,
 };
+
+/// netem's probabilities are fractions of 2^32 - 1.
+fn probability(percent: u8) u32 {
+    assert(percent <= 100);
+    const scaled = @as(u64, std.math.maxInt(u32)) * percent / 100;
+    return @intCast(scaled);
+}
 
 /// One end of a veth pair: its interface name, its MAC address, and a process in the network
 /// namespace it goes to.

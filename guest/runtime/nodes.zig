@@ -42,6 +42,9 @@ pub fn system_load(arena: std.mem.Allocator) !schema.System {
 pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
     try mkdir_all(state_root);
     try mkdir_all(cgroup_root);
+    // The cpu controller in node cgroups, for CPU throttling faults.
+    try file_write("/sys/fs/cgroup/cgroup.subtree_control", "+cpu");
+    try file_write(cgroup_root ++ "/cgroup.subtree_control", "+cpu");
     try hosts_write("/etc/hosts", system);
     for (system.nodes) |*node| {
         try start(arena, system, node);
@@ -160,6 +163,37 @@ pub fn kill(name: []const u8) !void {
         sleep_ns(poll_interval_ns);
     } else return error.NodeDidNotStop;
     sdk.event("node_kill", .{ .node = name });
+}
+
+/// Caps the node's CPU to `percent` of one CPU, or with null lifts the cap.
+pub fn cpu_limit(name: []const u8, percent: ?u8) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    var path_buffer: [path_size_max]u8 = undefined;
+    const path = try print_z(&path_buffer, "{s}/cpu.max", .{paths.cgroup});
+    var value_buffer: [32]u8 = undefined;
+    const period_us = 100_000;
+    const value = if (percent) |share| blk: {
+        const quota_us = @as(u32, share) * period_us / 100;
+        break :blk try std.fmt.bufPrint(&value_buffer, "{d} {d}", .{ quota_us, period_us });
+    } else "max 100000";
+    try file_write(path, value);
+}
+
+/// The node's processes, in the order its cgroup lists them.
+pub fn processes(name: []const u8, pids: []linux.pid_t) !u32 {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    var buffer: [16 * 1024]u8 = undefined;
+    const text = read_small(paths.cgroup_procs, &buffer) orelse return error.NoCgroup;
+    var count: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (count == pids.len) break;
+        pids[count] = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
+        count += 1;
+    }
+    return count;
 }
 
 pub fn freeze(name: []const u8, state: enum { frozen, thawed }) !void {

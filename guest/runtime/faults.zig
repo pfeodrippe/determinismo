@@ -22,7 +22,21 @@ const delay_ns_max = 300 * std.time.ns_per_ms;
 const duration_ns_max = 500 * std.time.ns_per_ms;
 const clock_skip_ns_max = 60 * std.time.ns_per_s;
 
-const Kind = enum { pause, isolate, partition, degrade, restart, clock_skip };
+const Kind = enum {
+    pause,
+    isolate,
+    partition,
+    degrade,
+    restart,
+    throttle,
+    process_pause,
+    clock_skip,
+};
+const throttle_percent_min = 5;
+const throttle_percent_max = 50;
+const processes_max = 1024;
+/// What a degraded link does: one flavor per fault.
+const Degradation = enum { delay_loss, duplicate, corrupt, reorder, congestion };
 const degrade_delay_ns_max = 200 * std.time.ns_per_ms;
 const degrade_loss_percent_max = 30;
 
@@ -77,6 +91,10 @@ fn faults_collect(
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
         if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
         if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
+        if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
+        if (allowed.process_pause) {
+            faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
+        }
         links_collect(system, index, faults, &count);
     }
     if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
@@ -122,10 +140,24 @@ fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
 /// Applies one fault for a random duration and undoes it, even when stopped meanwhile.
 fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const Fault) void {
     const duration_ns = sdk.random_below(duration_ns_max);
+    switch (fault.kind) {
+        .pause, .restart, .throttle, .process_pause => {
+            inject_node(arena, system, fault, duration_ns);
+        },
+        .isolate, .partition, .degrade => inject_link(system, fault, duration_ns),
+        .clock_skip => inject_clock(duration_ns),
+    }
+}
+
+fn inject_node(
+    arena: std.mem.Allocator,
+    system: *const schema.System,
+    fault: *const Fault,
+    duration_ns: u64,
+) void {
     const details = .{
         .kind = @tagName(fault.kind),
         .node = fault.node,
-        .peer = fault.peer,
         .duration_ns = duration_ns,
     };
     switch (fault.kind) {
@@ -135,6 +167,45 @@ fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const 
             sleep_ns(duration_ns);
             nodes.freeze(fault.node, .thawed) catch {};
         },
+        .restart => {
+            nodes.kill(fault.node) catch return;
+            sdk.event("fault", details);
+            sleep_ns(duration_ns);
+            const node = system.node(fault.node).?;
+            nodes.start(arena, system, node) catch |err| {
+                sdk.event("fault_restart_failed", .{ .node = fault.node, .err = @errorName(err) });
+            };
+        },
+        .throttle => {
+            const range = throttle_percent_max - throttle_percent_min;
+            const percent: u8 = @intCast(throttle_percent_min + sdk.random_below(range + 1));
+            nodes.cpu_limit(fault.node, percent) catch return;
+            sdk.event("fault", .{ .kind = "throttle", .node = fault.node, .cpu_percent = percent });
+            sleep_ns(duration_ns);
+            nodes.cpu_limit(fault.node, null) catch {};
+        },
+        .process_pause => {
+            var pids: [processes_max]linux.pid_t = undefined;
+            const count = nodes.processes(fault.node, &pids) catch return;
+            if (count == 0) return;
+            const pid = sdk.random_choice(linux.pid_t, pids[0..count]);
+            _ = linux.kill(pid, .STOP);
+            sdk.event("fault", .{ .kind = "process_pause", .node = fault.node, .pid = pid });
+            sleep_ns(duration_ns);
+            _ = linux.kill(pid, .CONT);
+        },
+        else => unreachable,
+    }
+}
+
+fn inject_link(system: *const schema.System, fault: *const Fault, duration_ns: u64) void {
+    const details = .{
+        .kind = @tagName(fault.kind),
+        .node = fault.node,
+        .peer = fault.peer,
+        .duration_ns = duration_ns,
+    };
+    switch (fault.kind) {
         .isolate => {
             if (!links_set(system, fault.node, .down)) return;
             sdk.event("fault", details);
@@ -148,42 +219,56 @@ fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const 
             nodes.link_set(system, fault.node, fault.peer, .up) catch {};
         },
         .degrade => {
-            const netem = nodes.Netem{
-                .delay_ns = sdk.random_below(degrade_delay_ns_max),
-                .jitter_ns = sdk.random_below(degrade_delay_ns_max / 4),
-                .loss_percent = @intCast(sdk.random_below(degrade_loss_percent_max + 1)),
-                .seed = sdk.random_u64(),
-            };
+            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            const netem = degradation(flavor);
             nodes.link_degrade(fault.node, fault.peer, netem) catch return;
             sdk.event("fault", .{
                 .kind = "degrade",
+                .flavor = @tagName(flavor),
                 .from = fault.node,
                 .to = fault.peer,
-                .delay_ns = netem.delay_ns,
-                .loss_percent = netem.loss_percent,
+                .netem = netem,
                 .duration_ns = duration_ns,
             });
             sleep_ns(duration_ns);
             nodes.link_degrade(fault.node, fault.peer, null) catch {};
         },
-        .restart => {
-            nodes.kill(fault.node) catch return;
-            sdk.event("fault", details);
-            sleep_ns(duration_ns);
-            const node = system.node(fault.node).?;
-            nodes.start(arena, system, node) catch |err| {
-                sdk.event("fault_restart_failed", .{ .node = fault.node, .err = @errorName(err) });
-            };
+        else => unreachable,
+    }
+}
+
+fn inject_clock(duration_ns: u64) void {
+    const forward = sdk.random_below(2) == 0;
+    const skip_ns = sdk.random_below(clock_skip_ns_max);
+    sdk.event("fault", .{ .kind = "clock_skip", .forward = forward, .skip_ns = skip_ns });
+    clock_shift(skip_ns, .{ .forward = forward });
+    sleep_ns(duration_ns);
+    clock_shift(skip_ns, .{ .forward = !forward }); // Skips are temporary.
+}
+
+/// netem settings for one flavor of degradation, every parameter a platform decision.
+fn degradation(flavor: Degradation) nodes.Netem {
+    var netem = nodes.Netem{
+        .delay_ns = sdk.random_below(degrade_delay_ns_max),
+        .seed = sdk.random_u64(),
+    };
+    switch (flavor) {
+        .delay_loss => {
+            netem.jitter_ns = sdk.random_below(degrade_delay_ns_max / 4);
+            netem.loss_percent = @intCast(sdk.random_below(degrade_loss_percent_max + 1));
         },
-        .clock_skip => {
-            const forward = sdk.random_below(2) == 0;
-            const skip_ns = sdk.random_below(clock_skip_ns_max);
-            sdk.event("fault", .{ .kind = "clock_skip", .forward = forward, .skip_ns = skip_ns });
-            clock_shift(skip_ns, .{ .forward = forward });
-            sleep_ns(duration_ns);
-            clock_shift(skip_ns, .{ .forward = !forward }); // Skips are temporary.
+        .duplicate => netem.duplicate_percent = @intCast(1 + sdk.random_below(30)),
+        .corrupt => netem.corrupt_percent = @intCast(1 + sdk.random_below(10)),
+        .reorder => {
+            netem.delay_ns = 1 + netem.delay_ns; // Reordering needs a delay to jump.
+            netem.reorder_percent = @intCast(1 + sdk.random_below(50));
+        },
+        .congestion => {
+            const rate_min = 10 * 1024;
+            netem.rate_bytes_per_second = @intCast(rate_min + sdk.random_below(1024 * 1024));
         },
     }
+    return netem;
 }
 
 /// Every link of `name` (to the runner and to each other node) goes up or down.
@@ -228,7 +313,8 @@ test faults_collect {
     const scenario = schema.Scenario{ .name = "s", .commands = &.{}, .clock_skip = true };
     const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
     var faults: [faults_max]Fault = undefined;
-    // a: pause, restart; with the runner and with b: partition and degrade both ways (6).
-    // b: pause, isolate; with the runner: partition and degrade both ways (3). Clock skip.
-    try std.testing.expectEqual(@as(u32, 14), faults_collect(&system, &scenario, &faults));
+    // a: pause, restart, throttle, process pause; with the runner and with b: partition and
+    // degrade both ways (6). b: pause, isolate, throttle, process pause; with the runner:
+    // partition and degrade both ways (3). Clock skip.
+    try std.testing.expectEqual(@as(u32, 18), faults_collect(&system, &scenario, &faults));
 }
