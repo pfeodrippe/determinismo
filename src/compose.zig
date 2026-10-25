@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Imports a Compose file as a profile (ARCHITECTURE.md §10: Compose is an importer).
 //!
-//! Each service becomes a node: `image` or `build` as its source, `entrypoint` and `command`
+//! Each service becomes a node: `image` (by name, as Antithesis uses it) or else `build` as its
+//! source, `entrypoint` and `command`
 //! (lists, or strings split like a shell), `environment` (list or map), `working_dir`, `user`,
 //! `depends_on` (dependencies start first), `mem_limit`, `privileged`, and the first container
 //! port of `ports`
@@ -18,15 +19,20 @@ const yaml = @import("yaml.zig");
 pub const sdk_output_variable = "ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo";
 
 const ignored_fields = [_][]const u8{
-    "volumes",   "networks",       "restart", "deploy", "logging", "container_name", "hostname",
-    "env_file",  "cap_add",        "cap_drop", "ulimits", "labels", "init",
-    "stop_signal", "healthcheck", "platform", "tty", "stdin_open", "security_opt",
+    "volumes",      "networks",    "restart",     "deploy",   "logging", "container_name",
+    "hostname",     "env_file",    "cap_add",     "cap_drop", "ulimits", "labels",
+    "init",         "stop_signal", "healthcheck", "platform", "tty",     "stdin_open",
+    "security_opt",
 };
 
 /// The profile ("default") of the Compose file at `path`. Relative build contexts are taken
 /// from the file's directory.
 pub fn profile(arena: std.mem.Allocator, io: std.Io, path: []const u8) !schema.Profile {
-    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    const directory_of = std.fs.path.dirname(path) orelse ".";
+    const env_path = try std.fs.path.join(arena, &.{ directory_of, ".env" });
+    const env = std.Io.Dir.cwd().readFileAlloc(io, env_path, arena, .limited(1 << 16)) catch "";
+    const source = try interpolate(arena, raw, env);
     const root = try yaml.parse(arena, source);
     const services = root.get("services") orelse return error.NoServices;
     if (services != .mapping or services.mapping.len == 0) return error.NoServices;
@@ -35,18 +41,6 @@ pub fn profile(arena: std.mem.Allocator, io: std.Io, path: []const u8) !schema.P
     var nodes: std.ArrayList(schema.Node) = .empty;
     for (services.mapping) |service| {
         try nodes.append(arena, try node_from_service(arena, directory, service));
-    }
-    // A service may use, by name, the image another one builds (several nodes of one image):
-    // it is that build, not an image to pull.
-    for (nodes.items) |*node| {
-        const image = node.source.image orelse continue;
-        for (nodes.items, services.mapping) |builder, service| {
-            const build = builder.source.build orelse continue;
-            const built = service.value.get("image") orelse continue;
-            if (!std.mem.eql(u8, scalar(built) catch continue, image)) continue;
-            node.source = .{ .build = build };
-            break;
-        }
     }
     return .{ .name = "default", .nodes = try dependency_order(arena, nodes.items) };
 }
@@ -69,8 +63,11 @@ fn node_from_service(
         }
     }
     var node = schema.Node{ .name = service.key, .source = .{} };
-    if (fields.get("image")) |image| node.source.image = try scalar(image);
-    if (fields.get("build")) |build| {
+    // As Antithesis does, an image is used by name (built beforehand, as the project's own
+    // scripts build it, or pulled); `build` only when no image is named.
+    if (fields.get("image")) |image| {
+        node.source.image = try scalar(image);
+    } else if (fields.get("build")) |build| {
         node.source = .{ .build = try build_source(arena, directory, build) };
     }
     if (node.source.kind_count() != 1) return error.ServiceNeedsImageOrBuild;
@@ -196,6 +193,79 @@ fn dependency_order(arena: std.mem.Allocator, nodes: []const schema.Node) ![]con
         if (count == before) return error.DependencyCycleOrUnknownService;
     }
     return ordered;
+}
+
+/// Compose's variables: `${NAME}`, `${NAME:-default}` (also when empty), `${NAME-default}`,
+/// `$NAME` and `$$` (a dollar), from the `.env` beside the file (NAME=value lines). Not from
+/// the caller's environment: the same files make the same system.
+fn interpolate(arena: std.mem.Allocator, source: []const u8, env: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var at: usize = 0;
+    while (at < source.len) {
+        const dollar = std.mem.indexOfScalarPos(u8, source, at, '$') orelse {
+            try out.appendSlice(arena, source[at..]);
+            break;
+        };
+        try out.appendSlice(arena, source[at..dollar]);
+        const rest = source[dollar + 1 ..];
+        if (rest.len > 0 and rest[0] == '$') {
+            try out.append(arena, '$');
+            at = dollar + 2;
+            continue;
+        }
+        if (rest.len > 0 and rest[0] == '{') {
+            const close = std.mem.indexOfScalar(u8, rest, '}') orelse return error.BadVariable;
+            const body = rest[1..close];
+            const name_end = std.mem.indexOfAny(u8, body, ":-") orelse body.len;
+            const name = body[0..name_end];
+            const value = env_value(env, name);
+            const default: ?[]const u8 = if (std.mem.startsWith(u8, body[name_end..], ":-"))
+                body[name_end + 2 ..]
+            else if (std.mem.startsWith(u8, body[name_end..], "-")) body[name_end + 1 ..] else null;
+            const empty_counts = std.mem.startsWith(u8, body[name_end..], ":-");
+            const chosen = if (value) |text|
+                (if (empty_counts and text.len == 0) default orelse "" else text)
+            else
+                default orelse "";
+            try out.appendSlice(arena, chosen);
+            at = dollar + 2 + close;
+            continue;
+        }
+        var end: usize = 0;
+        while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) {
+            end += 1;
+        }
+        if (end == 0) {
+            try out.append(arena, '$');
+            at = dollar + 1;
+            continue;
+        }
+        try out.appendSlice(arena, env_value(env, rest[0..end]) orelse "");
+        at = dollar + 1 + end;
+    }
+    return out.items;
+}
+
+fn env_value(env: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, env, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, trimmed[0..equals], " "), name)) continue;
+        return std.mem.trim(u8, trimmed[equals + 1 ..], " \"'");
+    }
+    return null;
+}
+
+test interpolate {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const image = "node:${BUILD_TAG:-latest}";
+    try std.testing.expectEqualStrings("node:latest", try interpolate(a, image, ""));
+    try std.testing.expectEqualStrings("node:v2", try interpolate(a, image, "BUILD_TAG=v2\n"));
+    try std.testing.expectEqualStrings("a $ b", try interpolate(a, "a $$ b", ""));
 }
 
 fn scalar(value: yaml.Value) ![]const u8 {

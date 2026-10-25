@@ -5,6 +5,7 @@
 //! strategy steers faults like any other decision and a tape replays them.
 //!
 //! Usage: det-faults --scenario <name>
+//!        det-faults inject '<json>'   (a fault now, from a scenario: see below)
 //!
 //! The faults come from /det/system.json: what each node allows (pause, isolate, partition,
 //! restart) and whether the scenario wants clock skips.
@@ -14,7 +15,18 @@
 //! node comes back), and no new faults start until the longest requested period is over,
 //! except clock skips, which go on.
 //!
-//! Network faults overlap (see "Network faults" below); node faults happen one at a time.
+//! Network faults overlap (see "Network faults" below); node faults happen one at a time on a
+//! node, several nodes at once (see "Node faults").
+//!
+//! Faults from the scenario: `det-faults inject '<json>'` (any language, any node or command)
+//! or the SDK's `fault`, while the injector runs, apply that fault now, logged and undone like a
+//! drawn one: {"kind": "pause", "node": "db", "duration_ms": 2000}, {"kind":
+//! "partition_groups", "groups": [["runner", "a"], ["b", "c"]], "disruption": "stopped",
+//! "direction": "both"}, {"kind": "degrade", "node": "a", "peer": "b", "flavor": "delay_loss"},
+//! {"kind": "clog", "node": "a", "direction": "inbound"}, {"kind": "throttle", "node": "a",
+//! "cpu_percent": 10}, {"kind": "clock_skip", "skip_ms": 500, "forward": true} (permanent),
+//! {"kind": "restore"}; restart, crash, wipe, stop, process_pause, thread_pause, process_kill,
+//! isolate and partition (with "peer") too.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -39,6 +51,8 @@ const Kind = enum {
     crash,
     /// It starts again fresh from its image, everything it wrote gone.
     wipe,
+    /// A graceful stop (SIGTERM, then a kill after a grace period), then it starts again.
+    stop,
     throttle,
     process_pause,
     /// One thread of one of its processes stopped (ptrace), the others running: interleavings
@@ -112,6 +126,9 @@ var quiet_until_ns: u64 = 0;
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const arguments = try init.minimal.args.toSlice(arena);
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "inject")) {
+        return inject_request(arguments[2]);
+    }
     if (arguments.len != 3 or !std.mem.eql(u8, arguments[1], "--scenario")) return error.Usage;
     const system = try nodes.system_load(arena);
     const scenario = system.scenario(arguments[2]) orelse return error.UnknownScenario;
@@ -127,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
 
     control_open();
     system_active = &system;
+    arena_active = arena;
     sdk.event("faults_start", .{ .faults = count });
     baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
@@ -141,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
+    node_heal(&system);
     network_stop(&system);
     sdk.event("faults_stop", .{ .injections = injections });
 }
@@ -194,6 +213,8 @@ const Applied = struct {
     /// For partition_groups: each endpoint's group (runner first), group_none for those left out.
     /// (u16, not u8: JSON writes byte arrays as strings.)
     groups: [endpoints_max]u16 = @splat(group_none),
+    /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
+    injected: bool = false,
 };
 
 /// A fault's parameters, drawn from platform randomness.
@@ -230,6 +251,11 @@ fn draw(fault: *const Fault) Applied {
         .partition_groups => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
             applied.groups = groups_draw(fault.endpoints);
+            // Asymmetric half the time (Antithesis's): only from lower groups to higher
+            // (outbound) or the other way (inbound).
+            applied.direction = if (sdk.random_below(2) == 0)
+                .both
+            else if (sdk.random_below(2) == 0) .outbound else .inbound;
         },
         .clog => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
@@ -287,6 +313,7 @@ fn run_script(
         apply(arena, system, fault);
         injections += 1;
     }
+    node_heal(system);
     network_stop(system);
     sdk.event("faults_stop", .{ .injections = injections, .script = true });
 }
@@ -310,6 +337,7 @@ fn faults_collect(
         if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
         if (allowed.crash) faults_add(faults, &count, .{ .kind = .crash, .node = node.name });
         if (allowed.wipe) faults_add(faults, &count, .{ .kind = .wipe, .node = node.name });
+        if (allowed.stop) faults_add(faults, &count, .{ .kind = .stop, .node = node.name });
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
@@ -383,40 +411,15 @@ fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
 /// carries everything about it, so that `determinismo script` can put it in a script.
 fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const Applied) void {
     switch (applied.kind) {
-        .pause => {
-            nodes.freeze(applied.node, .frozen) catch return;
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            nodes.freeze(applied.node, .thawed) catch {};
-        },
-        .restart, .crash, .wipe => {
-            const stopped = switch (applied.kind) {
-                .crash => nodes.crash(applied.node),
-                .wipe => nodes.wipe(applied.node),
-                else => nodes.kill(applied.node),
-            };
-            stopped catch |err| {
-                sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
-                return;
-            };
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            const node = system.node(applied.node) orelse return;
-            nodes.start(arena, system, node) catch |err| {
-                const details = .{ .node = applied.node, .err = @errorName(err) };
-                sdk.event("fault_restart_failed", details);
-                return;
-            };
-            network_node_new(system, applied.node); // Its links are new.
-        },
-        .throttle => {
-            nodes.cpu_limit(applied.node, applied.cpu_percent) catch return;
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            nodes.cpu_limit(applied.node, null) catch {};
-        },
-        .process_pause => apply_process_pause(applied),
-        .thread_pause => apply_thread_pause(applied),
+        .pause,
+        .restart,
+        .crash,
+        .wipe,
+        .stop,
+        .throttle,
+        .process_pause,
+        .thread_pause,
+        => node_start(system, applied),
         .process_kill => apply_process_kill(applied),
         .isolate, .partition, .degrade, .partition_groups, .clog => network_start(system, applied),
         .restore => network_restore(system, applied),
@@ -429,6 +432,128 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         },
         .custom => apply_custom(arena, system, applied),
     }
+}
+
+// Node faults -----------------------------------------------------------------------------
+// Antithesis's: one at a time on a node (another drawn for it meanwhile is skipped, and not
+// logged), several nodes at once. Each is undone at its end, and all at a quiet period or the
+// stop.
+
+const NodeFault = struct {
+    applied: Applied,
+    end_ns: u64,
+    /// The process or thread stopped (process_pause, thread_pause).
+    pid: linux.pid_t = 0,
+};
+var nodes_faulted: [schema.nodes_max]?NodeFault = @splat(null);
+/// For starting nodes again when their fault ends (set once faults start).
+var arena_active: ?std.mem.Allocator = null;
+/// How long a graceful stop waits for the node to exit before it is killed.
+const stop_grace_ns = 5 * std.time.ns_per_s;
+
+fn node_slot(system: *const schema.System, name: []const u8) ?*?NodeFault {
+    const index = endpoint_index(system, name) orelse return null;
+    if (index == 0) return null; // The runner is not a node.
+    return &nodes_faulted[index - 1];
+}
+
+fn node_start(system: *const schema.System, applied: *const Applied) void {
+    const slot = node_slot(system, applied.node) orelse return;
+    if (slot.* != null) return;
+    var fault = NodeFault{ .applied = applied.*, .end_ns = monotonic_ns() + applied.duration_ns };
+    const started: anyerror!void = switch (applied.kind) {
+        .pause => nodes.freeze(applied.node, .frozen),
+        .restart => nodes.kill(applied.node),
+        .crash => nodes.crash(applied.node),
+        .wipe => nodes.wipe(applied.node),
+        .stop => nodes.stop(applied.node, stop_grace_ns),
+        .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
+        .process_pause => process_stop(applied, &fault),
+        .thread_pause => thread_stop(applied, &fault),
+        else => unreachable,
+    };
+    started catch |err| {
+        sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+        return;
+    };
+    sdk.event("fault", applied.*);
+    slot.* = fault;
+}
+
+fn node_end(system: *const schema.System, slot: *?NodeFault) void {
+    const fault = slot.* orelse return;
+    slot.* = null;
+    const name = fault.applied.node;
+    switch (fault.applied.kind) {
+        .pause => nodes.freeze(name, .thawed) catch {},
+        .restart, .crash, .wipe, .stop => {
+            const node = system.node(name) orelse return;
+            const arena = arena_active orelse return;
+            nodes.start(arena, system, node) catch |err| {
+                sdk.event("fault_restart_failed", .{ .node = name, .err = @errorName(err) });
+                return;
+            };
+            network_node_new(system, name); // Its links are new.
+        },
+        .throttle => nodes.cpu_limit(name, null) catch {},
+        .process_pause => _ = linux.kill(fault.pid, .CONT),
+        .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
+        else => {},
+    }
+}
+
+fn node_expire(system: *const schema.System, now_ns: u64) void {
+    for (&nodes_faulted) |*slot| {
+        const fault = slot.* orelse continue;
+        if (fault.end_ns <= now_ns) node_end(system, slot);
+    }
+}
+
+fn node_next_end() ?u64 {
+    var next: ?u64 = null;
+    for (nodes_faulted) |slot| {
+        const fault = slot orelse continue;
+        next = @min(next orelse fault.end_ns, fault.end_ns);
+    }
+    return next;
+}
+
+fn node_heal(system: *const schema.System) void {
+    for (&nodes_faulted) |*slot| node_end(system, slot);
+}
+
+/// One of the node's processes stopped (SIGSTOP).
+fn process_stop(applied: *const Applied, fault: *NodeFault) !void {
+    var pids: [processes_max]linux.pid_t = undefined;
+    const count = try nodes.processes(applied.node, &pids);
+    if (count == 0) return error.NoProcess;
+    fault.pid = pids[applied.process_index % count];
+    _ = linux.kill(fault.pid, .STOP);
+}
+
+const ptrace_detach = 17;
+const wait_all = 0x40000000; // __WALL: threads too.
+
+/// One thread stopped with ptrace (seize, interrupt): the process's other threads run on.
+fn thread_stop(applied: *const Applied, fault: *NodeFault) !void {
+    var pids: [processes_max]linux.pid_t = undefined;
+    const count = try nodes.processes(applied.node, &pids);
+    if (count == 0) return error.NoProcess;
+    const pid = pids[applied.process_index % count];
+    var tids: [threads_max]linux.pid_t = undefined;
+    const threads = nodes.threads(pid, &tids);
+    if (threads == 0) return error.NoThread;
+    const tid = tids[applied.thread_index % threads];
+    if (linux.errno(linux.ptrace(linux.PTRACE.SEIZE, tid, 0, 0, 0)) != .SUCCESS) {
+        return error.Ptrace;
+    }
+    if (linux.errno(linux.ptrace(linux.PTRACE.INTERRUPT, tid, 0, 0, 0)) != .SUCCESS) {
+        _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
+        return error.Ptrace;
+    }
+    var status: i32 = 0;
+    _ = linux.wait4(tid, &status, wait_all, null); // Stopped.
+    fault.pid = tid;
 }
 
 /// Runs the node's fault program to completion (its duration is its own); nothing to undo.
@@ -449,40 +574,6 @@ fn apply_custom(
         return;
     };
     sdk.event("fault_custom_done", .{ .program = applied.program, .status = status });
-}
-
-fn apply_process_pause(applied: *const Applied) void {
-    var pids: [processes_max]linux.pid_t = undefined;
-    const count = nodes.processes(applied.node, &pids) catch return;
-    if (count == 0) return;
-    const pid = pids[applied.process_index % count];
-    _ = linux.kill(pid, .STOP);
-    sdk.event("fault", applied.*);
-    sleep_ns(applied.duration_ns);
-    _ = linux.kill(pid, .CONT);
-}
-
-const ptrace_detach = 17;
-const wait_all = 0x40000000; // __WALL: threads too.
-
-/// Stops one thread with ptrace (seize, interrupt) for the fault's duration, then detaches:
-/// the process's other threads run on meanwhile.
-fn apply_thread_pause(applied: *const Applied) void {
-    var pids: [processes_max]linux.pid_t = undefined;
-    const count = nodes.processes(applied.node, &pids) catch return;
-    if (count == 0) return;
-    const pid = pids[applied.process_index % count];
-    var tids: [threads_max]linux.pid_t = undefined;
-    const threads = nodes.threads(pid, &tids);
-    if (threads == 0) return;
-    const tid = tids[applied.thread_index % threads];
-    if (linux.errno(linux.ptrace(linux.PTRACE.SEIZE, tid, 0, 0, 0)) != .SUCCESS) return;
-    defer _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
-    if (linux.errno(linux.ptrace(linux.PTRACE.INTERRUPT, tid, 0, 0, 0)) != .SUCCESS) return;
-    var status: i32 = 0;
-    _ = linux.wait4(tid, &status, wait_all, null); // Stopped.
-    sdk.event("fault", applied.*);
-    sleep_ns(applied.duration_ns);
 }
 
 /// A crash: one of the node's processes other than its main one (a worker, a pod's process)
@@ -526,7 +617,11 @@ fn disrupts(system: *const schema.System, applied: *const Applied, a: usize, b: 
     if (a == b) return false;
     return switch (applied.kind) {
         .partition_groups => applied.groups[a] != group_none and
-            applied.groups[b] != group_none and applied.groups[a] != applied.groups[b],
+            applied.groups[b] != group_none and switch (applied.direction orelse .both) {
+            .both => applied.groups[a] != applied.groups[b],
+            .outbound => applied.groups[a] < applied.groups[b],
+            .inbound => applied.groups[a] > applied.groups[b],
+        },
         .clog => blk: {
             const node = endpoint_index(system, applied.node) orelse break :blk false;
             break :blk switch (applied.direction.?) {
@@ -810,9 +905,14 @@ fn sleep_ns(duration_ns: u64) void {
     const deadline_ns = monotonic_ns() + duration_ns;
     for (0..injections_max) |_| {
         const now_ns = monotonic_ns();
-        if (system_active) |system| network_expire(system, now_ns);
+        if (system_active) |system| {
+            network_expire(system, now_ns);
+            node_expire(system, now_ns);
+        }
         if (now_ns >= deadline_ns or stopping.load(.acquire)) return;
-        const wake_ns = @min(deadline_ns, network_next_end() orelse deadline_ns);
+        const network_end = network_next_end() orelse deadline_ns;
+        const node_end_ns = node_next_end() orelse deadline_ns;
+        const wake_ns = @min(deadline_ns, network_end, node_end_ns);
         const left_ns = wake_ns -| now_ns;
         if (control < 0) {
             nodes.sleep_ns(left_ns);
@@ -827,7 +927,10 @@ fn sleep_ns(duration_ns: u64) void {
         if (linux.errno(result) == .INTR) return; // A stop.
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         if (requests_read() > 0) {
-            if (system_active) |system| network_heal(system);
+            if (system_active) |system| {
+                network_heal(system);
+                node_heal(system);
+            }
             return;
         }
     }
@@ -843,27 +946,155 @@ fn sleep_through_ns(duration_ns: u64) void {
     }
 }
 
-/// Takes the pending requests: the quiet period ends at the latest one asks for. Returns
-/// how many there were.
+/// A request on the control FIFO is a u64 (little endian): a quiet period in nanoseconds, or,
+/// with its top bit set, the length (low 32 bits) of the JSON fault that follows (`inject`).
+/// Each fits in one write of at most PIPE_BUF: atomic.
+const inject_flag: u64 = 1 << 63;
+const request_size_max = 4096;
+
+/// Takes the pending requests: injected faults are applied; the quiet period ends at the latest
+/// one asks for. Returns how many quiet-period requests there were.
 fn requests_read() u32 {
-    var requests: [64]u64 = undefined;
-    const bytes: [*]u8 = @ptrCast(&requests);
-    const size = linux.read(control, bytes, @sizeOf(@TypeOf(requests)));
+    var buffer: [16 * request_size_max]u8 = undefined;
+    const size = linux.read(control, &buffer, buffer.len);
     if (linux.errno(size) != .SUCCESS) return 0;
-    const count: u32 = @intCast(size / @sizeOf(u64));
-    const now_ns = monotonic_ns();
-    for (requests[0..count]) |request| {
-        const duration_ns = std.mem.littleToNative(u64, request);
-        if (duration_ns == 0) {
-            // A zero-length request ends the quiet period (Antithesis's unpause).
-            quiet_until_ns = 0;
-            sdk.event("faults_resume", .{});
+    var quiet: u32 = 0;
+    var at: usize = 0;
+    while (at + 8 <= size) {
+        const header = std.mem.readInt(u64, buffer[at..][0..8], .little);
+        at += 8;
+        if (header & inject_flag != 0) {
+            const length: usize = @intCast(header & 0xffff_ffff);
+            if (at + length > size) break;
+            inject(buffer[at..][0..length]);
+            at += length;
             continue;
         }
-        quiet_until_ns = @max(quiet_until_ns, now_ns + duration_ns);
-        sdk.event("faults_quiet", .{ .duration_ns = duration_ns, .until_ns = quiet_until_ns });
+        quiet += 1;
+        quiet_request(header);
     }
-    return count;
+    return quiet;
+}
+
+fn quiet_request(duration_ns: u64) void {
+    if (duration_ns == 0) {
+        // A zero-length request ends the quiet period (Antithesis's unpause).
+        quiet_until_ns = 0;
+        sdk.event("faults_resume", .{});
+        return;
+    }
+    quiet_until_ns = @max(quiet_until_ns, monotonic_ns() + duration_ns);
+    sdk.event("faults_quiet", .{ .duration_ns = duration_ns, .until_ns = quiet_until_ns });
+}
+
+/// A fault the scenario asks for, as `det-faults inject` and the SDK's `fault` write it.
+const Request = struct {
+    kind: Kind,
+    node: []const u8 = "",
+    peer: []const u8 = "",
+    duration_ms: u64 = 1000,
+    /// partition_groups: the groups, by name ("runner" for the test commands' side).
+    groups: []const []const []const u8 = &.{},
+    disruption: Disruption = .stopped,
+    direction: Direction = .both,
+    flavor: Degradation = .delay_loss,
+    cpu_percent: u8 = 20,
+    /// clock_skip (permanent: later skips stack on it).
+    skip_ms: u64 = 0,
+    forward: bool = true,
+    program: []const u8 = "",
+};
+
+fn inject(json: []const u8) void {
+    const system = system_active orelse return;
+    var parse_buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&parse_buffer);
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const allocator = fixed.allocator();
+    const request = std.json.parseFromSliceLeaky(Request, allocator, json, options) catch |err| {
+        sdk.event("fault_inject_refused", .{ .err = @errorName(err) });
+        return;
+    };
+    const applied = injected_applied(system, &request) catch |err| {
+        const kind = @tagName(request.kind);
+        sdk.event("fault_inject_refused", .{ .kind = kind, .err = @errorName(err) });
+        return;
+    };
+    if (applied.kind == .clock_skip) {
+        sdk.event("fault", applied);
+        clock_shift(applied.skip_ns, .{ .forward = applied.forward });
+        return;
+    }
+    apply(arena_active orelse return, system, &applied);
+}
+
+/// The fault a request describes; what it leaves out (which process, which thread) is drawn.
+fn injected_applied(system: *const schema.System, request: *const Request) !Applied {
+    var applied = Applied{
+        .kind = request.kind,
+        .node = request.node,
+        .peer = request.peer,
+        .duration_ns = request.duration_ms * std.time.ns_per_ms,
+        .injected = true,
+    };
+    for ([_][]const u8{ request.node, request.peer }) |name| {
+        if (name.len > 0 and endpoint_index(system, name) == null) return error.UnknownNode;
+    }
+    switch (request.kind) {
+        .throttle => applied.cpu_percent = request.cpu_percent,
+        .process_pause, .process_kill => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
+        .thread_pause => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+            applied.thread_index = @intCast(sdk.random_below(threads_max));
+        },
+        .degrade => {
+            applied.flavor = request.flavor;
+            applied.netem = degradation(request.flavor);
+        },
+        .clog => {
+            applied.disruption = request.disruption;
+            applied.direction = request.direction;
+        },
+        .partition_groups => {
+            if (request.groups.len < 2) return error.FewerThanTwoGroups;
+            for (request.groups, 0..) |group, number| {
+                for (group) |name| {
+                    const index = endpoint_index(system, name) orelse return error.UnknownNode;
+                    applied.groups[index] = @intCast(number);
+                }
+            }
+            applied.disruption = request.disruption;
+            applied.direction = request.direction;
+        },
+        .clock_skip => {
+            applied.skip_ns = request.skip_ms * std.time.ns_per_ms;
+            applied.forward = request.forward;
+            applied.permanent = true;
+        },
+        .custom => applied.program = request.program,
+        else => {},
+    }
+    return applied;
+}
+
+/// `det-faults inject '<json>'`: asks the running injector for that fault now.
+fn inject_request(json: []const u8) !void {
+    if (json.len + 8 > request_size_max) return error.RequestTooLarge;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open(control_path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        std.debug.print("det-faults inject: no fault injector is running (faults happen " ++
+            "while drivers run)\n", .{});
+        return error.NoInjector;
+    }
+    defer _ = linux.close(@intCast(fd));
+    var message: [request_size_max]u8 = undefined;
+    std.mem.writeInt(u64, message[0..8], inject_flag | json.len, .little);
+    @memcpy(message[8..][0..json.len], json);
+    const written = linux.write(@intCast(fd), &message, json.len + 8);
+    if (linux.errno(written) != .SUCCESS) return error.WriteFailed;
 }
 
 test faults_collect {

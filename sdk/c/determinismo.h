@@ -53,6 +53,13 @@ void det_unreachable(const char *message, const char *details);
 void det_setup_complete(const char *details); /* The platform snapshots here. */
 void det_event(const char *name, const char *details);
 
+/* Faults from the scenario. A quiet period of `seconds` (0 ends it): faults stop, except clock
+   skips. A fault now (`json` as det-faults inject takes it, e.g. {"kind": "pause", "node": "db",
+   "duration_ms": 2000}): applied, logged and undone like a drawn one. Both only while the
+   fault injector runs (the drivers); otherwise nothing happens. */
+void det_stop_faults(double seconds);
+void det_fault(const char *json);
+
 /* Guidance assertions: the compared values in the details, and a guidance event telling
    strategies how far the timeline is from the interesting outcome (lower is closer). `always`
    is 1 for an always, 0 for a sometimes; `relation` is one of DET_GREATER, ... */
@@ -469,6 +476,35 @@ void det_setup_complete(const char *details) {
   int length = snprintf(line, sizeof line, "{\"lifecycle\":\"setup_complete\",\"details\":%s}",
                         details ? details : "{}");
   if (length > 0 && (size_t)length < sizeof line) det_emit(line, (size_t)length);
+}
+
+#define DET_FAULTS_CONTROL "/opt/determinismo/faults-control" /* faults.zig's control_path */
+
+static void det_faults_control(const void *message, size_t size) {
+  int fd = open(DET_FAULTS_CONTROL, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return; /* No injector running. */
+  ssize_t written = write(fd, message, size); /* Atomic: under PIPE_BUF. */
+  (void)written;
+  close(fd);
+}
+
+static void det_u64_le(unsigned char *out, uint64_t value) {
+  for (int i = 0; i < 8; i++) out[i] = (unsigned char)(value >> (8 * i));
+}
+
+void det_stop_faults(double seconds) {
+  unsigned char message[8];
+  det_u64_le(message, seconds > 0 ? (uint64_t)(seconds * 1e9) : 0);
+  det_faults_control(message, sizeof message);
+}
+
+void det_fault(const char *json) {
+  unsigned char message[4096];
+  size_t length = strlen(json);
+  if (length + 8 > sizeof message) return;
+  det_u64_le(message, ((uint64_t)1 << 63) | length);
+  memcpy(message + 8, json, length);
+  det_faults_control(message, length + 8);
 }
 
 void det_event(const char *name, const char *details) {

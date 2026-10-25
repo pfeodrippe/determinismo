@@ -179,6 +179,8 @@ pub fn build(b: *std.Build) void {
     e2e_run.setCwd(b.path(".")); // Its defaults (zig-out/bin) and the examples' paths.
     const e2e_only = b.option([]const u8, "only", "e2e: the checks whose names contain this");
     if (e2e_only) |only| e2e_run.addArgs(&.{ "--only", only });
+    const e2e_guest = b.option([]const u8, "guest", "e2e: the guest kernel and initramfs ($HOME/guest)");
+    if (e2e_guest) |guest| e2e_run.addArgs(&.{ "--guest", guest });
     b.step("e2e", "Boot real systems: exploration, exact replays, tapes (on the Linux host)")
         .dependOn(&e2e_run.step);
 

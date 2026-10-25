@@ -551,6 +551,26 @@ pub fn stop_faults(duration_ns: u64) void {
     _ = linux.write(@intCast(fd), &request, request.len); // Atomic: under PIPE_BUF.
 }
 
+/// A fault now, from the scenario (as `det-faults inject`): the injector applies it, logs it
+/// and undoes it like one it drew. `request` is written as JSON: `.{ .kind = "pause", .node =
+/// "db", .duration_ms = 2000 }`, `.{ .kind = "partition_groups", .groups = .{ .{ "runner", "a"
+/// }, .{"b"} }, .disruption = "stopped", .direction = "both" }`, `.{ .kind = "degrade", .node =
+/// "a", .peer = "b", .flavor = "delay_loss" }`; guest/runtime/faults.zig lists them all. Only
+/// while the injector runs (the drivers); otherwise nothing happens.
+pub fn fault(request: anytype) void {
+    const control_path = "/opt/determinismo/faults-control"; // faults.zig's control_path.
+    var message: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(message[8..]);
+    std.json.Stringify.value(request, .{}, &writer) catch return; // Too large: not sent.
+    const length = writer.buffered().len;
+    std.mem.writeInt(u64, message[0..8], (@as(u64, 1) << 63) | length, .little);
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open(control_path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), &message, length + 8); // Atomic: under PIPE_BUF.
+}
+
 fn Result(comptime Function: type) type {
     return @typeInfo(Function).@"fn".return_type.?;
 }

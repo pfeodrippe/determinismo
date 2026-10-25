@@ -263,6 +263,37 @@ def event(name, details=None):
     _emit({"event": name, "details": details or {}})
 
 
+_FAULTS_CONTROL = "/opt/determinismo/faults-control"  # faults.zig's control_path
+
+
+def _faults_control(message):
+    try:
+        fd = os.open(_FAULTS_CONTROL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return  # No injector running.
+    try:
+        os.write(fd, message)  # Atomic: under PIPE_BUF.
+    finally:
+        os.close(fd)
+
+
+def stop_faults(seconds):
+    """A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS): faults stop for `seconds`,
+    except clock skips; 0 ends it. Only while the fault injector runs."""
+    _faults_control(int(max(seconds, 0) * 1e9).to_bytes(8, "little"))
+
+
+def fault(**request):
+    """A fault now, from the scenario: fault(kind="pause", node="db", duration_ms=2000),
+    fault(kind="partition_groups", groups=[["runner", "a"], ["b"]], disruption="stopped").
+    Applied, logged and undone like a drawn one (guest/runtime/faults.zig lists the kinds).
+    Only while the fault injector runs (the drivers)."""
+    body = json.dumps(request).encode()
+    if len(body) + 8 > 4096:
+        raise ValueError("a fault request is at most 4088 bytes")
+    _faults_control(((1 << 63) | len(body)).to_bytes(8, "little") + body)
+
+
 def coverage_start(paths=None):
     """Code coverage for strategies (Python 3.12+): from now on, each line of code under `paths`
     (prefixes of file names; None for every file but this SDK's) emits a "coverage" event the

@@ -99,6 +99,9 @@ pub const Faults = struct {
     /// Kill it and start it fresh from its image: everything it wrote is gone (Antithesis's
     /// restarts that "lose all of their modified data").
     wipe: bool = false,
+    /// Stop it gracefully (SIGTERM, then a kill after a grace period) and start it again
+    /// (Antithesis's node stop, beside the kill that restart is).
+    stop: bool = false,
     /// Degrade single links, in one direction, for a while: delay and loss, duplication,
     /// corruption, reordering or congestion.
     degrade: bool = true,

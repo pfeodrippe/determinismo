@@ -175,6 +175,18 @@
   ([name] (event name nil))
   ([name data] (Determinismo/event name (details-json data))))
 
+(defn fault
+  "A fault now, from the scenario: (fault {:kind \"pause\" :node \"db\" :duration_ms 2000}),
+  (fault {:kind \"partition_groups\" :groups [[\"runner\" \"a\"] [\"b\"]]}). Applied, logged
+  and undone like a drawn one; only while the fault injector runs (the drivers)."
+  [request]
+  (Determinismo/fault (details-json request)))
+
+(defn stop-faults
+  "A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of `seconds`; 0 ends it."
+  [seconds]
+  (Determinismo/stopFaults (double seconds)))
+
 (defn setup-complete
   "The system is up: timelines branch from here."
   ([] (setup-complete nil))

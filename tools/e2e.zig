@@ -91,12 +91,13 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "until", check_until_and_causality },     .{ "coverage", check_coverage },
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
         .{ "tree", check_tree },                     .{ "disk", check_disk },
-        .{ "mutate", check_mutate },                 .{ "compose", check_compose },
-        .{ "shards", check_shards },                 .{ "stress", check_stress },
-        .{ "controller", check_controller },         .{ "clojure", check_clojure },
-        .{ "k3s", check_k3s },                       .{ "script", check_script },
-        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
-        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
+        .{ "mutate", check_mutate },                 .{ "inject", check_inject },
+        .{ "compose", check_compose },               .{ "shards", check_shards },
+        .{ "stress", check_stress },                 .{ "controller", check_controller },
+        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
+        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },               .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1066,6 +1067,23 @@ fn deepest_replays(
     const replays = original != null and parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, original.?.events_hash);
     return .{ .index = index, .depth = depth_max, .replays = replays };
+}
+
+/// Faults a scenario asks for (sdk.fault, det-faults inject): a pause, a graceful stop and a
+/// one-way partition each take the node away and give it back, in every timeline.
+fn check_inject(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const report = try explore(context, &.{
+        "--program",  program, "--profile", "injectable", "--scenario", "inject", "--seed", "1",
+        "--branches", "2",
+    });
+    const passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null and
+        std.mem.indexOf(u8, report, "injected faults came and went") != null;
+    expect(context, passes, "inject: a pause, a stop and a one-way partition asked for by " ++
+        "the scenario take the node away and give it back", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "fault_inject_refused", "fault_failed",
+    }) catch ""});
 }
 
 /// A mutation campaign (determinismo mutate): of two mutants, the one that breaks the sums is

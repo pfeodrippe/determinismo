@@ -272,6 +272,10 @@ const RunRequest = struct {
     time_budget: ?[]const u8 = null,
     /// "flat" or "tree" (explore's --branching).
     branching: ?[]const u8 = null,
+    /// Fault kinds every node also allows, nodes that allow none (explore's --faults,
+    /// --no-faults).
+    faults: ?[]const u8 = null,
+    no_faults: ?[]const u8 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
     from_branch: ?u32 = null,
@@ -303,6 +307,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     if (asked.branching) |branching| {
         try argv.appendSlice(server.arena, &.{ "--branching", branching });
     }
+
     if (asked.branches != null or asked.time_budget == null) {
         const branches = try print(server, "{d}", .{asked.branches orelse 16});
         try argv.appendSlice(server.arena, &.{ "--branches", branches });
@@ -764,6 +769,9 @@ fn system_arguments(
     if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
     if (asked.cpu_modulation) try argv.append(arena, "--cpu-modulation");
+    // They change the system (what its nodes allow): runs and their replays both.
+    if (asked.faults) |kinds| try argv.appendSlice(arena, &.{ "--faults", kinds });
+    if (asked.no_faults) |names| try argv.appendSlice(arena, &.{ "--no-faults", names });
 }
 
 fn run_find(server: *Server, id: u32) ?*Run {

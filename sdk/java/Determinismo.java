@@ -259,6 +259,34 @@ public final class Determinismo {
   }
 
   /**
+   * A fault now, from the scenario: {@code fault("{\"kind\":\"pause\",\"node\":\"db\"}")}
+   * (as det-faults inject takes it). Applied, logged and undone like a drawn one; only while the
+   * fault injector runs. Through det-faults: the JVM cannot open a FIFO without blocking.
+   */
+  public static void fault(String json) {
+    faultsCommand("inject", json);
+  }
+
+  /** A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of {@code seconds}; 0 ends it. */
+  public static void stopFaults(double seconds) {
+    String command = System.getenv("DETERMINISMO_STOP_FAULTS");
+    run(new String[] {command == null ? "/opt/determinismo/bin/det-stop-faults" : command,
+        Double.toString(seconds)});
+  }
+
+  private static void faultsCommand(String verb, String argument) {
+    run(new String[] {"/opt/determinismo/bin/det-faults", verb, argument});
+  }
+
+  private static void run(String[] command) {
+    try {
+      new ProcessBuilder(command).inheritIO().start().waitFor();
+    } catch (java.io.IOException | InterruptedException unavailable) {
+      // Outside determinismo: nothing to ask.
+    }
+  }
+
+  /**
    * Which evaluations become events: every one (false, the default: queries see each), or, as
    * Antithesis's SDKs do, each assertion's first pass and first failure in this process (true:
    * for hot paths, the same verdict with far fewer events). Set it once, at the start.

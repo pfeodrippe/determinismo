@@ -13,6 +13,9 @@
 //!   quiet      (profile "workers") a driver asks for a 2 second quiet period from inside the
 //!              echo node (det-stop-faults, as Antithesis's ANTITHESIS_STOP_FAULTS): no fault
 //!              but clock skips may start during it
+//!   inject     (profile "injectable") faults the scenario asks for (sdk.fault): a pause, a
+//!              graceful stop and a one-way partition, each taking the node away and giving it
+//!              back
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
 //!              survives a crash, what it did not is lost, a wipe loses both
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
@@ -52,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
             .oom = oom,
             .crash = crash,
             .disk = disk,
+            .inject = inject,
             .stress = stress,
             .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
@@ -103,12 +107,22 @@ fn describe(d: *System.Describe) !void {
         .ready = .{ .tcp = port },
         .faults = crashes,
     });
+    // Faults the scenario asks for: the injector runs (it may pause or stop the node).
+    const injectable = try d.profile("injectable");
+    var asked = quiet;
+    asked.pause = true;
+    asked.stop = true;
+    injectable.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = asked,
+    });
     try describe_mazes(d);
     const controller = try d.profile("controller");
     controller.node(.controller, .{
         .directory = "zig-out/bin", // determinismo and det-fake-explore.
         .command = &.{
-            "/determinismo", "serve",      "--listen",           "0.0.0.0:7878",
+            "/determinismo", "serve",     "--listen",   "0.0.0.0:7878",
             "--data",        "/var/runs", "--explorer", "/det-fake-explore",
         },
         .ready = .{ .tcp = 7878 },
@@ -202,6 +216,42 @@ fn crash_and_wipe(context: *System.Context) !void {
     // The node wrote both again on its fresh start: the wipe lost what the crash kept.
     sdk.always(file_present(&echo, "/data/unsynced"), "a wipe starts the node fresh", .{});
     sdk.stop_faults(0);
+}
+
+fn inject(s: *System.Scenario) void {
+    s.singleton_driver("faults_on_request", faults_on_request);
+}
+
+/// In a quiet period (no drawn faults; requested ones still apply), the driver asks for a
+/// pause, a graceful stop and a partition from the runner to the node: each takes the node
+/// away for a while, then it answers again.
+fn faults_on_request(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    sdk.fault(.{ .kind = "pause", .node = echo.name, .duration_ms = 2000 });
+    sdk.sleep_ms(100);
+    sdk.always(!answering(echo.address), "an injected pause stops the node", .{});
+    try sdk.retry(100, 100, answers, .{echo.address});
+    sdk.fault(.{ .kind = "stop", .node = echo.name, .duration_ms = 1000 });
+    sdk.sleep_ms(200);
+    sdk.always(!answering(echo.address), "an injected stop takes the node down", .{});
+    try sdk.retry(100, 100, answers, .{echo.address});
+    sdk.fault(.{
+        .kind = "partition_groups",
+        .groups = .{ .{"runner"}, .{echo.name} },
+        .direction = "outbound",
+        .duration_ms = 1500,
+    });
+    sdk.sleep_ms(100);
+    sdk.always(!answering(echo.address), "an injected one-way partition cuts the node off", .{});
+    try sdk.retry(100, 100, answers, .{echo.address});
+    sdk.reachable("injected faults came and went", .{});
+    sdk.stop_faults(0);
+}
+
+fn answering(address: [4]u8) bool {
+    answers(address) catch return false;
+    return true;
 }
 
 fn file_present(node: *const sdk.Node, path: []const u8) bool {
