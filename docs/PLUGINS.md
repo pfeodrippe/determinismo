@@ -44,3 +44,19 @@ inputs is refused, since it would be a different universe.
 
 Overridden values are at most 64 bytes (SDK pulls are 8). A plugin must answer every request; a
 plugin that exits or writes a malformed line ends the exploration with an error.
+
+## Two levels of strategy
+
+A plugin (this protocol) decides inside a run: it sees every event with its moment and may
+override any randomness pull (scheduling choices of the composer, faults and their parameters,
+test inputs). It may be written in any language and use any algorithm (a fixed policy, a
+learned one, a language model); it does not need to be deterministic, because every override
+it makes is written to the branch's tape, and the tape alone replays the branch.
+
+An outer loop decides across runs: it drives determinismo through the MCP server or the HTTP
+API (`describe`, `explore`, `replay`, `fork`), reads the JSON results, and chooses what to do
+next: which scenario, how many branches, which branch and moment to fork from. Reinforcement
+learning over whole timelines, or an agent forming and testing hypotheses about a failure,
+lives here. See docs/AGENTS.md.
+
+Both compose: an outer loop can run explorations whose branches are steered by a plugin.
