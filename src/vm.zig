@@ -57,6 +57,12 @@ action_pending: ?[]const u8,
 /// The moment's commands after the one running: a moment command can be several, separated by
 /// NUL bytes (which no argument can contain), run one after the other (`--exec-script`).
 moment_commands_rest: []const u8,
+/// A labeled decision (`{"decision": {...}}` from the SDK's `decide`): the label of the next
+/// randomness pull of the process that announced it, sent to the strategy with that pull.
+decision_label: [decision_label_size_max]u8,
+decision_label_size: u32,
+decision_source: [source_size_max]u8,
+decision_source_size: u32,
 /// The event count at the last exec_done handled: later doorbells (with no event) keep exec_done
 /// as the last event, and must not finish the next command.
 exec_done_handled: u64,
@@ -261,6 +267,10 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .moment_printing = false,
         .action_pending = null,
         .moment_commands_rest = "",
+        .decision_label = undefined,
+        .decision_label_size = 0,
+        .decision_source = undefined,
+        .decision_source_size = 0,
         .exec_done_handled = 0,
         .target_is_moment = false,
         .deterministic = options.deterministic,
@@ -835,6 +845,7 @@ fn handle_request(vm: *VM, address: u32) !void {
             const moment_now = try vm.moment();
             var lines = std.mem.tokenizeScalar(u8, data, '\n');
             while (lines.next()) |line| {
+                vm.decision_note(line, source);
                 try vm.events.emit(moment_now, line);
                 try vm.checkpoint(moment_now);
                 if (vm.until != null and !vm.until_hit and !vm.moment_reached) {
@@ -890,8 +901,33 @@ fn source_trim(comm: *const [source_size_max]u8) []const u8 {
 }
 
 /// One randomness pull: the seeded default, unless a replayed tape or the strategy overrides it.
+const decision_label_size_max = 2048;
+
+/// Keeps a decision's label for the next pull of the process that announced it.
+fn decision_note(vm: *VM, line: []const u8, source: []const u8) void {
+    const prefix = "{\"decision\":";
+    if (!std.mem.startsWith(u8, line, prefix) or line[line.len - 1] != '}') return;
+    const label = line[prefix.len .. line.len - 1];
+    if (label.len > decision_label_size_max or source.len > source_size_max) return;
+    @memcpy(vm.decision_label[0..label.len], label);
+    vm.decision_label_size = @intCast(label.len);
+    @memcpy(vm.decision_source[0..source.len], source);
+    vm.decision_source_size = @intCast(source.len);
+}
+
+/// The label of this pull, if its process announced one (used once).
+fn decision_take(vm: *VM, source: []const u8) ?[]const u8 {
+    if (vm.decision_label_size == 0) return null;
+    const announced = vm.decision_source[0..vm.decision_source_size];
+    if (!std.mem.eql(u8, announced, source)) return null;
+    const label = vm.decision_label[0..vm.decision_label_size];
+    vm.decision_label_size = 0;
+    return label;
+}
+
 fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
     assert(value.len > 0);
+    const label = vm.decision_take(source);
     const pull = vm.decisions.pulls;
     vm.decisions.random(value);
     assert(vm.decisions.pulls == pull + 1);
@@ -900,7 +936,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
         _ = try overrides.apply(pull, value);
     } else if (vm.strategy) |strategy| {
         if (value.len > Strategy.override_size_max) return; // Too large to override.
-        if (try strategy.random(pull, try vm.moment(), source, value)) {
+        if (try strategy.random(pull, try vm.moment(), source, label, value)) {
             if (vm.tape_fd) |fd| tape.write_override(fd, pull, value);
         }
     }

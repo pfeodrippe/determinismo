@@ -13,6 +13,11 @@
 //! events: those are features too. Events of determinismo's own processes (faults injected,
 //! commands started) are the exploration's doing, not the system's behavior: not features.
 //!
+//! Guidance (the SDKs' guidance assertions, `always_greater_than` and the like) is a feature
+//! too: an assertion's distance to its interesting outcome, in buckets of powers of two, so a
+//! timeline that comes closer is kept; its children change any of the guided process's recent
+//! decisions, since each may be an input to the comparison.
+//!
 //! Parents: half the time the newest corpus entry (the latest progress), else the rarest of a
 //! few entries drawn at random, by how often the features they reached first have been hit.
 //!
@@ -60,6 +65,12 @@ const Tape = struct {
     /// reached it.
     frontier: u32 = 0,
     frontier_source: u32 = 0,
+    /// Where guidance last reached something new (an assertion came closer to its outcome),
+    /// kept apart from the frontier, which later features move: the comparison's inputs are
+    /// any of that process's decisions before it, not only its last.
+    guided: bool = false,
+    guided_frontier: u32 = 0,
+    guided_source: u32 = 0,
     /// The features it reached first (its claim to a place in the corpus).
     found: [found_max]u64 = undefined,
     found_count: u32 = 0,
@@ -82,10 +93,10 @@ const synced_max = 4096;
 const imports_per_branch_max = 16;
 /// A branch's first-seen features, shared with its corpus entry.
 const found_max = 64;
-/// A corpus entry on disk, little endian: count, frontier, found count, frontier source (u32
-/// each), then the
-/// found features and the values (u64 each), then the sources (u32 each).
-const entry_header_size = 16;
+/// A corpus entry on disk, little endian: count, frontier, found count, frontier source, guided
+/// (1 or 0), guided frontier, guided source (u32 each), then the found features and the values
+/// (u64 each), then the sources (u32 each).
+const entry_header_size = 28;
 var entry_buffer: [entry_header_size + (found_max + pulls_max) * 8 + pulls_max * 4]u8 = undefined;
 
 const Mutate = struct {
@@ -125,6 +136,7 @@ const Mutate = struct {
         strategy.prng = .init(seed ^ 0x6d7574617465);
         strategy.current.count = 0;
         strategy.current.frontier = 0;
+        strategy.current.guided = false;
         strategy.parent = null;
         strategy.mutation_count = 0;
         strategy.features_new = 0;
@@ -193,6 +205,7 @@ const Mutate = struct {
             if (std.mem.eql(u8, source, runtime)) return;
         }
         var hasher = std.hash.Wyhash.init(0x66656174);
+        var guided = false;
         if (value.object.get("assert")) |assertion| {
             if (assertion != .object) return;
             hash_field(&hasher, assertion.object, "type");
@@ -209,11 +222,31 @@ const Mutate = struct {
         } else if (value.object.get("lifecycle")) |lifecycle| {
             if (lifecycle != .string) return;
             hasher.update(lifecycle.string);
+        } else if (value.object.get("guidance")) |guidance| {
+            // How far an assertion is from its interesting outcome, in buckets of powers of two:
+            // a timeline that comes into a closer bucket reached something new.
+            if (guidance != .object) return;
+            hash_field(&hasher, guidance.object, "message");
+            const distance = guidance.object.get("distance") orelse return;
+            const bucket = distance_bucket(switch (distance) {
+                .integer => |integer| @floatFromInt(integer),
+                .float => |float| float,
+                else => return,
+            });
+            hasher.update(std.mem.asBytes(&bucket));
+            guided = true;
         } else return;
-        strategy.feature(hasher.final(), source_hash(source));
+        strategy.feature(hasher.final(), source_hash(source), guided);
     }
 
-    fn feature(strategy: *Mutate, hash: u64, source: u32) void {
+    /// 0 at or past the outcome (distance 0 or less), else 1 + log2 of the distance, capped.
+    fn distance_bucket(distance: f64) u8 {
+        if (!(distance > 0)) return 0;
+        if (distance >= 1 << 62) return 64;
+        return 1 + std.math.log2_int(u64, @as(u64, @intFromFloat(distance)) | 1);
+    }
+
+    fn feature(strategy: *Mutate, hash: u64, source: u32, guided: bool) void {
         const key = hash | 1; // 0 marks an empty slot.
         const found = strategy.feature_insert(key) orelse return;
         strategy.feature_hits[found.slot] +|= 1;
@@ -222,6 +255,11 @@ const Mutate = struct {
         const current = &strategy.current;
         current.frontier = current.count;
         current.frontier_source = source;
+        if (guided) {
+            current.guided = true;
+            current.guided_frontier = current.count;
+            current.guided_source = source;
+        }
         if (current.found_count < found_max) {
             current.found[current.found_count] = key;
             current.found_count += 1;
@@ -332,6 +370,9 @@ const Mutate = struct {
         std.mem.writeInt(u32, entry_buffer[4..8], tape.frontier, .little);
         std.mem.writeInt(u32, entry_buffer[8..12], tape.found_count, .little);
         std.mem.writeInt(u32, entry_buffer[12..16], tape.frontier_source, .little);
+        std.mem.writeInt(u32, entry_buffer[16..20], @intFromBool(tape.guided), .little);
+        std.mem.writeInt(u32, entry_buffer[20..24], tape.guided_frontier, .little);
+        std.mem.writeInt(u32, entry_buffer[24..28], tape.guided_source, .little);
         const found = std.mem.sliceAsBytes(tape.found[0..tape.found_count]);
         const values = std.mem.sliceAsBytes(tape.values[0..tape.count]);
         const sources = std.mem.sliceAsBytes(tape.sources[0..tape.count]);
@@ -378,6 +419,9 @@ const Mutate = struct {
             tape.count = count;
             tape.frontier = std.mem.readInt(u32, data[4..8], .little);
             tape.frontier_source = std.mem.readInt(u32, data[12..16], .little);
+            tape.guided = std.mem.readInt(u32, data[16..20], .little) & 1 != 0;
+            tape.guided_frontier = std.mem.readInt(u32, data[20..24], .little);
+            tape.guided_source = std.mem.readInt(u32, data[24..28], .little);
             const values_end = found_end + count * 8;
             @memcpy(std.mem.sliceAsBytes(tape.values[0..count]), data[found_end..values_end]);
             @memcpy(std.mem.sliceAsBytes(tape.sources[0..count]), data[values_end..]);
@@ -410,6 +454,19 @@ fn frontier_candidates(
     out: *[2 * frontier_sources_max]u32,
 ) u32 {
     const frontier = @min(tape.frontier, tape.count);
+    if (tape.guided and prng.boolean()) {
+        // Any of the guided process's decisions before it may be an input to its comparison.
+        const guided = @min(tape.guided_frontier, tape.count);
+        var count: u32 = 0;
+        var before = guided;
+        while (before > 0 and guided - before < frontier_window and count < out.len) {
+            before -= 1;
+            if (tape.sources[before] != tape.guided_source) continue;
+            out[count] = before;
+            count += 1;
+        }
+        if (count > 0) return count;
+    }
     if (prng.uintLessThan(u32, 100) < frontier_source_percent) {
         var count: u32 = 0;
         var before = frontier;

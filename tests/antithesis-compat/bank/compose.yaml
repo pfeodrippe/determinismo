@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # The bank, written the Antithesis way: a Compose file, and test commands in the client image
 # under /opt/antithesis/test/v1/bank/. Run with:
-#   determinismo explore ... --compose examples/compose-bank/compose.yaml --scenario bank
+#   determinismo explore ... --compose tests/antithesis-compat/bank/compose.yaml --scenario bank
 services:
   redis:
     image: docker.io/library/redis:7.4-alpine

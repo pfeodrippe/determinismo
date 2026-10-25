@@ -91,7 +91,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "stress", check_stress },                 .{ "controller", check_controller },
         .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
         .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },
+        .{ "profile", check_profile },               .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -200,10 +201,10 @@ fn check_coverage(context: *Context) !void {
         "--program", program, "--profile", "maze-zig", "--scenario", "maze",
     };
     const python = [_][]const u8{
-        "--compose", "examples/compose-python/compose.yaml", "--scenario", "maze",
+        "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
     };
     const java = [_][]const u8{
-        "--compose", "examples/compose-java/compose.yaml", "--scenario", "maze",
+        "--compose", "tests/antithesis-compat/java/compose.yaml", "--scenario", "maze",
     };
     const mazes = [_]Maze{
         .{ .label = "C, one worker", .system = &c, .jobs = 1, .branches = 300 },
@@ -289,18 +290,20 @@ fn check_python_strategy(context: *Context) !void {
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
 /// spread over them): the workload survives faults, and a branch replays exactly.
 fn check_k3s(context: *Context) !void {
-    try check_k3s_compose(context, "examples/k3s/compose.yaml", "4096", "one node");
-    try check_k3s_compose(context, "examples/k3s/cluster.yaml", "8192", "three nodes");
+    try check_k3s_profile(context, "single", "4096", "one node");
+    try check_k3s_profile(context, "cluster", "8192", "three nodes");
 }
 
-fn check_k3s_compose(
+fn check_k3s_profile(
     context: *Context,
-    compose: []const u8,
+    profile: []const u8,
     memory_mib: []const u8,
     label: []const u8,
 ) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "k3s-test" });
     const common = [_][]const u8{
-        "--compose", compose, "--scenario", "cluster", "--seed", "1", "--memory-mib", memory_mib,
+        "--program",    program,    "--profile", profile, "--scenario", "cluster", "--seed", "1",
+        "--memory-mib", memory_mib,
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4" }));
     const passes = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
@@ -857,6 +860,53 @@ fn check_cpu_modulation(context: *Context) !void {
         "change, the bug is found, branch 3 replays exactly", .{ changed, count });
 }
 
+/// The assertion catalog: an assertion no timeline evaluates fails, known from the catalog the
+/// test program announced as it started; the C node announced its own.
+fn check_catalog(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest-catalog" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "catalog.jsonl" });
+    const report = try explore(context, &.{
+        "--program", program, "--scenario", "catalog", "--seed", "1", "--branch", "0",
+        "--events",  events,
+    });
+    // The catalog's verdict comes last: the line after its header names the assertion.
+    const verdict = std.mem.indexOf(u8, report, "not reached in any scenario") orelse report.len;
+    const failed = std.mem.indexOf(u8, report[verdict..], "FAIL sometimes") != null and
+        std.mem.indexOf(u8, report[verdict..], "catalog: a branch no timeline takes") != null;
+    const cwd = std.Io.Dir.cwd();
+    const log = cwd.readFileAlloc(context.io, events, arena, .limited(1 << 24)) catch "";
+    const declared_c = std.mem.indexOf(u8, log, "\"message\":\"the C SDK's randomness stays " ++
+        "below its bound\",\"hit\":false") != null;
+    expect(context, failed and declared_c, "catalog: an assertion no timeline evaluates fails " ++
+        "from the catalog alone; the C node announces its own", .{});
+}
+
+/// Guidance: four digits must add up to 35 (5 timelines in 10000), one comparison that coverage
+/// cannot see into. 300 timelines miss it by chance; with the guidance assertion's distance,
+/// det-strategy-mutate climbs to it.
+fn check_guidance(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{
+        "--program",  program, "--profile", "maze-sum", "--scenario", "maze", "--seed", "3",
+        "--branches", "300",
+    };
+    const property = "PASS sometimes             hit in  300/300 branches, failing in    0  " ++
+        "maze sum";
+    const random = try explore(context, &common);
+    const sync = try std.fmt.allocPrint(arena, "{s}/guidance-sync", .{context.scratch});
+    try std.Io.Dir.cwd().createDirPath(context.io, sync);
+    const strategy = try std.fmt.allocPrint(arena, "{s}/det-strategy-mutate --sync-dir {s}", .{
+        context.bin, sync,
+    });
+    const guided = try explore(context, &(common ++ [_][]const u8{ "--strategy", strategy }));
+    const missed = std.mem.indexOf(u8, random, property) == null;
+    const found = std.mem.indexOf(u8, guided, property) != null;
+    expect(context, missed and found, "guidance: 300 random timelines miss the sum maze; " ++
+        "guided by its distance, the strategy solves it", .{});
+}
+
 /// Branches give the same timelines whether one worker runs them or one per CPU does.
 fn check_parallel(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
@@ -880,9 +930,8 @@ fn check_tla(context: *Context, jar: []const u8) !void {
         std.debug.print("SKIP tla: no {s}\n", .{jar});
         return;
     };
-    const common = [_][]const u8{
-        "--compose", "examples/clojure-bank/compose.yaml", "--scenario", "bank", "--seed", "5",
-    };
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "clojure-bank-test" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "5" };
     const spec = "examples/clojure-bank/tla/Bank.tla";
     const scratch = context.scratch;
     const buggy_events = try std.fs.path.join(context.arena, &.{ scratch, "tla-buggy.jsonl" });
@@ -890,7 +939,7 @@ fn check_tla(context: *Context, jar: []const u8) !void {
     _ = try explore(context, &(common ++ buggy));
     const fixed_events = try std.fs.path.join(context.arena, &.{ scratch, "tla-fixed.jsonl" });
     _ = try explore(context, &(common ++ [_][]const u8{
-        "--from-branch", "1",                                 "--from-vtime-ms", "3000",
+        "--from-branch", "1",                                 "--from-vtime-ms", "3700",
         "--from-exec",   "det-nodes exec bank /app/patch.sh", "--branch",        "2",
         "--events",      fixed_events,
     }));
@@ -953,11 +1002,10 @@ fn failing_count(report: []const u8) u32 {
 /// A JVM service, patched through its REPL at a moment: its futures stop losing money; and a
 /// moment before the snapshot is refused.
 fn check_clojure(context: *Context) !void {
-    const common = [_][]const u8{
-        "--compose", "examples/clojure-bank/compose.yaml", "--scenario", "bank", "--seed", "5",
-    };
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "clojure-bank-test" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "5" };
     const fork = common ++ [_][]const u8{
-        "--from-branch", "0", "--from-vtime-ms", "3000", "--branches", "4",
+        "--from-branch", "0", "--from-vtime-ms", "3700", "--branches", "4",
     };
     const plain = try explore(context, &fork);
     const patched = try explore(context, &(fork ++ [_][]const u8{
@@ -1062,9 +1110,8 @@ fn field_json(line: []const u8, comptime key: []const u8) ?[]const u8 {
 /// An Antithesis-style project (Compose file, test templates in an image, SDK-format
 /// assertions) explores, finds its bug, and replays.
 fn check_compose(context: *Context) !void {
-    const common = [_][]const u8{
-        "--compose", "examples/compose-bank/compose.yaml", "--scenario", "bank", "--seed", "3",
-    };
+    const compose = "tests/antithesis-compat/bank/compose.yaml";
+    const common = [_][]const u8{ "--compose", compose, "--scenario", "bank", "--seed", "3" };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "8" }));
     var branches: [branches_max]Branch = undefined;
     const count = parse_branches(report, &branches);

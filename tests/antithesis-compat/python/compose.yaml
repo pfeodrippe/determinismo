@@ -10,8 +10,8 @@ services:
       - "6379"
   client:
     build:
-      context: ../..
-      dockerfile: examples/compose-python/client/Dockerfile
+      context: ../../..
+      dockerfile: tests/antithesis-compat/python/client/Dockerfile
     command: [sleep, infinity]
     depends_on:
       - redis

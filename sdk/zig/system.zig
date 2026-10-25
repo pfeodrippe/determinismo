@@ -14,6 +14,9 @@ const profiles_max = 16;
 const system_size_max = 1 << 20;
 const nodes_binary = "/opt/determinismo/bin/det-nodes";
 
+/// A command's exit status and what it printed.
+pub const Output = struct { status: u8, output: []const u8 };
+
 /// A node as tests see it in the guest.
 pub const Node = struct {
     name: []const u8,
@@ -46,7 +49,19 @@ pub const Node = struct {
         arguments[0] = "exec";
         arguments[1] = node.name;
         for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
-        return nodes_run(arguments[0 .. argv.len + 2]);
+        return (try nodes_run(arguments[0 .. argv.len + 2], null)).status;
+    }
+
+    /// Like `exec`, with the command's standard output captured into `buffer` (what fits; the
+    /// rest is read and dropped): for tools whose answer is their output (kubectl get, psql).
+    pub fn exec_output(node: *const Node, argv: []const []const u8, buffer: []u8) !Output {
+        assert(argv.len > 0);
+        assert(argv.len + 3 <= exec_arguments_max);
+        var arguments: [exec_arguments_max][]const u8 = undefined;
+        arguments[0] = "exec";
+        arguments[1] = node.name;
+        for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
+        return nodes_run(arguments[0 .. argv.len + 2], buffer);
     }
 
     /// Cuts (or restores) the link between this node and `peer` (a node name or "runner").
@@ -183,6 +198,8 @@ pub fn System(comptime Nodes: type) type {
         /// `--describe` on the host, `run <scenario> <command>` in the guest. `definition` is
         /// `.{ .describe = fn (*Describe) !void, .scenarios = .{ .name = fn (*Scenario) void } }`.
         pub fn main(init: std.process.Init, comptime definition: anytype) !void {
+            // A test program: its assertion catalog spans all its scenarios.
+            std.mem.doNotOptimizeAway(&@import("determinismo.zig").test_program_mark);
             const arena = init.arena.allocator();
             const arguments = try init.minimal.args.toSlice(arena);
             if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "--describe")) {
@@ -349,11 +366,12 @@ const exec_arguments_max = 32;
 const argument_size_max = 1024;
 
 fn nodes_command(arguments: []const []const u8) !void {
-    if (try nodes_run(arguments) != 0) return error.NodeCommandFailed;
+    if ((try nodes_run(arguments, null)).status != 0) return error.NodeCommandFailed;
 }
 
-/// Runs det-nodes with `arguments`; returns its exit status.
-fn nodes_run(arguments: []const []const u8) !u8 {
+/// Runs det-nodes with `arguments`; returns its exit status, and its standard output when
+/// `capture` is given.
+fn nodes_run(arguments: []const []const u8, capture: ?[]u8) !Output {
     assert(arguments.len + 1 <= exec_arguments_max);
     var storage: [exec_arguments_max][argument_size_max]u8 = undefined;
     var argv: [exec_arguments_max:null]?[*:0]const u8 = @splat(null);
@@ -362,16 +380,37 @@ fn nodes_run(arguments: []const []const u8) !u8 {
         argv[index] = try std.fmt.bufPrintSentinel(&storage[index], "{s}", .{argument}, 0);
     }
     const environment = [_:null]?[*:0]const u8{"PATH=/opt/determinismo/bin:/usr/bin:/bin"};
+    var pipe: [2]linux.fd_t = .{ -1, -1 };
+    if (capture != null) {
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    }
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
+        if (capture != null) _ = linux.dup2(pipe[1], 1);
         _ = linux.execve(nodes_binary, &argv, &environment);
         linux.exit_group(127);
+    }
+    var size: usize = 0;
+    if (capture) |buffer| {
+        _ = linux.close(pipe[1]);
+        defer _ = linux.close(pipe[0]);
+        var drain: [4096]u8 = undefined;
+        while (true) {
+            const target = if (size < buffer.len) buffer[size..] else drain[0..];
+            const result = linux.read(pipe[0], target.ptr, target.len);
+            if (linux.errno(result) != .SUCCESS or result == 0) break;
+            if (size < buffer.len) size += result;
+        }
     }
     var status: i32 = 0;
     _ = linux.wait4(@intCast(pid), &status, 0, null);
     const bits: u32 = @bitCast(status);
-    return if (bits & 0x7f == 0) @intCast((bits >> 8) & 0xff) else @intCast(128 + (bits & 0x7f));
+    const code: u8 = if (bits & 0x7f == 0)
+        @intCast((bits >> 8) & 0xff)
+    else
+        @intCast(128 + (bits & 0x7f));
+    return .{ .status = code, .output = if (capture) |buffer| buffer[0..size] else "" };
 }
 
 test "scenarios and profiles are typed" {

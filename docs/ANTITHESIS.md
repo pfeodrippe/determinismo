@@ -10,7 +10,7 @@ change that moves it.
 | Antithesis | determinismo | Status |
 |---|---|---|
 | Docker Compose setup | `--compose` importer: images, builds, env, depends_on, ports, mem_limit, privileged | ✅ |
-| Kubernetes setup | K3s in a privileged node, or a three-node cluster (`examples/k3s`) | ✅ |
+| Kubernetes setup | K3s in a privileged node, or a three-node cluster (`examples/k3s`) | 🟡 no importer for your own manifests: the example is a template |
 | Setup mode, `setup_complete` | snapshot at `setup_complete` (SDKs, composer, `setup_` template commands) | ✅ |
 | The Antithesis environment (one vCPU, no rdrand, deterministic time) | patched KVM, branches clock, CPUID baseline | ✅ |
 | Handling external dependencies | no network beyond the guest; [DEPENDENCIES.md](DEPENDENCIES.md): containers or mocks (MinIO, LocalStack, emulators, stripe-mock), names, readiness, storage, memory | ✅ |
@@ -20,11 +20,13 @@ change that moves it.
 | Antithesis | determinismo | Status |
 |---|---|---|
 | Test templates, test commands (first, parallel/serial/singleton drivers, anytime, eventually, finally) | composer follows the reference | ✅ |
-| Assertions: always, always-or-unreachable, sometimes, reachable, unreachable | Zig, C, Python, JVM SDKs; Antithesis SDK messages accepted. Judged as Antithesis does: a timeline violates only `always`-style properties and `unreachable`; `sometimes` (true in some timeline), `reachable`, and an `always` never hit are judged across the multiverse | ✅ |
-| Assertion catalog (declared, not yet hit) | `hit: false` declares (`sdk.declare`): a declared `reachable`/`sometimes` that no timeline reaches fails | ✅ |
+| Assertions: always, always-or-unreachable, sometimes, reachable, unreachable | Zig, C, Python, JVM SDKs; Antithesis SDK messages accepted. Judged as Antithesis does: a timeline violates only `always`-style properties and `unreachable`; `sometimes` (true in some timeline), `reachable`, and an `always` never hit are judged across the multiverse | 🟡 no guidance assertions (comparisons, some/all), no locations; no Go, Rust or JavaScript SDK |
+| Assertion catalog (declared, not yet hit) | Automatic in every SDK, as code loads, before it runs: Zig (a section entry per call site, announced at startup), C (`DET_*` macros, same section, a constructor), JVM (a Java agent reads each class's bytecode as it loads: Java, Kotlin, Scala, AOT Clojure), Clojure (macros declare as the namespace compiles), Python (each module's syntax tree as it runs). A test program's catalog spans its scenarios and is judged over all of them; an assertion no timeline reaches fails | ✅ |
 | Randomness (SDK random) | SDK random, `rng()`, `prng()`; kernel reseeded per branch | ✅ |
 | Lifecycle | `setup_complete`, `guest_done` | ✅ |
-| Coverage instrumentation | C, Zig (edges), Python, JVM (lines); used by `mutate` | ✅ |
+| Coverage instrumentation | C, Zig (edges), Python, JVM (lines); used by `mutate` | 🟡 opt-in per language (build flags, `coverage_start`, a Java agent); edges never map back to source lines |
+| Guidance assertions (`alwaysGreaterThan`, `sometimesLessThan`, ..., `alwaysSome`, `sometimesAll`) | none: plain conditions only | ❌ |
+| Assertion locations and ids; first pass and first failure per process | messages only; every evaluation is sent | ❌ |
 | Fallback SDK (JSONL to a file) | `ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo` | ✅ |
 
 ## Faults
@@ -34,10 +36,11 @@ change that moves it.
 | Partitions (stopped, slowed, jammed; groups; asymmetric) | `partition_groups`: the runner and nodes split into 2-3 groups, stopped, slowed or jammed (held, then delivered); single links too, either direction | ✅ |
 | Clogs (a node's inbound/outbound) | `clog`: a node's inbound, outbound or both, stopped, slowed or jammed; isolate (links down) | ✅ |
 | Baseline latency, restore | `network_baseline`: delay, jitter and drops (ppm) drawn per timeline, on every link that allows degradation, all run long. Network faults overlap, each link carrying the most aggressive (down, then loss, then delay); `restore` heals them all at once (logged only when some were under way) | ✅ |
-| Node throttling, pause, kill/stop and restart | throttle, pause, restart, process_kill | ✅ |
+| Node throttling, pause, kill/stop and restart | throttle, pause, restart, process_kill | 🟡 no graceful stop: a restart always kills |
 | Clock skips | clock_skip, forward or back; a quarter permanent, so they stack | ✅ |
 | Thread pausing | `thread_pause`: one thread stopped (ptrace), the rest of its process running; process_pause too | ✅ |
-| CPU modulation | `--cpu-modulation` (CLI, MCP, HTTP): branches run up to twice as slow for stretches of 10-200 ms of virtual time, each speed a decision (a strategy can steer it, tapes replay it), so timer interrupts and preemption land at other points | ✅ (opt-in) |
+| CPU modulation | `--cpu-modulation` (CLI, MCP, HTTP): branches run up to twice as slow for stretches of 10-200 ms of virtual time, each speed a decision (a strategy can steer it, tapes replay it), so timer interrupts and preemption land at other points | 🟡 opt-in; Antithesis turns it on with faults |
+| Disk faults (the mutation campaign's) | none | ❌ |
 | Custom faults | `Faults.custom`: commands in a node the injector runs at random times (they can draw randomness); quiet periods hold them too | ✅ |
 | Pausing faults (quiet periods) | `$DETERMINISMO_STOP_FAULTS <seconds>` (also `$ANTITHESIS_STOP_FAULTS`) in every node and command: the fault under way ends, none but clock skips start, overlapping requests merge to the longest; faults only in the driver phase | ✅ |
 
@@ -60,6 +63,7 @@ change that moves it.
 
 | Antithesis | determinismo | Status |
 |---|---|---|
+| Retroactive logging (verbose output to a black hole, regenerated by replay) | every line is stored | ❌ |
 | Event log: every event with its moment (vtime, timeline) | events JSONL with vtime and branches clock | ✅ |
 | Container stdout/stderr as events | node and test command output, line by line, `{"output":{source, stream, text}}` | ✅ |
 | Events of every timeline, queryable | `explore --events-dir`: setup, fork, and every branch (serve and MCP record them) | ✅ |
@@ -85,5 +89,8 @@ change that moves it.
 | Core dumps | det-core (the kernel's core_pattern) keeps every crashed process's core in `/run/det/cores`, with a `core_dump` event; `extract --file runner:<path>` takes it out | ✅ |
 | Debuggers (gdb, delve, jdb) | `determinismo stacks`: every thread's named stack at a moment (`thread apply all bt`, jstack); gdb and the like through `--exec` with the tools in the image, on the process or a core dump | ✅ |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
-| Notebook | the UI's Notebook view of a run: JavaScript cells run in order with shared names, `print`, `md`, `query`, `events`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`, `action`); kept with the run (`/runs/<id>/notebook`) | ✅ |
+| Notebook | the UI's Notebook view of a run: JavaScript cells run in order with shared names, `print`, `md`, `query`, `events`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`, `action`); kept with the run (`/runs/<id>/notebook`) | 🟡 no process objects, `run_in_background` or containers API in cells |
+| Agent skills (research, workload, debug, mutation testing) | docs/AGENTS.md only | ❌ |
+| Mutation testing campaigns (agents write subtle mutants; caught, never ran, or ran unnoticed) | one hand-made mutant in the e2e | ❌ |
+| Targeted runs (a change's code, from a diff) | none | ❌ |
 | Snouty CLI for agents (runs, properties, search, exec, debug) | CLI, MCP (`describe`, `explore`, `replay`, `fork`, `query`) | ✅ |

@@ -136,19 +136,14 @@ fn Bank(comptime account_count: u32) type {
 
         /// Faults are over by now: Redis must answer again, soon.
         fn audit_finally(context: *System.Context) !void {
-            for (0..audit_attempts_max) |_| {
-                audit(context, "finally") catch |err| {
-                    if (!Connection.is_unavailable(err)) return err;
-                    sleep_ms(50);
-                    continue;
-                };
-                return;
-            }
-            sdk.assert_unreachable("redis answers once faults stop", .{});
-            return error.RedisUnavailable;
+            sdk.retry(audit_attempts_max, 50, audit, .{ context, "finally" }) catch |err| {
+                if (!Connection.is_unavailable(err)) return err;
+                sdk.assert_unreachable("redis answers once faults stop", .{});
+                return error.RedisUnavailable;
+            };
         }
 
-        fn audit(context: *System.Context, comptime phase: []const u8) !void {
+        fn audit(context: *System.Context, phase: []const u8) !void {
             var connection: Connection = undefined;
             try connection.open(context.nodes.redis.address, redis_port);
             defer connection.close();
@@ -168,7 +163,8 @@ fn Bank(comptime account_count: u32) type {
             }
             const details = .{ .total = total, .phase = phase, .accounts = account_count };
             sdk.always(total == balance_total, "total balance is conserved", details);
-            sdk.sometimes(true, phase ++ " audit ran", .{});
+            if (std.mem.eql(u8, phase, "anytime")) sdk.sometimes(true, "anytime audit ran", .{});
+            if (std.mem.eql(u8, phase, "finally")) sdk.sometimes(true, "finally audit ran", .{});
         }
 
         fn account_key(buffer: *[16]u8, account: u64) []const u8 {
@@ -182,14 +178,6 @@ fn Bank(comptime account_count: u32) type {
 fn unavailable(err: anyerror) !void {
     if (!Connection.is_unavailable(err)) return err;
     sdk.sometimes(true, "redis was unavailable to a test command", .{ .err = @errorName(err) });
-}
-
-fn sleep_ms(duration_ms: u64) void {
-    const request = std.os.linux.timespec{
-        .sec = @intCast(duration_ms / std.time.ms_per_s),
-        .nsec = @intCast((duration_ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.os.linux.nanosleep(&request, null);
 }
 
 fn read_balance(connection: *Connection, key: []const u8) !i64 {

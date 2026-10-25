@@ -27,6 +27,7 @@ const Nodes = struct {
     controller: ?sdk.Node,
     maze: ?sdk.Node,
     zigmaze: ?sdk.Node,
+    summaze: ?sdk.Node,
 };
 pub const System = sdk.System(Nodes);
 const port = 7000;
@@ -96,6 +97,12 @@ fn describe(d: *System.Describe) !void {
         .faults = quiet,
     });
     // The same maze in Zig: coverage through the Zig SDK.
+    const maze_sum = try d.profile("maze-sum");
+    maze_sum.node(.summaze, .{
+        .binary = "zig-out/bin/det-maze-sum",
+        .command = &.{ "/bin/det-maze-sum", "idle" },
+        .faults = quiet,
+    });
     const maze_zig = try d.profile("maze-zig");
     maze_zig.node(.zigmaze, .{
         .binary = "zig-out/bin/det-maze-zig",
@@ -240,6 +247,7 @@ fn maze(s: *System.Scenario) void {
 fn maze_attempt(context: *System.Context) !void {
     if (context.nodes.maze) |node| _ = try node.exec(&.{ "/bin/det-maze", "solve" });
     if (context.nodes.zigmaze) |node| _ = try node.exec(&.{ "/bin/det-maze-zig", "solve" });
+    if (context.nodes.summaze) |node| _ = try node.exec(&.{ "/bin/det-maze-sum", "solve" });
 }
 
 fn ping(context: *System.Context) !void {

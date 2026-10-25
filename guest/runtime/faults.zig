@@ -126,11 +126,14 @@ pub fn main(init: std.process.Init) !void {
     sdk.event("faults_start", .{ .faults = count });
     baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
+    const names = try fault_names(arena, faults[0..count]);
     var injections: u32 = 0;
     while (injections < injections_max) : (injections += 1) {
-        sleep_ns(delay_ns_min + sdk.random_below(delay_ns_max - delay_ns_min));
+        const wait_ns = sdk.random_below_named("fault.wait_ns", delay_ns_max - delay_ns_min);
+        sleep_ns(delay_ns_min + wait_ns);
         if (stopping.load(.acquire)) break;
-        const applied = draw(&sdk.random_choice(Fault, faults[0..count]));
+        // Labeled decisions: a strategy sees which faults it chooses among, by name.
+        const applied = draw(&faults[sdk.decide("fault", names)]);
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
@@ -144,6 +147,23 @@ fn network_stop(system: *const schema.System) void {
     if (network.count == 0) return;
     nodes.sleep_ns(release_ns); // A stop ends sleep_ns: this one is plain.
     network_expire(system, monotonic_ns() + release_ns);
+}
+
+/// Each fault's name, as a strategy reads it: its kind and whom it hits ("pause raft-2",
+/// "partition raft-1 raft-3", "degrade raft-1 runner").
+fn fault_names(arena: std.mem.Allocator, faults: []const Fault) ![]const []const u8 {
+    const names = try arena.alloc([]const u8, faults.len);
+    for (faults, names) |fault, *name| {
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(arena, @tagName(fault.kind));
+        for ([_][]const u8{ fault.node, fault.peer, fault.program }) |part| {
+            if (part.len == 0) continue;
+            try text.append(arena, ' ');
+            try text.appendSlice(arena, part);
+        }
+        name.* = text.items;
+    }
+    return names;
 }
 
 /// One fault as applied: everything needed to apply it again. A script's fault entries are
@@ -179,7 +199,7 @@ fn draw(fault: *const Fault) Applied {
         .node = fault.node,
         .peer = fault.peer,
         .program = fault.program,
-        .duration_ns = sdk.random_below(duration_ns_max),
+        .duration_ns = sdk.random_below_named("fault.duration_ns", duration_ns_max),
     };
     switch (fault.kind) {
         .throttle => {

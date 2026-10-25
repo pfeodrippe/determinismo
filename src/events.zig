@@ -23,6 +23,10 @@ pub const Property = struct {
     hits: u64 = 0,
     trues: u64 = 0,
     first_failure: ?Moment = null,
+    /// Declared by a test program's catalog (`"scope": "program"`): the program holds several
+    /// scenarios, so whether it must be reached is judged over all of them (main.zig), not in
+    /// one scenario's multiverse.
+    program_scoped: bool = false,
 
     pub fn name(property: *const Property) []const u8 {
         assert(property.message_size > 0);
@@ -164,7 +168,9 @@ fn declaration(assertion: std.json.ObjectMap) bool {
 
 fn declare(events: *Events, kind: Kind, assertion: std.json.ObjectMap) !void {
     const message = string_field(assertion, "message") orelse return error.BadAssertion;
-    _ = try events.property_get_or_put(kind, message);
+    const property = try events.property_get_or_put(kind, message);
+    const scope = string_field(assertion, "scope") orelse "";
+    if (std.mem.eql(u8, scope, "program")) property.program_scoped = true;
 }
 
 /// An assertion from an Antithesis SDK (`{"antithesis_assert": {...}}`): its `display_type`
@@ -215,7 +221,15 @@ fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Prope
     const size: u8 = @intCast(@min(message.len, message_size_max));
     for (events.properties[0..events.property_count]) |*property| {
         if (std.mem.eql(u8, property.name(), message[0..size])) {
-            if (property.kind != kind) return error.BadAssertion;
+            if (property.kind != kind) {
+                // One property per message (as in Antithesis): a message with two kinds is a
+                // test's mistake, worth saying plainly.
+                std.debug.print("[determinismo] the assertion \"{s}\" is both {s} and {s}: give " ++
+                    "each kind its own message\n", .{
+                    property.name(), @tagName(property.kind), @tagName(kind),
+                });
+                return error.AssertionKindsDiffer;
+            }
             return property;
         }
     }

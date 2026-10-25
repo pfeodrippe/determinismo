@@ -283,7 +283,8 @@ fn kernel_check() void {
                 .crash => crash_property,
                 .kernel => kernel_property,
             };
-            sdk.always(false, property, .{ .kernel_us = record.time_us, .line = record.text });
+            const details = .{ .kernel_us = record.time_us, .line = record.text };
+            sdk.assert_computed(.always, false, property, details);
         }
     }
     if (!seen.get(.oom_kill)) sdk.always(true, oom_property, .{});

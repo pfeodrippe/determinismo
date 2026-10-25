@@ -12,6 +12,7 @@ const line_size_max = 16 * 1024;
 const parse_buffer_size = 64 * 1024;
 const argument_count_max = 16;
 
+/// The plugin's process, or 0 for a plugin reached over TCP (it runs elsewhere).
 pid: linux.pid_t,
 to_plugin: linux.fd_t,
 from_plugin: linux.fd_t,
@@ -24,7 +25,9 @@ parse_buffer: [parse_buffer_size]u8,
 const Strategy = @This();
 
 /// `command` is the plugin's program followed by its arguments, separated by spaces; a program
-/// without a slash is looked up in PATH, as a shell would. The plugin inherits `environ`.
+/// without a slash is looked up in PATH, as a shell would. The plugin inherits `environ`. Or
+/// `tcp://<IPv4 address>:<port>`: a plugin already listening there, anywhere (one connection
+/// per exploration worker; an SSH tunnel brings one from a laptop).
 pub fn start(
     strategy: *Strategy,
     arena: std.mem.Allocator,
@@ -32,6 +35,7 @@ pub fn start(
     environ: [:null]const ?[*:0]const u8,
 ) !void {
     assert(command.len > 0);
+    if (std.mem.startsWith(u8, command, "tcp://")) return strategy.connect(command["tcp://".len..]);
     var argv: [argument_count_max + 1:null]?[*:0]const u8 = @splat(null);
     var words = std.mem.tokenizeScalar(u8, command, ' ');
     var count: u32 = 0;
@@ -62,6 +66,41 @@ pub fn start(
     strategy.response_end = 0;
 }
 
+fn connect(strategy: *Strategy, address_text: []const u8) !void {
+    const colon = std.mem.lastIndexOfScalar(u8, address_text, ':') orelse return error.BadAddress;
+    const port = std.fmt.parseInt(u16, address_text[colon + 1 ..], 10) catch
+        return error.BadAddress;
+    const host = address_text[0..colon];
+    var address: [4]u8 = undefined;
+    if (std.mem.eql(u8, host, "localhost")) {
+        address = .{ 127, 0, 0, 1 };
+    } else {
+        var parts = std.mem.splitScalar(u8, host, '.');
+        for (&address) |*byte| {
+            byte.* = std.fmt.parseInt(u8, parts.next() orelse return error.BadAddress, 10) catch
+                return error.BadAddress;
+        }
+        if (parts.next() != null) return error.BadAddress;
+    }
+    const socket = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try check(socket);
+    const fd: linux.fd_t = @intCast(socket);
+    const target = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(address),
+    };
+    check(linux.connect(fd, @ptrCast(&target), @sizeOf(linux.sockaddr.in))) catch {
+        _ = linux.close(fd);
+        std.debug.print("[determinismo] strategy: nothing listens at {s}\n", .{address_text});
+        return error.PluginUnreachable;
+    };
+    strategy.pid = 0;
+    strategy.to_plugin = fd;
+    strategy.from_plugin = @intCast(linux.dup(fd)); // Closed separately, as pipes would be.
+    strategy.response_start = 0;
+    strategy.response_end = 0;
+}
+
 fn program_find(
     arena: std.mem.Allocator,
     name: []const u8,
@@ -82,9 +121,9 @@ fn program_find(
 }
 
 pub fn stop(strategy: *Strategy) void {
-    assert(strategy.pid > 0);
     _ = linux.close(strategy.to_plugin); // The plugin sees end of input and exits.
     _ = linux.close(strategy.from_plugin);
+    if (strategy.pid == 0) return; // Remote: its connection closed.
     var status: i32 = 0;
     _ = linux.waitpid(strategy.pid, &status, 0);
 }
@@ -114,6 +153,8 @@ pub fn random(
     pull: u64,
     moment: Events.Moment,
     source: []const u8,
+    /// The decision's label (`{"name": ..., "options": [...]}` or `"range"`), if announced.
+    label: ?[]const u8,
     value: []u8,
 ) !bool {
     assert(value.len > 0);
@@ -122,9 +163,11 @@ pub fn random(
         pull, value.len,
     });
     for (value) |byte| try writer.print("{x:0>2}", .{byte});
-    try writer.print("\",\"source\":{f},\"vtime_ns\":{d},\"branches\":{d}}}", .{
+    try writer.print("\",\"source\":{f},\"vtime_ns\":{d},\"branches\":{d}", .{
         std.json.fmt(source, .{}), moment.vtime_ns, moment.branches,
     });
+    if (label) |decision| try writer.print(",\"decision\":{s}", .{decision});
+    try writer.writeAll("}");
     const reply = try strategy.call(writer.buffered());
     const hex = reply.get("hex") orelse return false;
     if (hex != .string) return error.BadPluginReply;

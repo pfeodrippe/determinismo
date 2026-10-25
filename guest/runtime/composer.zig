@@ -74,7 +74,8 @@ const Composer = struct {
     fn start(composer: *Composer, command: *const Command) void {
         assert(composer.running_count < running_max);
         var buffer: [256]u8 = undefined;
-        sdk.reachable(command_property(&buffer, "started", command.name), .{});
+        const property = command_property(&buffer, "started", command.name);
+        sdk.assert_computed(.reachable, true, property, .{});
         assert(composer.started_count < starts_max * 2);
         const pid = if (composer.node) |node|
             spawn_logged(command.name, &.{ nodes_path, "exec", node, command.path.? })
@@ -122,7 +123,8 @@ const Composer = struct {
         assert(composer.faults_pid == null);
         if (!composer.faults) return;
         composer.faults_pid = spawn(&.{ faults_path, "--scenario", composer.scenario });
-        sdk.reachable(faults_property, .{});
+        // Declared only when the scenario has faults (commands_declare): not in the catalog.
+        sdk.assert_computed(.reachable, true, faults_property, .{});
     }
 
     fn faults_stop(composer: *Composer) void {
@@ -144,8 +146,6 @@ const Composer = struct {
         composer.start(command);
         composer.wait_all();
     }
-
-
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -430,7 +430,8 @@ fn report_exit(command: *const Command, status: u32) void {
     const exited = status & 0x7f == 0;
     if (exited) {
         var buffer: [256]u8 = undefined;
-        sdk.reachable(command_property(&buffer, "completed", command.name), .{});
+        const property = command_property(&buffer, "completed", command.name);
+        sdk.assert_computed(.reachable, true, property, .{});
     }
     const code = if (exited) (status >> 8) & 0xff else 128 + (status & 0x7f);
     const name = command.name;
@@ -446,4 +447,3 @@ fn pause(duration_ns: u64) void {
     };
     _ = linux.nanosleep(&request, null); // Interruption only shortens a random pause.
 }
-

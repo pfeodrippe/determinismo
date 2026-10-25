@@ -36,6 +36,9 @@ pub const schema = @import("schema.zig");
 const system = @import("system.zig");
 pub const System = system.System;
 pub const Node = system.Node;
+pub const Output = system.Output;
+/// TCP connections with timeouts, for protocol clients (see tcp.zig).
+pub const tcp = @import("tcp");
 
 pub const device_path = "/dev/determinismo";
 /// One event or one randomness pull per device call (the guest module's page size limit).
@@ -58,6 +61,35 @@ pub fn random_below(count: u64) u64 {
     const value = random_u64() % count; // Bias is below 2^-32 for counts below 2^32.
     assert(value < count);
     return value;
+}
+
+/// A named decision among options, for strategies that reason about what they steer (which
+/// fault, which account, which node): the platform sees the name and the options' names, then
+/// picks the index, a decision like any other (replayed, steerable).
+pub fn decide(name: []const u8, options: []const []const u8) usize {
+    assert(options.len > 0);
+    decision_announce(name, .{ .options = options });
+    return @intCast(random_below(options.len));
+}
+
+/// `random_below`, named for strategies: "fault.duration_ns", "retry.jitter_ms".
+pub fn random_below_named(name: []const u8, count: u64) u64 {
+    decision_announce(name, .{ .range = count });
+    return random_below(count);
+}
+
+fn decision_announce(name: []const u8, what: anytype) void {
+    if (device_get() != .fd) return; // Only the platform's strategies read labels.
+    var buffer: [message_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"decision\":{\"name\":") catch unreachable;
+    json_write(&writer, name);
+    inline for (@typeInfo(@TypeOf(what)).@"struct".field_names) |field| {
+        writer.writeAll(",\"" ++ field ++ "\":") catch return;
+        json_write(&writer, @field(what, field));
+    }
+    writer.writeAll("}}") catch return;
+    emit_raw(writer.buffered());
 }
 
 pub fn random_choice(comptime T: type, items: []const T) T {
@@ -107,37 +139,331 @@ pub fn prng() std.Random.DefaultPrng {
     return .init(random_u64());
 }
 
-pub fn always(condition: bool, message: []const u8, details: anytype) void {
+// Assertions ------------------------------------------------------------------------------
+// Messages are literals (comptime): each call site is in the program's assertion catalog, which
+// it announces as it starts, before any assertion runs (Antithesis's catalog). An assertion no
+// timeline reaches is then judged too: a `sometimes` or `reachable` never hit fails, as does an
+// `always` that never ran. `assert_computed` takes a message computed at run time, outside the
+// catalog.
+
+pub fn always(condition: bool, comptime message: []const u8, details: anytype) void {
+    catalog_site("always", message);
     emit_assertion("always", .{ .condition = condition, .message = message }, details);
 }
 
-pub fn always_or_unreachable(condition: bool, message: []const u8, details: anytype) void {
+pub fn always_or_unreachable(condition: bool, comptime message: []const u8, details: anytype) void {
+    catalog_site("always_or_unreachable", message);
     const assertion = Assertion{ .condition = condition, .message = message };
     emit_assertion("always_or_unreachable", assertion, details);
 }
 
-pub fn sometimes(condition: bool, message: []const u8, details: anytype) void {
+pub fn sometimes(condition: bool, comptime message: []const u8, details: anytype) void {
+    catalog_site("sometimes", message);
     emit_assertion("sometimes", .{ .condition = condition, .message = message }, details);
 }
 
-pub fn reachable(message: []const u8, details: anytype) void {
+pub fn reachable(comptime message: []const u8, details: anytype) void {
+    catalog_site("reachable", message);
     emit_assertion("reachable", .{ .condition = true, .message = message }, details);
 }
 
-pub fn assert_unreachable(message: []const u8, details: anytype) void {
+pub fn assert_unreachable(comptime message: []const u8, details: anytype) void {
+    catalog_site("unreachable", message);
     emit_assertion("unreachable", .{ .condition = true, .message = message }, details);
+}
+
+// Guidance assertions -----------------------------------------------------------------------
+// As Antithesis's: a comparison's values go in the details (`left`, `right`), and a guidance
+// event tells strategies how far the timeline is from the interesting outcome (an `always`
+// violated, a `sometimes` true): `distance`, lower is closer, 0 or less is there. Strategies keep
+// timelines that come closer (det-strategy-mutate does).
+
+pub fn always_greater_than(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.always, .greater, left, right, message, details);
+}
+pub fn always_greater_than_or_equal(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.always, .greater_or_equal, left, right, message, details);
+}
+pub fn always_less_than(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.always, .less, left, right, message, details);
+}
+pub fn always_less_than_or_equal(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.always, .less_or_equal, left, right, message, details);
+}
+pub fn sometimes_greater_than(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.sometimes, .greater, left, right, message, details);
+}
+pub fn sometimes_greater_than_or_equal(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.sometimes, .greater_or_equal, left, right, message, details);
+}
+pub fn sometimes_less_than(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.sometimes, .less, left, right, message, details);
+}
+pub fn sometimes_less_than_or_equal(
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    compare(.sometimes, .less_or_equal, left, right, message, details);
+}
+
+/// At least one of the named conditions holds, every time (all are evaluated: no short
+/// circuit). `conditions` is a struct of bools: `.{ .leader = a, .follower = b }`.
+pub fn always_some(conditions: anytype, comptime message: []const u8, details: anytype) void {
+    const held = conditions_held(conditions);
+    always(held > 0, message, .{ .conditions = conditions, .details = details });
+    guidance(message, @floatFromInt(held)); // Violated when none holds.
+}
+
+/// All the named conditions hold together, at least once.
+pub fn sometimes_all(conditions: anytype, comptime message: []const u8, details: anytype) void {
+    const total = @typeInfo(@TypeOf(conditions)).@"struct".field_names.len;
+    const held = conditions_held(conditions);
+    sometimes(held == total, message, .{ .conditions = conditions, .details = details });
+    guidance(message, @floatFromInt(total - held)); // Conditions still missing.
+}
+
+const Relation = enum { greater, greater_or_equal, less, less_or_equal };
+
+fn compare(
+    comptime kind: enum { always, sometimes },
+    comptime relation: Relation,
+    left: anytype,
+    right: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
+    const a = number(left);
+    const b = number(right);
+    const holds = switch (relation) {
+        .greater => a > b,
+        .greater_or_equal => a >= b,
+        .less => a < b,
+        .less_or_equal => a <= b,
+    };
+    // How much the relation holds by (negative: it does not).
+    const margin = switch (relation) {
+        .greater, .greater_or_equal => a - b,
+        .less, .less_or_equal => b - a,
+    };
+    const merged = .{ .left = left, .right = right, .details = details };
+    switch (kind) {
+        .always => always(holds, message, merged),
+        .sometimes => sometimes(holds, message, merged),
+    }
+    // An `always` is interesting where it breaks, a `sometimes` where it holds.
+    guidance(message, if (kind == .always) margin else -margin);
+}
+
+fn number(value: anytype) f64 {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .int, .comptime_int => @floatFromInt(value),
+        .float, .comptime_float => @floatCast(value),
+        else => @compileError("guidance assertions compare numbers"),
+    };
+}
+
+fn conditions_held(conditions: anytype) u32 {
+    const info = @typeInfo(@TypeOf(conditions)).@"struct";
+    var held: u32 = 0;
+    inline for (info.field_names, info.field_types) |name, Type| {
+        comptime assert(Type == bool);
+        held += @intFromBool(@field(conditions, name));
+    }
+    return held;
+}
+
+/// `{"guidance":{"message":M,"distance":D}}`: how far this timeline is from the assertion's
+/// interesting outcome, for strategies.
+fn guidance(message: []const u8, distance: f64) void {
+    var buffer: [message_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"guidance\":{\"message\":") catch unreachable;
+    json_write(&writer, message);
+    writer.print(",\"distance\":{d}}}}}", .{distance}) catch unreachable;
+    emit_raw(writer.buffered());
+}
+
+test "guidance assertions compute their distance" {
+    try std.testing.expectEqual(@as(f64, 3), number(@as(u8, 3)));
+    const conditions = .{ .a = true, .b = false, .c = true };
+    try std.testing.expectEqual(@as(u32, 2), conditions_held(conditions));
+}
+
+pub const Kind = enum { always, always_or_unreachable, sometimes, reachable, @"unreachable" };
+
+/// An assertion whose message is computed at run time: known to the platform only once it runs
+/// (declare it with `declare` to have it judged before).
+pub fn assert_computed(kind: Kind, condition: bool, message: []const u8, details: anytype) void {
+    const value = Assertion{ .condition = condition, .message = message };
+    switch (kind) {
+        inline else => |known| emit_assertion(@tagName(known), value, details),
+    }
+}
+
+/// One catalog entry, in the det_catalog section: every assertion call site compiled into the
+/// program has one (the magic tells entries from the linker's padding between them).
+pub const CatalogEntry = extern struct {
+    magic: u64 = catalog_magic,
+    kind: [*:0]const u8,
+    message: [*:0]const u8,
+    message_size: u64,
+};
+const catalog_magic: u64 = 0x676f_6c61_7461_6364; // "dcatalog"
+
+fn catalog_site(comptime kind: [:0]const u8, comptime message: []const u8) void {
+    comptime assert(message.len > 0);
+    const Site = struct {
+        const entry: CatalogEntry linksection("det_catalog") = .{
+            .kind = kind,
+            .message = message ++ "",
+            .message_size = message.len,
+        };
+    };
+    // A reference from the call site keeps its entry (and the section) in the linked program.
+    std.mem.doNotOptimizeAway(&Site.entry);
+}
+
+extern const __start_det_catalog: u8;
+extern const __stop_det_catalog: u8;
+/// Keeps the section in every program that uses the SDK, assertions or not.
+const catalog_sentinel: CatalogEntry linksection("det_catalog") = .{
+    .kind = "",
+    .message = "",
+    .message_size = 0,
+};
+
+/// Announces the catalog: run before main (.init_array), so a program that never calls the SDK
+/// still declares its assertions. Only inside determinismo, and once per program file on each
+/// machine or node: a test program runs as many processes, one per command.
+fn catalog_announce() callconv(.c) void {
+    std.mem.doNotOptimizeAway(&catalog_sentinel);
+    // Probed, not cached when absent: det-init starts before /dev is mounted.
+    if (device == .unopened) {
+        const result = linux.open(device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(result) != .SUCCESS) return;
+        device = .{ .fd = @intCast(result) };
+    }
+    if (device != .fd) return;
+    if (!catalog_first()) return;
+    const start = @intFromPtr(&__start_det_catalog);
+    const stop = @intFromPtr(&__stop_det_catalog);
+    const program = catalog_has_mark(start, stop);
+    var at = std.mem.alignForward(usize, start, @alignOf(CatalogEntry));
+    while (at + @sizeOf(CatalogEntry) <= stop) {
+        const entry: *const CatalogEntry = @ptrFromInt(at);
+        if (entry.magic != catalog_magic) {
+            at += @alignOf(CatalogEntry);
+            continue;
+        }
+        at += @sizeOf(CatalogEntry);
+        if (entry.message_size == 0) continue; // The sentinel.
+        const message = entry.message[0..entry.message_size];
+        declare_scoped(std.mem.span(entry.kind), message, program);
+    }
+}
+
+const Hook = *const fn () callconv(.c) void;
+export const determinismo_catalog_announce: Hook linksection(".init_array") = &catalog_announce;
+
+/// Whether this is the first process of this program file to announce its catalog here: a
+/// marker named after the file (device and inode) is created once.
+fn catalog_first() bool {
+    var status: linux.Statx = undefined;
+    const statted = linux.statx(linux.AT.FDCWD, "/proc/self/exe", 0, .{ .INO = true }, &status);
+    if (linux.errno(statted) != .SUCCESS) return true;
+    var path_buffer: [96]u8 = undefined;
+    const format = "/tmp/.determinismo-catalog-{x}-{x}-{x}";
+    const path = std.fmt.bufPrintSentinel(&path_buffer, format, .{
+        status.dev_major, status.dev_minor, status.ino,
+    }, 0) catch return true;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const result = linux.open(path, flags, 0o444);
+    switch (linux.errno(result)) {
+        .SUCCESS => {
+            _ = linux.close(@intCast(result));
+            return true;
+        },
+        .EXIST => return false,
+        else => return true, // No /tmp to mark: announcing twice is harmless.
+    }
 }
 
 /// Declares an assertion without evaluating it (Antithesis's catalog): a `reachable` or
 /// `sometimes` declared and never reached (or never true) in any timeline fails, as an
-/// `always` never hit does.
+/// `always` never hit does. Assertions with literal messages are declared already.
 pub fn declare(comptime kind: []const u8, message: []const u8) void {
+    declare_runtime(kind, message);
+}
+
+/// In the catalog of test programs (System.main refers to it, so only they have it): their
+/// catalog covers all their scenarios, and is judged over them together (any one scenario
+/// reaches only its own).
+pub const test_program_mark: CatalogEntry linksection("det_catalog") = .{
+    .kind = test_program_kind,
+    .message = "",
+    .message_size = 0,
+};
+const test_program_kind = "test_program";
+
+fn catalog_has_mark(start: usize, stop: usize) bool {
+    var at = std.mem.alignForward(usize, start, @alignOf(CatalogEntry));
+    while (at + @sizeOf(CatalogEntry) <= stop) : (at += @alignOf(CatalogEntry)) {
+        const entry: *const CatalogEntry = @ptrFromInt(at);
+        if (entry.magic != catalog_magic) continue;
+        if (std.mem.eql(u8, std.mem.span(entry.kind), test_program_kind)) return true;
+    }
+    return false;
+}
+
+fn declare_runtime(kind: []const u8, message: []const u8) void {
+    declare_scoped(kind, message, false);
+}
+
+fn declare_scoped(kind: []const u8, message: []const u8, program: bool) void {
     assert(message.len > 0);
     var buffer: [message_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    writer.writeAll("{\"assert\":{\"type\":\"" ++ kind ++ "\",\"message\":") catch unreachable;
+    writer.print("{{\"assert\":{{\"type\":\"{s}\",\"message\":", .{kind}) catch unreachable;
     json_write(&writer, message);
-    writer.writeAll(",\"hit\":false}}") catch unreachable;
+    const scope = if (program) ",\"scope\":\"program\"" else "";
+    writer.print("{s},\"hit\":false}}}}", .{scope}) catch unreachable;
     emit_raw(writer.buffered());
 }
 
@@ -167,6 +493,40 @@ pub fn event(name: []const u8, details: anytype) void {
     json_write(&writer, details);
     writer.writeAll("}") catch unreachable;
     emit_raw(writer.buffered());
+}
+
+/// Sleeps for `duration_ms` of (virtual) time.
+pub fn sleep_ms(duration_ms: u64) void {
+    const request = linux.timespec{
+        .sec = @intCast(duration_ms / std.time.ms_per_s),
+        .nsec = @intCast((duration_ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&request, null);
+}
+
+fn Result(comptime Function: type) type {
+    return @typeInfo(Function).@"fn".return_type.?;
+}
+
+/// Calls `function` with `arguments` until it succeeds, at most `attempts` times and
+/// `interval_ms` apart: what checks need while a system recovers (after faults, a restart).
+/// Returns its value, or its last error.
+pub fn retry(
+    attempts: u32,
+    interval_ms: u64,
+    function: anytype,
+    arguments: anytype,
+) Result(@TypeOf(function)) {
+    assert(attempts > 0);
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        if (@call(.auto, function, arguments)) |value| {
+            return value;
+        } else |err| {
+            if (attempt == attempts) return err;
+            sleep_ms(interval_ms);
+        }
+    }
 }
 
 const Assertion = struct { condition: bool, message: []const u8 };
@@ -270,6 +630,20 @@ fn device_get() Device {
 test {
     _ = schema;
     _ = system;
+}
+
+test retry {
+    const Flaky = struct {
+        var calls: u32 = 0;
+        fn call(succeed_at: u32) !u32 {
+            calls += 1;
+            if (calls < succeed_at) return error.NotYet;
+            return calls;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 3), try retry(5, 0, Flaky.call, .{3}));
+    Flaky.calls = 0;
+    try std.testing.expectError(error.NotYet, retry(2, 0, Flaky.call, .{3}));
 }
 
 test "rng and prng draw (from the OS outside determinismo)" {

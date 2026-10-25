@@ -103,17 +103,12 @@ fn browse(context: *System.Context) !void {
 
 /// Faults are over: every cached price must be the database's.
 fn coherent(context: *System.Context) !void {
-    for (0..check_attempts_max) |_| {
-        check(context) catch |err| {
-            if (!is_unavailable(err)) return err;
-            sleep_ms(50);
-            continue;
-        };
-        sdk.sometimes(true, "coherence check ran", .{});
-        return;
-    }
-    sdk.assert_unreachable("the services answer once faults stop", .{});
-    return error.ServicesUnavailable;
+    sdk.retry(check_attempts_max, 50, check, .{context}) catch |err| {
+        if (!is_unavailable(err)) return err;
+        sdk.assert_unreachable("the services answer once faults stop", .{});
+        return error.ServicesUnavailable;
+    };
+    sdk.sometimes(true, "coherence check ran", .{});
 }
 
 fn check(context: *System.Context) !void {
@@ -169,12 +164,4 @@ fn is_unavailable(err: anyerror) bool {
 fn unavailable(err: anyerror) !void {
     if (!is_unavailable(err)) return err;
     sdk.sometimes(true, "a service was unavailable to a test command", .{ .err = @errorName(err) });
-}
-
-fn sleep_ms(duration_ms: u64) void {
-    const request = std.os.linux.timespec{
-        .sec = @intCast(duration_ms / std.time.ms_per_s),
-        .nsec = @intCast((duration_ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.os.linux.nanosleep(&request, null);
 }

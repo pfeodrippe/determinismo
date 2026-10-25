@@ -7,6 +7,7 @@ timelines from a snapshot, inject faults, and replay any timeline exactly.
 Design: [ARCHITECTURE.md](ARCHITECTURE.md). Style: [docs/STYLE.md](docs/STYLE.md).
 Strategy plugins: [docs/PLUGINS.md](docs/PLUGINS.md). Agents: [docs/AGENTS.md](docs/AGENTS.md).
 Where we stand against Antithesis, feature by feature: [docs/ANTITHESIS.md](docs/ANTITHESIS.md).
+What comes next: [docs/PLAN.md](docs/PLAN.md).
 Databases, cloud services and other dependencies inside the machine: [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
 ## What works today
@@ -104,14 +105,20 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-Full examples: [examples/bank](examples/bank) (Redis, a lost update),
-[examples/shop](examples/shop) (Postgres and Redis, a stale cache) and
-[examples/clojure-bank](examples/clojure-bank) (a JVM service, debugged by redefining a function
-through its REPL at a moment). Other languages: the Python
-SDK ([sdk/python](sdk/python), one file) in [examples/compose-python](examples/compose-python),
-the C SDK ([sdk/c](sdk/c), one header, for C, C++ and any FFI), the JVM SDK
-([sdk/java](sdk/java), one file, used from Clojure in examples/clojure-bank), or any Antithesis
-SDK (see below).
+Every example is a test program like this one, written in Zig against the SDK (`sdk.tcp`,
+`sdk.retry`, `node.exec_output` and the rest keep them about the system, not the plumbing):
+[examples/bank](examples/bank) (Redis, a lost update), [examples/shop](examples/shop) (Postgres
+and Redis, a stale cache), [examples/clojure-bank](examples/clojure-bank) (a JVM service with
+the Clojure SDK, debugged by redefining a function through its REPL at a moment),
+[examples/k3s](examples/k3s) (Kubernetes: one node, or a three-node cluster) and
+[examples/raft](examples/raft) (HashiCorp Raft, three nodes replicating a chain of blocks).
+
+The services themselves use the SDK of their language for their own assertions, events and
+randomness (every SDK announces its program's assertions as the code loads, before they run, so
+one that no timeline reaches is judged too): Zig ([sdk/zig](sdk/zig)), C ([sdk/c](sdk/c), one header, for C, C++ and any FFI),
+Python ([sdk/python](sdk/python), one file), the JVM ([sdk/java](sdk/java), one file) and Clojure
+([sdk/clojure](sdk/clojure), over the JVM one, with Clojure data), or any Antithesis SDK (see
+below).
 
 ## Randomness
 
@@ -136,10 +143,11 @@ Bring the same project: a Compose file, and test commands in an image under
 `/opt/antithesis/test/v1/<template>/` (`first_*`, `parallel_driver_*`, `finally_*`, ...). Each
 template becomes a scenario whose commands run inside that service; assertions in the Antithesis
 SDK's format (written to `$ANTITHESIS_SDK_LOCAL_OUTPUT`, which points to determinismo) count as
-properties. Example: [examples/compose-bank](examples/compose-bank).
+properties. [tests/antithesis-compat](tests/antithesis-compat) holds such projects (test
+commands in shell, Python and Java), which `zig build e2e` runs to keep the importer honest.
 
 ```
-determinismo explore ... --compose examples/compose-bank/compose.yaml --scenario bank --branches 40
+determinismo explore ... --compose tests/antithesis-compat/bank/compose.yaml --scenario bank --branches 40
 ```
 
 ## Quickstart (on the host)

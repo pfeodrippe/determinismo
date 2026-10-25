@@ -8,11 +8,18 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
+    // TCP with timeouts (sdk.tcp), its own module so that protocol clients use it too.
+    const tcp = b.addModule("tcp", .{
+        .root_source_file = b.path("sdk/zig/tcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     // The SDK for tests written in Zig; it also holds the system schema the VMM reads.
     const sdk = b.addModule("determinismo", .{
         .root_source_file = b.path("sdk/zig/determinismo.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "tcp", .module = tcp }},
     });
     const exe = b.addExecutable(.{
         .name = "determinismo",
@@ -30,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("examples/bank/resp.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "tcp", .module = tcp }},
     });
 
     // Guest side: the in-guest runtime and example tests, static binaries that run in the VM.
@@ -44,8 +52,13 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-core", .path = "guest/runtime/cores.zig" },
         .{ .name = "bank-test", .path = "examples/bank/bank_test.zig" },
         .{ .name = "shop-test", .path = "examples/shop/shop_test.zig" },
+        .{ .name = "clojure-bank-test", .path = "examples/clojure-bank/clojure_bank_test.zig" },
+        .{ .name = "k3s-test", .path = "examples/k3s/k3s_test.zig" },
+        .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
         .{ .name = "det-selftest-node", .path = "tests/selftest/node.zig" },
+        .{ .name = "det-selftest-catalog", .path = "tests/selftest/catalog_test.zig" },
+        .{ .name = "det-maze-sum", .path = "tests/selftest/maze_sum.zig" },
         .{ .name = "det-fake-explore", .path = "tests/selftest/fake_explore.zig" },
     };
     for (guest_programs) |program| {
@@ -174,6 +187,7 @@ pub fn build(b: *std.Build) void {
     const test_roots = [_][]const u8{
         "src/main.zig",
         "sdk/zig/determinismo.zig",
+        "sdk/zig/tcp.zig",
         "guest/runtime/init.zig",
         "guest/runtime/nodes.zig",
         "guest/runtime/netlink.zig",
@@ -190,7 +204,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(root),
             .target = target,
             .optimize = .Debug,
-            .imports = &.{.{ .name = "determinismo", .module = sdk }},
+            .imports = &.{
+                .{ .name = "determinismo", .module = sdk },
+                .{ .name = "tcp", .module = tcp },
+            },
         }) });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }

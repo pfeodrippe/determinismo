@@ -280,17 +280,24 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     };
     const base_cmdline = arguments.cmdline;
     var failing_scenarios: u32 = 0;
-    for (try scenarios_selected(arena, &arguments, prepared)) |scenario| {
+    var catalog = report.Catalog{ .arena = arena };
+    const scenarios = try scenarios_selected(arena, &arguments, prepared);
+    for (scenarios) |scenario| {
         options.cmdline = try cmdline_build(arena, base_cmdline, arguments.disk_count, scenario);
         if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
         switch (arguments.command) {
             .run => try command_run(vm, &options),
             .explore => {
-                const failing = try command_explore(context, vm, &options, &arguments);
-                failing_scenarios += @intFromBool(failing > 0);
+                const multiverse = try command_explore(context, vm, &options, &arguments);
+                failing_scenarios += @intFromBool(multiverse.failing_properties() > 0);
+                try multiverse.catalog_reached(&catalog);
             },
         }
     }
+    // A test program's assertions are its scenarios' together: judged once all ran.
+    const every_scenario = if (prepared) |known| scenarios.len == known.system.scenarios.len else
+        true;
+    if (catalog.judge(every_scenario) > 0) failing_scenarios += 1;
     return failing_scenarios;
 }
 
@@ -460,13 +467,13 @@ const Exploration = struct {
 };
 
 /// Boots once to setup_complete, snapshots, then runs every branch from the snapshot.
-/// Returns the number of branches with failing properties.
+/// Returns the multiverse: its verdict, and what the test program's catalog saw.
 fn command_explore(
     context: Context,
     vm: *VM,
     options: *VM.Options,
     arguments: *const Arguments,
-) !u32 {
+) !*const report.Multiverse {
     assert(options.deterministic);
     var exploration = Exploration{
         .exploration_seed = arguments.seed,
@@ -570,7 +577,7 @@ fn command_explore(
         try explore_parallel(context, vm, options, branches, jobs);
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
-    return multiverse.failing_properties();
+    return multiverse;
 }
 
 const Fork = struct { from: *const Snapshot, exploration: *const Exploration, fork: tape.Fork };

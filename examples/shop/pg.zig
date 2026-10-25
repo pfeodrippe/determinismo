@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! A minimal PostgreSQL client (wire protocol 3, simple queries, trust authentication) over a
-//! blocking TCP socket, with fixed buffers.
+//! A minimal PostgreSQL client (wire protocol 3, simple queries, trust authentication) over the
+//! SDK's TCP connection (sdk/zig/tcp.zig).
 const std = @import("std");
 const assert = std.debug.assert;
-const linux = std.os.linux;
+const tcp = @import("determinismo").tcp;
 
-const buffer_size = 64 * 1024;
 const query_size_max = 4096;
 const timeout_ms = 2000;
 const protocol_version: u32 = 3 << 16;
 
-fd: linux.fd_t,
-buffer: [buffer_size]u8 = undefined,
-start: u32 = 0,
-end: u32 = 0,
+socket: tcp.Connection,
 /// The server's message for the last error.ServerError.
 error_message: [256]u8 = undefined,
 error_message_size: u32 = 0,
@@ -21,28 +17,14 @@ error_message_size: u32 = 0,
 const Connection = @This();
 
 pub fn open(connection: *Connection, address: [4]u8, port: u16, user: []const u8) !void {
-    const socket = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
-    connection.* = .{ .fd = @intCast(socket) };
-    errdefer _ = linux.close(connection.fd);
-    const timeout = linux.timeval{ .sec = 0, .usec = timeout_ms * std.time.us_per_ms };
-    for ([_]u32{ linux.SO.RCVTIMEO, linux.SO.SNDTIMEO }) |option| {
-        const size = @sizeOf(linux.timeval);
-        _ = linux.setsockopt(connection.fd, linux.SOL.SOCKET, option, @ptrCast(&timeout), size);
-    }
-    const target = linux.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(address), // Already in network order.
-    };
-    const result = linux.connect(connection.fd, @ptrCast(&target), @sizeOf(linux.sockaddr.in));
-    if (linux.errno(result) != .SUCCESS) return error.ConnectFailed;
+    connection.error_message_size = 0;
+    try connection.socket.open(address, port, .{ .timeout_ms = timeout_ms });
+    errdefer connection.socket.close();
     try connection.startup(user);
 }
 
 pub fn close(connection: *Connection) void {
-    assert(connection.fd >= 0);
-    _ = linux.close(connection.fd);
-    connection.fd = -1;
+    connection.socket.close();
 }
 
 pub fn last_error(connection: *const Connection) []const u8 {
@@ -141,54 +123,20 @@ fn server_error(connection: *Connection, body: []const u8) error{ServerError} {
 const Message = struct { kind: u8, body: []const u8 };
 
 fn message_read(connection: *Connection) !Message {
-    try connection.fill(5);
-    const header = connection.buffer[connection.start..][0..5];
-    const kind = header[0]; // Copied: the next fill may move the buffered bytes.
+    // The header is copied out: the body's read may move the buffered bytes.
+    const header = try connection.socket.read_exact(5);
+    const kind = header[0];
     const size = std.mem.readInt(u32, header[1..5], .big);
-    if (size < 4 or size > buffer_size - 1) return error.ReplyTooLarge;
-    try connection.fill(1 + size);
-    const message = Message{
-        .kind = kind,
-        .body = connection.buffer[connection.start + 5 ..][0 .. size - 4],
-    };
-    connection.start += 1 + size;
-    return message;
-}
-
-/// Ensures `size` unread bytes are buffered.
-fn fill(connection: *Connection, size: u32) !void {
-    assert(size <= buffer_size);
-    if (connection.end - connection.start >= size) return;
-    const pending = connection.end - connection.start;
-    const unread = connection.buffer[connection.start..connection.end];
-    std.mem.copyForwards(u8, connection.buffer[0..pending], unread);
-    connection.start = 0;
-    connection.end = pending;
-    while (connection.end < size) {
-        const free = connection.buffer[connection.end..];
-        const result = linux.read(connection.fd, free.ptr, free.len);
-        if (linux.errno(result) != .SUCCESS) return error.ReadFailed;
-        if (result == 0) return error.ConnectionClosed;
-        connection.end += @intCast(result);
-    }
+    if (size < 4 or size > tcp.buffer_size - 1) return error.ReplyTooLarge;
+    return .{ .kind = kind, .body = try connection.socket.read_exact(size - 4) };
 }
 
 fn write_all(connection: *Connection, bytes: []const u8) !void {
-    var written: u64 = 0;
-    while (written < bytes.len) {
-        const result = linux.write(connection.fd, bytes[written..].ptr, bytes.len - written);
-        if (linux.errno(result) != .SUCCESS) return error.WriteFailed;
-        written += result;
-    }
+    try connection.socket.write_all(bytes);
 }
 
 /// Whether `err` means the server could not be reached (as opposed to an SQL or protocol error).
-pub fn is_unavailable(err: anyerror) bool {
-    return switch (err) {
-        error.ConnectFailed, error.WriteFailed, error.ReadFailed, error.ConnectionClosed => true,
-        else => false,
-    };
-}
+pub const is_unavailable = tcp.unavailable;
 
 test first_cell {
     var cell: [8]u8 = undefined;

@@ -11,6 +11,12 @@
  * randomness comes from the OS and events go to stderr, so the same binary runs everywhere.
  * `details` arguments are JSON objects as strings ("{}" or NULL for none).
  *
+ * Assertions: DET_ALWAYS, DET_ALWAYS_OR_UNREACHABLE, DET_SOMETIMES, DET_REACHABLE and
+ * DET_UNREACHABLE take literal messages and put each call site in the program's assertion
+ * catalog, announced as the program starts, before any assertion runs (Antithesis's catalog):
+ * one no timeline reaches is judged too. The det_* functions take messages computed at run time,
+ * known only once they run.
+ *
  * Code coverage for strategies: build with `-fsanitize-coverage=trace-pc-guard` and define
  * DETERMINISMO_COVERAGE next to DETERMINISMO_IMPLEMENTATION. Each edge reports itself the first
  * time it runs (a "coverage" event), which strategies such as det-strategy-mutate use to keep
@@ -39,6 +45,60 @@ void det_unreachable(const char *message, const char *details);
 void det_setup_complete(const char *details); /* The platform snapshots here. */
 void det_event(const char *name, const char *details);
 
+/* The assertion catalog: one entry per call site, in the det_catalog section (the layout the Zig
+   SDK uses too); the magic tells entries from the linker's padding. */
+struct det_catalog_entry {
+  uint64_t magic;
+  const char *kind;
+  const char *message;
+  uint64_t message_size;
+};
+#define DET_CATALOG_MAGIC 0x676f6c6174616364ull
+
+#if defined(__has_attribute)
+#if __has_attribute(retain)
+#define DET_RETAIN __attribute__((retain))
+#endif
+#endif
+#ifndef DET_RETAIN
+#define DET_RETAIN
+#endif
+
+/* "" message "": a literal, or this does not compile. */
+#define DET_CATALOG_SITE(kind, message)                                                        \
+  do {                                                                                         \
+    static const struct det_catalog_entry det_catalog_site_                                    \
+        __attribute__((used, section("det_catalog"), aligned(8))) DET_RETAIN = {               \
+            DET_CATALOG_MAGIC, kind, "" message "", sizeof(message) - 1};                      \
+    (void)det_catalog_site_;                                                                   \
+  } while (0)
+
+#define DET_ALWAYS(condition, message, details)                                                \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_always((condition), (message), (details));                                             \
+  } while (0)
+#define DET_ALWAYS_OR_UNREACHABLE(condition, message, details)                                 \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always_or_unreachable", message);                                        \
+    det_always_or_unreachable((condition), (message), (details));                              \
+  } while (0)
+#define DET_SOMETIMES(condition, message, details)                                             \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_sometimes((condition), (message), (details));                                          \
+  } while (0)
+#define DET_REACHABLE(message, details)                                                        \
+  do {                                                                                         \
+    DET_CATALOG_SITE("reachable", message);                                                    \
+    det_reachable((message), (details));                                                       \
+  } while (0)
+#define DET_UNREACHABLE(message, details)                                                      \
+  do {                                                                                         \
+    DET_CATALOG_SITE("unreachable", message);                                                  \
+    det_unreachable((message), (details));                                                     \
+  } while (0)
+
 #ifdef __cplusplus
 }
 #endif
@@ -50,10 +110,12 @@ void det_event(const char *name, const char *details);
 #pragma clang attribute push(__attribute__((no_sanitize("coverage"))), apply_to = function)
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define DET_DEVICE_PATH "/dev/determinismo"
@@ -147,6 +209,51 @@ void det_reachable(const char *message, const char *details) {
 }
 void det_unreachable(const char *message, const char *details) {
   det_assert("unreachable", 1, message, details);
+}
+
+static void det_declare(const char *kind, const char *message, size_t message_size) {
+  char text[DET_MESSAGE_SIZE_MAX];
+  if (message_size >= sizeof text) return;
+  memcpy(text, message, message_size);
+  text[message_size] = 0;
+  char line[DET_MESSAGE_SIZE_MAX];
+  size_t used = (size_t)snprintf(line, sizeof line, "{\"assert\":{\"type\":\"%s\",\"message\":", kind);
+  used = det_json_string(line, used, sizeof line, text);
+  if (used + sizeof(",\"hit\":false}}") > sizeof line) return;
+  memcpy(line + used, ",\"hit\":false}}", sizeof(",\"hit\":false}}") - 1);
+  det_emit(line, used + sizeof(",\"hit\":false}}") - 1);
+}
+
+/* Present only when the program has catalogued assertions (weak: no section, no symbols). */
+extern const char __start_det_catalog[] __attribute__((weak));
+extern const char __stop_det_catalog[] __attribute__((weak));
+
+/* Announces the catalog as the program starts: inside determinismo only, and once per program
+   file on each machine or node (a marker named after the file). */
+__attribute__((constructor)) static void det_catalog_announce(void) {
+  if (!__start_det_catalog || !__stop_det_catalog) return;
+  int probe = open(DET_DEVICE_PATH, O_RDWR | O_CLOEXEC);
+  if (probe < 0) return;
+  close(probe);
+  struct stat status;
+  if (stat("/proc/self/exe", &status) == 0) {
+    char marker[96];
+    snprintf(marker, sizeof marker, "/tmp/.determinismo-catalog-c-%llx-%llx",
+             (unsigned long long)status.st_dev, (unsigned long long)status.st_ino);
+    int fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0444);
+    if (fd < 0 && errno == EEXIST) return;
+    if (fd >= 0) close(fd);
+  }
+  for (const char *at = __start_det_catalog;
+       at + sizeof(struct det_catalog_entry) <= __stop_det_catalog;) {
+    const struct det_catalog_entry *entry = (const struct det_catalog_entry *)(const void *)at;
+    if (entry->magic != DET_CATALOG_MAGIC) {
+      at += 8;
+      continue;
+    }
+    det_declare(entry->kind, entry->message, (size_t)entry->message_size);
+    at += sizeof(struct det_catalog_entry);
+  }
 }
 
 void det_setup_complete(const char *details) {

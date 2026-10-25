@@ -4,8 +4,8 @@
 ;; money appears or disappears.
 ;; Protocol (one line per connection): "transfer FROM TO AMOUNT" -> "ok", "total" -> "N".
 (ns bank
-  (:require [clojure.string :as string])
-  ;; Determinismo (sdk/java) is in the default package: named directly, not imported.
+  (:require [clojure.string :as string]
+            [determinismo :as det]) ; sdk/clojure, over sdk/java
   (:import [java.net ServerSocket]
            [java.io BufferedReader InputStreamReader PrintWriter]))
 
@@ -16,8 +16,7 @@
 (def trace-lock (Object.))
 
 (defn trace! []
-  (Determinismo/event "tla" (str "{\"state\":{\"accounts\":["
-                                 (string/join "," (vals @accounts)) "]}}")))
+  (det/event "tla" {:state {:accounts (vec (vals @accounts))}}))
 
 (defn write! [f & arguments]
   (locking trace-lock
@@ -32,8 +31,8 @@
       (write! assoc from (- from-balance amount))
       (write! assoc to (+ to-balance amount))
       ;; An invariant the service itself checks (it holds even with the bug: no overdraft).
-      (Determinismo/always (every? #(>= % 0) (vals @accounts))
-                           "balances never go negative" nil))))
+      (det/always (every? #(>= % 0) (vals @accounts))
+                  "balances never go negative" {:from from :to to :amount amount}))))
 
 (defn total [] (reduce + (vals @accounts)))
 

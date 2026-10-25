@@ -98,6 +98,49 @@ pub fn snapshot_taken(snapshot: *const Snapshot, wall_ns: u64) void {
     });
 }
 
+/// A test program's catalog across the scenarios explored: an assertion must be reached (made
+/// true, for a `sometimes`) in some timeline of some scenario, as in an Antithesis run, which
+/// explores every test template together.
+pub const Catalog = struct {
+    arena: std.mem.Allocator,
+    entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
+
+    const Entry = struct { kind: Events.Kind, reached: bool };
+
+    pub fn note(catalog: *Catalog, kind: Events.Kind, message: []const u8, reached: bool) !void {
+        const entry = try catalog.entries.getOrPut(catalog.arena, message);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try catalog.arena.dupe(u8, message);
+            entry.value_ptr.* = .{ .kind = kind, .reached = false };
+        }
+        entry.value_ptr.reached = entry.value_ptr.reached or reached;
+    }
+
+    /// Prints the assertions no scenario reached; returns how many fail (always, sometimes,
+    /// reachable: the kinds that must be reached), when every scenario was explored.
+    pub fn judge(catalog: *const Catalog, every_scenario: bool) u32 {
+        var failing: u32 = 0;
+        var header = false;
+        for (catalog.entries.keys(), catalog.entries.values()) |message, entry| {
+            if (entry.reached) continue;
+            const must = switch (entry.kind) {
+                .always, .sometimes, .reachable => true,
+                .always_or_unreachable, .@"unreachable" => false,
+            };
+            if (!must) continue;
+            if (!header) {
+                const scope = if (every_scenario) "any scenario" else "the scenarios explored";
+                print("[determinismo] test program assertions not reached in {s}:\n", .{scope});
+                header = true;
+            }
+            const status = if (every_scenario) "FAIL" else "----";
+            print("  {s} {s:<21} {s}\n", .{ status, @tagName(entry.kind), message });
+            failing += @intFromBool(every_scenario);
+        }
+        return failing;
+    }
+};
+
 /// Whether a property fails across the multiverse (Antithesis's semantics): an `always` fails
 /// where a timeline made it false or if no timeline hit it; `always_or_unreachable` and
 /// `unreachable` where a timeline violated them; `sometimes` if no timeline made it true;
@@ -161,7 +204,18 @@ pub const Multiverse = struct {
         first_failing_branch: ?u32 = null,
         first_failure: ?Events.Moment = null,
 
+        /// A test program's assertion no timeline of this scenario reached: judged across the
+        /// program's scenarios (main.zig), not here.
+        fn unreached_here(aggregate: *const Aggregate) bool {
+            const must_hit = switch (aggregate.property.kind) {
+                .always, .sometimes, .reachable => true,
+                .always_or_unreachable, .@"unreachable" => false,
+            };
+            return must_hit and aggregate.property.program_scoped and aggregate.branches_hit == 0;
+        }
+
         fn failing(aggregate: *const Aggregate) bool {
+            if (aggregate.unreached_here()) return false;
             return property_failing(aggregate.property.kind, .{
                 .branches_hit = aggregate.branches_hit,
                 .branches_true = aggregate.branches_true,
@@ -285,6 +339,8 @@ pub const Multiverse = struct {
             multiverse.branches, multiverse.failing_branches, seconds(wall_ns),
         });
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            // Listed once, after all scenarios, with the program's catalog (main.zig).
+            if (aggregate.unreached_here()) continue;
             const status = if (aggregate.failing()) "FAIL" else "PASS";
             print("  {s} {s:<21} hit in {d:>4}/{d} branches, failing in {d:>4}  {s}", .{
                 status,              @tagName(aggregate.property.kind), aggregate.branches_hit,
@@ -304,6 +360,23 @@ pub const Multiverse = struct {
         });
         overshoot_warn(multiverse.overshoots);
         multiverse.record_summary(wall_ns);
+    }
+
+    /// The test program's catalog as this multiverse saw it: each program-scoped assertion, and
+    /// whether a timeline reached it.
+    pub fn catalog_reached(multiverse: *const Multiverse, catalog: *Catalog) !void {
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            if (!aggregate.property.program_scoped) continue;
+            const reached = aggregate.branches_hit > 0 and !property_failing(
+                aggregate.property.kind,
+                .{
+                    .branches_hit = aggregate.branches_hit,
+                    .branches_true = aggregate.branches_true,
+                    .branches_failing = 0, // Violations are judged in their scenario.
+                },
+            );
+            try catalog.note(aggregate.property.kind, aggregate.property.name(), reached);
+        }
     }
 
     fn vtime_per_wall(multiverse: *const Multiverse) f64 {

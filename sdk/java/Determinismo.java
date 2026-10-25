@@ -117,6 +117,20 @@ public final class Determinismo {
     assertion("unreachable", true, message, details);
   }
 
+  /**
+   * Announces an assertion before it runs (the catalog): one never reached is then judged too.
+   * DeterminismoCatalog (a Java agent) and the Clojure SDK's macros call it as code loads; each
+   * assertion is announced once.
+   */
+  public static void declare(String kind, String message) {
+    if (!declared.add(kind + '\u0000' + message)) return;
+    emit("{\"assert\":{\"type\":" + quote(kind) + ",\"message\":" + quote(message)
+        + ",\"hit\":false}}");
+  }
+
+  private static final java.util.Set<String> declared =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+
   /** The system is ready: the platform snapshots here. */
   public static void setupComplete(String details) {
     emit("{\"lifecycle\":\"setup_complete\",\"details\":" + orEmpty(details) + "}");

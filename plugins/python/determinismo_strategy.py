@@ -5,7 +5,10 @@ A strategy is an object with any of these methods; missing ones answer the defau
 
     hello(exploration_seed)                   once, at start (seeds are ints)
     branch(index, seed)                       before each branch
-    random(pull, default, source, moment)     a decision: return bytes to override, or None
+    random(pull, default, source, moment[, decision])
+                                              a decision: return bytes to override, or None;
+                                              `decision` is its label when the guest named it
+                                              ({"name", "options"} or {"name", "range"})
     event(event, source, moment)              a guest event (a dict)
     branch_end(index, outcome, events, failing)   return True to stop the exploration
 
@@ -13,6 +16,7 @@ A strategy is an object with any of these methods; missing ones answer the defau
 is (vtime_ns, branches). Run it with `serve(strategy)`; anything printed to stderr reaches the
 user, stdout is the protocol.
 """
+import inspect
 import json
 import sys
 
@@ -41,7 +45,10 @@ def _dispatch(strategy, name, request):
         if not hasattr(strategy, "random"):
             return {}
         default = bytes.fromhex(request["default"])
-        answer = strategy.random(request["pull"], default, request.get("source", ""), moment)
+        arguments = [request["pull"], default, request.get("source", ""), moment]
+        if "decision" in inspect.signature(strategy.random).parameters:
+            arguments.append(request.get("decision"))
+        answer = strategy.random(*arguments)
         if answer is None:
             return {}
         assert len(answer) == len(default), "an override has the default's size"
