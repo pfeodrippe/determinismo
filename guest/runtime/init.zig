@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var cmdline_buffer: [cmdline_size_max]u8 = undefined;
     const cmdline = read_cmdline(&cmdline_buffer);
     for (modules) |module| module_load(module, cmdline);
+    sdk_output_mount();
     _ = spawn(&.{bin ++ "det-agent"}); // Multiverse debugging; asleep unless pushed to.
     const status = run(arena, cmdline);
     std.debug.print("[guest] done, status {d}\n", .{status});
@@ -122,6 +123,20 @@ fn cores_setup() void {
     nodes.file_write("/proc/sys/kernel/core_pattern", pattern) catch |err| {
         std.debug.print("[guest] core_pattern: {s}\n", .{@errorName(err)});
     };
+}
+
+/// The SDK output as a regular file (detfs, from det_guest): /opt/determinismo/sdk/output, in
+/// the runner and (through /opt/determinismo) in every node. For SDKs that truncate their
+/// output file, which /dev/determinismo cannot be (Antithesis's Go SDK).
+pub const sdk_output_path = "/opt/determinismo/sdk/output";
+
+fn sdk_output_mount() void {
+    const directory = "/opt/determinismo/sdk";
+    _ = linux.mkdir(directory, 0o755);
+    const result = linux.mount("detfs", directory, "detfs", 0, 0);
+    if (linux.errno(result) != .SUCCESS) {
+        std.debug.print("[guest] detfs: {s}\n", .{@tagName(linux.errno(result))});
+    }
 }
 
 /// Loads a module with its `<module>.<parameter>=` words from the kernel command line (what

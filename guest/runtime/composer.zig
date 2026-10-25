@@ -20,6 +20,28 @@ const starts_max = 64;
 const parallelism_max = 4;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
+/// detfs (det_guest): "1" once an SDK declared the system's setup complete.
+const sdk_setup_path = "/opt/determinismo/sdk/setup";
+const sdk_setup_wait_ns = 300 * std.time.ns_per_s;
+
+/// A system with an Antithesis SDK declares its own setup (once it is ready: a leader elected,
+/// data loaded); the drivers start after it, as Antithesis's do. The platform snapshots at that
+/// declaration. A system that never declares it is started anyway after a while.
+fn sdk_setup_wait() void {
+    const poll_ns = 10 * std.time.ns_per_ms;
+    var waited_ns: u64 = 0;
+    while (waited_ns < sdk_setup_wait_ns) : (waited_ns += poll_ns) {
+        var buffer: [4]u8 = undefined;
+        const fd = linux.open(sdk_setup_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) == .SUCCESS) {
+            const size = linux.read(@intCast(fd), &buffer, buffer.len);
+            _ = linux.close(@intCast(fd));
+            if (linux.errno(size) == .SUCCESS and size > 0 and buffer[0] == '1') return;
+        }
+        nodes.sleep_ns(poll_ns);
+    }
+    sdk.event("sdk_setup_missing", .{ .waited_ns = waited_ns });
+}
 const faults_control_path = "/opt/determinismo/faults-control"; // faults.zig's control_path.
 const program_path = "/det/program";
 const nodes_path = "/opt/determinismo/bin/det-nodes";
@@ -186,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
         composer.command_count += 1;
     }
     if (setup) |*command| composer.run_to_completion(command);
+    if (system.sdk_setup) sdk_setup_wait();
     sdk.setup_complete(.{ .scenario = composer.scenario });
     kernel_reseed();
     commands_declare(&composer);

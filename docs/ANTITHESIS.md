@@ -27,7 +27,7 @@ change that moves it.
 | Coverage instrumentation | C, Zig (edges), Python, JVM (lines); used by `mutate` | 🟡 opt-in per language (build flags, `coverage_start`, a Java agent); edges never map back to source lines |
 | Guidance assertions (`alwaysGreaterThan`, `sometimesLessThan`, ..., `alwaysSome`, `sometimesAll`) | In every SDK (Zig, C, Python, JVM, Clojure): the compared values in the details, and a guidance event with the distance to the interesting outcome; det-strategy-mutate keeps timelines that come closer (the sum maze: solved guided, missed in 300 random timelines) | ✅ |
 | Assertion locations and ids; first pass and first failure per process | locations (file, line, function) in every SDK: C (macros), Python (the caller's frame), the JVM and Clojure (StackWalker, once per assertion), Zig (the return address and the program's debug info); in the report, the record and the UI. First pass and first failure per process, opt-in in every SDK (Zig `assertion_events = .first`, C `det_first_pass_first_failure`, Python `assertion_events = "first"`, JVM `firstPassFirstFailure`, Clojure `first-pass-first-failure!`); guidance sent only when it improves | ✅ |
-| Fallback SDK (JSONL to a file) | `ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo` | ✅ |
+| Fallback SDK (JSONL to a file) | `ANTITHESIS_SDK_LOCAL_OUTPUT=/opt/determinismo/sdk/output`: a regular file (detfs, from the guest module) whose writes go to the platform; it can be truncated, as Antithesis's Go SDK does | ✅ |
 
 ## Faults
 

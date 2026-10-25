@@ -12,8 +12,14 @@
  *
  * Each call is one request to the VMM through the doorbell port (a deterministic VM exit).
  * Test authors never use this directly; SDKs and the in-guest runtime do.
+ *
+ * And detfs (mount -t detfs detfs <dir>): a regular file, `output`, whose writes are those
+ * events too. For SDKs that need a regular file (Antithesis's Go SDK truncates its output file,
+ * which a device cannot be): truncating it is accepted and changes nothing. And `setup`, which
+ * reads 1 once an SDK declared the system's setup complete (the composer waits for it).
  */
 #include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/miscdevice.h>
@@ -21,6 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
@@ -40,6 +47,8 @@ struct det_request {
 } __packed;
 
 static struct det_request *req;
+/* An SDK declared the system's setup complete (antithesis_setup): detfs's `setup` reads 1. */
+static atomic_t det_sdk_setup = ATOMIC_INIT(0);
 static DEFINE_MUTEX(det_lock);
 static DECLARE_WAIT_QUEUE_HEAD(det_actions);
 
@@ -93,6 +102,8 @@ static ssize_t det_write(struct file *f, const char __user *buf, size_t n, loff_
 		mutex_unlock(&det_lock);
 		return -EFAULT;
 	}
+	if (!atomic_read(&det_sdk_setup) && strnstr((char *)req->data, "\"antithesis_setup\"", n))
+		atomic_set(&det_sdk_setup, 1);
 	req->op = DET_OP_EMIT;
 	req->len = n;
 	/* The source after the event, flagged in result, when it fits. */
@@ -131,6 +142,63 @@ static const struct file_operations det_fops = {
 	.unlocked_ioctl = det_ioctl,
 };
 
+/* detfs ------------------------------------------------------------------------------------ */
+
+#define DETFS_MAGIC 0x64657466 /* "detf" */
+
+static const struct file_operations det_output_fops = {
+	.owner = THIS_MODULE,
+	.write = det_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t det_setup_read(struct file *f, char __user *buf, size_t n, loff_t *off)
+{
+	const char *state = atomic_read(&det_sdk_setup) ? "1\n" : "0\n";
+
+	return simple_read_from_buffer(buf, n, off, state, 2);
+}
+
+static const struct file_operations det_setup_fops = {
+	.owner = THIS_MODULE,
+	.read = det_setup_read,
+	.llseek = default_llseek,
+};
+
+static int detfs_fill_super(struct super_block *sb, struct fs_context *fc)
+{
+	/* Inode numbers from 2 (1 is the root), as simple_fill_super expects. */
+	static const struct tree_descr files[] = {
+		[2] = { "output", &det_output_fops, 0666 },
+		[3] = { "setup", &det_setup_fops, 0444 },
+		{ "" },
+	};
+
+	return simple_fill_super(sb, DETFS_MAGIC, files);
+}
+
+static int detfs_get_tree(struct fs_context *fc)
+{
+	return get_tree_single(fc, detfs_fill_super); /* One instance, wherever it is mounted. */
+}
+
+static const struct fs_context_operations detfs_context_ops = {
+	.get_tree = detfs_get_tree,
+};
+
+static int detfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &detfs_context_ops;
+	return 0;
+}
+
+static struct file_system_type detfs_type = {
+	.owner = THIS_MODULE,
+	.name = "detfs",
+	.init_fs_context = detfs_init_fs_context,
+	.kill_sb = kill_litter_super,
+};
+
 static struct miscdevice det_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = "determinismo",
@@ -152,15 +220,23 @@ static int __init det_init(void)
 		return err;
 	}
 	err = misc_register(&det_dev);
-	if (err) {
-		free_irq(DET_IRQ, NULL);
-		free_page((unsigned long)req);
-	}
+	if (err)
+		goto irq;
+	err = register_filesystem(&detfs_type);
+	if (err)
+		goto device;
+	return 0;
+device:
+	misc_deregister(&det_dev);
+irq:
+	free_irq(DET_IRQ, NULL);
+	free_page((unsigned long)req);
 	return err;
 }
 
 static void __exit det_exit(void)
 {
+	unregister_filesystem(&detfs_type);
 	misc_deregister(&det_dev);
 	free_irq(DET_IRQ, NULL);
 	free_page((unsigned long)req);

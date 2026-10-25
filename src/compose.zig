@@ -7,7 +7,7 @@
 //! `depends_on` (dependencies start first), `mem_limit`, `privileged`, and the first container
 //! port of `ports`
 //! or `expose` as its readiness check. Every node gets
-//! ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo, so
+//! ANTITHESIS_SDK_LOCAL_OUTPUT (a regular file the platform reads: detfs), so
 //! services and tests using an Antithesis SDK report to determinismo. Fields with no meaning in
 //! one deterministic machine (volumes, networks, restart policies, ...) are reported, not
 //! silently dropped.
@@ -16,7 +16,9 @@ const assert = std.debug.assert;
 const schema = @import("determinismo").schema;
 const yaml = @import("yaml.zig");
 
-pub const sdk_output_variable = "ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo";
+/// A regular file (detfs, det-init.sdk_output_path): Antithesis's Go SDK truncates its output
+/// file, which /dev/determinismo, a device, cannot be.
+pub const sdk_output_variable = "ANTITHESIS_SDK_LOCAL_OUTPUT=/opt/determinismo/sdk/output";
 
 const ignored_fields = [_][]const u8{
     "volumes",      "networks",    "restart",     "deploy",   "logging", "container_name",

@@ -153,6 +153,9 @@ pub const System = struct {
     profile: []const u8,
     nodes: []const Resolved,
     scenarios: []const Scenario,
+    /// The system declares its own setup through an Antithesis SDK (Compose projects): the
+    /// composer waits for it before the drivers, as Antithesis does.
+    sdk_setup: bool = false,
 
     pub fn scenario(system: *const System, name: []const u8) ?*const Scenario {
         for (system.scenarios) |*entry| {
