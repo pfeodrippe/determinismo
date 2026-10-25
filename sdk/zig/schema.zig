@@ -84,6 +84,8 @@ pub const Faults = struct {
     partition: bool = true,
     /// Kill it and start it again (its files survive, its memory does not).
     restart: bool = false,
+    /// Delay and drop packets on single links, in one direction, for a while.
+    degrade: bool = true,
 };
 
 pub const Scenario = struct {

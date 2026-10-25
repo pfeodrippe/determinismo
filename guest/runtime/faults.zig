@@ -22,7 +22,9 @@ const delay_ns_max = 300 * std.time.ns_per_ms;
 const duration_ns_max = 500 * std.time.ns_per_ms;
 const clock_skip_ns_max = 60 * std.time.ns_per_s;
 
-const Kind = enum { pause, isolate, partition, restart, clock_skip };
+const Kind = enum { pause, isolate, partition, degrade, restart, clock_skip };
+const degrade_delay_ns_max = 200 * std.time.ns_per_ms;
+const degrade_loss_percent_max = 30;
 
 const Fault = struct {
     kind: Kind,
@@ -75,18 +77,40 @@ fn faults_collect(
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
         if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
         if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
-        if (!allowed.partition) continue;
-        const runner = Fault{ .kind = .partition, .node = node.name, .peer = schema.runner_name };
-        faults_add(faults, &count, runner);
-        for (system.nodes[index + 1 ..]) |peer| {
-            if (!peer.faults.partition) continue;
-            const link = Fault{ .kind = .partition, .node = node.name, .peer = peer.name };
-            faults_add(faults, &count, link);
-        }
+        links_collect(system, index, faults, &count);
     }
     if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
     assert(count <= faults_max);
     return count;
+}
+
+/// Link faults between node `index` and the runner or a later node, as both ends allow (the
+/// runner allows all). A degraded link is one direction: both directions are listed.
+fn links_collect(
+    system: *const schema.System,
+    index: usize,
+    faults: *[faults_max]Fault,
+    count: *u32,
+) void {
+    const node = &system.nodes[index];
+    links_add(faults, count, node, schema.runner_name, .{});
+    for (system.nodes[index + 1 ..]) |peer| links_add(faults, count, node, peer.name, peer.faults);
+}
+
+fn links_add(
+    faults: *[faults_max]Fault,
+    count: *u32,
+    node: *const schema.Resolved,
+    peer: []const u8,
+    peer_faults: schema.Faults,
+) void {
+    if (node.faults.partition and peer_faults.partition) {
+        faults_add(faults, count, .{ .kind = .partition, .node = node.name, .peer = peer });
+    }
+    if (node.faults.degrade and peer_faults.degrade) {
+        faults_add(faults, count, .{ .kind = .degrade, .node = node.name, .peer = peer });
+        faults_add(faults, count, .{ .kind = .degrade, .node = peer, .peer = node.name });
+    }
 }
 
 fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
@@ -122,6 +146,25 @@ fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const 
             sdk.event("fault", details);
             sleep_ns(duration_ns);
             nodes.link_set(system, fault.node, fault.peer, .up) catch {};
+        },
+        .degrade => {
+            const netem = nodes.Netem{
+                .delay_ns = sdk.random_below(degrade_delay_ns_max),
+                .jitter_ns = sdk.random_below(degrade_delay_ns_max / 4),
+                .loss_percent = @intCast(sdk.random_below(degrade_loss_percent_max + 1)),
+                .seed = sdk.random_u64(),
+            };
+            nodes.link_degrade(fault.node, fault.peer, netem) catch return;
+            sdk.event("fault", .{
+                .kind = "degrade",
+                .from = fault.node,
+                .to = fault.peer,
+                .delay_ns = netem.delay_ns,
+                .loss_percent = netem.loss_percent,
+                .duration_ns = duration_ns,
+            });
+            sleep_ns(duration_ns);
+            nodes.link_degrade(fault.node, fault.peer, null) catch {};
         },
         .restart => {
             nodes.kill(fault.node) catch return;
@@ -185,6 +228,7 @@ test faults_collect {
     const scenario = schema.Scenario{ .name = "s", .commands = &.{}, .clock_skip = true };
     const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
     var faults: [faults_max]Fault = undefined;
-    // a: pause, restart, partition(runner), partition(b); b: pause, isolate, partition(runner).
-    try std.testing.expectEqual(@as(u32, 8), faults_collect(&system, &scenario, &faults));
+    // a: pause, restart; with the runner and with b: partition and degrade both ways (6).
+    // b: pause, isolate; with the runner: partition and degrade both ways (3). Clock skip.
+    try std.testing.expectEqual(@as(u32, 14), faults_collect(&system, &scenario, &faults));
 }

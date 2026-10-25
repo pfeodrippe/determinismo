@@ -208,6 +208,21 @@ fn endpoint_address(system: *const schema.System, name: []const u8) !netlink.Add
     return address_parse(node.address);
 }
 
+/// Degrades the direction `from` → `to` of a link (delay, jitter, loss), or with null restores it.
+pub fn link_degrade(from: []const u8, to: []const u8, netem: ?netlink.Netem) !void {
+    assert(!std.mem.eql(u8, from, to));
+    const pid = pid_of(from) orelse return;
+    var name: [netlink.interface_name_size_max]u8 = undefined;
+    const interface = interface_name(&name, to);
+    if (netem) |settings| {
+        try netlink.in_namespace_of(pid, netlink.Socket.netem_set, .{ interface, settings });
+    } else {
+        try netlink.in_namespace_of(pid, netlink.Socket.netem_clear, .{interface});
+    }
+}
+
+pub const Netem = netlink.Netem;
+
 /// The PID (in the guest's root namespace) of the node's first process, or 1 for the runner.
 pub fn pid_of(name: []const u8) ?linux.pid_t {
     if (std.mem.eql(u8, name, schema.runner_name)) return 1;

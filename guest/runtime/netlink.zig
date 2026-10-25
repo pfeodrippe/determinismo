@@ -15,6 +15,18 @@ const message_error: u16 = 2;
 const rtm_newlink: u16 = 16;
 const rtm_newaddr: u16 = 20;
 const rtm_newroute: u16 = 24;
+const rtm_newqdisc: u16 = 36;
+const rtm_delqdisc: u16 = 37;
+const flag_replace: u16 = 0x100;
+const tca_kind: u16 = 1;
+const tca_options: u16 = 2;
+const tca_netem_latency64: u16 = 10;
+const tca_netem_jitter64: u16 = 11;
+const tca_netem_prng_seed: u16 = 14;
+const tc_handle_root: u32 = 0xffff_ffff;
+const tc_handle_netem: u32 = 0x1_0000; // 1:0
+const tcmsg_size = 20;
+const netem_limit_packets = 10_000;
 const ifla_address: u16 = 1;
 const ifla_ifname: u16 = 3;
 const ifla_linkinfo: u16 = 18;
@@ -110,6 +122,50 @@ pub const Socket = struct {
         try socket.send(&message);
     }
 
+    /// Delays and drops what leaves through the interface (one direction of a link), with
+    /// netem's own randomness seeded by the caller so that it is a platform decision too.
+    pub fn netem_set(socket: *Socket, name: []const u8, netem: Netem) !void {
+        assert(netem.loss_percent <= 100);
+        var message: Message = .init(rtm_newqdisc, flag_create | flag_replace);
+        message.append_bytes(&try socket.tcmsg(name));
+        message.attribute(tca_kind, "netem\x00");
+        const options = message.nest_begin(tca_options);
+        // struct tc_netem_qopt: latency, limit, loss, gap, duplicate, jitter (latency and jitter
+        // in the legacy unit are superseded by the 64-bit nanosecond attributes below).
+        var qopt: [24]u8 = @splat(0);
+        std.mem.writeInt(u32, qopt[4..8], netem_limit_packets, .little);
+        const loss: u64 = @as(u64, std.math.maxInt(u32)) * netem.loss_percent / 100;
+        std.mem.writeInt(u32, qopt[8..12], @intCast(loss), .little);
+        message.append_bytes(&qopt);
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &value, netem.delay_ns, .little);
+        message.attribute(tca_netem_latency64, &value);
+        std.mem.writeInt(u64, &value, netem.jitter_ns, .little);
+        message.attribute(tca_netem_jitter64, &value);
+        std.mem.writeInt(u64, &value, netem.seed, .little);
+        message.attribute(tca_netem_prng_seed, &value);
+        message.nest_end(options);
+        try socket.send(&message);
+    }
+
+    pub fn netem_clear(socket: *Socket, name: []const u8) !void {
+        var message: Message = .init(rtm_delqdisc, 0);
+        message.append_bytes(&try socket.tcmsg(name));
+        socket.send(&message) catch |err| switch (err) {
+            error.NetlinkRequestFailed => {}, // No qdisc to remove.
+            else => return err,
+        };
+    }
+
+    fn tcmsg(socket: *const Socket, name: []const u8) ![tcmsg_size]u8 {
+        var header: [tcmsg_size]u8 = @splat(0);
+        header[0] = linux.AF.UNSPEC;
+        std.mem.writeInt(i32, header[4..8], try socket.index(name), .little);
+        std.mem.writeInt(u32, header[8..12], tc_handle_netem, .little);
+        std.mem.writeInt(u32, header[12..16], tc_handle_root, .little);
+        return header;
+    }
+
     fn index(socket: *const Socket, name: []const u8) !i32 {
         assert(name.len > 0);
         if (name.len > interface_name_size_max) return error.InterfaceNameTooLong;
@@ -153,6 +209,13 @@ pub const Socket = struct {
         std.debug.print("netlink request failed: {s}\n", .{@tagName(errno)});
         return error.NetlinkRequestFailed;
     }
+};
+
+pub const Netem = struct {
+    delay_ns: u64,
+    jitter_ns: u64 = 0,
+    loss_percent: u8 = 0,
+    seed: u64,
 };
 
 /// One end of a veth pair: its interface name, its MAC address, and a process in the network
