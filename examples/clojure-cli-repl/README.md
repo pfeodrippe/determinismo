@@ -30,8 +30,6 @@ determinismo explore --kernel ... --initrd ... --memory-mib 4096 \
 
 ## Findings (clojure-cli.repl 0.2.1)
 
-Not reported upstream yet.
-
 1. **A terminal that does not read stops editor evaluations.** The watch middleware sends each
    editor evaluation's output to every watching terminal from inside the evaluation
    (`watch/reply-to-watchers`, synchronously, in the transport's `send`). When a terminal stops

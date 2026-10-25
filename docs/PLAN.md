@@ -38,10 +38,11 @@ build e2e` tests it.
 5. **clojure-cli.repl**: examples/clojure-cli-repl, its server beside plain nREPL 1.7.0. Found
    (README): an editor evaluation hangs while a watching terminal does not read (over ~100 KB
    of output); closed sessions are kept; one inspector view for all terminals. Left: rerun the
-   editors scenario with the warm-up fix; interrupts and long evaluations racing watchers; ask
-   before reporting upstream (an issue is drafted).
+   editors scenario with the warm-up fix; interrupts and long evaluations racing watchers.
+   Findings stay documented here (nothing is filed with other projects).
 6. **Blind exploration of the real targets**: nREPL, the Clojure libraries, Raft (pinned commit,
-   with restarts), with the tree explorer and the strategies; findings reported upstream.
+   with restarts), with the tree explorer and the strategies; findings documented in each
+   example's README.
 
 ## Antithesis parity found missing
 
@@ -110,7 +111,7 @@ as hints of where bugs hide. To get there:
 ## Real systems: find real issues
 
 Each gets a test program in `examples/` (or a separate repository when it grows), explored
-blind, with its findings reported upstream.
+blind, with its findings documented in its README.
 
 1. **Raft**: HashiCorp Raft (examples/raft, at the article's upstream commit 4c8f61ac), then
    OpenRaft, MicroRaft, Aeron Cluster.
