@@ -33,6 +33,9 @@ const Arguments = struct {
     branches: ?u32 = null,
     time_budget: ?[]const u8 = null,
     branch: ?u32 = null,
+    /// Replays a timeline from its tape (an exploration's tape_dir/branch-<n>.jsonl): the way
+    /// to replay a tree exploration's timeline past its first generation.
+    tape: ?[]const u8 = null,
     at_vtime_ms: ?u64 = null,
     exec: ?[]const u8 = null,
     @"continue": bool = false,
@@ -139,8 +142,12 @@ fn tool_call(
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     if (arguments.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
     if (eql(u8, name, "replay")) {
-        const branch = arguments.branch orelse return error.MissingBranch;
-        try argv.appendSlice(arena, &.{ "--branch", try number(arena, branch) });
+        if (arguments.tape) |tape| {
+            try argv.appendSlice(arena, &.{ "--tape", tape });
+        } else {
+            const branch = arguments.branch orelse return error.MissingBranch;
+            try argv.appendSlice(arena, &.{ "--branch", try number(arena, branch) });
+        }
         if (arguments.at_vtime_ms) |ms| {
             try argv.appendSlice(arena, &.{ "--at-vtime-ms", try number(arena, ms) });
         }
@@ -191,13 +198,17 @@ fn tool_call(
     const events = try std.fmt.allocPrint(arena, "{s}/events-{d}-{d}", .{
         options.scratch_directory, linux.getpid(), explorations,
     });
+    const tapes = try std.fmt.allocPrint(arena, "{s}/tapes-{d}-{d}", .{
+        options.scratch_directory, linux.getpid(), explorations,
+    });
     try argv.appendSlice(arena, &.{ "--record", record, "--events-dir", events });
+    try argv.appendSlice(arena, &.{ "--tape-dir", tapes });
     _ = try std.process.run(arena, io, .{ .argv = argv.items });
     const cwd = std.Io.Dir.cwd();
     const results = try cwd.readFileAlloc(io, record, arena, .limited(result_size_max));
-    // Where every branch's events are, for the query tool.
-    return std.fmt.allocPrint(arena, "{s}{{\"events_dir\":{f}}}\n", .{
-        results, std.json.fmt(events, .{}),
+    // Where every branch's events are, for the query tool, and its tapes, for replay.
+    return std.fmt.allocPrint(arena, "{s}{{\"events_dir\":{f},\"tape_dir\":{f}}}\n", .{
+        results, std.json.fmt(events, .{}), std.json.fmt(tapes, .{}),
     });
 }
 

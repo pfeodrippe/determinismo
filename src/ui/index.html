@@ -267,9 +267,31 @@ async function runOpen(id) {
 }
 
 async function runRefresh() {
+  const before = state.run;
   state.run = await apiJson(`/runs/${state.runId}`);
   if (state.view === "notebook" && $("#notebook")) return; // Never under the writer's cursor.
+  // While the run goes on, what changes is updated in place (no flicker, no re-query of every
+  // section); the tree, which queries every timeline's events, every 10 seconds.
+  const same = before && before.id === state.run.id && $("#stats-live");
+  if (same && before.state === "running" && state.run.state === "running") return liveUpdate();
   render();
+}
+
+function liveUpdate() {
+  $("#stats-live").outerHTML = statsHtml();
+  $("#charts-live").outerHTML = chartsHtml();
+  discoveryDraw();
+  const bar = $(".progress div");
+  if (bar) bar.style.width = `${100 * progress()}%`;
+  const properties = $("#properties");
+  if (properties && document.activeElement !== $("#property-filter")) {
+    $(".summary", properties).innerHTML = propertiesSummary();
+    $(".body", properties).innerHTML = propertiesBody();
+    propertiesWire();
+  }
+  const map = $("#map");
+  if (map) $(".summary", map).textContent = `${state.run.branches.length} timelines from the setup snapshot`;
+  if (Date.now() - (state.treeDrawn || 0) > 10000) { state.treeDrawn = Date.now(); mapDraw(); }
 }
 
 // Rendering -------------------------------------------------------------------------------
@@ -297,7 +319,7 @@ function statsHtml() {
   const stat = (title, value, note, color = "") =>
     `<div class="stat"><div class="title">${title}</div><div class="value" style="color:${color}">${value}</div><div class="note">${note}</div></div>`;
   const planned = info.time_budget_s ? `budget ${duration(info.time_budget_s)}` : `of ${info.branches || "?"}`;
-  return `<div class="stats">
+  return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), `${planned} · ${duration(wall)} wall`)}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
     ${stat("Properties", `${failed} / ${list.length}`, run.summary ? "failing" : "failing so far", failed ? "var(--fail)" : "var(--pass)")}
@@ -312,7 +334,7 @@ function chartsHtml() {
   const bars = list.slice(0, 7).map((p) => `<div class="bar" data-message="${escape(p.message)}" title="${escape(p.message)}">
       <span class="name">${escape(p.message)}</span><span class="track"><span class="fill" style="display:block;width:${100 * p.branches_failing / most}%"></span></span>
       <span class="count fail-text">${p.branches_failing || "never"}</span></div>`).join("");
-  return `<div class="charts">
+  return `<div class="charts" id="charts-live">
     <div class="chart"><div class="head"><h3>New behavior discovery</h3><span>distinct behaviors by timelines</span></div>
       <div id="discovery" class="muted">Loading…</div></div>
     <div class="chart"><div class="head"><h3>Failing properties</h3><span>timelines failing each one</span></div>

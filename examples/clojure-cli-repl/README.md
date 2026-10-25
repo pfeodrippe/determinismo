@@ -46,7 +46,9 @@ Not reported upstream yet.
    removes one: after 50 sessions evaluated and closed, the server still held 54 (with their
    `*1`, `*2`, `*3`).
 3. **One inspector for all terminals.** The inspector's state (`inspect/view`) is one atom for
-   the server: when two terminals inspect, one's `inspect-out` answers with the other's view.
+   the server: when two terminals inspect, one moves the other's view. determinismo (scenario
+   `inspector`, seed 1): a terminal that stepped once into its result (`*1 / 0`) found its view
+   at `*1 / 0 / :mine`, another terminal's step applied to it.
 
 Findings 2 and 3 were seen first by a direct probe; the `sessions` and `inspector` scenarios
 check them under concurrency and faults.

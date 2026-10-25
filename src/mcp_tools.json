@@ -76,7 +76,12 @@
           "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere; replays need it too"
         },
         "branch": {
-          "type": "integer"
+          "type": "integer",
+          "description": "The timeline to replay (one of a tree exploration's first 16; others by their tape)"
+        },
+        "tape": {
+          "type": "string",
+          "description": "Replay the timeline of this tape instead (explore returns tape_dir; its timelines are tape_dir/branch-<n>.jsonl): any timeline of a tree exploration"
         },
         "at_vtime_ms": {
           "type": "integer"
@@ -101,9 +106,7 @@
           "description": "With until: the moment this many milliseconds of virtual time before the condition holds (Antithesis's rewind)"
         }
       },
-      "required": [
-        "branch"
-      ]
+      "required": []
     }
   },
   {

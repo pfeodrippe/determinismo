@@ -141,7 +141,8 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
 }
 
 fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
-    const hash = query.behavior_hash(value) orelse guidance_hash(value) orelse return;
+    const hash = query.behavior_hash(value) orelse guidance_hash(value) orelse
+        output_hash(value) orelse return;
     if (events.behavior_count == behavior_count_max) return;
     const key = hash | 1; // 0 marks an empty slot.
     var slot = key % behavior_slot_count;
@@ -172,6 +173,13 @@ fn behavior_label(writer: *std.Io.Writer, value: std.json.Value) void {
         writer.print("closer to \"{s}\"", .{message}) catch {};
         return;
     };
+    if (value.object.get("output")) |output| if (output == .object) {
+        const source = string_field(output.object, "source") orelse "";
+        var template: [output_template_size]u8 = undefined;
+        const text = output_template(string_field(output.object, "text") orelse "", &template);
+        writer.print("{s} printed \"{s}\"", .{ source, text }) catch {};
+        return;
+    };
     const name_value = value.object.get("event") orelse return;
     if (name_value != .string) return;
     writer.writeAll(name_value.string) catch return;
@@ -181,6 +189,60 @@ fn behavior_label(writer: *std.Io.Writer, value: std.json.Value) void {
         const text = string_field(details.object, key) orelse continue;
         writer.print(" {s}", .{text}) catch return;
     }
+}
+
+/// A kind of line a node printed: its text with numbers, hex and ids blanked (`#`), per source
+/// and stream; a node saying something it never said before (a new error, an exception) is a
+/// new behavior.
+fn output_hash(value: std.json.Value) ?u64 {
+    const output = value.object.get("output") orelse return null;
+    if (output != .object) return null;
+    const text = string_field(output.object, "text") orelse return null;
+    var hasher = std.hash.Wyhash.init(0x6f7574707574);
+    hasher.update(string_field(output.object, "source") orelse "");
+    hasher.update(string_field(output.object, "stream") orelse "");
+    var template: [output_template_size]u8 = undefined;
+    hasher.update(output_template(text, &template));
+    return hasher.final();
+}
+
+const output_template_size = 96;
+
+/// `text` with every run of digits, hex digits mixed with digits, or `-`/`.`/`:` between them
+/// made one `#`, cut to the buffer (where variable parts usually are past).
+fn output_template(text: []const u8, buffer: *[output_template_size]u8) []const u8 {
+    var size: usize = 0;
+    var index: usize = 0;
+    while (index < text.len and size < buffer.len) {
+        const c = text[index];
+        if (!std.ascii.isDigit(c)) {
+            buffer[size] = c;
+            size += 1;
+            index += 1;
+            continue;
+        }
+        // A number, an id or an address: digits with hex letters and separators around them.
+        var end = index;
+        while (end < text.len and (std.ascii.isHex(text[end]) or text[end] == '-' or
+            text[end] == '.' or text[end] == ':')) end += 1;
+        // Hex letters before the digits belong to it too (`a708a334-...`).
+        while (size > 0 and std.ascii.isHex(buffer[size - 1]) and
+            !std.ascii.isDigit(buffer[size - 1])) size -= 1;
+        buffer[size] = '#';
+        size += 1;
+        index = end;
+    }
+    return buffer[0..size];
+}
+
+test output_template {
+    var buffer: [output_template_size]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Exception in thread \"nREPL-session-#\" java.net.SocketException: Socket closed",
+        output_template("Exception in thread \"nREPL-session-a708a334-2896-48df-891a-" ++
+            "8d76d5056a9c\" java.net.SocketException: Socket closed", &buffer),
+    );
+    try std.testing.expectEqualStrings("took # ms", output_template("took 12.5 ms", &buffer));
 }
 
 /// A guidance assertion's distance by power of two (0 or less: there): a timeline that came

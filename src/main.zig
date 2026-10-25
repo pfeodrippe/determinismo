@@ -33,8 +33,9 @@ const usage =
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--time-budget <duration>]   (e.g. 90s, 10m, 2h: timelines until
     \\                            then, --branches at most)
-    \\                            [--branching flat|tree]   (tree: also from moments of earlier
-    \\                            branches that reached new behaviors; replay one by its tape)
+    \\                            [--branching tree|flat]   (tree, the default: also from moments
+    \\                            of earlier branches that reached new behaviors; replay one by
+    \\                            its tape)
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms>] [--until '<condition>' [--rewind-ms <ms>]]
@@ -111,8 +112,10 @@ const Arguments = struct {
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
     branches_given: bool = false,
-    /// flat: every branch from the setup snapshot; tree: from moments of earlier branches too.
-    branching: enum { flat, tree } = .flat,
+    /// flat: every branch from the setup snapshot; tree (the default when nothing else plans
+    /// the branches): from moments of earlier branches too.
+    branching: enum { flat, tree } = .tree,
+    branching_given: bool = false,
     /// Explore until this much wall time has passed (from the start, boot included), at most
     /// `branches` timelines: as many as fit, as an Antithesis run's duration.
     time_budget_ns: ?u64 = null,
@@ -749,6 +752,29 @@ fn jobs_count(arguments: *const Arguments) u32 {
     const shard_branches = std.math.divCeil(u32, arguments.branches, arguments.shard_count) catch
         unreachable;
     return @max(1, @min(jobs, shard_branches, jobs_max));
+}
+
+/// Tree branching unless something else plans the branches (a strategy, a tape, a fork, one
+/// branch, shards, a moment): then flat; asked for a tree, an error.
+fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
+    if (arguments.branching != .tree) return;
+    const planned = arguments.strategy_command != null or arguments.branch_only != null or
+        arguments.tape_path != null or arguments.from_branch != null or
+        arguments.shard_count > 1 or at_moment;
+    if (planned and arguments.branching_given) return error.Usage;
+    // A tree's first generation starts from the snapshot, as flat branches do; later ones start
+    // inside others and replay from their tapes only.
+    if (arguments.branch_only) |only| {
+        if (!arguments.branching_given and only >= tree.generation_size) {
+            std.debug.print("[determinismo] branch {d} of a tree exploration (the default) " ++
+                "starts from a moment of another: replay it from its tape (--tape " ++
+                "<tape dir>/branch-{d}.jsonl), or explore with --branching flat\n", .{
+                only, only,
+            });
+            return error.Usage;
+        }
+    }
+    if (planned) arguments.branching = .flat;
 }
 
 /// A duration: a number of seconds, or with a unit (`500ms`, `90s`, `10m`, `2h`).
@@ -1497,14 +1523,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         return error.Usage;
     }
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
-    if (arguments.branching == .tree) {
-        // The tree explorer plans its own branches; strategies plan theirs. One of its
-        // branches replays from its tape (which holds its path).
-        const planned = arguments.strategy_command != null or arguments.branch_only != null or
-            arguments.tape_path != null or arguments.from_branch != null or
-            arguments.shard_count > 1;
-        if (planned or moment or commands) return error.Usage;
-    }
+    try branching_resolve(&arguments, moment or commands);
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
     if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
     if (arguments.deterministic) {
@@ -1569,6 +1588,7 @@ fn parse_option(
     } else if (eql(u8, flag, "--branching")) {
         arguments.branching = std.meta.stringToEnum(@TypeOf(arguments.branching), value) orelse
             return error.Usage;
+        arguments.branching_given = true;
     } else if (eql(u8, flag, "--time-budget")) {
         arguments.time_budget_ns = try duration_parse(value);
         arguments.time_budget_text = value;
