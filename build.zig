@@ -85,6 +85,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(redis_workload);
 
+    // A node written in C with the C SDK, for the self-tests.
+    const c_node = b.addExecutable(.{
+        .name = "det-selftest-c",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    c_node.root_module.addCSourceFile(.{
+        .file = b.path("tests/selftest/c_node.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_node.root_module.addIncludePath(b.path("sdk/c"));
+    b.installArtifact(c_node);
+
     // The guest's base initramfs, built on the host from the guest runtime above.
     const initramfs = b.addExecutable(.{
         .name = "det-initramfs",

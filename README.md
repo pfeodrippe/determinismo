@@ -58,7 +58,8 @@ pub fn main(init: std.process.Init) !void {
 Full examples: [examples/bank](examples/bank) (Redis, a lost update) and
 [examples/shop](examples/shop) (Postgres and Redis, a stale cache). Other languages: the Python
 SDK ([sdk/python](sdk/python), one file) in [examples/compose-python](examples/compose-python),
-or any Antithesis SDK (see below).
+the C SDK ([sdk/c](sdk/c), one header, for C, C++ and any FFI), or any Antithesis SDK (see
+below).
 
 ## Coming from Antithesis
 

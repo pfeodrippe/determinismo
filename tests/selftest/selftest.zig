@@ -12,7 +12,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
 
-const Nodes = struct { echo: sdk.Node };
+const Nodes = struct { echo: sdk.Node, csdk: sdk.Node };
 const System = sdk.System(Nodes);
 const port = 7000;
 
@@ -28,7 +28,26 @@ fn describe(d: *System.Describe) !void {
     default.node(.echo, .{
         .binary = "zig-out/bin/det-selftest-node",
         .ready = .{ .tcp = port },
-        .faults = .{ .pause = false, .isolate = false, .partition = false, .degrade = false },
+        .faults = .{
+            .pause = false,
+            .isolate = false,
+            .partition = false,
+            .degrade = false,
+            .throttle = false,
+            .process_pause = false,
+        },
+    });
+    // A node in C reporting through the C SDK; no faults (its properties are about the SDK).
+    default.node(.csdk, .{
+        .binary = "zig-out/bin/det-selftest-c",
+        .faults = .{
+            .pause = false,
+            .isolate = false,
+            .partition = false,
+            .degrade = false,
+            .throttle = false,
+            .process_pause = false,
+        },
     });
 }
 
