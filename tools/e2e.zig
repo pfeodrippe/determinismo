@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     try check_fork(&context);
     try check_compose(&context);
     try check_shards(&context);
+    try check_stress(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -177,6 +178,26 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// Adversarial guest (§14 level 2): clocks, sleeps, page faults and forks at once replay.
+fn check_stress(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "stress", "--seed", "4" };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "6" }));
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    expect(context, count == 6, "stress: explored {d} branches", .{count});
+    if (count == 0) return;
+    var all_same = true;
+    for ([_][]const u8{ "1", "4" }) |index| {
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+        var replayed: [1]Branch = undefined;
+        const ok = parse_branches(replay, &replayed) == 1 and
+            same_timelines(&replayed, branches[0..count]);
+        all_same = all_same and ok;
+    }
+    expect(context, all_same, "stress: branches replay from fresh boots", .{});
 }
 
 /// Two shards, merged, give the timelines of one exploration.
