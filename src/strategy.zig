@@ -23,8 +23,14 @@ parse_buffer: [parse_buffer_size]u8,
 
 const Strategy = @This();
 
-/// `command` is the plugin's path followed by its arguments, separated by spaces.
-pub fn start(strategy: *Strategy, arena: std.mem.Allocator, command: []const u8) !void {
+/// `command` is the plugin's program followed by its arguments, separated by spaces; a program
+/// without a slash is looked up in PATH, as a shell would. The plugin inherits `environ`.
+pub fn start(
+    strategy: *Strategy,
+    arena: std.mem.Allocator,
+    command: []const u8,
+    environ: [:null]const ?[*:0]const u8,
+) !void {
     assert(command.len > 0);
     var argv: [argument_count_max + 1:null]?[*:0]const u8 = @splat(null);
     var words = std.mem.tokenizeScalar(u8, command, ' ');
@@ -34,6 +40,7 @@ pub fn start(strategy: *Strategy, arena: std.mem.Allocator, command: []const u8)
         argv[count] = try arena.dupeSentinel(u8, word, 0);
         count += 1;
     }
+    const program = try program_find(arena, std.mem.span(argv[0].?), environ);
     var requests: [2]linux.fd_t = undefined;
     var responses: [2]linux.fd_t = undefined;
     try check(linux.pipe2(&requests, .{ .CLOEXEC = true }));
@@ -43,7 +50,7 @@ pub fn start(strategy: *Strategy, arena: std.mem.Allocator, command: []const u8)
     if (pid == 0) {
         _ = linux.dup2(requests[0], 0);
         _ = linux.dup2(responses[1], 1);
-        _ = linux.execve(argv[0].?, &argv, &.{null});
+        _ = linux.execve(program, &argv, environ.ptr);
         linux.exit_group(127);
     }
     _ = linux.close(requests[0]);
@@ -53,6 +60,25 @@ pub fn start(strategy: *Strategy, arena: std.mem.Allocator, command: []const u8)
     strategy.from_plugin = responses[0];
     strategy.response_start = 0;
     strategy.response_end = 0;
+}
+
+fn program_find(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    environ: [:null]const ?[*:0]const u8,
+) ![*:0]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return try arena.dupeSentinel(u8, name, 0);
+    const path = for (environ) |entry| {
+        const text = std.mem.span(entry.?);
+        if (std.mem.startsWith(u8, text, "PATH=")) break text["PATH=".len..];
+    } else "/usr/local/bin:/usr/bin:/bin";
+    var directories = std.mem.tokenizeScalar(u8, path, ':');
+    while (directories.next()) |directory| {
+        const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
+        if (linux.errno(linux.access(candidate, linux.X_OK)) == .SUCCESS) return candidate;
+    }
+    std.debug.print("[determinismo] strategy: {s} not found in PATH\n", .{name});
+    return error.PluginNotFound;
 }
 
 pub fn stop(strategy: *Strategy) void {

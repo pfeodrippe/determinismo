@@ -62,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     try check_example(&context, .{ .program = "bank-test", .scenario = "bank", .branches = 12 });
     try check_example(&context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
     try check_tapes(&context);
+    try check_python_strategy(&context);
     try check_builtin_properties(&context);
     try check_coverage(&context);
     try check_parallel(&context);
@@ -222,6 +223,33 @@ fn check_maze(context: *Context, maze: Maze, index: usize) !void {
     expect(context, same, "coverage ({s}): the solving branch {d} replays from its tape", .{
         maze.label, branch.index,
     });
+}
+
+/// A strategy written in Python (found through PATH, as a shell would) steers decisions, and a
+/// branch it steered replays from its tape without it.
+fn check_python_strategy(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "python-tapes" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
+    const report = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "12", "--jobs", "1", "--strategy", "python3 plugins/python/extremes.py",
+        "--tape-dir", tapes,
+    }));
+    var branches: [12]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    expect(context, count == 12, "python strategy: explored {d} branches", .{count});
+    if (count == 0) return;
+    // The bandit tries its rates in order: branch 1 overrides 5% of the decisions.
+    const tape = try std.fs.path.join(context.arena, &.{ tapes, "branch-1.jsonl" });
+    const recorded = std.Io.Dir.cwd().readFileAlloc(context.io, tape, context.arena,
+        .limited(1 << 24)) catch "";
+    const steered = std.mem.indexOf(u8, recorded, "\"pull\"") != null;
+    expect(context, steered, "python strategy: it overrides decisions", .{});
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
+    var replayed: [1]Branch = undefined;
+    const same = parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash);
+    expect(context, same, "python strategy: its branch replays from the tape without it", .{});
 }
 
 /// The built-in properties pass on a steady system and catch a node that exits by itself and an

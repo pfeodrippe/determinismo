@@ -206,7 +206,11 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
         .builtin_properties = has_system,
     };
-    const context = Context{ .arena = arena, .io = init.io };
+    const context = Context{
+        .arena = arena,
+        .io = init.io,
+        .environ = init.minimal.environ.block.slice,
+    };
     const base_cmdline = arguments.cmdline;
     var failing_scenarios: u32 = 0;
     for (try scenarios_selected(arena, &arguments, prepared)) |scenario| {
@@ -366,7 +370,12 @@ fn command_run(vm: *VM, options: *const VM.Options) !void {
     }
 }
 
-const Context = struct { arena: std.mem.Allocator, io: std.Io };
+const Context = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    /// determinismo's environment, which strategy plugins inherit.
+    environ: [:null]const ?[*:0]const u8,
+};
 
 /// What drives the branches of one exploration besides the seed.
 const Exploration = struct {
@@ -525,7 +534,7 @@ const cpuid_tsc_hz = @import("cpuid.zig").tsc_hz;
 fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
     const command = arguments.strategy_command orelse return;
     const strategy = try context.arena.create(Strategy);
-    try strategy.start(context.arena, command);
+    try strategy.start(context.arena, command, context.environ);
     try strategy.hello(exploration.exploration_seed);
     exploration.strategy = strategy;
 }

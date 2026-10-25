@@ -3,11 +3,16 @@
 A strategy decides what the guest gets at each decision point. determinismo runs it as a separate
 process and talks to it over its stdin/stdout: one JSON object per line, strictly alternating
 request (from determinismo) and response (from the plugin). Anything a plugin writes to stderr is
-passed through to the user. Plugins can be written in any language; the reference plugins are in
-`plugins/` (Zig).
+passed through to the user. Plugins can be written in any language: the reference plugins are in
+`plugins/` (Zig, with `protocol.zig`), and `plugins/python/` has a helper for Python
+(`determinismo_strategy.py`, standard library only) with an example that learns
+(`extremes.py`: a UCB1 bandit over how often to push decisions to their extremes). The command
+is split at spaces; a program without a slash is looked up in PATH, and the plugin inherits
+determinismo's environment (so a strategy that asks a model can read its API key):
 
 ```
-determinismo explore ... --strategy "plugins/mutate --corpus-max 64"
+determinismo explore ... --strategy "det-strategy-mutate --sync-dir /tmp/corpus"
+determinismo explore ... --strategy "python3 plugins/python/extremes.py"
 ```
 
 ## Messages
