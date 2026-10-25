@@ -136,6 +136,7 @@ const Arguments = struct {
     /// How long (virtual time) each timeline's drivers run: commands keep starting until then
     /// (Antithesis's long timelines). Without it, a drawn number of starts (4 to 64).
     timeline_ms: ?u64 = null,
+    timeline_text: ?[]const u8 = null,
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
@@ -367,6 +368,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         from_branch: ?u32,
         from_vtime_ms: ?u64,
         cpu_modulation: bool,
+        timeline: ?[]const u8,
     };
     const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
         .program = arguments.program_path,
@@ -384,6 +386,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         .from_branch = arguments.from_branch,
         .from_vtime_ms = arguments.from_vtime_ms,
         .cpu_modulation = arguments.cpu_modulation,
+        .timeline = arguments.timeline_text,
     }, .{})});
     var buffer: [256]u8 = undefined;
     const tcp = @import("determinismo").tcp;
@@ -1755,6 +1758,7 @@ fn parse_option(
         arguments.time_budget_text = value;
     } else if (eql(u8, flag, "--timeline")) {
         arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
+        arguments.timeline_text = value;
     } else if (eql(u8, flag, "--branch")) {
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-branch")) {
