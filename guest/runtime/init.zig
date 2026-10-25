@@ -259,8 +259,10 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
     for (node_names) |name| {
         if (nodes.pid_recorded(name) != pid) continue;
         const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
-        // As Antithesis's "no unexpected container exits": 0, SIGKILL and SIGTERM are expected.
-        const expected = code == 0 or code == 128 + 9 or code == 128 + 15;
+        // As Antithesis's "no unexpected container exits": 0, SIGKILL and SIGTERM are expected;
+        // and any exit while the node's disk fails (giving up on I/O errors is legitimate).
+        const signaled = code == 128 + 9 or code == 128 + 15;
+        const expected = code == 0 or signaled or nodes.disk_failing(name);
         sdk.always(expected, node_exit_property, .{ .node = name, .status = code });
         return;
     }

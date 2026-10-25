@@ -25,8 +25,10 @@
 //! "direction": "both"}, {"kind": "degrade", "node": "a", "peer": "b", "flavor": "delay_loss"},
 //! {"kind": "clog", "node": "a", "direction": "inbound"}, {"kind": "throttle", "node": "a",
 //! "cpu_percent": 10}, {"kind": "clock_skip", "skip_ms": 500, "forward": true} (permanent),
-//! {"kind": "restore"}; restart, crash, wipe, stop, process_pause, thread_pause, process_kill,
-//! isolate and partition (with "peer") too.
+//! {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
+//! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); restart, crash,
+//! wipe, stop, process_pause, thread_pause, process_kill, isolate and partition (with "peer")
+//! too.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -53,6 +55,8 @@ const Kind = enum {
     wipe,
     /// A graceful stop (SIGTERM, then a kill after a grace period), then it starts again.
     stop,
+    /// Its disk fails for a while (nodes.DiskFailure).
+    disk,
     throttle,
     process_pause,
     /// One thread of one of its processes stopped (ptrace), the others running: interleavings
@@ -82,6 +86,8 @@ const endpoints_max = schema.nodes_max + 1;
 const group_none = 255;
 const throttle_percent_min = 5;
 const throttle_percent_max = 50;
+const disk_delay_ms_max = 200;
+const disk_sector_size = 512;
 const processes_max = 1024;
 const threads_max = 1024;
 /// What a degraded link does: one flavor per fault.
@@ -215,6 +221,7 @@ const Applied = struct {
     groups: [endpoints_max]u16 = @splat(group_none),
     /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
     injected: bool = false,
+    disk: ?nodes.DiskFault = null,
 };
 
 /// A fault's parameters, drawn from platform randomness.
@@ -260,6 +267,15 @@ fn draw(fault: *const Fault) Applied {
         .clog => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
             applied.direction = sdk.random_choice(Direction, std.enums.values(Direction));
+        },
+        .disk => {
+            const failures = std.enums.values(nodes.DiskFailure);
+            applied.disk = .{
+                .failure = sdk.random_choice(nodes.DiskFailure, failures),
+                .delay_ms = @intCast(1 + sdk.random_below(disk_delay_ms_max)),
+                .corrupt_byte = @intCast(1 + sdk.random_below(disk_sector_size)),
+                .corrupt_value = @intCast(sdk.random_below(256)),
+            };
         },
         else => {},
     }
@@ -338,6 +354,7 @@ fn faults_collect(
         if (allowed.crash) faults_add(faults, &count, .{ .kind = .crash, .node = node.name });
         if (allowed.wipe) faults_add(faults, &count, .{ .kind = .wipe, .node = node.name });
         if (allowed.stop) faults_add(faults, &count, .{ .kind = .stop, .node = node.name });
+        if (allowed.disk) faults_add(faults, &count, .{ .kind = .disk, .node = node.name });
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
@@ -416,6 +433,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .crash,
         .wipe,
         .stop,
+        .disk,
         .throttle,
         .process_pause,
         .thread_pause,
@@ -472,6 +490,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .crash => nodes.crash(applied.node),
         .wipe => nodes.wipe(applied.node),
         .stop => stop_begin(applied.node, &fault),
+        .disk => nodes.disk_fail(applied.node, applied.disk.?),
         .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
@@ -493,19 +512,30 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .pause => nodes.freeze(name, .thawed) catch {},
         .restart, .crash, .wipe, .stop => {
             if (fault.grace_end_ns != null) nodes.kill_remaining(name) catch {}; // Healed early.
-            const node = system.node(name) orelse return;
-            const arena = arena_active orelse return;
-            nodes.start(arena, system, node) catch |err| {
-                sdk.event("fault_restart_failed", .{ .node = name, .err = @errorName(err) });
+            node_start_again(system, name);
+        },
+        .disk => {
+            const again = nodes.disk_heal(name) catch |err| {
+                sdk.event("fault_heal_failed", .{ .node = name, .err = @errorName(err) });
                 return;
             };
-            network_node_new(system, name); // Its links are new.
+            if (again) node_start_again(system, name);
         },
         .throttle => nodes.cpu_limit(name, null) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
         else => {},
     }
+}
+
+fn node_start_again(system: *const schema.System, name: []const u8) void {
+    const node = system.node(name) orelse return;
+    const arena = arena_active orelse return;
+    nodes.start(arena, system, node) catch |err| {
+        sdk.event("fault_restart_failed", .{ .node = name, .err = @errorName(err) });
+        return;
+    };
+    network_node_new(system, name); // Its links are new.
 }
 
 fn node_expire(system: *const schema.System, now_ns: u64) void {
@@ -1024,6 +1054,9 @@ const Request = struct {
     skip_ms: u64 = 0,
     forward: bool = true,
     program: []const u8 = "",
+    /// disk.
+    failure: nodes.DiskFailure = .errors,
+    delay_ms: u32 = 50,
 };
 
 fn inject(json: []const u8) void {
@@ -1095,6 +1128,12 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
             applied.permanent = true;
         },
         .custom => applied.program = request.program,
+        .disk => applied.disk = .{
+            .failure = request.failure,
+            .delay_ms = request.delay_ms,
+            .corrupt_byte = @intCast(1 + sdk.random_below(disk_sector_size)),
+            .corrupt_value = @intCast(sdk.random_below(256)),
+        },
         else => {},
     }
     return applied;

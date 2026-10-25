@@ -102,6 +102,12 @@ pub const Faults = struct {
     /// Stop it gracefully (SIGTERM, then a kill after a grace period) and start it again
     /// (Antithesis's node stop, beside the kill that restart is).
     stop: bool = false,
+    /// Make its disk fail for a while: every I/O failing, writes failing, writes acknowledged
+    /// and never stored, reads corrupted, or slow I/O. The node's writable layer is then an
+    /// ext4 disk of its own (as with crash). An exit while the disk fails is expected; at the
+    /// fault's end a node that exited, or whose filesystem gave up (read-only), starts again
+    /// with its disk mounted afresh, as an operator would reboot it.
+    disk: bool = false,
     /// Degrade single links, in one direction, for a while: delay and loss, duplication,
     /// corruption, reordering or congestion.
     degrade: bool = true,

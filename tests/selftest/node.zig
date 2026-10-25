@@ -8,6 +8,8 @@
 //! a custom fault: it draws a number and reports it, with where the node finds det-stop-faults.
 //! With DET_DURABLE set, a first start writes /data/synced (synced: the file and its directory)
 //! and /data/unsynced (not synced): what crashes and wipes must keep and lose.
+//! `det-selftest-node write <path>` writes a file in /data and syncs it and its directory,
+//! exiting 1 if the disk refused (disk faults).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -29,6 +31,10 @@ pub fn main(init: std.process.Init) !void {
         linux.exit_group(if (found) 0 else 1);
     }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "write")) {
+        synced_write(arguments[2], "written\n") catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "custom-fault")) {
         const stop_faults = init.environ_map.get("ANTITHESIS_STOP_FAULTS") orelse "";
         const draw = sdk.random_below(1000);
@@ -64,15 +70,20 @@ pub fn main(init: std.process.Init) !void {
 fn durable_write() !void {
     if (linux.errno(linux.access("/data/synced", linux.F_OK)) == .SUCCESS) return;
     _ = linux.mkdir("/data", 0o755);
-    const synced = try file_create("/data/synced", "kept\n");
-    defer _ = linux.close(synced);
-    if (linux.errno(linux.fsync(synced)) != .SUCCESS) return error.Fsync;
+    try synced_write("/data/synced", "kept\n");
+    const unsynced = try file_create("/data/unsynced", "lost in a crash\n");
+    _ = linux.close(unsynced);
+}
+
+/// The file written and synced, then its directory (/data) synced: durable once it returns.
+fn synced_write(path: [*:0]const u8, content: []const u8) !void {
+    const file = try file_create(path, content);
+    defer _ = linux.close(file);
+    if (linux.errno(linux.fsync(file)) != .SUCCESS) return error.Fsync;
     const directory = linux.open("/data", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(directory) != .SUCCESS) return error.Open;
     defer _ = linux.close(@intCast(directory));
     if (linux.errno(linux.fsync(@intCast(directory))) != .SUCCESS) return error.Fsync;
-    const unsynced = try file_create("/data/unsynced", "lost in a crash\n");
-    _ = linux.close(unsynced);
 }
 
 fn file_create(path: [*:0]const u8, content: []const u8) !linux.fd_t {

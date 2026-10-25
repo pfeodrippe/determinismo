@@ -1121,7 +1121,11 @@ fn check_disk(context: *Context) !void {
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "3" }));
     const passes = std.mem.indexOf(u8, report, "3 branches, 0 with failing properties") != null and
         std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
-            "failing in    0  a crash keeps what was synced and loses the rest") != null;
+            "failing in    0  a crash keeps what was synced and loses the rest") != null and
+        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
+            "failing in    0  writes a disk drops are synced, then gone after a crash") != null and
+        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
+            "failing in    0  a disk works again after its faults") != null;
     var branches: [3]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -1132,9 +1136,10 @@ fn check_disk(context: *Context) !void {
             same_timelines(&replayed, branches[0..count]);
     }
     expect(context, passes and same, "disk: a crash keeps what was synced and loses the " ++
-        "rest, a wipe loses both; a timeline replays exactly", .{});
+        "rest, a wipe loses both; dropped writes vanish, refused ones fail, a slow disk is " ++
+        "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
-        "FAIL", "fault_failed", "det-nodes",
+        "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
     }) catch ""});
 }
 

@@ -36,7 +36,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 - **Faults as decisions**: pause, isolate, clog, partition (into groups too: stopped, slowed or
   jammed) and restart nodes; delay, loss, duplication,
   corruption, reordering and congestion per link direction; CPU throttling; process and thread
-  pauses; process kills (a crash for a supervisor or kubelet to recover from); clock skips, some
+  pauses; process kills (a crash for a supervisor or kubelet to recover from); power losses
+  (`crash`: a node's ext4 disk keeps what was synced) and wipes; disk faults (`disk`: every I/O
+  failing, writes failing, writes acknowledged and never stored, corrupted reads, or a slow
+  disk, through device-mapper); graceful stops; clock skips, some
   permanent; custom faults (your programs, run in a node at random times); a baseline of
   latency, jitter and rare drops on every link, always on; CPU modulation (`--cpu-modulation`:
   stretches of a slower machine, so preemption lands elsewhere); quiet periods requested from

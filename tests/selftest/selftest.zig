@@ -17,7 +17,8 @@
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
-//!              survives a crash, what it did not is lost, a wipe loses both
+//!              survives a crash, what it did not is lost, a wipe loses both; then disk faults
+//!              asked for: lost writes, failing writes, a slow disk, and the disk afterwards
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -97,26 +98,7 @@ fn describe(d: *System.Describe) !void {
         .ready = .{ .tcp = port },
         .faults = kills,
     });
-    // A disk of its own (crash faults allowed), for the "disk" scenario.
-    const durable = try d.profile("durable");
-    var crashes = quiet;
-    crashes.crash = true;
-    durable.node(.echo, .{
-        .binary = "zig-out/bin/det-selftest-node",
-        .env = &.{"DET_DURABLE=1"},
-        .ready = .{ .tcp = port },
-        .faults = crashes,
-    });
-    // Faults the scenario asks for: the injector runs (it may pause or stop the node).
-    const injectable = try d.profile("injectable");
-    var asked = quiet;
-    asked.pause = true;
-    asked.stop = true;
-    injectable.node(.echo, .{
-        .binary = "zig-out/bin/det-selftest-node",
-        .ready = .{ .tcp = port },
-        .faults = asked,
-    });
+    try describe_faulted(d);
     try describe_mazes(d);
     const controller = try d.profile("controller");
     controller.node(.controller, .{
@@ -132,6 +114,31 @@ fn describe(d: *System.Describe) !void {
     default.node(.csdk, .{
         .binary = "zig-out/bin/det-selftest-c",
         .faults = quiet,
+    });
+}
+
+/// The echo node with faults the scenarios ask for.
+fn describe_faulted(d: *System.Describe) !void {
+    // A disk of its own (crash faults allowed), for the "disk" scenario.
+    const durable = try d.profile("durable");
+    var crashes = quiet;
+    crashes.crash = true;
+    crashes.disk = true;
+    durable.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_DURABLE=1"},
+        .ready = .{ .tcp = port },
+        .faults = crashes,
+    });
+    // Faults the scenario asks for: the injector runs (it may pause or stop the node).
+    const injectable = try d.profile("injectable");
+    var asked = quiet;
+    asked.pause = true;
+    asked.stop = true;
+    injectable.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = asked,
     });
 }
 
@@ -194,18 +201,24 @@ fn segfault(context: *System.Context) !void {
 }
 
 fn disk(s: *System.Scenario) void {
-    s.singleton_driver("crash_and_wipe", crash_and_wipe);
+    s.singleton_driver("disk_faults", disk_faults);
+}
+
+fn disk_faults(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    try crash_and_wipe(&echo);
+    try disk_failures(&echo);
+    sdk.stop_faults(0);
 }
 
 /// The echo node wrote one file synced and one not (DET_DURABLE). After a crash the first is
 /// there and the second is not; after a wipe neither is. In a quiet period: only these.
-fn crash_and_wipe(context: *System.Context) !void {
-    const echo = context.nodes.echo.?;
-    sdk.stop_faults(600 * std.time.ns_per_s);
+fn crash_and_wipe(echo: *const sdk.Node) !void {
     try echo.crash();
     try sdk.retry(100, 100, answers, .{echo.address});
-    const synced = file_present(&echo, "/data/synced");
-    const unsynced = file_present(&echo, "/data/unsynced");
+    const synced = file_present(echo, "/data/synced");
+    const unsynced = file_present(echo, "/data/unsynced");
     sdk.event("disk_after_crash", .{ .synced = synced, .unsynced = unsynced });
     sdk.always(synced and !unsynced, "a crash keeps what was synced and loses the rest", .{
         .synced = synced,
@@ -214,8 +227,73 @@ fn crash_and_wipe(context: *System.Context) !void {
     try echo.wipe();
     try sdk.retry(100, 100, answers, .{echo.address});
     // The node wrote both again on its fresh start: the wipe lost what the crash kept.
-    sdk.always(file_present(&echo, "/data/unsynced"), "a wipe starts the node fresh", .{});
-    sdk.stop_faults(0);
+    sdk.always(file_present(echo, "/data/unsynced"), "a wipe starts the node fresh", .{});
+}
+
+/// Disk faults asked for. Writes a disk drops are acknowledged, synced even, and gone after a
+/// crash; writes a disk refuses fail the sync (and the node, its filesystem read-only, starts
+/// again at the fault's end); a slow disk slows a sync; afterwards the disk works.
+fn disk_failures(echo: *const sdk.Node) !void {
+    const lost_ms = 1000;
+    sdk.fault(.{
+        .kind = "disk",
+        .node = echo.name,
+        .failure = "lost_writes",
+        .duration_ms = lost_ms,
+    });
+    sdk.sleep_ms(100); // The injector applies it.
+    const acknowledged = synced_write(echo, "/data/lost");
+    sdk.sleep_ms(lost_ms); // The fault is over: the disk is healthy again.
+    try echo.crash();
+    try sdk.retry(100, 100, answers, .{echo.address});
+    const vanished = !file_present(echo, "/data/lost");
+    const message = "writes a disk drops are synced, then gone after a crash";
+    sdk.always(acknowledged and vanished, message, .{
+        .acknowledged = acknowledged,
+        .vanished = vanished,
+    });
+
+    sdk.fault(.{
+        .kind = "disk",
+        .node = echo.name,
+        .failure = "write_errors",
+        .duration_ms = 1000,
+    });
+    sdk.sleep_ms(100);
+    sdk.always(!synced_write(echo, "/data/refused"), "a disk refusing writes fails a sync", .{});
+    sdk.sleep_ms(1000);
+    try sdk.retry(100, 100, answers, .{echo.address});
+
+    const slow_ms = 300;
+    sdk.fault(.{
+        .kind = "disk",
+        .node = echo.name,
+        .failure = "slow",
+        .delay_ms = slow_ms,
+        .duration_ms = 5000,
+    });
+    sdk.sleep_ms(100);
+    const start_ns = monotonic_ns();
+    _ = synced_write(echo, "/data/slow");
+    const took_ns = monotonic_ns() - start_ns;
+    // A file and its directory synced: data, journal and commit, each waiting.
+    sdk.always(took_ns >= 2 * slow_ms * std.time.ns_per_ms, "a slow disk slows a sync", .{
+        .took_ns = took_ns,
+    });
+    sdk.sleep_ms(5000);
+    sdk.always(synced_write(echo, "/data/after"), "a disk works again after its faults", .{});
+}
+
+/// The node writes the file and syncs it and its directory: whether the disk took it.
+fn synced_write(node: *const sdk.Node, path: []const u8) bool {
+    const status = node.exec(&.{ "/bin/det-selftest-node", "write", path }) catch return false;
+    return status == 0;
+}
+
+fn monotonic_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
 
 fn inject(s: *System.Scenario) void {

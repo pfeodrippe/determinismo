@@ -6,35 +6,27 @@ build e2e` tests it.
 
 ## Now
 
-1. **e2e green on everything.** The last full run passed all but two checks: `clojure` (the
-   REPL patch's timing) and K3s with three nodes (a property failed in 4 branches: ours or
-   K3s's, to find out). Then a tree-exploration check: the same tree with one worker or many,
-   and a deep timeline replaying alone from its tape.
+1. **e2e green on everything** (the tree check included: the same tree with one worker or four,
+   a deep timeline replaying alone from its tape, with and without a strategy).
 2. **The tree explorer** (Go-Explore over snapshots: generations, returns just after new
-   behaviors, paths in tapes and records) is the default; `--branch N` replays first-generation
-   timelines (others by their tapes; MCP explore keeps tapes). Behaviors: assertion outcomes,
-   categorical events, guidance distances, and new kinds of output lines. Next steps for it:
+   behaviors, paths in tapes and records) is the default; strategies decide within timelines
+   and choose the moments to return to (`returns`), with reasons. Behaviors: assertion
+   outcomes, categorical events (coverage lines and edges included), guidance distances, and
+   new kinds of output lines. Next steps for it:
    - Snapshot during the run when a timeline first reaches something new, instead of replaying
      to the moment after the generation (no replay; the same tree).
-   - Behaviors from code coverage too (edges and lines, where the SDK instruments), and rarity
-     weighting (Go-Explore's cell selection), and a budget split between depth and fresh starts
-     learned from what found new behaviors.
-   - Strategies in the tree: today a node replays its parent with its seed alone, so a
-     strategy's overrides (in the parent's tape) would be lost and the tree refuses one. Replay
-     each ancestor with its tape's overrides (the tape directory becomes required), then let
-     strategies both decide within timelines and choose the moments to return to
-     (`{"method":"returns","candidates":[...]}` after each generation, answered with moments
-     and reasons), so mutate and the LLM steer the tree.
+   - Rarity weighting (Go-Explore's cell selection), and a budget split between depth and fresh
+     starts learned from what found new behaviors.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
    when it is guided (`fault after "leader elected": partition the leader`), the mutate
    strategy's (which parent, which mutation), and reasons in the logs and the notebook.
 4. **The UI.** Done: stat cards, discovery and failing-property charts, the multiverse tree with
-   shared prefixes, branch points and forks, styled tooltips, Clojure notebooks (babashka) with a
-   per-run nREPL server, fork from a moment, time budgets. Left: zoom and pan in the tree (and
-   a minimap for runs of thousands of timelines), a timeline's logs showing its parents'
-   events before it branched, live updates of the tree while a run goes.
+   shared prefixes, branch points and forks, zoom and pan, live updates, styled tooltips, logs
+   with the parents' events, Clojure notebooks (babashka) with a per-run nREPL server, fork
+   from a moment, time budgets, strategy uploads. Left: a minimap for runs of thousands of
+   timelines.
 5. **clojure-cli.repl**: examples/clojure-cli-repl, its server beside plain nREPL 1.7.0. Found
    (README): an editor evaluation hangs while a watching terminal does not read (over ~100 KB
    of output); closed sessions are kept; one inspector view for all terminals. Left: rerun the
@@ -42,7 +34,10 @@ build e2e` tests it.
    Findings stay documented here (nothing is filed with other projects).
 6. **Blind exploration of the real targets**: nREPL, the Clojure libraries, Raft (pinned commit,
    with restarts), with the tree explorer and the strategies; findings documented in each
-   example's README.
+   example's README. Antithesis's own Raft project (antithesishq/hashicorp-raft-poc) runs
+   unchanged through the Compose importer (its Go SDK writes to detfs, a regular file; its
+   client declares the setup, where the snapshot is taken): an hour's exploration, then its
+   findings against the blog post's.
 
 ## Antithesis parity found missing
 
@@ -56,8 +51,9 @@ in ANTITHESIS.md yet.
    det-init's built-ins (which have no place in user code).
 3. **First pass, first failure**: done in every SDK (opt-in; guidance only when it improves).
 4. **Disk faults**: Antithesis documents restarts that keep durably synced changes or lose all
-   of them: `crash` (an ext4 disk per node, shut down without flushing) and `wipe`, with an e2e
-   check. Left: I/O errors and latency on a node's disk (device-mapper or the VMM's virtio).
+   of them: `crash` (an ext4 disk per node, shut down without flushing) and `wipe`. Beyond
+   them, `disk`: I/O errors, write errors, lost writes, corrupted reads and latency through
+   device-mapper. All in the e2e `disk` check.
    Fault types audited against antithesis.com/docs/.../fault_types (all present: partitions
    both ways or one way, clogs, restore, throttle, pause, kill and graceful stop, crash and wipe,
    thread pause, clock skips, CPU modulation, custom; network faults overlap, node faults one at
@@ -74,9 +70,9 @@ in ANTITHESIS.md yet.
    code and writes subtle mutants (races, wrong ordering; not syntax that only panics), one
    patch each; determinismo explores each mutant and reports per property whether it was
    falsified, with why not when it was not: the mutated code never ran (coverage), or it ran and
-   no property noticed (a gap in the properties). `determinismo mutate` is written (patches to a
-   node's build, caught / never ran / unnoticed). Left: an e2e check, an MCP tool, and the
-   determinismo-mutants skill that writes the mutants.
+   no property noticed (a gap in the properties). `determinismo mutate` (patches to a node's
+   build, caught / never ran / unnoticed), its e2e check and the determinismo-mutants skill are
+   done. Left: an MCP tool.
 
 ## Strategy guidance (next)
 

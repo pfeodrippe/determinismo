@@ -256,6 +256,8 @@ pub fn wipe(name: []const u8) !void {
     try paths.init(name);
     try kill(name);
     if (exists(paths.mounted)) try layer_unmount(&paths);
+    var mapper_buffer: [mapper_name_size]u8 = undefined;
+    _ = mapper_call(dm_dev_remove, try mapper_name(&mapper_buffer, name), 0, null) catch {};
     var text_buffer: [16]u8 = undefined;
     if (read_small(paths.loop, &text_buffer)) |text| {
         const number = std.fmt.parseInt(u32, text, 10) catch return error.BadLoop;
@@ -283,13 +285,18 @@ const loop_clr_fd = 0x4c01;
 const durable_size = 4 << 30;
 const durable_template_path = "/opt/determinismo/durable.blocks"; // initramfs.zig's.
 
-/// The node's writable layer: a tmpfs of its own, or (crash faults) its ext4 disk.
+/// The node's writable layer: a tmpfs of its own, or (crash and disk faults) its ext4 disk,
+/// through device-mapper (disk faults swap its table).
 fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
-    if (!node.faults.crash) return mount("tmpfs", paths.layer, "tmpfs", 0, null);
+    if (!node.faults.crash and !node.faults.disk) {
+        return mount("tmpfs", paths.layer, "tmpfs", 0, null);
+    }
     if (!exists(paths.image)) try durable_image_create(paths.image);
     const loop = try loop_attach(paths);
+    const minor = try mapper_attach(node.name, loop);
     var device_buffer: [32]u8 = undefined;
-    const device = try print_z(&device_buffer, "/dev/loop{d}", .{loop});
+    const device = try print_z(&device_buffer, "/dev/dm-{d}", .{minor});
+    try device_wait(device);
     // noinit_itable: no background zeroing of inode tables (it would fill guest memory).
     try mount(device, paths.layer, "ext4", 0, "data=ordered,noinit_itable");
     // The template is small; grown in place to the disk's size (nothing to do the next time).
@@ -390,6 +397,228 @@ fn loop_attach(paths: *const Paths) !u32 {
     var number_buffer: [16]u8 = undefined;
     try file_write(paths.loop, try std.fmt.bufPrint(&number_buffer, "{d}", .{number}));
     return number;
+}
+
+// Disk faults ------------------------------------------------------------------------------
+// A durable node's disk is a device-mapper device over its loop device: linear while healthy,
+// another target while it fails (the table swapped without freezing the filesystem, so no
+// dirty data is flushed by it: a crash after still loses what was not synced).
+
+/// How a failing disk behaves.
+pub const DiskFailure = enum {
+    /// Every read and write fails (EIO).
+    errors,
+    /// Writes fail; reads work.
+    write_errors,
+    /// Writes are acknowledged and never stored (a lying disk or controller cache): a crash
+    /// after loses them although they were synced.
+    lost_writes,
+    /// Reads return one byte of each request changed (bit rot); what is stored is intact.
+    corrupt_reads,
+    /// Every request waits (a slow or overloaded disk).
+    slow,
+};
+
+/// One disk fault's parameters (platform decisions, or asked for by a scenario).
+pub const DiskFault = struct {
+    failure: DiskFailure,
+    /// slow: how long each request waits.
+    delay_ms: u32 = 0,
+    /// corrupt_reads: which byte of each read (from 1) becomes `corrupt_value`.
+    corrupt_byte: u32 = 1,
+    corrupt_value: u8 = 0,
+};
+
+/// The node's disk fails as `fault` says until disk_heal. Its exit meanwhile is expected.
+pub fn disk_fail(name: []const u8, fault: DiskFault) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    const loop = try loop_read(&paths);
+    var parameters_buffer: [128]u8 = undefined;
+    const target: MapperTarget = switch (fault.failure) {
+        // flakey: <device> <offset> <up seconds> <down seconds> [<feature count> <features>]:
+        // never up, down until the table is swapped back.
+        .errors => .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 0 1",
+            .{loop},
+        ) },
+        .write_errors => .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 0 1 1 error_writes",
+            .{loop},
+        ) },
+        .lost_writes => .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 0 1 1 drop_writes",
+            .{loop},
+        ) },
+        .corrupt_reads => .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 0 1 5 corrupt_bio_byte {d} r {d} 0",
+            .{ loop, @max(fault.corrupt_byte, 1), fault.corrupt_value },
+        ) },
+        .slow => .{ .kind = "delay", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 {d}",
+            .{ loop, fault.delay_ms },
+        ) },
+    };
+    var flag_buffer: [path_size_max]u8 = undefined;
+    try file_write(try disk_failing_path(&flag_buffer, &paths), "1");
+    var name_buffer: [mapper_name_size]u8 = undefined;
+    try mapper_table(try mapper_name(&name_buffer, name), target);
+    sdk.event("node_disk_fail", .{ .node = name, .failure = fault.failure });
+}
+
+/// The node's disk works again. True when the node must start again (the caller starts it):
+/// it exited, or its filesystem gave up (ext4 remounts read-only when its journal fails); it
+/// is then stopped, and its disk unmounted (mounted afresh at the start: the journal replays).
+pub fn disk_heal(name: []const u8) !bool {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    var flag_buffer: [path_size_max]u8 = undefined;
+    const flag = try disk_failing_path(&flag_buffer, &paths);
+    defer _ = linux.unlink(flag);
+    const loop = try loop_read(&paths);
+    var parameters_buffer: [64]u8 = undefined;
+    const parameters = try std.fmt.bufPrint(&parameters_buffer, "7:{d} 0", .{loop});
+    var name_buffer: [mapper_name_size]u8 = undefined;
+    const mapper = try mapper_name(&name_buffer, name);
+    try mapper_table(mapper, .{ .kind = "linear", .parameters = parameters });
+    sdk.event("node_disk_heal", .{ .node = name });
+    if (pid_read(name) != null and !mounted_read_only(paths.layer)) return false;
+    try kill(name);
+    if (exists(paths.mounted)) try layer_unmount(&paths);
+    return true;
+}
+
+/// Whether the node's disk is failing (a disk fault is under way): its exit is expected.
+pub fn disk_failing(name: []const u8) bool {
+    var paths: Paths = undefined;
+    paths.init(name) catch return false;
+    var flag_buffer: [path_size_max]u8 = undefined;
+    return exists(disk_failing_path(&flag_buffer, &paths) catch return false);
+}
+
+fn disk_failing_path(buffer: *[path_size_max]u8, paths: *const Paths) ![:0]const u8 {
+    return print_z(buffer, "{s}/disk-failing", .{paths.directory});
+}
+
+fn loop_read(paths: *const Paths) !u32 {
+    var text_buffer: [16]u8 = undefined;
+    const text = read_small(paths.loop, &text_buffer) orelse return error.NotADurableDisk;
+    return std.fmt.parseInt(u32, text, 10) catch error.BadLoop;
+}
+
+/// Whether the filesystem at `path` is mounted read-only (statfs's ST_RDONLY).
+fn mounted_read_only(path: [:0]const u8) bool {
+    var buffer: [15]u64 = undefined; // struct statfs on x86_64: f_flags is its 11th field.
+    const result = linux.syscall2(.statfs, @intFromPtr(path.ptr), @intFromPtr(&buffer));
+    if (linux.errno(result) != .SUCCESS) return false;
+    return buffer[10] & 1 != 0;
+}
+
+/// devtmpfs creates the device node as the device appears.
+fn device_wait(device: [:0]const u8) !void {
+    for (0..stop_attempts_max) |_| {
+        if (exists(device)) return;
+        sleep_ns(poll_interval_ns);
+    }
+    return error.NoDevice;
+}
+
+// device-mapper's ioctls (linux/dm-ioctl.h), on /dev/mapper/control.
+const DmIoctl = extern struct {
+    version: [3]u32 = .{ 4, 0, 0 },
+    data_size: u32 = 0,
+    data_start: u32 = 0,
+    target_count: u32 = 0,
+    open_count: i32 = 0,
+    flags: u32 = 0,
+    event_nr: u32 = 0,
+    padding: u32 = 0,
+    dev: u64 = 0,
+    name: [128]u8 = @splat(0),
+    uuid: [129]u8 = @splat(0),
+    data: [7]u8 = @splat(0),
+};
+const DmTargetSpec = extern struct {
+    sector_start: u64 = 0,
+    length: u64,
+    status: i32 = 0,
+    next: u32 = 0,
+    target_type: [16]u8 = @splat(0),
+};
+comptime {
+    assert(@sizeOf(DmIoctl) == 312);
+    assert(@sizeOf(DmTargetSpec) == 40);
+}
+const dm_dev_create = 3;
+const dm_dev_remove = 4;
+const dm_dev_suspend = 6; // Without DM_SUSPEND_FLAG: resume, swapping in a loaded table.
+const dm_dev_status = 7;
+const dm_table_load = 9;
+/// Swap tables without freezing the filesystem (which would flush its dirty data).
+const dm_skip_lockfs_flag = 1 << 10;
+const mapper_name_size = 128;
+const mapper_buffer_size = @sizeOf(DmIoctl) + @sizeOf(DmTargetSpec) + 256;
+
+const MapperTarget = struct { kind: []const u8, parameters: []const u8 };
+
+fn mapper_name(buffer: *[mapper_name_size]u8, node: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "det-{s}", .{node});
+}
+
+/// The node's device-mapper device over its loop device (linear), created once: its minor.
+fn mapper_attach(node: []const u8, loop: u32) !u32 {
+    var name_buffer: [mapper_name_size]u8 = undefined;
+    const name = try mapper_name(&name_buffer, node);
+    const dev = mapper_call(dm_dev_status, name, 0, null) catch blk: {
+        _ = try mapper_call(dm_dev_create, name, 0, null);
+        var parameters_buffer: [64]u8 = undefined;
+        const parameters = try std.fmt.bufPrint(&parameters_buffer, "7:{d} 0", .{loop});
+        try mapper_table(name, .{ .kind = "linear", .parameters = parameters });
+        break :blk try mapper_call(dm_dev_status, name, 0, null);
+    };
+    // The kernel's huge_encode_dev: minor bits 0-7, then 20 and up.
+    return @intCast((dev & 0xff) | ((dev >> 12) & 0xfff00));
+}
+
+/// Loads `target` over the whole disk and swaps it in.
+fn mapper_table(name: []const u8, target: MapperTarget) !void {
+    _ = try mapper_call(dm_table_load, name, 0, target);
+    _ = try mapper_call(dm_dev_suspend, name, dm_skip_lockfs_flag, null);
+}
+
+fn mapper_call(command: u8, name: []const u8, flags: u32, target: ?MapperTarget) !u64 {
+    const control = linux.open("/dev/mapper/control", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(control) != .SUCCESS) return error.NoMapperControl;
+    defer _ = linux.close(@intCast(control));
+    var buffer: [mapper_buffer_size]u8 align(8) = @splat(0);
+    const header: *DmIoctl = @ptrCast(&buffer);
+    header.* = .{ .data_size = buffer.len, .data_start = @sizeOf(DmIoctl), .flags = flags };
+    if (name.len >= header.name.len) return error.NameTooLong;
+    @memcpy(header.name[0..name.len], name);
+    if (target) |chosen| {
+        header.target_count = 1;
+        const spec: *DmTargetSpec = @ptrCast(@alignCast(buffer[@sizeOf(DmIoctl)..]));
+        spec.* = .{ .length = durable_size / 512 };
+        if (chosen.kind.len >= spec.target_type.len) return error.TargetTooLong;
+        @memcpy(spec.target_type[0..chosen.kind.len], chosen.kind);
+        const parameters = buffer[@sizeOf(DmIoctl) + @sizeOf(DmTargetSpec) ..];
+        if (chosen.parameters.len >= parameters.len) return error.ParametersTooLong;
+        @memcpy(parameters[0..chosen.parameters.len], chosen.parameters);
+    }
+    // _IOWR(0xfd, command, struct dm_ioctl)
+    const request: u32 = (3 << 30) | (@sizeOf(DmIoctl) << 16) | (0xfd << 8) | @as(u32, command);
+    const result = linux.ioctl(@intCast(control), request, @intFromPtr(&buffer));
+    return switch (linux.errno(result)) {
+        .SUCCESS => header.dev,
+        .NXIO => error.NoMapperDevice,
+        .BUSY => error.MapperBusy,
+        else => error.MapperFailed,
+    };
 }
 
 /// Caps the node's CPU to `percent` of one CPU, or with null lifts the cap.
