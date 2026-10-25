@@ -14,9 +14,11 @@ const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
 const prepare = @import("prepare.zig");
+const serve = @import("serve.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
+    \\       determinismo serve   [--listen <address:port>] [--data <dir>] <machine options>
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
@@ -87,7 +89,9 @@ const Arguments = struct {
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    var arguments = parse_arguments(arena, try init.minimal.args.toSlice(arena)) catch {
+    const argv = try init.minimal.args.toSlice(arena);
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
+    var arguments = parse_arguments(arena, argv) catch {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
@@ -137,6 +141,38 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (failing_scenarios > 0) std.process.exit(3);
+}
+
+/// `determinismo serve [--listen <address:port>] [--data <dir>] <machine options>`: the HTTP
+/// API (serve.zig). Machine options are passed to every run it starts.
+fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
+    const arena = init.arena.allocator();
+    var listen: []const u8 = "127.0.0.1:7878";
+    var data: []const u8 = ".determinismo-data";
+    var machine: std.ArrayList([]const u8) = .empty;
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const flag = argv[index];
+        const value = if (index + 1 < argv.len) argv[index + 1] else "";
+        if (std.mem.eql(u8, flag, "--listen")) {
+            listen = value;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--data")) {
+            data = value;
+            index += 1;
+        } else {
+            try machine.append(arena, flag);
+        }
+    }
+    var self_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const self_size = linux.readlink("/proc/self/exe", &self_buffer, self_buffer.len);
+    if (linux.errno(self_size) != .SUCCESS) return error.SelfPath;
+    try serve.serve(arena, init.io, .{
+        .listen = listen,
+        .data_directory = data,
+        .machine = machine.items,
+        .self = self_buffer[0..self_size],
+    });
 }
 
 /// Builds the disks of the program's system and records what was resolved.
@@ -821,4 +857,5 @@ test {
     _ = @import("tape.zig");
     _ = @import("virtio_block.zig");
     _ = @import("prepare.zig");
+    _ = @import("serve.zig");
 }
