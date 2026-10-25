@@ -37,7 +37,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   (`--from-exec`), e.g. a function redefined through a service's REPL.
 - **Coverage-guided exploration**: strategies see behavior (events) and, for programs built with
   coverage, code edges; `mutate` keeps timelines that reach something new and changes decisions
-  at their frontier (it solves a 1-in-10000 maze in about 100 branches).
+  at their frontier (it solves a 1-in-10000 maze in about 100 branches), and parallel workers
+  share one corpus.
 - **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
   mutation testing with mutant profiles.
 - **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.

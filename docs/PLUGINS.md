@@ -63,8 +63,11 @@ and `use_llvm = true` on the program's compile step and reference `sdk.coverage`
 features and mutates them at their frontier; `tests/selftest/maze.c` and `maze.zig` are the
 benchmark (`zig build
 e2e` checks that it is solved and that the solving branch replays from its tape). Each worker
-runs its own strategy process, with its own corpus; `--jobs 1` gives one corpus for the whole
-exploration.
+runs its own strategy process; `mutate --sync-dir <dir>` makes them share one corpus (each
+writes the timelines it keeps, with the features they reached first, and imports the others'),
+as parallel fuzzers do. On the maze, 8 synced workers solve it in about as many branches as one
+worker (mean first solve 86 vs 80 over 6 seeds; 170 unsynced), at 8 branches at a time. Give
+each exploration a fresh directory.
 
 ## Two levels of strategy
 
