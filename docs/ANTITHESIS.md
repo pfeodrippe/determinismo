@@ -65,7 +65,7 @@ change that moves it.
 | Default: commands finish with zero exit code | test commands exit successfully | ✅ |
 | Default: all commands started / completed at least once | "test command started: X", "test command completed: X", declared for every command | ✅ |
 | Default: no unexpected crashes (error signals) | "no process crashes" (segfault, illegal instruction, ... from the kernel's log); kernel warnings, BUGs, OOM kills | ✅ |
-| Default: peak memory, virtual vs wall time, logging limited | "peak memory usage stays under 95% of the machine's memory" (cgroup memory.peak); "logging output stays under 200 MB per hour of virtual time"; virtual time per wall time in every report; "the fault injector started"; exits 0, 137 and 143 are expected | ✅ |
+| Default: peak memory, virtual vs wall time, logging limited | "peak memory usage stays under 95% of the machine's memory" (cgroup memory.peak); "logging output stays under 200 MB per hour of virtual time" (over all timelines' output and virtual time, as Antithesis's ratio to the simulation's CPU time: no timeline fails it alone); virtual time per wall time in every report; "the fault injector started"; exits 0, 137 and 143 are expected | ✅ |
 | Language properties (Go/Rust panics, Java uncaught exceptions) | "no panics (Go)", "no fatal errors (Go)", "no data races (Go)", "no panics (Rust)", "no uncaught exceptions (Java)", from output events (shown when violated) | ✅ |
 
 ## Logs and queries

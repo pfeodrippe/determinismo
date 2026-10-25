@@ -189,6 +189,9 @@ test property_failing {
     try std.testing.expect(!property_failing(.sometimes, one_true));
 }
 
+const logging_property = "logging output stays under 200 MB per hour of virtual time";
+const logging_bytes_per_hour_max = 200 * 1000 * 1000;
+
 /// Properties across all branches of an exploration.
 pub const Multiverse = struct {
     branches: u32 = 0,
@@ -202,6 +205,10 @@ pub const Multiverse = struct {
     /// took, each on one core: Antithesis's "virtual time per wall time".
     vtime_ns: u64 = 0,
     wall_ns: u64 = 0,
+    /// Output the timelines printed, and the virtual time they printed it over: Antithesis's
+    /// "Logging output was limited" is a ratio over the whole simulation, not per timeline.
+    output_bytes: u64 = 0,
+    output_span_ns: u64 = 0,
 
     pub const Branch = struct {
         index: u32,
@@ -225,6 +232,9 @@ pub const Multiverse = struct {
         branches_failing: u32 = 0,
         first_failing_branch: ?u32 = null,
         first_failure: ?Events.Moment = null,
+        /// For a property judged across the whole run (no timeline violates it alone): whether
+        /// it fails.
+        run_failing: ?bool = null,
 
         /// An assertion no timeline of this scenario reached (known from a catalog): a test
         /// program or a service may serve several scenarios, so it is judged across the
@@ -238,6 +248,7 @@ pub const Multiverse = struct {
         }
 
         fn failing(aggregate: *const Aggregate) bool {
+            if (aggregate.run_failing) |verdict| return verdict;
             if (aggregate.unreached_here()) return false;
             return property_failing(aggregate.property.kind, .{
                 .branches_hit = aggregate.branches_hit,
@@ -267,6 +278,9 @@ pub const Multiverse = struct {
         multiverse.overshoots += state.overshoots;
         multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
         multiverse.wall_ns += branch.wall_ns;
+        multiverse.output_bytes += vm.events.output_bytes;
+        multiverse.output_span_ns += vm.events.output_span_ns(state.tsc / tsc_per_ns);
+        try multiverse.logging_judge();
         // One write per line: parallel workers share the terminal.
         var line_buffer: [4096]u8 = undefined;
         var line: std.Io.Writer = .fixed(&line_buffer);
@@ -343,6 +357,8 @@ pub const Multiverse = struct {
         multiverse.overshoots += other.overshoots;
         multiverse.vtime_ns += other.vtime_ns;
         multiverse.wall_ns += other.wall_ns;
+        multiverse.output_bytes += other.output_bytes;
+        multiverse.output_span_ns += other.output_span_ns;
         for (other.aggregates[0..other.aggregate_count]) |*incoming| {
             const aggregate = try multiverse.aggregate_find(&incoming.property);
             location_adopt(&aggregate.property, &incoming.property);
@@ -356,7 +372,27 @@ pub const Multiverse = struct {
                 aggregate.first_failure = incoming.first_failure;
             }
         }
+        try multiverse.logging_judge();
         assert(multiverse.failing_branches <= multiverse.branches);
+    }
+
+    /// Antithesis's "Logging output was limited": output over the virtual time of all timelines
+    /// (one vCPU each: core-hours) stays under 200 MB an hour.
+    fn logging_judge(multiverse: *Multiverse) !void {
+        var property = Events.Property{
+            .kind = .always,
+            .message = undefined,
+            .message_size = logging_property.len,
+        };
+        @memcpy(property.message[0..logging_property.len], logging_property);
+        const aggregate = try multiverse.aggregate_find(&property);
+        const limit: u128 = @as(u128, logging_bytes_per_hour_max) * multiverse.output_span_ns;
+        const over = @as(u128, multiverse.output_bytes) * std.time.ns_per_hour >= limit and
+            multiverse.output_span_ns >= std.time.ns_per_s; // Too short to judge a rate.
+        aggregate.branches_hit = multiverse.branches;
+        aggregate.branches_true = if (over) 0 else multiverse.branches;
+        aggregate.branches_failing = 0; // No timeline violates it alone.
+        aggregate.run_failing = over;
     }
 
     /// A property's location, from whichever branch or worker reported one.

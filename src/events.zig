@@ -444,25 +444,15 @@ pub fn finish(events: *Events, moment: Moment, outcome: enum { ended, cut_short 
         "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ finish_property ++
             "\",\"condition\":false,\"details\":{}}}";
     try events.emit(moment, assertion);
-    try events.emit(moment, if (events.logging_limited(moment))
-        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ logging_property ++
-            "\",\"condition\":true,\"details\":{}}}"
-    else
-        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ logging_property ++
-            "\",\"condition\":false,\"details\":{}}}");
 }
 
 const finish_property = "the guest finishes its scenario (no panic, hang or crash)";
-/// Antithesis's "Logging output was limited": 200 MB per core-hour (one vCPU: virtual hours).
-const logging_property = "logging output stays under 200 MB per hour of virtual time";
-const logging_bytes_per_hour_max = 200 * 1000 * 1000;
 
-fn logging_limited(events: *const Events, moment: Moment) bool {
-    const start_ns = events.first_vtime_ns orelse return true;
-    const span_ns = moment.vtime_ns -| start_ns;
-    if (span_ns < std.time.ns_per_s) return true; // Too short to judge a rate.
-    const limit: u128 = @as(u128, logging_bytes_per_hour_max) * span_ns;
-    return @as(u128, events.output_bytes) * std.time.ns_per_hour < limit;
+/// Virtual time from the first event to `end_ns`: what the timeline's output was printed over
+/// (the logging property, judged across the multiverse: report.zig).
+pub fn output_span_ns(events: *const Events, end_ns: u64) u64 {
+    const start_ns = events.first_vtime_ns orelse return 0;
+    return end_ns -| start_ns;
 }
 
 pub fn last_event_is(events: *const Events, name: []const u8) bool {
