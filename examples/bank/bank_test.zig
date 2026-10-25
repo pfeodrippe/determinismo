@@ -10,6 +10,7 @@
 //! The system: one Redis node from the official image. Profiles:
 //!   default    Redis may be paused, isolated, or cut off from the tests
 //!   restarts   also restarts, with an append-only file so the data survives them
+//!   built      Redis built from examples/bank/redis/Dockerfile
 //! Scenarios, both from the same function with a different account count:
 //!   bank       10 accounts
 //!   bank_hot   2 accounts: every transfer collides
@@ -54,6 +55,12 @@ fn describe(d: *System.Describe) !void {
         },
         .ready = .{ .tcp = redis_port },
         .faults = .{ .restart = true },
+    });
+    // The same Redis, built from a Dockerfile (paths are relative to where determinismo runs).
+    const built = try d.profile("built");
+    built.node(.redis, .{
+        .build = .{ .context = "examples/bank/redis" },
+        .ready = .{ .tcp = redis_port },
     });
 }
 
