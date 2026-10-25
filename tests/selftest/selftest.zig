@@ -7,19 +7,27 @@
 //!              "nodes do not exit unexpectedly" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report
 //!              what they observe as events: any nondeterminism changes the event hash
+//!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
+//!              as the system under test, with a fake explorer, under pauses, partitions and
+//!              restarts: every run it accepted must survive with a sensible state
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
 
-const Nodes = struct { echo: sdk.Node, csdk: sdk.Node };
-const System = sdk.System(Nodes);
+const Nodes = struct { echo: ?sdk.Node, csdk: ?sdk.Node, controller: ?sdk.Node };
+pub const System = sdk.System(Nodes);
 const port = 7000;
 
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
-        .scenarios = .{ .steady = steady, .node_exit = node_exit, .stress = stress },
+        .scenarios = .{
+            .steady = steady,
+            .node_exit = node_exit,
+            .stress = stress,
+            .controller = @import("controller.zig").scenario,
+        },
     });
 }
 
@@ -36,6 +44,16 @@ fn describe(d: *System.Describe) !void {
             .throttle = false,
             .process_pause = false,
         },
+    });
+    const controller = try d.profile("controller");
+    controller.node(.controller, .{
+        .directory = "zig-out/bin", // determinismo and det-fake-explore.
+        .command = &.{
+            "/determinismo", "serve",      "--listen",           "0.0.0.0:7878",
+            "--data",        "/var/runs", "--explorer", "/det-fake-explore",
+        },
+        .ready = .{ .tcp = 7878 },
+        .faults = .{ .restart = true },
     });
     // A node in C reporting through the C SDK; no faults (its properties are about the SDK).
     default.node(.csdk, .{
@@ -129,13 +147,13 @@ fn forks(_: *System.Context) !void {
 
 fn ping(context: *System.Context) !void {
     var reply: [16]u8 = undefined;
-    const answer = try request(context.nodes.echo.address, "ping\n", &reply);
+    const answer = try request(context.nodes.echo.?.address, "ping\n", &reply);
     sdk.always(std.mem.eql(u8, answer, "ping\n"), "the echo node echoes", .{});
 }
 
 fn tell_die(context: *System.Context) !void {
     var reply: [16]u8 = undefined;
-    _ = request(context.nodes.echo.address, "die\n", &reply) catch {}; // It exits instead.
+    _ = request(context.nodes.echo.?.address, "die\n", &reply) catch {}; // It exits instead.
     const pause = linux.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
     _ = linux.nanosleep(&pause, null); // Let the runtime see the exit.
 }

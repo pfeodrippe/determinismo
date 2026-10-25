@@ -170,6 +170,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
     var listen: []const u8 = "127.0.0.1:7878";
     var data: []const u8 = ".determinismo-data";
+    var explorer: ?[]const u8 = null;
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
@@ -180,6 +181,9 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             index += 1;
         } else if (std.mem.eql(u8, flag, "--data")) {
             data = value;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--explorer")) {
+            explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
         } else {
             try machine.append(arena, flag);
@@ -192,7 +196,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .listen = listen,
         .data_directory = data,
         .machine = machine.items,
-        .self = self_buffer[0..self_size],
+        .self = explorer orelse self_buffer[0..self_size],
     });
 }
 

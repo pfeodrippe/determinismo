@@ -68,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
     try check_compose(&context);
     try check_shards(&context);
     try check_stress(&context);
+    try check_controller(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -178,6 +179,17 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// Self-test level 1 (§14): the HTTP API under faults keeps every run and its result.
+fn check_controller(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const report = try explore(context, &.{
+        "--program", program, "--profile", "controller", "--scenario", "controller",
+        "--seed",    "2",     "--branches", "16",
+    });
+    const passes = std.mem.indexOf(u8, report, "16 branches, 0 with failing properties") != null;
+    expect(context, passes, "controller: runs survive pauses, partitions and restarts", .{});
 }
 
 /// Adversarial guest (§14 level 2): clocks, sleeps, page faults and forks at once replay.

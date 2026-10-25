@@ -283,15 +283,27 @@ fn run_find(server: *Server, id: u32) ?*Run {
     return null;
 }
 
-/// Runs of an earlier server: finished as far as this one knows.
+/// Runs of an earlier server (before a restart). A run whose record has its summary finished:
+/// it passed or failed by that summary; one without was interrupted (an error).
 fn runs_load(server: *Server) !void {
     var id: u32 = 1;
     while (id < runs_max) : (id += 1) {
         const directory = try run_directory(server, id);
         std.Io.Dir.cwd().access(server.io, directory, .{}) catch break;
-        server.runs[server.run_count] = .{ .id = id, .pid = 0, .status = 255 };
+        const record = run_file(server, id, "record.jsonl") catch "";
+        server.runs[server.run_count] = .{ .id = id, .pid = 0, .status = recorded_status(record) };
         server.run_count += 1;
     }
+}
+
+fn recorded_status(record: []const u8) u32 {
+    const key = "{\"summary\":";
+    const start = std.mem.lastIndexOf(u8, record, key) orelse return 255;
+    const failing_key = "\"failing_branches\":";
+    const failing = std.mem.indexOfPos(u8, record, start, failing_key) orelse return 255;
+    const digit = failing + failing_key.len;
+    if (digit >= record.len) return 255;
+    return if (record[digit] == '0') 0 else 3; // As explore exits.
 }
 
 fn runs_reap(server: *Server) void {
@@ -409,6 +421,14 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
         if (linux.errno(result) != .SUCCESS) return;
         done += result;
     }
+}
+
+test recorded_status {
+    try std.testing.expectEqual(@as(u32, 255), recorded_status("{\"run\":{}}\n"));
+    const passed = "{\"summary\":{\"branches\":2,\"failing_branches\":0}}\n";
+    try std.testing.expectEqual(@as(u32, 0), recorded_status(passed));
+    const failed = "{\"summary\":{\"branches\":2,\"failing_branches\":1}}\n";
+    try std.testing.expectEqual(@as(u32, 3), recorded_status(failed));
 }
 
 test content_length {

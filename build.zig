@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "shop-test", .path = "examples/shop/shop_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
         .{ .name = "det-selftest-node", .path = "tests/selftest/node.zig" },
+        .{ .name = "det-fake-explore", .path = "tests/selftest/fake_explore.zig" },
     };
     for (guest_programs) |program| {
         const guest_exe = b.addExecutable(.{
