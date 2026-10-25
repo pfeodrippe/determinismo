@@ -6,6 +6,7 @@ timelines from a snapshot, inject faults, and replay any timeline exactly.
 
 Design: [ARCHITECTURE.md](ARCHITECTURE.md). Style: [docs/STYLE.md](docs/STYLE.md).
 Strategy plugins: [docs/PLUGINS.md](docs/PLUGINS.md). Agents: [docs/AGENTS.md](docs/AGENTS.md).
+Where we stand against Antithesis, feature by feature: [docs/ANTITHESIS.md](docs/ANTITHESIS.md).
 
 ## What works today
 
