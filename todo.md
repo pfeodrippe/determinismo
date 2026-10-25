@@ -1,1 +1,2 @@
-- [ ] Test TLC ( https://github.com/tlaplus/tlaplus )
+- [ ] test TLC ( https://github.com/tlaplus/tlaplus )
+- [ ] test determinismo itself (nested kvm)
