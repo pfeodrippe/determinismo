@@ -507,6 +507,17 @@ fn check_profile(context: *Context) !void {
     const same = std.mem.eql(u8, folded[0], folded[1]);
     expect(context, samples > 0 and named and same, "profile: {d} samples of a node at a " ++
         "moment, functions named, the same twice", .{samples});
+    // Every thread's stack at the same moment.
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "stacks" });
+    try argv.appendSlice(arena, context.machine);
+    try argv.appendSlice(arena, &system);
+    try argv.appendSlice(arena, &.{ "--branch", "0", "--at-vtime-ms", "1050", "--node", "echo" });
+    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const stacks = std.mem.indexOf(u8, result.stderr, " thread ") != null and
+        std.mem.indexOf(u8, result.stderr, "#0  ") != null and
+        std.mem.indexOf(u8, result.stderr, "_start") != null;
+    expect(context, stacks, "stacks: every thread of a node at a moment, named", .{});
 }
 
 /// Rewind: 5 ms of virtual time before the first violation, where it has not happened yet.

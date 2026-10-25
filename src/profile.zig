@@ -12,6 +12,12 @@
 //! functions with the most samples; --svg writes a flame graph and --folded the folded stacks
 //! (for any flame graph tool). The same moment and options give the same profile, sample for
 //! sample.
+//!
+//!   determinismo stacks <machine and system options> --seed <s> --branch <n> (moment options)
+//!       --node <node> [--pid <pid>]
+//!
+//! Every thread's stack at the moment, named (`thread apply all bt`, jstack): where each thread
+//! of the node is, running or waiting.
 const std = @import("std");
 const assert = std.debug.assert;
 const extract = @import("extract.zig");
@@ -77,6 +83,44 @@ pub fn run(
         try cwd.writeFile(io, .{ .sub_path = path, .data = graph });
         std.debug.print("[determinismo] flame graph: {s}\n", .{path});
     }
+    return 0;
+}
+
+pub fn stacks_run(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    self: []const u8,
+    arguments: []const [:0]const u8,
+) !u8 {
+    var node: ?[]const u8 = null;
+    var pid: ?[]const u8 = null;
+    var rest: std.ArrayList([]const u8) = .empty;
+    var index: usize = 0;
+    while (index < arguments.len) : (index += 1) {
+        const flag = arguments[index];
+        const ours = std.mem.eql(u8, flag, "--node") or std.mem.eql(u8, flag, "--pid");
+        if (!ours) {
+            try rest.append(arena, flag);
+            continue;
+        }
+        index += 1;
+        if (index == arguments.len) return error.Usage;
+        if (std.mem.eql(u8, flag, "--node")) node = arguments[index] else pid = arguments[index];
+    }
+    const target = node orelse return error.Usage;
+    if (!node_valid(target)) return error.Usage;
+    var command: std.ArrayList(u8) = .empty;
+    try command.print(arena, "{s} {s} --stacks", .{ profiler_path, target });
+    if (pid) |value| {
+        _ = std.fmt.parseInt(u32, value, 10) catch return error.Usage;
+        try command.print(arena, " --pid {s}", .{value});
+    }
+    const stacks = try extract.exec_run(arena, io, self, rest.items, command.items);
+    if (stacks.len == 0) {
+        std.debug.print("[determinismo] stacks: no threads (is {s} running?)\n", .{target});
+        return 1;
+    }
+    std.debug.print("{s}", .{stacks});
     return 0;
 }
 

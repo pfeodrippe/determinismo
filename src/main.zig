@@ -55,6 +55,8 @@ const usage =
     \\       determinismo profile <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --node <node> [--ms <duration>] [--interval-us <us>] [--all]
     \\                            [--pid <pid>] [--svg <flame graph.svg>] [--folded <file>]
+    \\       determinismo stacks  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
+    \\                            --node <node> [--pid <pid>]   (every thread's stack there)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -211,6 +213,8 @@ fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8
         extract.inject_run(arena, io, argv[0], rest)
     else if (eql(u8, name, "profile"))
         profiler.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "stacks"))
+        profiler.stacks_run(arena, io, argv[0], rest)
     else if (eql(u8, name, "query"))
         query.run(arena, io, rest)
     else if (eql(u8, name, "events"))

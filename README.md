@@ -53,7 +53,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   (`--from-exec`), e.g. a function redefined through a service's REPL; take a node's file out at
   any moment (`determinismo extract`) or put one in (`determinismo inject`); profile a node from
   a moment on (`determinismo profile`: the functions with the most samples and a flame graph,
-  the same on every replay); list the nodes there (`det-nodes list`); a crash's core dump is
+  the same on every replay); every thread's stack there (`determinismo stacks`); list the nodes
+  there (`det-nodes list`); a crash's core dump is
   kept (`core_dump` event) for `extract --file runner:/run/det/cores/...` and gdb.
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
   event and decision) and code coverage (C and Zig edges, Python and JVM lines); `mutate` keeps

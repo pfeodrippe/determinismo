@@ -83,7 +83,7 @@ change that moves it.
 | Profiler (`profiler.start/stop/report`, flame graph) | `determinismo profile`: det-profile samples a node's threads every interval of virtual time (ptrace, frame pointers, ELF symbols): top functions, folded stacks, an SVG flame graph; the same twice | ✅ |
 | `containers.list`, `fault_injector.pause/unpause` | `det-nodes list` at a moment (name, state, pid, address, image); `det-stop-faults <seconds>` and `det-stop-faults 0` | ✅ |
 | Core dumps | det-core (the kernel's core_pattern) keeps every crashed process's core in `/run/det/cores`, with a `core_dump` event; `extract --file runner:<path>` takes it out | ✅ |
-| Debuggers (gdb, delve, jdb) | through `--exec` with the tools in the image, at any moment | 🟡 no helpers |
+| Debuggers (gdb, delve, jdb) | `determinismo stacks`: every thread's named stack at a moment (`thread apply all bt`, jstack); gdb and the like through `--exec` with the tools in the image, on the process or a core dump | ✅ |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
 | Notebook | web UI (logs, search, run a command at a moment), MCP tools, HTTP API, CLI | 🟡 no scripting notebook |
 | Snouty CLI for agents (runs, properties, search, exec, debug) | CLI, MCP (`describe`, `explore`, `replay`, `fork`, `query`) | ✅ |

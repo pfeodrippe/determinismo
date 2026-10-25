@@ -7,7 +7,8 @@
 //! ELF symbol tables of the mapped files. It prints folded stacks ("process;outer;...;inner
 //! count", most samples first), which `determinismo profile` turns into a flame graph.
 //! Code built without frame pointers shows its leaf function only. With --all, threads that
-//! wait are sampled too (a wall-clock profile).
+//! wait are sampled too (a wall-clock profile). With --stacks it prints every thread's stack
+//! once instead (`thread apply all bt`, jstack): what each thread is doing at the moment.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -29,6 +30,7 @@ const Options = struct {
     interval_ns: u64 = 5 * std.time.ns_per_ms,
     pid: ?linux.pid_t = null,
     all: bool = false,
+    stacks: bool = false,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -36,10 +38,14 @@ pub fn main(init: std.process.Init) !u8 {
     const arguments = try init.minimal.args.toSlice(arena);
     const options = options_parse(arguments) catch {
         std.debug.print("usage: det-profile <node> [--ms <duration>] [--interval-us <us>] " ++
-            "[--pid <pid>] [--all]\n", .{});
+            "[--pid <pid>] [--all] [--stacks]\n", .{});
         return 2;
     };
     var profile = Profile{ .arena = arena };
+    if (options.stacks) {
+        try profile.stacks_print(&options);
+        return 0;
+    }
     const start_ns = monotonic_ns();
     while (monotonic_ns() - start_ns < options.duration_ns) {
         try profile.tick(&options);
@@ -57,6 +63,10 @@ fn options_parse(arguments: []const [:0]const u8) !Options {
         const flag = arguments[index];
         if (std.mem.eql(u8, flag, "--all")) {
             options.all = true;
+            continue;
+        }
+        if (std.mem.eql(u8, flag, "--stacks")) {
+            options.stacks = true;
             continue;
         }
         index += 1;
@@ -99,6 +109,40 @@ const Profile = struct {
                 try profile.add(pid, frames[0..depth]);
             }
         }
+    }
+
+    /// Every thread's stack, innermost frame first, under its process, thread and state.
+    fn stacks_print(profile: *Profile, options: *const Options) !void {
+        var out: std.Io.Writer.Allocating = .init(profile.arena);
+        var pids: [processes_max]linux.pid_t = undefined;
+        const count = if (options.pid) |pid| one: {
+            pids[0] = pid;
+            break :one 1;
+        } else nodes.processes(options.node, &pids) catch return error.NoSuchNode;
+        for (pids[0..count]) |pid| {
+            var maps: Maps = .{};
+            maps.load(pid);
+            var tids: [threads_max]linux.pid_t = undefined;
+            const threads = nodes.threads(pid, &tids);
+            for (tids[0..threads]) |tid| {
+                const state: u8 = if (runnable(tid)) 'R' else 'S';
+                try out.writer.print("{s} pid {d} thread {d} ({c})\n", .{
+                    process_name(tid), pid, tid, state,
+                });
+                var frames: [frames_max]u64 = undefined;
+                const depth = stack_sample(pid, tid, &frames);
+                var valid: usize = @min(depth, 1);
+                while (valid < depth and maps.find(frames[valid]) != null) valid += 1;
+                for (frames[0..valid], 0..) |frame, index| {
+                    const address = if (index == 0) frame else frame - 1;
+                    try out.writer.print("  #{d:<2} ", .{index});
+                    try profile.name_write(&out.writer, pid, &maps, address);
+                    try out.writer.writeByte('\n');
+                }
+                try out.writer.writeByte('\n');
+            }
+        }
+        try write_stdout(out.written());
     }
 
     /// Names the frames (outermost first) and counts the stack.
@@ -178,15 +222,18 @@ const Profile = struct {
         try out.writer.print("# det-profile: {d} samples\n", .{profile.samples});
         const shown = entries.items[0..@min(entries.items.len, folded_shown_max)];
         for (shown) |entry| try out.writer.print("{s} {d}\n", .{ entry.stack, entry.count });
-        var written: usize = 0;
-        const text = out.written();
-        while (written < text.len) {
-            const result = linux.write(1, text[written..].ptr, text.len - written);
-            if (linux.errno(result) != .SUCCESS) return error.Write;
-            written += result;
-        }
+        try write_stdout(out.written());
     }
 };
+
+fn write_stdout(text: []const u8) !void {
+    var written: usize = 0;
+    while (written < text.len) {
+        const result = linux.write(1, text[written..].ptr, text.len - written);
+        if (linux.errno(result) != .SUCCESS) return error.Write;
+        written += result;
+    }
+}
 
 /// Whether the thread is running or ready to (state R in /proc/<tid>/stat).
 fn runnable(tid: linux.pid_t) bool {
