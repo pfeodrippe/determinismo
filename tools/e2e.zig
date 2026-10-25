@@ -87,12 +87,12 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "network", check_network_faults },        .{ "serve", check_serve },
         .{ "until", check_until_and_causality },     .{ "coverage", check_coverage },
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
-        .{ "compose", check_compose },               .{ "shards", check_shards },
-        .{ "stress", check_stress },                 .{ "controller", check_controller },
-        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
-        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },               .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },
+        .{ "tree", check_tree },                     .{ "compose", check_compose },
+        .{ "shards", check_shards },                 .{ "stress", check_stress },
+        .{ "controller", check_controller },         .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                       .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
+        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -946,6 +946,62 @@ fn check_guidance(context: *Context) !void {
         "guided by its distance, the strategy solves it", .{});
 }
 
+/// The tree explorer: timelines return to moments of earlier ones (a path at least one deep);
+/// the tree is the same with one worker or four; and a timeline of the greatest depth replays
+/// alone, exactly, from its tape (which holds its path).
+fn check_tree(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fmt.allocPrint(arena, "{s}/tree-tapes", .{context.scratch});
+    const record = try std.fmt.allocPrint(arena, "{s}/tree.jsonl", .{context.scratch});
+    const common = [_][]const u8{
+        "--program",   program, "--scenario", "bank", "--seed", "5", "--branches", "40",
+        "--branching", "tree",
+    };
+    const one = try explore(context, &(common ++ [_][]const u8{
+        "--jobs", "1", "--tape-dir", tapes, "--record", record,
+    }));
+    const many = try explore(context, &(common ++ [_][]const u8{ "--jobs", "4" }));
+    var sequential: [branches_max]Branch = undefined;
+    var parallel: [branches_max]Branch = undefined;
+    const count = parse_branches(one, &sequential);
+    const same = count == 40 and parse_branches(many, &parallel) == count and
+        same_timelines(sequential[0..count], parallel[0..count]);
+    // The deepest timeline, from the record.
+    const cwd = std.Io.Dir.cwd();
+    const lines = cwd.readFileAlloc(context.io, record, arena, .limited(1 << 24)) catch "";
+    var deepest: ?u32 = null;
+    var depth_max: usize = 0;
+    var records = std.mem.tokenizeScalar(u8, lines, '\n');
+    while (records.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
+        const Line = struct { branch: struct { index: u32, path: []const struct { branch: u32 } } };
+        const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (parsed.branch.path.len <= depth_max) continue;
+        depth_max = parsed.branch.path.len;
+        deepest = parsed.branch.index;
+    }
+    var replays = false;
+    if (deepest) |index| {
+        const tape = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index });
+        const replay = try explore(context, &.{
+            "--program", program, "--scenario", "bank", "--tape", tape,
+        });
+        var replayed: [1]Branch = undefined;
+        const original = for (sequential[0..count]) |branch| {
+            if (branch.index == index) break branch;
+        } else null;
+        replays = original != null and parse_branches(replay, &replayed) == 1 and
+            std.mem.eql(u8, replayed[0].events_hash, original.?.events_hash);
+    }
+    expect(context, same and depth_max >= 1 and replays, "tree: {d} timelines, up to {d} deep, " ++
+        "the same with one worker or four; #{?d} replays alone from its tape", .{
+        count, depth_max, deepest,
+    });
+}
+
 /// Branches give the same timelines whether one worker runs them or one per CPU does.
 fn check_parallel(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
@@ -1043,8 +1099,16 @@ fn failing_count(report: []const u8) u32 {
 fn check_clojure(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "clojure-bank-test" });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "5" };
+    // Fork just after the setup snapshot (where it is depends on the guest's work so far): the
+    // patch lands before the futures run.
+    const probe = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+    const snapshot_ms = snapshot_vtime_ms(probe) orelse {
+        expect(context, false, "clojure: the setup snapshot's moment is reported", .{});
+        return;
+    };
+    const moment = try std.fmt.allocPrint(context.arena, "{d}", .{snapshot_ms + 200});
     const fork = common ++ [_][]const u8{
-        "--from-branch", "0", "--from-vtime-ms", "3700", "--branches", "4",
+        "--from-branch", "0", "--from-vtime-ms", moment, "--branches", "4",
     };
     const plain = try explore(context, &fork);
     const patched = try explore(context, &(fork ++ [_][]const u8{
@@ -1059,6 +1123,16 @@ fn check_clojure(context: *Context) !void {
     }));
     const refused = std.mem.indexOf(u8, early, "is not after the snapshot") != null;
     expect(context, refused, "moments before the snapshot are refused", .{});
+}
+
+/// The setup snapshot's virtual time from explore's report ("snapshot at setup_complete:
+/// vtime=3.512s").
+fn snapshot_vtime_ms(report: []const u8) ?u64 {
+    const key = "snapshot at setup_complete: vtime=";
+    const start = (std.mem.indexOf(u8, report, key) orelse return null) + key.len;
+    const end = std.mem.indexOfScalarPos(u8, report, start, 's') orelse return null;
+    const seconds = std.fmt.parseFloat(f64, report[start..end]) catch return null;
+    return @intFromFloat(seconds * std.time.ms_per_s);
 }
 
 /// Self-test level 1 (§14): the HTTP API under faults keeps every run and its result.

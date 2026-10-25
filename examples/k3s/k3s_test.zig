@@ -90,8 +90,12 @@ fn get(context: *System.Context) !void {
         "); do wget -qO- -T 2 \"http://$address\" 2>/dev/null | grep -q ok && " ++
         "answered=$((answered + 1)); done; echo $answered";
     var buffer: [64]u8 = undefined;
-    const result = try context.nodes.server.exec_output(&.{ "sh", "-c", script }, &buffer);
-    const answered = std.fmt.parseInt(u32, std.mem.trim(u8, result.output, " \n"), 10) catch 0;
+    // The node itself may be paused or restarting (faults): then nothing was answered.
+    const server = &context.nodes.server;
+    const answered = if (server.exec_output(&.{ "sh", "-c", script }, &buffer)) |result|
+        std.fmt.parseInt(u32, std.mem.trim(u8, result.output, " \n"), 10) catch 0
+    else |_|
+        0;
     sdk.sometimes(answered == requests_per_driver, "every request of a client is answered", .{});
     sdk.sometimes(answered < requests_per_driver, "faults keep some requests unanswered", .{});
 }

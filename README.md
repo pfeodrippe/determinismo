@@ -113,7 +113,9 @@ the Clojure SDK, debugged by redefining a function through its REPL at a moment)
 [examples/k3s](examples/k3s) (Kubernetes: one node, or a three-node cluster),
 [examples/raft](examples/raft) (HashiCorp Raft, three nodes replicating a chain of blocks),
 [examples/nrepl](examples/nrepl) (nREPL, the protocol Clojure editors speak, under concurrent
-sessions and interrupts) and [examples/clojure-libs](examples/clojure-libs) (Clojure's most used
+sessions and interrupts), [examples/clojure-cli-repl](examples/clojure-cli-repl) (the Clojure
+CLI's REPL: editors, watching terminals and the inspector over its nREPL middleware, with plain
+nREPL as the reference) and [examples/clojure-libs](examples/clojure-libs) (Clojure's most used
 libraries: core.async, manifold, round trips through cheshire, jsonista, data.json, nippy,
 clj-yaml, and malli; one scenario per library).
 

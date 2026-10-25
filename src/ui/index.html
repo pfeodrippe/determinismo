@@ -929,7 +929,22 @@ async function logsLoad() {
   const logs = state.logs;
   const condition = logs.filter || "seq>=0";
   try {
-    logs.events = await query({ condition, branch: logs.branch, up_to_vtime: logs.vtime_ns / 1e9 + 2, limit: 5000 });
+    // A tree explorer's timeline begins inside its ancestors: their events up to where each
+    // branched (the shared prefix), then its own.
+    const record = state.run.branches.find((b) => b.index === logs.branch);
+    const path = (record && record.path) || [];
+    // Every query has the shared setup (boot to the snapshot) first: each stretch keeps its
+    // events from where it began, the setup once.
+    const inherited = [];
+    let from = 0;
+    for (const step of path) {
+      const part = await query({ condition, branch: step.branch, up_to_vtime: step.vtime_ns / 1e9, limit: 5000 });
+      for (const event of part) if (event.vtime_ns >= from) inherited.push({ ...event, inherited: step.branch });
+      inherited.push({ divider: true, branch: step.branch, vtime_ns: step.vtime_ns });
+      from = step.vtime_ns;
+    }
+    const own = await query({ condition, branch: logs.branch, up_to_vtime: logs.vtime_ns / 1e9 + 2, limit: 5000 });
+    logs.events = inherited.concat(own.filter((event) => event.vtime_ns >= from));
   } catch (error) { logs.error = error.message; }
   const body = $("#logs .body");
   if (body) { body.innerHTML = logsBody(); logsWire(); }
@@ -941,14 +956,18 @@ function logsBody() {
   if (!logs) return `<div class="empty">Pick a property example, a search result or a timeline on the map.</div>`;
   const events = logs.events || [];
   let hereIndex = -1;
-  events.forEach((event, i) => { if (event.vtime_ns <= logs.vtime_ns) hereIndex = i; });
+  events.forEach((event, i) => { if (!event.divider && event.vtime_ns <= logs.vtime_ns) hereIndex = i; });
   return `<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
       <input id="logs-filter" style="flex:1" placeholder="Filter this timeline (a condition), e.g. output.source=postgres" value="${escape(logs.filter)}">
       <button id="logs-apply">Filter</button></div>
     <div class="logs">${logs.events === null ? `<div class="empty">Loading…</div>` : `<table>${events.map((event, i) => {
+      if (event.divider) {
+        return `<tr><td colspan="3" style="color:var(--accent);font-family:system-ui;padding:6px 8px">↳ branched from #${event.branch} at ${seconds(event.vtime_ns)}: what follows is this timeline's own</td></tr>`;
+      }
       const { kind, text, css } = describe(event.event);
-      return `<tr class="${i === hereIndex ? "here" : ""}"><td class="muted">${seconds(event.vtime_ns)}</td>
-        <td><span class="kind ${css}">${escape(kind)}</span></td><td>${escape(text)}</td></tr>`;
+      const from = event.inherited !== undefined ? `<span class="kind" title="Shared with #${event.inherited}: before this timeline branched">#${event.inherited}</span> ` : "";
+      return `<tr class="${i === hereIndex ? "here" : ""}" style="${event.inherited !== undefined ? "opacity:.75" : ""}"><td class="muted">${seconds(event.vtime_ns)}</td>
+        <td>${from}<span class="kind ${css}">${escape(kind)}</span></td><td>${escape(text)}</td></tr>`;
     }).join("")}</table>`}</div>
     ${logs.error ? `<div class="fail-text">${escape(logs.error)}</div>` : ""}
     <div style="margin-top:12px"><div class="group-title">At this moment (branch ${logs.branch}, ${seconds(logs.vtime_ns)})</div>

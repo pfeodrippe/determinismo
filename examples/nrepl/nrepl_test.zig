@@ -13,7 +13,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const sdk = @import("determinismo");
-const bencode = @import("bencode.zig");
+const nrepl = @import("nrepl");
+const Client = nrepl.Client;
 
 const Nodes = struct { nrepl: sdk.Node };
 const System = sdk.System(Nodes);
@@ -40,82 +41,9 @@ fn sessions(s: *System.Scenario) void {
     s.eventually("recovers", recovers);
 }
 
-/// One client: a connection, the session it cloned, and an arena for replies.
-const Client = struct {
-    connection: sdk.tcp.Connection = undefined,
-    session: []const u8 = "",
-    arena_state: std.heap.ArenaAllocator,
-    next_id: u32 = 0,
-
-    fn open(client: *Client, address: [4]u8) !void {
-        try client.connection.open(address, port, .{ .timeout_ms = 5000 });
-        errdefer client.connection.close();
-        const reply = try client.call(&.{.{ "op", "clone" }});
-        client.session = reply.string("new-session") orelse return error.NoSession;
-    }
-
-    fn close(client: *Client) void {
-        client.connection.close();
-        client.arena_state.deinit();
-    }
-
-    fn send(client: *Client, fields: []const [2][]const u8) ![]const u8 {
-        client.next_id += 1;
-        const id = try std.fmt.allocPrint(client.arena_state.allocator(), "{d}", .{client.next_id});
-        var all: [8][2][]const u8 = undefined;
-        @memcpy(all[0..fields.len], fields);
-        all[fields.len] = .{ "id", id };
-        var count = fields.len + 1;
-        if (client.session.len > 0) {
-            all[count] = .{ "session", client.session };
-            count += 1;
-        }
-        var buffer: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        try bencode.request_write(&writer, all[0..count]);
-        try client.connection.write_all(writer.buffered());
-        return id;
-    }
-
-    /// The replies to request `id` until its "done", merged: the last value, the status seen.
-    fn collect(client: *Client, id: []const u8) !Reply {
-        var reply = Reply{};
-        for (0..64) |_| {
-            const message = try bencode.read(client.arena_state.allocator(), &client.connection);
-            const for_id = message.string("id") orelse continue;
-            if (!std.mem.eql(u8, for_id, id)) continue;
-            if (message.string("value")) |value| reply.value = value;
-            if (message.string("new-session")) |session| reply.new_session = session;
-            if (message.status_has("interrupted")) reply.interrupted = true;
-            if (message.status_has("done")) {
-                reply.done = true;
-                return reply;
-            }
-        }
-        return error.NoDone;
-    }
-
-    fn call(client: *Client, fields: []const [2][]const u8) !Reply {
-        return client.collect(try client.send(fields));
-    }
-};
-
-const Reply = struct {
-    value: ?[]const u8 = null,
-    new_session: ?[]const u8 = null,
-    interrupted: bool = false,
-    done: bool = false,
-
-    fn string(reply: Reply, key: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, key, "new-session")) return reply.new_session;
-        if (std.mem.eql(u8, key, "value")) return reply.value;
-        return null;
-    }
-};
-
 fn evaluate_many(context: *System.Context) !void {
-    var client = Client{ .arena_state = .init(std.heap.page_allocator) };
-    client.open(context.nodes.nrepl.address) catch |err| return unavailable(err);
+    var client = Client.init();
+    client.open(context.nodes.nrepl.address, port) catch |err| return unavailable(err);
     defer client.close();
     for (0..evaluations_per_driver) |_| {
         evaluate_once(&client) catch |err| return unavailable(err);
@@ -142,8 +70,8 @@ fn evaluate_once(client: *Client) !void {
 
 /// A long evaluation, interrupted a random moment later.
 fn interrupt_one(context: *System.Context) !void {
-    var client = Client{ .arena_state = .init(std.heap.page_allocator) };
-    client.open(context.nodes.nrepl.address) catch |err| return unavailable(err);
+    var client = Client.init();
+    client.open(context.nodes.nrepl.address, port) catch |err| return unavailable(err);
     defer client.close();
     const long = "(do (Thread/sleep 3000) :slept)";
     const id = client.send(&.{ .{ "op", "eval" }, .{ "code", long } }) catch |err|
@@ -166,14 +94,14 @@ fn recovers(context: *System.Context) !void {
 }
 
 fn evaluates(address: [4]u8) !void {
-    var client = Client{ .arena_state = .init(std.heap.page_allocator) };
-    try client.open(address);
+    var client = Client.init();
+    try client.open(address, port);
     defer client.close();
     const reply = try client.call(&.{ .{ "op", "eval" }, .{ "code", "(+ 1 1)" } });
     if (!std.mem.eql(u8, reply.value orelse "", "2")) return error.WrongValue;
 }
 
 fn unavailable(err: anyerror) !void {
-    if (!sdk.tcp.unavailable(err) and err != error.NoDone) return err;
+    if (!nrepl.unavailable(err)) return err;
     sdk.sometimes(true, "the server was unavailable to a client", .{ .err = @errorName(err) });
 }

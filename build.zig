@@ -40,6 +40,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "tcp", .module = tcp }},
     });
 
+    // An nREPL client, shared by the nREPL and clojure-cli.repl examples.
+    const nrepl = b.createModule(.{
+        .root_source_file = b.path("examples/nrepl/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "determinismo", .module = sdk }},
+    });
+
     // Guest side: the in-guest runtime and example tests, static binaries that run in the VM.
     const guest_programs = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "det-init", .path = "guest/runtime/init.zig" },
@@ -57,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
+        .{ .name = "clojure-cli-repl-test", .path = "examples/clojure-cli-repl/cli_repl_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
         .{ .name = "det-selftest-node", .path = "tests/selftest/node.zig" },
         .{ .name = "det-selftest-catalog", .path = "tests/selftest/catalog_test.zig" },
@@ -73,6 +82,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "determinismo", .module = sdk },
                     .{ .name = "resp", .module = resp },
+                    .{ .name = "nrepl", .module = nrepl },
                 },
             }),
         });

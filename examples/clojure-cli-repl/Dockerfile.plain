@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Plain nREPL (plain/deps.edn), the reference for clojure-cli.repl's answers.
+FROM docker.io/library/clojure:temurin-21-tools-deps-alpine
+WORKDIR /app
+COPY examples/clojure-cli-repl/plain/deps.edn /app/
+RUN clojure -P -M:server
+ENTRYPOINT ["clojure", "-M:server"]

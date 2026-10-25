@@ -1,0 +1,7 @@
+;; SPDX-License-Identifier: MIT
+;; The project config clojure-cli.repl reads: a fixed port, every interface (probe.init: the
+;; test program is in another node), and middleware that puts server data on every eval's final
+;; response (as its example's heap middleware does).
+{:port 7888
+ :init probe.init/listen-everywhere
+ :middleware [probe.middleware/middleware]}

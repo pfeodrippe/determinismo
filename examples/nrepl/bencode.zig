@@ -38,7 +38,15 @@ pub const Value = union(enum) {
     }
 };
 
-/// A request: string keys and values, written in sorted key order as bencode requires.
+/// A field value written as a bencode integer (`i10e`), not a string: some operations take
+/// numbers (the inspector's rows, columns and indexes).
+pub fn integer(comptime value: comptime_int) []const u8 {
+    return integer_mark ++ std.fmt.comptimePrint("{d}", .{value});
+}
+const integer_mark = "\x00";
+
+/// A request: string keys and values (or `integer`s), written in sorted key order as bencode
+/// requires.
 pub fn request_write(writer: *std.Io.Writer, fields: []const [2][]const u8) !void {
     var sorted: [16][2][]const u8 = undefined;
     assert(fields.len <= sorted.len);
@@ -51,7 +59,12 @@ pub fn request_write(writer: *std.Io.Writer, fields: []const [2][]const u8) !voi
     std.mem.sort([2][]const u8, sorted[0..fields.len], {}, order.before);
     try writer.writeByte('d');
     for (sorted[0..fields.len]) |field| {
-        try writer.print("{d}:{s}{d}:{s}", .{ field[0].len, field[0], field[1].len, field[1] });
+        try writer.print("{d}:{s}", .{ field[0].len, field[0] });
+        if (std.mem.startsWith(u8, field[1], integer_mark)) {
+            try writer.print("i{s}e", .{field[1][integer_mark.len..]});
+        } else {
+            try writer.print("{d}:{s}", .{ field[1].len, field[1] });
+        }
     }
     try writer.writeByte('e');
 }
@@ -127,4 +140,7 @@ test request_write {
     var writer: std.Io.Writer = .fixed(&buffer);
     try request_write(&writer, &.{ .{ "op", "eval" }, .{ "code", "(+ 1 2)" }, .{ "id", "7" } });
     try std.testing.expectEqualStrings("d4:code7:(+ 1 2)2:id1:72:op4:evale", writer.buffered());
+    writer = .fixed(&buffer);
+    try request_write(&writer, &.{ .{ "op", "inspect-in" }, .{ "idx", integer(0) } });
+    try std.testing.expectEqualStrings("d3:idxi0e2:op10:inspect-ine", writer.buffered());
 }

@@ -523,6 +523,20 @@ pub fn sleep_ms(duration_ms: u64) void {
     _ = linux.nanosleep(&request, null);
 }
 
+/// A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS, as det-stop-faults): faults stop (the
+/// one under way is undone) for `duration_ns`, except clock skips; 0 ends it now. For checks a
+/// fault would explain away: what fails in a quiet period is the system's own doing. Does
+/// nothing without a running fault injector.
+pub fn stop_faults(duration_ns: u64) void {
+    const control_path = "/opt/determinismo/faults-control"; // faults.zig's control_path.
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open(control_path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    const request = std.mem.toBytes(std.mem.nativeToLittle(u64, duration_ns));
+    _ = linux.write(@intCast(fd), &request, request.len); // Atomic: under PIPE_BUF.
+}
+
 fn Result(comptime Function: type) type {
     return @typeInfo(Function).@"fn".return_type.?;
 }

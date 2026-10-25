@@ -1,0 +1,6 @@
+;; SPDX-License-Identifier: MIT
+;; Plain nREPL at the versions clojure-cli.repl 0.2.1 runs on (nREPL 1.7.0, Clojure 1.12.5): what
+;; it answers is the reference its differences are measured against.
+{:deps {org.clojure/clojure {:mvn/version "1.12.5"}
+        nrepl/nrepl {:mvn/version "1.7.0"}}
+ :aliases {:server {:main-opts ["-m" "nrepl.cmdline" "--port" "7888" "--bind" "0.0.0.0"]}}}

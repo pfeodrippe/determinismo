@@ -1,0 +1,4 @@
+;; SPDX-License-Identifier: MIT
+;; clojure-cli.repl's nREPL server, at its latest release (as its README installs it).
+{:deps {org.clojure/clojure {:mvn/version "1.12.5"}
+        io.github.clojure/clojure-cli.repl-server {:mvn/version "0.2.1"}}}
