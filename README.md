@@ -90,4 +90,6 @@ determinismo explore ... --program zig-out/bin/shop-test --seed 3 --branch 37 --
   --exec "det-nodes exec postgres psql -U postgres -c 'select * from price'"
 ```
 
-`zig build test` runs the unit tests (on Linux); `zig build tidy` checks style.
+`zig build test` runs the unit tests (on Linux); `zig build tidy` checks style; `zig build e2e`
+boots the examples and checks exploration, exact replays from fresh boots, and tapes (on the host,
+about 40 s).

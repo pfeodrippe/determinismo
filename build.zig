@@ -83,6 +83,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(redis_workload);
 
+    // End-to-end checks: real VMs through the command line, on the Linux host.
+    const e2e = b.addExecutable(.{
+        .name = "e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const e2e_run = b.addRunArtifact(e2e);
+    e2e_run.step.dependOn(b.getInstallStep());
+    e2e_run.setCwd(b.path(".")); // Its defaults (zig-out/bin) and the examples' paths.
+    b.step("e2e", "Boot real systems: exploration, exact replays, tapes (on the Linux host)")
+        .dependOn(&e2e_run.step);
+
     // Style checks run on the developer's machine, not the target.
     const tidy = b.addExecutable(.{
         .name = "tidy",
@@ -107,6 +122,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/faults.zig",
         "guest/runtime/composer.zig",
         "examples/shop/pg.zig",
+        "tools/e2e.zig",
     };
     for (test_roots) |root| {
         const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
