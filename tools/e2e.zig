@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
     try check_shards(&context);
     try check_stress(&context);
     try check_controller(&context);
+    try check_clojure(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -179,6 +180,30 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// A JVM service, patched through its REPL at a moment: its futures stop losing money; and a
+/// moment before the snapshot is refused.
+fn check_clojure(context: *Context) !void {
+    const common = [_][]const u8{
+        "--compose", "examples/clojure-bank/compose.yaml", "--scenario", "bank", "--seed", "5",
+    };
+    const fork = common ++ [_][]const u8{
+        "--from-branch", "0", "--from-vtime-ms", "3000", "--branches", "4",
+    };
+    const plain = try explore(context, &fork);
+    const patched = try explore(context, &(fork ++ [_][]const u8{
+        "--from-exec", "det-nodes exec bank /app/patch.sh",
+    }));
+    const fails = std.mem.indexOf(u8, plain, "4 branches, 0 with failing") == null;
+    const fixed = std.mem.indexOf(u8, patched, "4 branches, 0 with failing properties") != null;
+    const message = "clojure: futures fail, and pass once patched via the REPL";
+    expect(context, fails and fixed, message, .{});
+    const early = try explore(context, &(common ++ [_][]const u8{
+        "--branch", "0", "--at-vtime-ms", "100", "--exec", "true",
+    }));
+    const refused = std.mem.indexOf(u8, early, "is not after the snapshot") != null;
+    expect(context, refused, "moments before the snapshot are refused", .{});
 }
 
 /// Self-test level 1 (§14): the HTTP API under faults keeps every run and its result.

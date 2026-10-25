@@ -416,6 +416,7 @@ const Fork = struct { from: *const Snapshot, exploration: *const Exploration, fo
 /// Replays branch `fork.branch` of the setup snapshot to the moment and snapshots it there.
 fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*const Snapshot {
     const time_start_ns = monotonic_ns();
+    try moment_after_snapshot(fork.from, fork.fork.vtime_ns);
     options.seed = branch_seed(fork.exploration.exploration_seed, fork.fork.branch);
     options.moment_vtime_ns = fork.fork.vtime_ns;
     options.moment_command = fork.fork.exec;
@@ -442,6 +443,17 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     });
     return snapshot;
 }
+
+/// Branches start at their snapshot: a moment before it would be in the past.
+fn moment_after_snapshot(snapshot: *const Snapshot, vtime_ns: u64) !void {
+    const snapshot_ns = snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
+    if (vtime_ns > snapshot_ns) return;
+    std.debug.print("[determinismo] the moment {d}ns is not after the snapshot ({d}ns): " ++
+        "branches start there\n", .{ vtime_ns, snapshot_ns });
+    return error.MomentBeforeSnapshot;
+}
+
+const cpuid_tsc_hz = @import("cpuid.zig").tsc_hz;
 
 fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
     const command = arguments.strategy_command orelse return;
@@ -593,6 +605,13 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
 fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
     options.stop_at_setup_complete = true;
     defer options.stop_at_setup_complete = false;
+    // Moments belong to branches: none during the run to the snapshot.
+    const moment_vtime_ns = options.moment_vtime_ns;
+    const moment_command = options.moment_command;
+    options.moment_vtime_ns = null;
+    options.moment_command = null;
+    defer options.moment_vtime_ns = moment_vtime_ns;
+    defer options.moment_command = moment_command;
     try vm.init(options);
     const outcome = try vm.run_until_exit();
     if (outcome != .setup_complete) {
@@ -624,6 +643,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
     const first = replay_branch orelse branches.arguments.branch_only orelse 0;
     const single = replay_branch != null or branches.arguments.branch_only != null;
     const count = if (single) 1 else branches.arguments.branches;
+    if (branches.arguments.moment_vtime_ms) |ms| {
+        try moment_after_snapshot(branches.snapshot, ms * std.time.ns_per_ms);
+    }
     for (first..first + count) |index_usize| {
         const index: u32 = @intCast(index_usize);
         const shards = if (single) 1 else branches.arguments.shard_count;
