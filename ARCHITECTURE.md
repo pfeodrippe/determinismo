@@ -471,6 +471,12 @@ determinism makes state recomputable.
 
 - CPUID baseline across CPU models (only one model tested so far).
 - Hard stops still single-step `margin - skid` branches (about 500 VM exits, ~1.5 µs each).
+  Measured: handling those steps in KVM's exit fastpath (done) saves little, since the VMX
+  round trip itself dominates; branch stepping (TF + BTF) is unsafe, because exceptions the
+  guest takes without exiting (page faults) clear TF and run their handlers untrapped; a guest
+  tick of 250 Hz instead of 1000 was 15-25% faster with similar bug rates on small samples
+  (bank 30 vs 32 of 80, shop 1 vs 2 of 240), so HZ stays 1000 until a larger study. The
+  taken-branch event (`--branch-event 0x20c4`) is as deterministic as conditional branches.
   Candidates: count taken branches and step with branch trapping (TF + DEBUGCTL.BTF, one exit per
   counted branch instead of per instruction); more soft stop points than RDTSC (the VMM's own
   port and MMIO exits).

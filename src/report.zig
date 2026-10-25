@@ -43,13 +43,14 @@ pub fn run(vm: *VM, result: struct { outcome: VM.Outcome, wall_ns: u64 }) !void 
         const state = try vm.det_state();
         print("[determinismo] vtime={d:.3}s branches={d} rdtsc_exits={d} timer_fires={d} " ++
             "idle_skips={d} idle_vtime={d:.3}s mtf_steps={d} overflows={d} overshoots={d} " ++
-            "skid_max={d} soft_exits={d}\n", .{
+            "skid_max={d} soft_exits={d} exit_timer_fires={d} fast_steps={d}\n", .{
             seconds(state.tsc / tsc_per_ns), state.branches,
             state.rdtsc_exits,               vm.stats.timer_fires,
             vm.stats.idle_skips,             seconds(vm.stats.idle_tsc / tsc_per_ns),
             state.mtf_steps,                 state.overflows,
             state.overshoots,                state.skid_max,
-            state.soft_exits,
+            state.soft_exits,                vm.stats.exit_timer_fires,
+            state.fast_steps,
         });
         overshoot_warn(state.overshoots);
     }

@@ -124,6 +124,8 @@ pub const Stats = struct {
     exits: std.EnumArray(Kind, u64) = .initFill(0),
     io_ports: [65536]u32 = @splat(0),
     timer_fires: u64 = 0,
+    /// Timer interrupts delivered at a port or MMIO exit (see timer_due).
+    exit_timer_fires: u64 = 0,
     idle_skips: u64 = 0,
     idle_tsc: u64 = 0,
 
@@ -370,8 +372,14 @@ fn run_loop(vm: *VM) !Outcome {
             else => return err,
         };
         switch (vm.run.exit_reason) {
-            .io => if (try vm.handle_io()) |outcome| return outcome,
-            .mmio => try vm.handle_mmio(),
+            .io => {
+                if (try vm.handle_io()) |outcome| return outcome;
+                try vm.timer_due();
+            },
+            .mmio => {
+                try vm.handle_mmio();
+                try vm.timer_due();
+            },
             .det_target => {
                 assert(vm.deterministic);
                 vm.stats.exits.getPtr(.det_target).* += 1;
@@ -487,6 +495,19 @@ pub fn target_set(vm: *VM, target_branches: u64) !void {
 fn soft_set(vm: *VM, soft_tsc: u64) !void {
     var soft = soft_tsc;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_SET_SOFT_TSC, @intFromPtr(&soft));
+}
+
+/// At an exit the VMM handles anyway (an exact point, like a soft stop): fire a timer whose
+/// deadline has passed instead of waiting for its soft or hard stop.
+fn timer_due(vm: *VM) !void {
+    if (!vm.deterministic or vm.timer_slack_tsc == 0) return; // No slack: stops are exact.
+    if (vm.target_branches == 0 or vm.target_is_moment) return;
+    const deadline = vm.pit.deadline_tsc() orelse return;
+    const state = try vm.det_state();
+    if (state.tsc < deadline) return;
+    try vm.target_set(0);
+    try vm.timer_fire();
+    vm.stats.exit_timer_fires += 1;
 }
 
 fn timer_fire(vm: *VM) !void {

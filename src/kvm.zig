@@ -226,7 +226,9 @@ pub const DetState = extern struct {
     skid_max: u64,
     /// Exits at an RDTSC past the soft deadline (see DET_SET_SOFT_TSC).
     soft_exits: u64,
-    reserved: [6]u64,
+    /// Single-steps KVM handled in its exit fastpath.
+    fast_steps: u64,
+    reserved: [5]u64,
 };
 
 comptime {

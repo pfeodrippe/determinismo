@@ -60,6 +60,8 @@ const Arguments = struct {
     seed: u64 = 0,
     margin_branches: u32 = 128,
     timer_slack_us: u64 = 100,
+    /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
+    branch_event: u64 = 0x01c4,
     events_path: ?[]const u8 = null,
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
@@ -120,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
         .seed = arguments.seed,
         .margin_branches = arguments.margin_branches,
         .timer_slack_ns = arguments.timer_slack_us * std.time.ns_per_us,
+        .branch_event = arguments.branch_event,
         .events_fd = if (arguments.events_path) |path| try open_for_writing(arena, path) else null,
         .events_parse_buffer = try arena.alloc(u8, Events.parse_buffer_size),
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
@@ -672,6 +675,7 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     if (options.initrd) |initrd| hasher.update(initrd);
     hasher.update(options.cmdline);
     hasher.update(std.mem.asBytes(&options.timer_slack_ns)); // Where timer interrupts land.
+    hasher.update(std.mem.asBytes(&options.branch_event)); // What time is made of.
     for (arguments.disk_paths[0..arguments.disk_count]) |path| {
         hasher.update(std.fs.path.basename(path));
     }
@@ -761,6 +765,8 @@ fn parse_option(
         arguments.seed = try std.fmt.parseInt(u64, value, 0);
     } else if (eql(u8, flag, "--margin-branches")) {
         arguments.margin_branches = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--branch-event")) {
+        arguments.branch_event = try std.fmt.parseInt(u64, value, 0);
     } else if (eql(u8, flag, "--timer-slack-us")) {
         arguments.timer_slack_us = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--events")) {

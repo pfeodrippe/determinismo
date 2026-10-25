@@ -49,7 +49,7 @@ index 3f83e36..f6185fc 100644
  
  struct kvm_x86_init_ops vt_init_ops __initdata = {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 84420bf..90de3c8 100644
+index 84420bf..ea35e5a 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -73,6 +73,7 @@
@@ -60,7 +60,7 @@ index 84420bf..90de3c8 100644
  
  MODULE_AUTHOR("Qumranet");
  MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
-@@ -5924,9 +5925,245 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+@@ -5924,9 +5925,264 @@ static int handle_pause(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -176,6 +176,24 @@ index 84420bf..90de3c8 100644
 +	return ret;
 +}
 +
++/*
++ * Single-steps short of the target are the hot path of exact stops: count them and re-enter
++ * the guest from the fastpath (interrupts still off). The step that reaches the target goes
++ * through handle_monitor_trap(), which exits to userspace.
++ */
++static fastpath_t vmx_det_fastpath_step(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	if (!vmx->det.stepping || !vmx->det.target)
++		return EXIT_FASTPATH_NONE;
++	if (vmx_det_branches(vmx) >= vmx->det.target)
++		return EXIT_FASTPATH_NONE;
++	vmx->det.mtf_steps++;
++	vmx->det.fast_steps++;
++	return EXIT_FASTPATH_REENTER_GUEST;
++}
++
  static int handle_monitor_trap(struct kvm_vcpu *vcpu)
  {
 -	return 1;
@@ -280,6 +298,7 @@ index 84420bf..90de3c8 100644
 +		st.overshoots = vmx->det.overshoots;
 +		st.skid_max = vmx->det.skid_max;
 +		st.soft_exits = vmx->det.soft_exits;
++		st.fast_steps = vmx->det.fast_steps;
 +		return copy_to_user(argp, &st, sizeof(st)) ? -EFAULT : 0;
 +	}
 +	case KVM_DET_SET_SOFT_TSC: {
@@ -307,7 +326,7 @@ index 84420bf..90de3c8 100644
  }
  
  static int handle_invpcid(struct kvm_vcpu *vcpu)
-@@ -6109,6 +6346,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6109,6 +6365,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
@@ -315,7 +334,7 @@ index 84420bf..90de3c8 100644
  	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
-@@ -6620,6 +6858,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+@@ -6620,6 +6877,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
  
@@ -325,7 +344,16 @@ index 84420bf..90de3c8 100644
  	/*
  	 * Exit to user space when bus lock detected to inform that there is
  	 * a bus lock in guest.
-@@ -7503,6 +7744,8 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -7273,6 +7533,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+ 		return handle_fastpath_preemption_timer(vcpu, force_immediate_exit);
+ 	case EXIT_REASON_HLT:
+ 		return handle_fastpath_hlt(vcpu);
++	case EXIT_REASON_MONITOR_TRAP_FLAG:
++		return vmx_det_fastpath_step(vcpu);
+ 	default:
+ 		return EXIT_FASTPATH_NONE;
+ 	}
+@@ -7503,6 +7765,8 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
  	nested_vmx_free_vcpu(vcpu);
  	free_loaded_vmcs(vmx->loaded_vmcs);
  	free_page((unsigned long)vmx->ve_info);
@@ -335,10 +363,10 @@ index 84420bf..90de3c8 100644
  
  int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
-index a7e2de5..d4d6bea 100644
+index a7e2de5..bf7abc2 100644
 --- a/arch/x86/kvm/vmx/vmx.h
 +++ b/arch/x86/kvm/vmx/vmx.h
-@@ -363,6 +363,26 @@ struct vcpu_vmx {
+@@ -363,6 +363,27 @@ struct vcpu_vmx {
  
  	/* ve_info must be page aligned. */
  	struct vmx_ve_information *ve_info;
@@ -361,6 +389,7 @@ index a7e2de5..d4d6bea 100644
 +		u64 skid_max;		/* most branches seen between overflow and its handling */
 +		u64 soft_tsc;		/* exit at the first RDTSC at or past this (0: none) */
 +		u64 soft_exits;
++		u64 fast_steps;		/* single-steps handled in the exit fastpath */
 +	} det;
  };
  
@@ -415,7 +444,7 @@ index 99549df..147c6ef 100644
  	} else {
  		vcpu->run->exit_reason = reason;
 diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
-index 9222f5e..2cdd817 100644
+index 9222f5e..5297096 100644
 --- a/include/uapi/linux/kvm.h
 +++ b/include/uapi/linux/kvm.h
 @@ -183,6 +183,8 @@ struct kvm_xen_exit {
@@ -427,7 +456,7 @@ index 9222f5e..2cdd817 100644
  
  /* For KVM_EXIT_INTERNAL_ERROR */
  /* Emulate instruction failed. */
-@@ -1575,6 +1577,40 @@ struct kvm_create_guest_memfd {
+@@ -1575,6 +1577,41 @@ struct kvm_create_guest_memfd {
  
  #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
  
@@ -455,7 +484,8 @@ index 9222f5e..2cdd817 100644
 +	__u64 overshoots;
 +	__u64 skid_max;		/* most branches between a counter overflow and its handling */
 +	__u64 soft_exits;	/* exits at an RDTSC past the soft deadline */
-+	__u64 reserved[6];
++	__u64 fast_steps;	/* single-steps handled in the exit fastpath */
++	__u64 reserved[5];
 +};
 +
 +#define KVM_DET_ENABLE		_IOW(KVMIO, 0xf0, struct kvm_det_config)
