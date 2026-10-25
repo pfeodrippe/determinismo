@@ -37,7 +37,10 @@ use them in other repositories.
    did not, in time); `through` runs any program over the set (JSON lines in and out) for maps
    and folds.
 4. **Replay** a failing branch: same seed, `branch` = the example. It is the same timeline,
-   every time, so its events (with virtual times) are evidence, not noise.
+   every time, so its events (with virtual times) are evidence, not noise. Explorations branch
+   as a tree by default: a timeline past the first 16 started inside another (its `path` in the
+   results), so replay it from its tape: MCP `replay` with `tape` = `<tape_dir>/branch-<n>.jsonl`
+   (explore returns `tape_dir`), or `explore --tape` on the command line.
 5. **Look at a moment**: replay with `at_vtime_ms` just before the first failure and an `exec`
    command, e.g. `det-nodes exec postgres psql -U postgres -c 'select ...'` or
    `det-nodes exec redis redis-cli get key`. The output is identical on every replay.
@@ -62,6 +65,15 @@ use them in other repositories.
    inputs changed, so it is a different timeline); exploration is.
 
 ## Facts worth knowing
+
+- Exploration is a tree (Antithesis's "every event a potential branch point"): after each
+  generation of 16 timelines, the ones that first reached something (an assertion outcome, a
+  fault kind, a closer guidance distance, a new kind of output line) are returned to just after
+  it, and new timelines branch from there. Each timeline's `why` says why it starts where it
+  does. `--branching flat` starts every timeline at the setup snapshot; strategies plan flat
+  unless asked for a tree (`--branching tree --strategy ... --tape-dir ...`).
+- A run's notebook is Clojure (babashka on the server: `query`, `events`, `run`, `replay`,
+  `stacks`, ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
 
 - A branch is identified by (inputs, seed, branch index[, fork point]). Inputs are the kernel,
   initramfs, command line (scenario included), timer slack and disks; `explore` prints their hash.

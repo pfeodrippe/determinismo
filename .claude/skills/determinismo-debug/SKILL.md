@@ -13,8 +13,9 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
 2. **Query** what failures have in common: `determinismo query <events-dir>
    'assert.condition=false' --preceded-by 'event=fault'` (and `--not-preceded-by`), or an event
    set pipeline (`with_last`, `with_next`, `through`) with `determinismo events`.
-3. **Replay** the example: same seed, `--branch N`. Add `--until '<condition>'` to stop at the
-   first violation, `--rewind-ms` to stop before it.
+3. **Replay** the example: same seed, `--branch N` (a timeline past the first 16 of a tree
+   exploration started inside another: replay it with `--tape <tape dir>/branch-N.jsonl`). Add
+   `--until '<condition>'` to stop at the first violation, `--rewind-ms` to stop before it.
 4. **Look at the moment**: `--at-vtime-ms T --exec 'det-nodes exec <node> <command>'` (the
    output is the same on every replay); `determinismo stacks`, `determinismo profile`,
    `determinismo extract` for files and core dumps.
