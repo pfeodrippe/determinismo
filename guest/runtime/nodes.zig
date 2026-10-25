@@ -1,0 +1,623 @@
+// SPDX-License-Identifier: MIT
+//! The node runtime (ARCHITECTURE.md D19): runs each node of the resolved system
+//! (/det/system.json) as a container we build ourselves.
+//!
+//! A node gets its own mount, PID, network, UTS and IPC namespaces; its root filesystem is an
+//! overlay of its read-only disk and a tmpfs upper layer (so its writes live in guest memory and
+//! are part of every snapshot); its processes share one cgroup, which pauses (freeze) and kills
+//! them as a unit. The guest network is a full mesh: one veth pair between every two running
+//! nodes and between each node and the runner (the guest's root namespace, where tests run), so a
+//! partition is one link going down. Every link of a node carries the node's one /32 address,
+//! with a host route per peer.
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const sdk = @import("determinismo");
+const schema = sdk.schema;
+const netlink = @import("netlink.zig");
+pub const LinkState = netlink.LinkState;
+
+pub const system_path = "/det/system.json";
+const state_root = "/run/det/nodes";
+const cgroup_root = "/sys/fs/cgroup/nodes";
+const system_size_max = 1 << 20;
+const path_size_max = 256;
+const arguments_max = 64;
+const environment_max = 128;
+const poll_interval_ns = 10 * std.time.ns_per_ms;
+const ready_attempts_max = 6000; // 60 s of virtual time.
+const stop_attempts_max = 3000;
+const link_attempts_max = 500;
+
+pub fn system_load(arena: std.mem.Allocator) !schema.System {
+    const source = try read_file(arena, system_path, system_size_max);
+    const system = try schema.parse(schema.System, arena, source);
+    if (system.schema != schema.version) return error.SchemaVersion;
+    if (system.nodes.len > schema.nodes_max) return error.TooManyNodes;
+    return system;
+}
+
+/// Starts every node in order (the host checked that `after` only names earlier nodes) and
+/// waits for each to be ready before starting the next.
+pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
+    try mkdir_all(state_root);
+    try mkdir_all(cgroup_root);
+    try hosts_write("/etc/hosts", system);
+    for (system.nodes) |*node| {
+        try start(arena, system, node);
+        try ready_wait(node);
+    }
+    sdk.event("nodes_up", .{ .nodes = system.nodes.len });
+}
+
+/// Starts one node (again, after a kill: its files survive in the overlay's upper layer).
+pub fn start(
+    arena: std.mem.Allocator,
+    system: *const schema.System,
+    node: *const schema.Resolved,
+) !void {
+    assert(schema.name_valid(node.name));
+    if (pid_read(node.name) != null) return error.AlreadyRunning;
+    var paths: Paths = undefined;
+    try paths.init(node.name);
+    try root_prepare(&paths, system, node);
+    const launch = try Launch.init(arena, node, &paths);
+    var sync: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&sync, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
+        linux.CLONE.NEWNET | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD);
+    const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
+    if (linux.errno(result) != .SUCCESS) return error.Clone;
+    if (result == 0) {
+        _ = linux.close(sync[1]);
+        var byte: [1]u8 = undefined;
+        _ = linux.read(sync[0], &byte, 1); // The parent has set up cgroup and network.
+        launch.exec(); // Never returns.
+    }
+    const pid: linux.pid_t = @intCast(result);
+    _ = linux.close(sync[0]);
+    defer _ = linux.close(sync[1]);
+    try cgroup_join(&paths, pid);
+    try network_connect(system, node, pid);
+    try file_write(paths.pid, try std.fmt.allocPrint(arena, "{d}\n", .{pid}));
+    _ = linux.write(sync[1], "g", 1);
+    sdk.event("node_start", .{ .node = node.name, .pid = pid });
+}
+
+/// Kills every process of the node and waits until they are gone.
+pub fn kill(name: []const u8) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    if (pid_read(name) == null) return; // Not running.
+    try file_write(paths.cgroup_kill, "1");
+    for (0..stop_attempts_max) |_| {
+        if (!try cgroup_populated(&paths)) break;
+        sleep_ns(poll_interval_ns);
+    } else return error.NodeDidNotStop;
+    _ = linux.unlink(paths.pid);
+    sdk.event("node_kill", .{ .node = name });
+}
+
+pub fn freeze(name: []const u8, state: enum { frozen, thawed }) !void {
+    var paths: Paths = undefined;
+    try paths.init(name);
+    try file_write(paths.cgroup_freeze, if (state == .frozen) "1" else "0");
+}
+
+/// The link between `a` and `b` (either may be the runner) goes up or down on both ends.
+pub fn link_set(
+    system: *const schema.System,
+    a: []const u8,
+    b: []const u8,
+    state: LinkState,
+) !void {
+    assert(!std.mem.eql(u8, a, b));
+    const pid_a = pid_of(a) orelse return; // Not running: no link to change.
+    const pid_b = pid_of(b) orelse return;
+    const address_a = try endpoint_address(system, a);
+    const address_b = try endpoint_address(system, b);
+    var name_a: [netlink.interface_name_size_max]u8 = undefined;
+    var name_b: [netlink.interface_name_size_max]u8 = undefined;
+    const interface_a = interface_name(&name_a, b);
+    const interface_b = interface_name(&name_b, a);
+    try netlink.in_namespace_of(pid_a, link_change, .{ interface_a, address_b, state });
+    try netlink.in_namespace_of(pid_b, link_change, .{ interface_b, address_a, state });
+}
+
+/// Linux drops a link's routes when it goes down: bringing it up restores the host route.
+fn link_change(
+    socket: *netlink.Socket,
+    interface: []const u8,
+    peer: netlink.Address,
+    state: LinkState,
+) !void {
+    try socket.link_set(interface, state);
+    if (state == .down) return;
+    socket.route_add(interface, peer) catch |err| switch (err) {
+        error.Exists => {},
+        else => return err,
+    };
+}
+
+fn endpoint_address(system: *const schema.System, name: []const u8) !netlink.Address {
+    if (std.mem.eql(u8, name, schema.runner_name)) return schema.runner_address;
+    const node = system.node(name) orelse return error.UnknownNode;
+    return address_parse(node.address);
+}
+
+/// The PID (in the guest's root namespace) of the node's first process, or 1 for the runner.
+pub fn pid_of(name: []const u8) ?linux.pid_t {
+    if (std.mem.eql(u8, name, schema.runner_name)) return 1;
+    return pid_read(name);
+}
+
+fn pid_read(name: []const u8) ?linux.pid_t {
+    var paths: Paths = undefined;
+    paths.init(name) catch return null;
+    var buffer: [32]u8 = undefined;
+    const text = read_small(paths.pid, &buffer) orelse return null;
+    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return null;
+    if (linux.errno(linux.kill(pid, @enumFromInt(0))) != .SUCCESS) return null;
+    return pid;
+}
+
+const Paths = struct {
+    buffers: [8][path_size_max]u8 = undefined,
+    directory: [:0]const u8 = "",
+    lower: [:0]const u8 = "",
+    upper: [:0]const u8 = "",
+    work: [:0]const u8 = "",
+    root: [:0]const u8 = "",
+    pid: [:0]const u8 = "",
+    output: [:0]const u8 = "",
+    cgroup: [:0]const u8 = "",
+    cgroup_procs: [:0]const u8 = "",
+    cgroup_kill: [:0]const u8 = "",
+    cgroup_freeze: [:0]const u8 = "",
+    cgroup_events: [:0]const u8 = "",
+    cgroup_buffers: [5][path_size_max]u8 = undefined,
+
+    /// In place: the paths point into the struct's own buffers.
+    fn init(paths: *Paths, name: []const u8) !void {
+        if (!schema.name_valid(name)) return error.BadNodeName;
+        paths.* = .{};
+        const b = &paths.buffers;
+        paths.directory = try print_z(&b[0], state_root ++ "/{s}", .{name});
+        paths.lower = try print_z(&b[1], state_root ++ "/{s}/lower", .{name});
+        paths.upper = try print_z(&b[2], state_root ++ "/{s}/upper", .{name});
+        paths.work = try print_z(&b[3], state_root ++ "/{s}/work", .{name});
+        paths.root = try print_z(&b[4], state_root ++ "/{s}/root", .{name});
+        paths.pid = try print_z(&b[5], state_root ++ "/{s}/pid", .{name});
+        paths.output = try print_z(&b[6], state_root ++ "/{s}/output.log", .{name});
+        paths.cgroup = try print_z(&b[7], cgroup_root ++ "/{s}", .{name});
+        const c = &paths.cgroup_buffers;
+        paths.cgroup_procs = try print_z(&c[0], "{s}/cgroup.procs", .{paths.cgroup});
+        paths.cgroup_kill = try print_z(&c[1], "{s}/cgroup.kill", .{paths.cgroup});
+        paths.cgroup_freeze = try print_z(&c[2], "{s}/cgroup.freeze", .{paths.cgroup});
+        paths.cgroup_events = try print_z(&c[3], "{s}/cgroup.events", .{paths.cgroup});
+    }
+};
+
+/// Mounts the node's disk and overlay once, and (re)writes its network identity files.
+fn root_prepare(
+    paths: *const Paths,
+    system: *const schema.System,
+    node: *const schema.Resolved,
+) !void {
+    if (!exists(paths.root)) {
+        try mkdir_all(paths.directory);
+        for ([_][:0]const u8{ paths.lower, paths.upper, paths.work, paths.root }) |path| {
+            try mkdir_all(path);
+        }
+        var device_buffer: [32]u8 = undefined;
+        const device = try print_z(&device_buffer, "/dev/{s}", .{node.disk});
+        try mount(device, paths.lower, "erofs", linux.MS.RDONLY, null);
+        var options_buffer: [3 * path_size_max]u8 = undefined;
+        const options = try print_z(&options_buffer, "lowerdir={s},upperdir={s},workdir={s}", .{
+            paths.lower, paths.upper, paths.work,
+        });
+        try mount("overlay", paths.root, "overlay", 0, options);
+    }
+    try mkdir_all(paths.cgroup);
+    var path_buffer: [path_size_max]u8 = undefined;
+    try mkdir_all(try print_z(&path_buffer, "{s}/etc", .{paths.root}));
+    try hosts_write(try print_z(&path_buffer, "{s}/etc/hosts", .{paths.root}), system);
+    const resolv = try print_z(&path_buffer, "{s}/etc/resolv.conf", .{paths.root});
+    _ = linux.unlink(resolv); // Often a symlink in images; ours is a plain file.
+    try file_write(resolv, "# determinismo: names are in /etc/hosts\n");
+    const hostname = try print_z(&path_buffer, "{s}/etc/hostname", .{paths.root});
+    _ = linux.unlink(hostname);
+    var line_buffer: [schema.node_name_size_max + 1]u8 = undefined;
+    try file_write(hostname, try std.fmt.bufPrint(&line_buffer, "{s}\n", .{node.name}));
+}
+
+fn hosts_write(path: [:0]const u8, system: *const schema.System) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.writeAll("127.0.0.1 localhost\n");
+    const runner = schema.runner_address;
+    try writer.print("{d}.{d}.{d}.{d} {s}\n", .{
+        runner[0], runner[1], runner[2], runner[3], schema.runner_name,
+    });
+    for (system.nodes) |node| try writer.print("{s} {s}\n", .{ node.address, node.name });
+    _ = linux.unlink(path);
+    try file_write(path, writer.buffered());
+}
+
+fn cgroup_join(paths: *const Paths, pid: linux.pid_t) !void {
+    var buffer: [32]u8 = undefined;
+    try file_write(paths.cgroup_procs, try std.fmt.bufPrint(&buffer, "{d}\n", .{pid}));
+}
+
+fn cgroup_populated(paths: *const Paths) !bool {
+    var buffer: [256]u8 = undefined;
+    const events = read_small(paths.cgroup_events, &buffer) orelse return error.NoCgroup;
+    return std.mem.indexOf(u8, events, "populated 1") != null;
+}
+
+/// Links the new node to the runner and to every running node.
+fn network_connect(
+    system: *const schema.System,
+    node: *const schema.Resolved,
+    pid: linux.pid_t,
+) !void {
+    try netlink.in_namespace_of(pid, netlink.Socket.link_set, .{ "lo", .up });
+    const address = try address_parse(node.address);
+    const self = Endpoint{ .name = node.name, .address = address, .pid = pid };
+    try link_create(self, .{
+        .name = schema.runner_name,
+        .address = schema.runner_address,
+        .pid = 1,
+    });
+    for (system.nodes) |*peer| {
+        if (std.mem.eql(u8, peer.name, node.name)) continue;
+        const peer_pid = pid_read(peer.name) orelse continue;
+        try link_create(self, .{
+            .name = peer.name,
+            .address = try address_parse(peer.address),
+            .pid = peer_pid,
+        });
+    }
+}
+
+const Endpoint = struct { name: []const u8, address: netlink.Address, pid: linux.pid_t };
+
+fn link_create(a: Endpoint, b: Endpoint) !void {
+    var name_a: [netlink.interface_name_size_max]u8 = undefined;
+    var name_b: [netlink.interface_name_size_max]u8 = undefined;
+    const interface_a = interface_name(&name_a, b.name); // In a's namespace, towards b.
+    const interface_b = interface_name(&name_b, a.name);
+    const ends = [2]netlink.VethEnd{
+        .{ .name = interface_a, .mac = mac(a.address, b.address), .pid = a.pid },
+        .{ .name = interface_b, .mac = mac(b.address, a.address), .pid = b.pid },
+    };
+    // After a restart, the dead namespace's links disappear asynchronously: wait for them.
+    for (0..link_attempts_max) |_| {
+        var socket = try netlink.Socket.open();
+        defer socket.close();
+        socket.veth_create(ends) catch |err| switch (err) {
+            error.Exists => {
+                sleep_ns(poll_interval_ns);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    } else return error.StaleLink;
+    try netlink.in_namespace_of(a.pid, link_configure, .{ interface_a, a.address, b.address });
+    try netlink.in_namespace_of(b.pid, link_configure, .{ interface_b, b.address, a.address });
+}
+
+fn link_configure(
+    socket: *netlink.Socket,
+    interface: []const u8,
+    local: netlink.Address,
+    peer: netlink.Address,
+) !void {
+    try socket.address_add(interface, local);
+    try socket.link_set(interface, .up);
+    try socket.route_add(interface, peer);
+}
+
+fn interface_name(buffer: *[netlink.interface_name_size_max]u8, peer: []const u8) []const u8 {
+    assert(peer.len <= schema.node_name_size_max);
+    return std.fmt.bufPrint(buffer, "d-{s}", .{peer}) catch unreachable;
+}
+
+fn mac(local: netlink.Address, peer: netlink.Address) [6]u8 {
+    return .{ 0x02, 0xde, local[2], local[3], peer[2], peer[3] };
+}
+
+pub fn address_parse(text: []const u8) !netlink.Address {
+    var address: netlink.Address = undefined;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    for (&address) |*byte| {
+        byte.* = try std.fmt.parseInt(u8, parts.next() orelse return error.BadAddress, 10);
+    }
+    if (parts.next() != null) return error.BadAddress;
+    return address;
+}
+
+fn ready_wait(node: *const schema.Resolved) !void {
+    const ready = node.ready orelse return;
+    const address = try address_parse(node.address);
+    for (0..ready_attempts_max) |_| {
+        if (tcp_accepts(address, ready.tcp)) {
+            sdk.event("node_ready", .{ .node = node.name });
+            return;
+        }
+        var paths: Paths = undefined;
+        try paths.init(node.name);
+        if (!try cgroup_populated(&paths)) return error.NodeExited; // Its processes are gone.
+        sleep_ns(poll_interval_ns);
+    }
+    return error.NodeNotReady;
+}
+
+fn tcp_accepts(address: netlink.Address, port: u16) bool {
+    const fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var target = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(address),
+    };
+    const result = linux.connect(@intCast(fd), @ptrCast(&target), @sizeOf(linux.sockaddr.in));
+    return linux.errno(result) == .SUCCESS;
+}
+
+/// Everything the child needs after clone, prepared before it (the child only makes syscalls).
+const Launch = struct {
+    root: [:0]const u8,
+    output: [:0]const u8,
+    hostname: []const u8,
+    workdir: [:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    /// Absolute candidates for argv[0], one per PATH entry (or argv[0] itself).
+    executables: []const [:0]const u8,
+    uid: ?u32,
+    gid: ?u32,
+
+    fn init(arena: std.mem.Allocator, node: *const schema.Resolved, paths: *const Paths) !Launch {
+        if (node.command.len == 0 or node.command.len >= arguments_max) return error.BadCommand;
+        if (node.env.len >= environment_max) return error.TooManyEnvironmentEntries;
+        const argv = try arena.allocSentinel(?[*:0]const u8, node.command.len, null);
+        for (node.command, argv) |argument, *slot| slot.* = try arena.dupeSentinel(u8, argument, 0);
+        const envp = try arena.allocSentinel(?[*:0]const u8, node.env.len, null);
+        var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        for (node.env, envp) |entry, *slot| {
+            slot.* = try arena.dupeSentinel(u8, entry, 0);
+            if (std.mem.startsWith(u8, entry, "PATH=")) path_value = entry["PATH=".len..];
+        }
+        const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
+        return .{
+            .root = paths.root,
+            .output = paths.output,
+            .hostname = node.name,
+            .workdir = try arena.dupeSentinel(u8, node.workdir, 0),
+            .argv = argv.ptr,
+            .envp = envp.ptr,
+            .executables = try executables(arena, node.command[0], path_value),
+            .uid = if (ids) |i| i.uid else null,
+            .gid = if (ids) |i| i.gid else null,
+        };
+    }
+
+    /// In the child, PID 1 of the node's namespaces.
+    fn exec(launch: *const Launch) noreturn {
+        const output_flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true };
+        const output = linux.open(launch.output, output_flags, 0o644);
+        const null_input = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(output) == .SUCCESS) {
+            _ = linux.dup2(@intCast(output), 1);
+            _ = linux.dup2(@intCast(output), 2);
+        }
+        if (linux.errno(null_input) == .SUCCESS) _ = linux.dup2(@intCast(null_input), 0);
+        launch.mounts() catch |err| die("mounts", err);
+        _ = linux.syscall2(.sethostname, @intFromPtr(launch.hostname.ptr), launch.hostname.len);
+        if (launch.gid) |gid| {
+            _ = linux.syscall2(.setgroups, 0, 0);
+            if (linux.errno(linux.setgid(gid)) != .SUCCESS) die("setgid", error.Setgid);
+        }
+        if (launch.uid) |uid| {
+            if (linux.errno(linux.setuid(uid)) != .SUCCESS) die("setuid", error.Setuid);
+        }
+        if (linux.errno(linux.chdir(launch.workdir)) != .SUCCESS) _ = linux.chdir("/");
+        for (launch.executables) |path| {
+            _ = linux.execve(path, launch.argv, launch.envp);
+        }
+        die("exec", error.ExecutableNotFound);
+    }
+
+    fn mounts(launch: *const Launch) !void {
+        try mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, null);
+        var buffer: [path_size_max]u8 = undefined;
+        const Target = struct {
+            path: []const u8,
+            fs: [:0]const u8,
+            flags: u32,
+            data: ?[:0]const u8,
+        };
+        const targets = [_]Target{
+            .{ .path = "proc", .fs = "proc", .flags = 0, .data = null },
+            .{ .path = "sys", .fs = "sysfs", .flags = linux.MS.RDONLY, .data = null },
+            .{ .path = "dev", .fs = "devtmpfs", .flags = 0, .data = null },
+            .{ .path = "dev/pts", .fs = "devpts", .flags = 0, .data = "newinstance,ptmxmode=0666" },
+            .{ .path = "dev/shm", .fs = "tmpfs", .flags = 0, .data = null },
+        };
+        for (targets) |target| {
+            const path = try print_z(&buffer, "{s}/{s}", .{ launch.root, target.path });
+            try mkdir_all(path);
+            const data: ?[*:0]const u8 = if (target.data) |d| d.ptr else null;
+            try mount(target.fs, path, target.fs, target.flags, data);
+        }
+        // The guest's root is the initramfs, where pivot_root is not allowed: move the node's
+        // root over it and chroot, as switch_root does. The mount namespace is the node's own.
+        if (linux.errno(linux.chdir(launch.root)) != .SUCCESS) return error.Chdir;
+        try mount(".", "/", null, linux.MS.MOVE, null);
+        if (linux.errno(linux.chroot(".")) != .SUCCESS) return error.Chroot;
+        if (linux.errno(linux.chdir("/")) != .SUCCESS) return error.Chdir;
+    }
+};
+
+const Ids = struct { uid: u32, gid: u32 };
+
+/// `user[:group]`, each a number or a name from the node's /etc/passwd and /etc/group.
+fn user_resolve(arena: std.mem.Allocator, root: []const u8, text: []const u8) !Ids {
+    var parts = std.mem.splitScalar(u8, text, ':');
+    const user = parts.next().?;
+    const group = parts.next();
+    var buffer: [path_size_max]u8 = undefined;
+    const passwd = try read_file(arena, try print_z(&buffer, "{s}/etc/passwd", .{root}), 1 << 20);
+    const entry = id_lookup(passwd, user) orelse return error.UnknownUser;
+    var ids = Ids{ .uid = entry.id, .gid = entry.group };
+    if (group) |name| {
+        const group_path = try print_z(&buffer, "{s}/etc/group", .{root});
+        const groups = try read_file(arena, group_path, 1 << 20);
+        ids.gid = (id_lookup(groups, name) orelse return error.UnknownGroup).id;
+    }
+    return ids;
+}
+
+/// Finds `name` (or a number) in passwd/group lines: `name:x:id:group...`.
+fn id_lookup(database: []const u8, name: []const u8) ?struct { id: u32, group: u32 } {
+    if (std.fmt.parseInt(u32, name, 10)) |id| {
+        return .{ .id = id, .group = id };
+    } else |_| {}
+    var lines = std.mem.tokenizeScalar(u8, database, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        if (!std.mem.eql(u8, fields.next() orelse continue, name)) continue;
+        _ = fields.next(); // Password.
+        const id = std.fmt.parseInt(u32, fields.next() orelse return null, 10) catch return null;
+        const group_text = fields.next() orelse "";
+        const group = std.fmt.parseInt(u32, group_text, 10) catch id;
+        return .{ .id = id, .group = group };
+    }
+    return null;
+}
+
+fn executables(
+    arena: std.mem.Allocator,
+    program: []const u8,
+    path_value: []const u8,
+) ![]const [:0]const u8 {
+    if (std.mem.indexOfScalar(u8, program, '/') != null) {
+        const single = try arena.alloc([:0]const u8, 1);
+        single[0] = try arena.dupeSentinel(u8, program, 0);
+        return single;
+    }
+    var list: std.ArrayList([:0]const u8) = .empty;
+    var directories = std.mem.tokenizeScalar(u8, path_value, ':');
+    while (directories.next()) |directory| {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, program }, 0);
+        try list.append(arena, path);
+    }
+    return list.items;
+}
+
+fn die(what: []const u8, err: anyerror) noreturn {
+    std.debug.print("det-nodes: {s} failed: {s}\n", .{ what, @errorName(err) });
+    linux.exit_group(127);
+}
+
+fn mount(
+    special: ?[*:0]const u8,
+    target: [*:0]const u8,
+    fs: ?[*:0]const u8,
+    flags: u32,
+    data: ?[*:0]const u8,
+) !void {
+    const result = linux.mount(special, target, fs, flags, if (data) |d| @intFromPtr(d) else 0);
+    if (linux.errno(result) != .SUCCESS) {
+        const errno = @tagName(linux.errno(result));
+        std.debug.print("det-nodes: mount {s} failed: {s}\n", .{ target, errno });
+        return error.MountFailed;
+    }
+}
+
+pub fn mkdir_all(path: []const u8) !void {
+    assert(path.len > 0 and path.len < path_size_max);
+    var buffer: [path_size_max]u8 = undefined;
+    for (path, 0..) |byte, index| {
+        if (byte != '/' and index + 1 != path.len) continue;
+        const end = if (byte == '/') index else index + 1;
+        if (end == 0) continue;
+        @memcpy(buffer[0..end], path[0..end]);
+        buffer[end] = 0;
+        const result = linux.mkdir(buffer[0..end :0], 0o755);
+        switch (linux.errno(result)) {
+            .SUCCESS, .EXIST => {},
+            else => return error.Mkdir,
+        }
+    }
+}
+
+fn exists(path: [:0]const u8) bool {
+    return linux.errno(linux.access(path, linux.F_OK)) == .SUCCESS;
+}
+
+pub fn file_write(path: [:0]const u8, content: []const u8) !void {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
+    defer _ = linux.close(@intCast(fd));
+    const written = linux.write(@intCast(fd), content.ptr, content.len);
+    if (linux.errno(written) != .SUCCESS or written != content.len) return error.WriteFailed;
+}
+
+fn read_small(path: [:0]const u8, buffer: []u8) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return buffer[0..size];
+}
+
+fn read_file(arena: std.mem.Allocator, path: [:0]const u8, size_max: u32) ![]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
+    defer _ = linux.close(@intCast(fd));
+    const buffer = try arena.alloc(u8, size_max);
+    var size: u64 = 0;
+    while (size < buffer.len) {
+        const result = linux.read(@intCast(fd), buffer[size..].ptr, buffer.len - size);
+        if (linux.errno(result) != .SUCCESS) return error.ReadFailed;
+        if (result == 0) return buffer[0..size];
+        size += result;
+    }
+    return error.FileTooLarge;
+}
+
+/// Formats into `buffer` as a NUL-terminated path.
+pub fn print_z(buffer: []u8, comptime format: []const u8, arguments: anytype) ![:0]u8 {
+    return std.fmt.bufPrintSentinel(buffer, format, arguments, 0);
+}
+
+pub fn sleep_ns(duration_ns: u64) void {
+    const request = linux.timespec{
+        .sec = @intCast(duration_ns / std.time.ns_per_s),
+        .nsec = @intCast(duration_ns % std.time.ns_per_s),
+    };
+    _ = linux.nanosleep(&request, null);
+}
+
+test id_lookup {
+    const passwd = "root:x:0:0:root:/root:/bin/sh\nredis:x:999:1000::/data:/bin/false\n";
+    try std.testing.expectEqual(@as(u32, 999), id_lookup(passwd, "redis").?.id);
+    try std.testing.expectEqual(@as(u32, 1000), id_lookup(passwd, "redis").?.group);
+    try std.testing.expectEqual(@as(u32, 42), id_lookup(passwd, "42").?.id);
+    try std.testing.expect(id_lookup(passwd, "nobody") == null);
+}
+
+test address_parse {
+    try std.testing.expectEqual(netlink.Address{ 10, 0, 0, 7 }, try address_parse("10.0.0.7"));
+    try std.testing.expectError(error.BadAddress, address_parse("10.0.0"));
+}
+
+test mac {
+    const expected = [6]u8{ 2, 0xde, 0, 2, 0, 1 };
+    try std.testing.expectEqual(expected, mac(.{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }));
+}

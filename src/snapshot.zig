@@ -28,6 +28,8 @@ branches: u64,
 serial: @FieldType(VM, "serial"),
 rtc: @FieldType(VM, "rtc"),
 pit: @FieldType(VM, "pit"),
+blocks: @FieldType(VM, "blocks"),
+block_count: u32,
 decisions: @FieldType(VM, "decisions"),
 events: @FieldType(VM, "events"),
 
@@ -58,6 +60,8 @@ pub fn take(snapshot: *Snapshot, vm: *VM) !void {
         .serial = vm.serial,
         .rtc = vm.rtc,
         .pit = vm.pit,
+        .blocks = vm.blocks,
+        .block_count = vm.block_count,
         .decisions = vm.decisions,
         .events = vm.events,
     };
@@ -91,6 +95,9 @@ pub fn restore(snapshot: *const Snapshot, vm: *VM) !void {
     vm.serial = snapshot.serial;
     vm.rtc = snapshot.rtc;
     vm.pit = snapshot.pit;
+    // Disk contents never change; the devices' ring positions and registers do.
+    if (vm.block_count != snapshot.block_count) return error.SnapshotDisksDiffer;
+    vm.blocks = snapshot.blocks;
     vm.events = snapshot.events;
     vm.branches_offset = snapshot.branches;
     assert(vm.target_branches == 0);

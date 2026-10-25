@@ -13,6 +13,7 @@ const Events = @import("events.zig");
 const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
+const prepare = @import("prepare.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -21,8 +22,11 @@ const usage =
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
     \\
+    \\system options (instead of --disk; see ARCHITECTURE.md §10):
+    \\  --program <test program> [--profile <name>] [--scenario <name>|all] [--cache <dir>]
+    \\
     \\machine options:
-    \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>]
+    \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
     \\  [--cmdline <text> | --append <text>] [--deterministic] [--seed <n>]
     \\  [--margin-branches <n>]
     \\
@@ -60,14 +64,28 @@ const Arguments = struct {
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
     moment_vtime_ms: ?u64 = null,
     moment_command: ?[]const u8 = null,
+    /// Read-only disk images, in guest order (/dev/vda first).
+    disk_paths: [VM.disks_max][]const u8 = undefined,
+    disk_count: u32 = 0,
+    /// A test program: its system becomes the disks, its scenario the guest's work.
+    program_path: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    scenario: ?[]const u8 = null,
+    cache_directory: []const u8 = ".determinismo-cache",
 };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const arguments = parse_arguments(arena, try init.minimal.args.toSlice(arena)) catch {
+    var arguments = parse_arguments(arena, try init.minimal.args.toSlice(arena)) catch {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
+    const prepared = if (arguments.program_path) |program| try system_prepare(
+        arena,
+        init.io,
+        &arguments,
+        program,
+    ) else null;
     const cwd = std.Io.Dir.cwd();
     const kernel = try cwd.readFileAlloc(init.io, arguments.kernel_path, arena, .unlimited);
     const initrd = if (arguments.initrd_path) |path|
@@ -89,14 +107,93 @@ pub fn main(init: std.process.Init) !void {
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
+        .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
     };
-    switch (arguments.command) {
-        .run => try command_run(vm, &options),
-        .explore => {
-            const context = Context{ .arena = arena, .io = init.io };
-            try command_explore(context, vm, &options, &arguments);
-        },
+    const context = Context{ .arena = arena, .io = init.io };
+    const base_cmdline = arguments.cmdline;
+    var failing_scenarios: u32 = 0;
+    for (try scenarios_selected(arena, &arguments, prepared)) |scenario| {
+        options.cmdline = try cmdline_build(arena, base_cmdline, arguments.disk_count, scenario);
+        if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
+        switch (arguments.command) {
+            .run => try command_run(vm, &options),
+            .explore => {
+                const failing = try command_explore(context, vm, &options, &arguments);
+                failing_scenarios += @intFromBool(failing > 0);
+            },
+        }
     }
+    if (failing_scenarios > 0) std.process.exit(3);
+}
+
+/// Builds the disks of the program's system and records what was resolved.
+fn system_prepare(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    arguments: *Arguments,
+    program: []const u8,
+) !prepare.Prepared {
+    if (arguments.disk_count > 0) return error.DisksAndProgram;
+    const prepared = try prepare.prepare(arena, io, .{
+        .program = program,
+        .profile = arguments.profile,
+        .cache_directory = arguments.cache_directory,
+    });
+    if (prepared.disk_paths.len > VM.disks_max) return error.TooManyDisks;
+    for (prepared.disk_paths, 0..) |path, index| arguments.disk_paths[index] = path;
+    arguments.disk_count = @intCast(prepared.disk_paths.len);
+    std.debug.print("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}\n", .{
+        prepared.hash, prepared.system.profile, prepared.system.nodes.len, prepared.disk_paths[0],
+    });
+    return prepared;
+}
+
+/// The scenarios to run, one at a time (null: the guest decides, as without --program).
+fn scenarios_selected(
+    arena: std.mem.Allocator,
+    arguments: *const Arguments,
+    prepared: ?prepare.Prepared,
+) ![]const ?[]const u8 {
+    const system = (prepared orelse return &.{null}).system;
+    const wanted = arguments.scenario orelse if (system.scenarios.len == 1)
+        system.scenarios[0].name
+    else {
+        std.debug.print("[determinismo] pick a scenario with --scenario (or all)\n", .{});
+        return error.Usage;
+    };
+    if (std.mem.eql(u8, wanted, "all")) {
+        const all = try arena.alloc(?[]const u8, system.scenarios.len);
+        for (system.scenarios, all) |scenario, *name| name.* = scenario.name;
+        return all;
+    }
+    if (system.scenario(wanted) == null) {
+        std.debug.print("[determinismo] no scenario named {s}\n", .{wanted});
+        return error.Usage;
+    }
+    const one = try arena.alloc(?[]const u8, 1);
+    one[0] = wanted;
+    return one;
+}
+
+fn cmdline_build(
+    arena: std.mem.Allocator,
+    base: []const u8,
+    disk_count: u32,
+    scenario: ?[]const u8,
+) ![]const u8 {
+    var parts: [3][]const u8 = undefined;
+    var count: u32 = 0;
+    parts[count] = base;
+    count += 1;
+    if (disk_count > 0) {
+        parts[count] = try VM.disks_cmdline(arena, disk_count);
+        count += 1;
+    }
+    if (scenario) |name| {
+        parts[count] = try std.fmt.allocPrint(arena, "det.scenario={s}", .{name});
+        count += 1;
+    }
+    return std.mem.join(arena, " ", parts[0..count]);
 }
 
 fn command_run(vm: *VM, options: *const VM.Options) !void {
@@ -126,12 +223,13 @@ const Exploration = struct {
 };
 
 /// Boots once to setup_complete, snapshots, then runs every branch from the snapshot.
+/// Returns the number of branches with failing properties.
 fn command_explore(
     context: Context,
     vm: *VM,
     options: *VM.Options,
     arguments: *const Arguments,
-) !void {
+) !u32 {
     assert(options.deterministic);
     var exploration = Exploration{
         .exploration_seed = arguments.seed,
@@ -169,7 +267,7 @@ fn command_explore(
         .arguments = arguments,
     });
     multiverse.summarize(monotonic_ns() - time_start_ns);
-    if (multiverse.failing_branches > 0) std.process.exit(3);
+    return multiverse.failing_branches;
 }
 
 fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
@@ -326,6 +424,18 @@ fn parse_option(
         arguments.cmdline = value;
     } else if (eql(u8, flag, "--append")) {
         arguments.cmdline = try std.mem.join(arena, " ", &.{ arguments.cmdline, value });
+    } else if (eql(u8, flag, "--disk")) {
+        if (arguments.disk_count == VM.disks_max) return error.Usage;
+        arguments.disk_paths[arguments.disk_count] = value;
+        arguments.disk_count += 1;
+    } else if (eql(u8, flag, "--program")) {
+        arguments.program_path = value;
+    } else if (eql(u8, flag, "--profile")) {
+        arguments.profile = value;
+    } else if (eql(u8, flag, "--scenario")) {
+        arguments.scenario = value;
+    } else if (eql(u8, flag, "--cache")) {
+        arguments.cache_directory = value;
     } else if (eql(u8, flag, "--seed")) {
         arguments.seed = try std.fmt.parseInt(u64, value, 0);
     } else if (eql(u8, flag, "--margin-branches")) {
@@ -351,6 +461,25 @@ fn parse_option(
     } else {
         return error.Usage;
     }
+}
+
+fn open_disks(arena: std.mem.Allocator, paths: []const []const u8) ![]const VM.Disk {
+    assert(paths.len <= VM.disks_max);
+    const disks = try arena.alloc(VM.Disk, paths.len);
+    for (paths, disks) |path, *disk| {
+        const path_z = try arena.dupeSentinel(u8, path, 0);
+        const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(result) != .SUCCESS) {
+            std.debug.print("[determinismo] cannot open disk {s}\n", .{path});
+            return error.OpenFailed;
+        }
+        const fd: linux.fd_t = @intCast(result);
+        const size = linux.lseek(fd, 0, linux.SEEK.END);
+        if (linux.errno(size) != .SUCCESS) return error.DiskSize;
+        if (size % 512 != 0) return error.DiskSizeNotSectors;
+        disk.* = .{ .fd = fd, .size = size };
+    }
+    return disks;
 }
 
 fn open_for_writing(arena: std.mem.Allocator, path: []const u8) !linux.fd_t {
@@ -384,4 +513,6 @@ test {
     _ = @import("decisions.zig");
     _ = @import("events.zig");
     _ = @import("tape.zig");
+    _ = @import("virtio_block.zig");
+    _ = @import("prepare.zig");
 }

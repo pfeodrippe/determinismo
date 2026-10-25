@@ -93,9 +93,12 @@ fn check_line(name: Name, line_number: u32, line: []const u8) u32 {
     return violations;
 }
 
+/// A function whose body we measure. Functions returning `type` are containers (generic
+/// structs), like files: their own length is free, and the functions inside them are measured.
 fn is_function_start(line: []const u8) bool {
     const trimmed = std.mem.trimStart(u8, line, " ");
     if (!std.mem.endsWith(u8, line, "{")) return false;
+    if (std.mem.endsWith(u8, line, ") type {")) return false;
     if (std.mem.startsWith(u8, trimmed, "fn ")) return true;
     if (std.mem.startsWith(u8, trimmed, "pub fn ")) return true;
     return std.mem.startsWith(u8, trimmed, "export fn ");
@@ -110,4 +113,5 @@ test is_function_start {
     try std.testing.expect(is_function_start("pub fn main() !void {"));
     try std.testing.expect(is_function_start("    fn helper(a: u32) u32 {"));
     try std.testing.expect(!is_function_start("const x = fn_pointer;"));
+    try std.testing.expect(!is_function_start("pub fn System(comptime Nodes: type) type {"));
 }

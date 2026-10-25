@@ -1,9 +1,0 @@
-#!/bin/sh
-# SPDX-License-Identifier: MIT
-# Diagnostics: what the guest runtime looks like from inside.
-cat /proc/interrupts
-ls -la /dev/determinismo
-ps -eo pid,stat,wchan:20,comm | grep -v "\["
-sleep 1
-echo debug scenario done
-grep -E "determinismo|timer" /proc/interrupts

@@ -8,24 +8,27 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
+    // The SDK for tests written in Zig; it also holds the system schema the VMM reads.
+    const sdk = b.addModule("determinismo", .{
+        .root_source_file = b.path("sdk/zig/determinismo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exe = b.addExecutable(.{
         .name = "determinismo",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "determinismo", .module = sdk }},
         }),
     });
     b.installArtifact(exe);
 
-    // Guest side: the SDK for tests written in Zig, the in-guest runtime, and example tests.
-    // All are static binaries that run inside the VM.
-    const sdk = b.addModule("determinismo", .{
-        .root_source_file = b.path("sdk/zig/determinismo.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // Guest side: the in-guest runtime and example tests, static binaries that run in the VM.
     const guest_programs = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "det-init", .path = "guest/runtime/init.zig" },
+        .{ .name = "det-nodes", .path = "guest/runtime/nodes_main.zig" },
         .{ .name = "det-composer", .path = "guest/runtime/composer.zig" },
         .{ .name = "det-faults", .path = "guest/runtime/faults.zig" },
         .{ .name = "det-agent", .path = "guest/runtime/agent.zig" },
@@ -87,15 +90,30 @@ pub fn build(b: *std.Build) void {
     tidy_run.setCwd(b.path("."));
     b.step("tidy", "Check line and function lengths, headers and whitespace").dependOn(&tidy_run.step);
 
-    // Unit tests run natively on the developer's machine.
-    const test_step = b.step("test", "Run unit tests");
-    const test_roots = [_][]const u8{ "src/main.zig", "sdk/zig/determinismo.zig", "tools/tidy.zig" };
+    // Unit tests use Linux system calls: they run on the Linux host (`zig build test` there).
+    const test_step = b.step("test", "Run unit tests (on x86-64 Linux)");
+    const test_roots = [_][]const u8{
+        "src/main.zig",
+        "sdk/zig/determinismo.zig",
+        "guest/runtime/init.zig",
+        "guest/runtime/nodes.zig",
+        "guest/runtime/netlink.zig",
+        "guest/runtime/faults.zig",
+        "guest/runtime/composer.zig",
+    };
     for (test_roots) |root| {
         const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(root),
-            .target = b.graph.host,
+            .target = target,
             .optimize = .Debug,
+            .imports = &.{.{ .name = "determinismo", .module = sdk }},
         }) });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
+    const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/tidy.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(tidy_tests).step);
 }

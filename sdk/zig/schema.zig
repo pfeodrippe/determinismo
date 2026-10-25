@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+//! The system description, schema version 1 (ARCHITECTURE.md §10): what a test program's
+//! `--describe` prints, and the resolved form determinismo freezes into the guest disk
+//! (/det/system.json) and the run record.
+//!
+//! A test program is anything that answers two commands:
+//!   <program> --describe                 print a `Description` as JSON on stdout (on the host)
+//!   <program> run <scenario> <command>   run one command of a scenario (in the guest)
+//! so any language can describe a system and its tests; SDKs only make it convenient.
+const std = @import("std");
+const assert = std.debug.assert;
+
+pub const version: u32 = 1;
+pub const nodes_max = 15; // Plus disk 0, within the VMM's 16 disks.
+pub const scenarios_max = 64;
+pub const commands_max = 64;
+/// Node names become host names and interface names ("d-<name>", at most 15 bytes).
+pub const node_name_size_max = 12;
+pub const runner_name = "runner";
+pub const runner_address = [4]u8{ 10, 0, 0, 1 };
+
+pub const Description = struct {
+    schema: u32 = version,
+    profiles: []const Profile,
+    scenarios: []const Scenario,
+};
+
+/// One way to build the system under test.
+pub const Profile = struct {
+    name: []const u8,
+    nodes: []const Node,
+};
+
+pub const Node = struct {
+    name: []const u8,
+    source: Source,
+    /// The command to run; null runs the image's entrypoint and command.
+    command: ?[]const []const u8 = null,
+    /// `NAME=value` entries, added to (and overriding) the image's environment.
+    env: []const []const u8 = &.{},
+    workdir: ?[]const u8 = null,
+    /// A numeric `uid[:gid]`; null keeps the image's user.
+    user: ?[]const u8 = null,
+    ready: ?Ready = null,
+    /// Nodes that must be ready before this one starts.
+    after: []const []const u8 = &.{},
+    faults: Faults = .{},
+};
+
+/// Where a node's root filesystem comes from: exactly one field is set.
+pub const Source = struct {
+    /// An OCI image reference, pinned to a digest when resolved.
+    image: ?[]const u8 = null,
+    /// A directory on the host, used as the root filesystem.
+    directory: ?[]const u8 = null,
+    /// A static executable on the host, alone in an otherwise empty root filesystem.
+    binary: ?[]const u8 = null,
+
+    pub fn kind_count(source: Source) u32 {
+        return @as(u32, @intFromBool(source.image != null)) +
+            @intFromBool(source.directory != null) + @intFromBool(source.binary != null);
+    }
+};
+
+/// The node is ready once this succeeds (from the runner).
+pub const Ready = struct { tcp: u16 };
+
+/// What the fault injector may do to the node.
+pub const Faults = struct {
+    /// Freeze all its processes for a while.
+    pause: bool = true,
+    /// Cut all its network links for a while.
+    isolate: bool = true,
+    /// Cut single links between it and other nodes for a while.
+    partition: bool = true,
+    /// Kill it and start it again (its files survive, its memory does not).
+    restart: bool = false,
+};
+
+pub const Scenario = struct {
+    name: []const u8,
+    commands: []const Command,
+    /// Whether the fault injector runs during the driver phase.
+    faults: bool = true,
+    clock_skip: bool = false,
+};
+
+pub const Command = struct { kind: Kind, name: []const u8 };
+
+pub const Kind = enum {
+    setup,
+    first,
+    parallel_driver,
+    serial_driver,
+    singleton_driver,
+    anytime,
+    eventually,
+    finally,
+};
+
+/// What the guest receives: one profile, resolved, and every scenario.
+pub const System = struct {
+    schema: u32 = version,
+    profile: []const u8,
+    nodes: []const Resolved,
+    scenarios: []const Scenario,
+
+    pub fn scenario(system: *const System, name: []const u8) ?*const Scenario {
+        for (system.scenarios) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
+    pub fn node(system: *const System, name: []const u8) ?*const Resolved {
+        for (system.nodes) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+};
+
+/// A node with everything the guest needs to run it.
+pub const Resolved = struct {
+    name: []const u8,
+    /// IPv4 address on the guest network, "10.0.0.N".
+    address: []const u8,
+    /// The block device holding its root filesystem ("vdb", "vdc", ...).
+    disk: []const u8,
+    /// Identifies the root filesystem's content (image digest or content hash).
+    digest: []const u8,
+    command: []const []const u8,
+    env: []const []const u8,
+    workdir: []const u8 = "/",
+    user: ?[]const u8 = null,
+    ready: ?Ready = null,
+    after: []const []const u8 = &.{},
+    faults: Faults = .{},
+};
+
+pub fn node_address(index: u32) [4]u8 {
+    assert(index < nodes_max);
+    return .{ 10, 0, 0, @intCast(index + 2) };
+}
+
+/// The block device of node `index` (disk 0, vda, is the system disk).
+pub fn node_disk(buffer: *[3]u8, index: u32) []const u8 {
+    assert(index < nodes_max);
+    buffer.* = .{ 'v', 'd', @intCast('b' + index) };
+    return buffer;
+}
+
+pub fn name_valid(name: []const u8) bool {
+    if (name.len == 0 or name.len > node_name_size_max) return false;
+    if (std.mem.eql(u8, name, runner_name)) return false;
+    for (name) |byte| {
+        const valid = std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-';
+        if (!valid) return false;
+    }
+    return std.ascii.isLower(name[0]);
+}
+
+pub fn parse(comptime T: type, arena: std.mem.Allocator, source: []const u8) !T {
+    return std.json.parseFromSliceLeaky(T, arena, source, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+test name_valid {
+    try std.testing.expect(name_valid("redis"));
+    try std.testing.expect(name_valid("pg-1"));
+    try std.testing.expect(!name_valid("Redis"));
+    try std.testing.expect(!name_valid("runner"));
+    try std.testing.expect(!name_valid("a-very-long-name"));
+}
+
+test "a system round-trips through JSON" {
+    const arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var arena = arena_state;
+    defer arena.deinit();
+    const source =
+        \\{"schema":1,"profile":"default","nodes":[{"name":"redis","address":"10.0.0.2",
+        \\"disk":"vdb","digest":"sha256:x","command":["redis-server"],"env":["A=1"],
+        \\"ready":{"tcp":6379}}],"scenarios":[{"name":"bank","commands":[
+        \\{"kind":"setup","name":"seed"},{"kind":"parallel_driver","name":"transfer"}]}]}
+    ;
+    const system = try parse(System, arena.allocator(), source);
+    try std.testing.expectEqual(@as(u16, 6379), system.node("redis").?.ready.?.tcp);
+    const bank = system.scenario("bank").?;
+    try std.testing.expectEqual(Kind.parallel_driver, bank.commands[1].kind);
+    try std.testing.expect(bank.faults);
+}

@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! det-composer: runs one timeline of a test template, following Antithesis's test-command rules
+//! det-composer: runs one timeline of a scenario, following Antithesis's test-command rules
 //! (docs: test_composer_reference). Every choice it makes (which command, how many in parallel,
 //! when) is a randomness pull from the platform, so a strategy can steer it and a tape replays
 //! it.
 //!
-//! Usage: det-composer <command path>...   (typically a shell glob over a template directory)
+//! Usage: det-composer --scenario <name>
+//!
+//! The scenario comes from /det/system.json; its commands run as `/det/program run <scenario>
+//! <command>`. The composer runs the scenario's setup command and then signals setup_complete
+//! itself: that is where determinismo snapshots, so every branch starts after setup.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -16,19 +20,12 @@ const starts_max = 64;
 const parallelism_max = 4;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
-const faults_config_name = "faults.conf";
+const program_path = "/det/program";
+const nodes = @import("nodes.zig");
+const schema = sdk.schema;
+const Kind = schema.Kind;
 
-const Kind = enum {
-    first,
-    parallel_driver,
-    serial_driver,
-    singleton_driver,
-    anytime,
-    eventually,
-    finally,
-};
-
-const Command = struct { path: [:0]const u8, kind: Kind };
+const Command = struct { name: [:0]const u8, kind: Kind };
 
 const Running = struct { pid: linux.pid_t, command: *const Command };
 
@@ -38,8 +35,9 @@ const Composer = struct {
     running: [running_max]Running = undefined,
     running_count: u32 = 0,
     started_count: u32 = 0,
-    /// The template's faults.conf, if it has one, and the injector while it runs.
-    faults_config: ?[:0]const u8 = null,
+    scenario: [:0]const u8 = "",
+    /// Whether the scenario uses the fault injector, and its process while it runs.
+    faults: bool = false,
     faults_pid: ?linux.pid_t = null,
 
     fn kind_count(composer: *const Composer, kind: Kind) u32 {
@@ -67,7 +65,7 @@ const Composer = struct {
     fn start(composer: *Composer, command: *const Command) void {
         assert(composer.running_count < running_max);
         assert(composer.started_count < starts_max * 2);
-        const pid = spawn(&.{command.path.ptr});
+        const pid = spawn(&.{ program_path, "run", composer.scenario, command.name });
         composer.running[composer.running_count] = .{ .pid = pid, .command = command };
         composer.running_count += 1;
         composer.started_count += 1;
@@ -101,8 +99,8 @@ const Composer = struct {
     /// and stopped before eventually and finally commands, which check recovery.
     fn faults_start(composer: *Composer) void {
         assert(composer.faults_pid == null);
-        const config = composer.faults_config orelse return;
-        composer.faults_pid = spawn(&.{ faults_path, config.ptr });
+        if (!composer.faults) return;
+        composer.faults_pid = spawn(&.{ faults_path, "--scenario", composer.scenario });
     }
 
     fn faults_stop(composer: *Composer) void {
@@ -126,18 +124,26 @@ const Composer = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const arguments = try init.minimal.args.toSlice(init.arena.allocator());
-    var composer: Composer = .{};
-    for (arguments[1..]) |path| {
-        if (std.mem.eql(u8, std.fs.path.basename(path), faults_config_name)) {
-            composer.faults_config = path;
+    const arena = init.arena.allocator();
+    const arguments = try init.minimal.args.toSlice(arena);
+    if (arguments.len != 3 or !std.mem.eql(u8, arguments[1], "--scenario")) return error.Usage;
+    const system = try nodes.system_load(arena);
+    const scenario = system.scenario(arguments[2]) orelse return error.UnknownScenario;
+    var composer: Composer = .{ .scenario = arguments[2], .faults = scenario.faults };
+    var setup: ?Command = null;
+    for (scenario.commands) |command| {
+        const name = try arena.dupeSentinel(u8, command.name, 0);
+        if (command.kind == .setup) {
+            if (setup != null) return error.SeveralSetupCommands;
+            setup = .{ .name = name, .kind = .setup };
             continue;
         }
-        const kind = classify(std.fs.path.basename(path)) orelse continue;
         if (composer.command_count == commands_max) return error.TooManyCommands;
-        composer.commands[composer.command_count] = .{ .path = path, .kind = kind };
+        composer.commands[composer.command_count] = .{ .name = name, .kind = command.kind };
         composer.command_count += 1;
     }
+    if (setup) |*command| composer.run_to_completion(command);
+    sdk.setup_complete(.{ .scenario = composer.scenario });
     const drivers = composer.kind_count(.parallel_driver) + composer.kind_count(.serial_driver);
     const singletons = composer.kind_count(.singleton_driver);
     if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
@@ -209,19 +215,15 @@ fn run_ending(composer: *Composer) void {
     }
 }
 
-fn classify(name: []const u8) ?Kind {
-    inline for (comptime std.enums.values(Kind)) |kind| {
-        if (std.mem.startsWith(u8, name, @tagName(kind) ++ "_")) return kind;
-    }
-    return null;
-}
-
 const environment = [_:null]?[*:0]const u8{
     "PATH=/opt/determinismo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME=/root",
 };
 
 const spawn_arguments_max = 4;
+comptime {
+    assert(spawn_arguments_max >= 4); // program, "run", scenario, command.
+}
 
 fn spawn(arguments: []const [*:0]const u8) linux.pid_t {
     assert(arguments.len >= 1);
@@ -240,7 +242,7 @@ fn spawn(arguments: []const [*:0]const u8) linux.pid_t {
 fn report_exit(command: *const Command, status: u32) void {
     const exited = status & 0x7f == 0;
     const code = if (exited) (status >> 8) & 0xff else 128 + (status & 0x7f);
-    const name = std.fs.path.basename(command.path);
+    const name = command.name;
     sdk.event("command_exit", .{ .command = name, .status = code });
     sdk.always(code == 0, "test commands exit successfully", .{ .command = name, .status = code });
 }
@@ -254,8 +256,3 @@ fn pause(duration_ns: u64) void {
     _ = linux.nanosleep(&request, null); // Interruption only shortens a random pause.
 }
 
-test classify {
-    try std.testing.expectEqual(@as(?Kind, .parallel_driver), classify("parallel_driver_x"));
-    try std.testing.expectEqual(@as(?Kind, .first), classify("first_seed"));
-    try std.testing.expectEqual(@as(?Kind, null), classify("helper"));
-}

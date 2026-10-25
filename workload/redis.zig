@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     if (operations == 0 or operations > operations_max) return error.BadOperationCount;
 
     const connection = try init.arena.allocator().create(Connection);
-    try connection.open(6379);
+    try connection.open(.{ 127, 0, 0, 1 }, 6379);
     defer connection.close();
     var summary = Summary{};
     const time_start_ns = monotonic_ns();

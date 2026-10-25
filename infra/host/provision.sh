@@ -10,7 +10,8 @@ apt-get -y -q full-upgrade
 apt-get -y -q install \
   build-essential bc bison flex libelf-dev libssl-dev dwarves zstd \
   linux-headers-amd64 linux-perf msr-tools cpuid numactl \
-  git curl rsync tmux htop sudo nftables unattended-upgrades
+  git curl rsync tmux htop sudo nftables unattended-upgrades \
+  podman uidmap erofs-utils busybox-static xz-utils cpio file
 
 # The host kernel is pinned: our KVM modules are built against it.
 apt-mark hold linux-image-amd64 linux-headers-amd64 >/dev/null

@@ -4,29 +4,31 @@
 //! did. Every choice (when, which fault, how long) is a randomness pull from the platform, so a
 //! strategy steers faults like any other decision and a tape replays them.
 //!
-//! Usage: det-faults <faults.conf>, where each line is one fault the injector may use:
-//!   pause <pidfile>                 SIGSTOP the process for a while, then SIGCONT
-//!   restart <pidfile> <command...>  SIGKILL the process, wait, run the command (via /bin/sh)
-//!   clock_skip                      jump the wall clock (CLOCK_REALTIME) and later jump back
+//! Usage: det-faults --scenario <name>
+//!
+//! The faults come from /det/system.json: what each node allows (pause, isolate, partition,
+//! restart) and whether the scenario wants clock skips.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
+const schema = sdk.schema;
+const nodes = @import("nodes.zig");
 
-const faults_max = 16;
+const faults_max = 256;
 const injections_max = 10_000;
-const config_size_max = 8 * 1024;
 const delay_ns_min = 10 * std.time.ns_per_ms;
 const delay_ns_max = 300 * std.time.ns_per_ms;
 const duration_ns_max = 500 * std.time.ns_per_ms;
 const clock_skip_ns_max = 60 * std.time.ns_per_s;
 
-const Kind = enum { pause, restart, clock_skip };
+const Kind = enum { pause, isolate, partition, restart, clock_skip };
 
 const Fault = struct {
     kind: Kind,
-    pidfile: [:0]const u8 = "",
-    command: [:0]const u8 = "",
+    node: []const u8 = "",
+    /// The other end of a partitioned link (a node or the runner).
+    peer: []const u8 = "",
 };
 
 /// Set by the SIGTERM handler; checked between steps so a stop never leaves a fault applied.
@@ -37,14 +39,14 @@ fn on_terminate(_: linux.SIG) callconv(.c) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const arguments = try init.minimal.args.toSlice(init.arena.allocator());
-    if (arguments.len != 2) return error.Usage;
-    const limit: std.Io.Limit = .limited(config_size_max);
     const arena = init.arena.allocator();
-    const source = try std.Io.Dir.cwd().readFileAlloc(init.io, arguments[1], arena, limit);
+    const arguments = try init.minimal.args.toSlice(arena);
+    if (arguments.len != 3 or !std.mem.eql(u8, arguments[1], "--scenario")) return error.Usage;
+    const system = try nodes.system_load(arena);
+    const scenario = system.scenario(arguments[2]) orelse return error.UnknownScenario;
     var faults: [faults_max]Fault = undefined;
-    const count = try parse(arena, source, &faults);
-    if (count == 0) return; // Nothing configured: nothing to inject.
+    const count = faults_collect(&system, scenario, &faults);
+    if (count == 0) return; // Nothing allowed: nothing to inject.
     const action = linux.Sigaction{
         .handler = .{ .handler = on_terminate },
         .mask = linux.sigemptyset(),
@@ -57,28 +59,78 @@ pub fn main(init: std.process.Init) !void {
     while (injections < injections_max) : (injections += 1) {
         sleep_ns(delay_ns_min + sdk.random_below(delay_ns_max - delay_ns_min));
         if (stopping.load(.acquire)) break;
-        inject(&sdk.random_choice(Fault, faults[0..count]));
+        inject(arena, &system, &sdk.random_choice(Fault, faults[0..count]));
     }
     sdk.event("faults_stop", .{ .injections = injections });
 }
 
+fn faults_collect(
+    system: *const schema.System,
+    scenario: *const schema.Scenario,
+    faults: *[faults_max]Fault,
+) u32 {
+    var count: u32 = 0;
+    for (system.nodes, 0..) |node, index| {
+        const allowed = node.faults;
+        if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
+        if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
+        if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
+        if (!allowed.partition) continue;
+        const runner = Fault{ .kind = .partition, .node = node.name, .peer = schema.runner_name };
+        faults_add(faults, &count, runner);
+        for (system.nodes[index + 1 ..]) |peer| {
+            if (!peer.faults.partition) continue;
+            const link = Fault{ .kind = .partition, .node = node.name, .peer = peer.name };
+            faults_add(faults, &count, link);
+        }
+    }
+    if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
+    assert(count <= faults_max);
+    return count;
+}
+
+fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
+    if (count.* == faults_max) return;
+    faults[count.*] = fault;
+    count.* += 1;
+}
+
 /// Applies one fault for a random duration and undoes it, even when stopped meanwhile.
-fn inject(fault: *const Fault) void {
+fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const Fault) void {
     const duration_ns = sdk.random_below(duration_ns_max);
+    const details = .{
+        .kind = @tagName(fault.kind),
+        .node = fault.node,
+        .peer = fault.peer,
+        .duration_ns = duration_ns,
+    };
     switch (fault.kind) {
         .pause => {
-            const pid = read_pid(fault.pidfile) orelse return;
-            _ = linux.kill(pid, .STOP);
-            sdk.event("fault", .{ .kind = "pause", .pid = pid, .duration_ns = duration_ns });
+            nodes.freeze(fault.node, .frozen) catch return;
+            sdk.event("fault", details);
             sleep_ns(duration_ns);
-            _ = linux.kill(pid, .CONT);
+            nodes.freeze(fault.node, .thawed) catch {};
+        },
+        .isolate => {
+            if (!links_set(system, fault.node, .down)) return;
+            sdk.event("fault", details);
+            sleep_ns(duration_ns);
+            _ = links_set(system, fault.node, .up);
+        },
+        .partition => {
+            nodes.link_set(system, fault.node, fault.peer, .down) catch return;
+            sdk.event("fault", details);
+            sleep_ns(duration_ns);
+            nodes.link_set(system, fault.node, fault.peer, .up) catch {};
         },
         .restart => {
-            const pid = read_pid(fault.pidfile) orelse return;
-            _ = linux.kill(pid, .KILL);
-            sdk.event("fault", .{ .kind = "restart", .pid = pid, .downtime_ns = duration_ns });
+            nodes.kill(fault.node) catch return;
+            sdk.event("fault", details);
             sleep_ns(duration_ns);
-            run_shell(fault.command);
+            const node = system.node(fault.node).?;
+            nodes.start(arena, system, node) catch |err| {
+                sdk.event("fault_restart_failed", .{ .node = fault.node, .err = @errorName(err) });
+            };
         },
         .clock_skip => {
             const forward = sdk.random_below(2) == 0;
@@ -91,57 +143,14 @@ fn inject(fault: *const Fault) void {
     }
 }
 
-fn parse(arena: std.mem.Allocator, source: []const u8, faults: *[faults_max]Fault) !u32 {
-    var count: u32 = 0;
-    var lines = std.mem.tokenizeScalar(u8, source, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (count == faults_max) return error.TooManyFaults;
-        var words = std.mem.tokenizeScalar(u8, line, ' ');
-        const kind = std.meta.stringToEnum(Kind, words.next().?) orelse return error.UnknownFault;
-        var fault = Fault{ .kind = kind };
-        if (kind != .clock_skip) {
-            const pidfile = words.next() orelse return error.MissingPidfile;
-            fault.pidfile = try arena.dupeSentinel(u8, pidfile, 0);
-        }
-        if (kind == .restart) {
-            const command = std.mem.trim(u8, words.rest(), " ");
-            if (command.len == 0) return error.MissingRestartCommand;
-            fault.command = try arena.dupeSentinel(u8, command, 0);
-        }
-        faults[count] = fault;
-        count += 1;
+/// Every link of `name` (to the runner and to each other node) goes up or down.
+fn links_set(system: *const schema.System, name: []const u8, state: nodes.LinkState) bool {
+    nodes.link_set(system, name, schema.runner_name, state) catch return false;
+    for (system.nodes) |peer| {
+        if (std.mem.eql(u8, peer.name, name)) continue;
+        nodes.link_set(system, name, peer.name, state) catch {};
     }
-    assert(count <= faults_max);
-    return count;
-}
-
-fn read_pid(pidfile: [:0]const u8) ?linux.pid_t {
-    assert(pidfile.len > 0);
-    const fd = linux.open(pidfile, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) != .SUCCESS) return null; // Not running right now: skip this fault.
-    defer _ = linux.close(@intCast(fd));
-    var buffer: [32]u8 = undefined;
-    const size = linux.read(@intCast(fd), &buffer, buffer.len);
-    if (linux.errno(size) != .SUCCESS) return null;
-    const text = std.mem.trim(u8, buffer[0..size], " \n");
-    return std.fmt.parseInt(linux.pid_t, text, 10) catch null;
-}
-
-fn run_shell(command: [:0]const u8) void {
-    assert(command.len > 0);
-    const pid = linux.fork();
-    if (pid == 0) {
-        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command.ptr };
-        const environment = [_:null]?[*:0]const u8{
-            "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        };
-        _ = linux.execve("/bin/sh", &argv, &environment);
-        linux.exit_group(127);
-    }
-    var status: i32 = 0;
-    _ = linux.waitpid(@intCast(pid), &status, 0); // Restart commands daemonize and return.
+    return true;
 }
 
 fn clock_shift(skip_ns: u64, direction: struct { forward: bool }) void {
@@ -157,22 +166,25 @@ fn clock_shift(skip_ns: u64, direction: struct { forward: bool }) void {
 }
 
 fn sleep_ns(duration_ns: u64) void {
-    const request = linux.timespec{
-        .sec = @intCast(duration_ns / std.time.ns_per_s),
-        .nsec = @intCast(duration_ns % std.time.ns_per_s),
-    };
-    _ = linux.nanosleep(&request, null); // A stop interrupts it; the caller checks the flag.
+    nodes.sleep_ns(duration_ns); // A stop interrupts it; the caller checks the flag.
 }
 
-test parse {
-    var faults: [faults_max]Fault = undefined;
-    const source = "# comment\npause /tmp/a.pid\n" ++
-        "restart /tmp/b.pid service --daemonize yes\nclock_skip\n";
-    const count = try parse(std.testing.allocator, source, &faults);
-    defer for (faults[0..count]) |fault| {
-        if (fault.pidfile.len > 0) std.testing.allocator.free(fault.pidfile);
-        if (fault.command.len > 0) std.testing.allocator.free(fault.command);
+test faults_collect {
+    const node_faults = schema.Faults{ .pause = true, .isolate = false, .restart = true };
+    const base = schema.Resolved{
+        .name = "a",
+        .address = "10.0.0.2",
+        .disk = "vdb",
+        .digest = "",
+        .command = &.{"x"},
+        .env = &.{},
     };
-    try std.testing.expectEqual(@as(u32, 3), count);
-    try std.testing.expectEqualStrings("service --daemonize yes", faults[1].command);
+    var resolved = [2]schema.Resolved{ base, base };
+    resolved[0].faults = node_faults;
+    resolved[1].name = "b";
+    const scenario = schema.Scenario{ .name = "s", .commands = &.{}, .clock_skip = true };
+    const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
+    var faults: [faults_max]Fault = undefined;
+    // a: pause, restart, partition(runner), partition(b); b: pause, isolate, partition(runner).
+    try std.testing.expectEqual(@as(u32, 8), faults_collect(&system, &scenario, &faults));
 }

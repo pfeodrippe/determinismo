@@ -14,6 +14,7 @@ const cpuid = @import("cpuid.zig");
 const Serial = @import("serial.zig");
 const RTC = @import("rtc.zig");
 const PIT = @import("pit.zig");
+const VirtioBlock = @import("virtio_block.zig");
 const Decisions = @import("decisions.zig");
 const Events = @import("events.zig");
 const Snapshot = @import("snapshot.zig");
@@ -49,6 +50,9 @@ tsc_per_branch: u32,
 serial: Serial,
 rtc: RTC,
 pit: PIT,
+/// Read-only disks, one virtio-mmio slot each (see virtio_block.zig).
+blocks: [disks_max]VirtioBlock,
+block_count: u32,
 /// Branch count at which KVM stops the vCPU for the PIT deadline (0: none).
 target_branches: u64,
 decisions: Decisions,
@@ -91,7 +95,12 @@ pub const Options = struct {
     /// Stop at this virtual time, and optionally run a command in the guest there.
     moment_vtime_ns: ?u64 = null,
     moment_command: ?[]const u8 = null,
+    disks: []const Disk = &.{},
 };
+
+/// A read-only disk image, open for the whole process (branches share it).
+pub const Disk = struct { fd: linux.fd_t, size: u64 };
+pub const disks_max = 16;
 
 pub const Outcome = union(enum) {
     shutdown, // A triple fault: how the guest reboots with reboot=t.
@@ -194,6 +203,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .serial = .{},
         .rtc = .{ .epoch_seconds = options.epoch_seconds },
         .pit = .{ .tsc_hz = cpuid.tsc_hz },
+        .blocks = undefined,
+        .block_count = @intCast(options.disks.len),
         .target_branches = 0,
         .decisions = .{ .seed = options.seed },
         .events = undefined,
@@ -204,6 +215,10 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .overrides = null,
     };
     vm.events.init(options.events_parse_buffer, .{ .log_fd = options.events_fd });
+    if (options.disks.len > disks_max) return error.TooManyDisks;
+    for (options.disks, vm.blocks[0..options.disks.len]) |disk, *block| {
+        block.init(disk.fd, disk.size);
+    }
     const version = try kvm.ioctl(vm.kvm_fd, kvm.GET_API_VERSION, 0);
     if (version != kvm.api_version) return error.KVMVersion;
     vm.vm_fd = try kvm.ioctl_fd(vm.kvm_fd, kvm.CREATE_VM, 0);
@@ -335,7 +350,7 @@ pub fn run_until_exit(vm: *VM) !Outcome {
         };
         switch (vm.run.exit_reason) {
             .io => if (try vm.handle_io()) |outcome| return outcome,
-            .mmio => vm.handle_mmio(),
+            .mmio => try vm.handle_mmio(),
             .det_target => {
                 assert(vm.deterministic);
                 vm.stats.exits.getPtr(.det_target).* += 1;
@@ -473,11 +488,44 @@ fn now_tsc(vm: *VM) !u64 {
     return 0; // KVM's own PIT handles the ports; the RTC reads the epoch.
 }
 
-fn handle_mmio(vm: *VM) void {
+fn handle_mmio(vm: *VM) !void {
     assert(vm.run.exit_reason == .mmio);
     vm.stats.exits.getPtr(.mmio).* += 1;
     const mmio = &vm.run.exit.mmio;
-    if (mmio.is_write == 0) @memset(&mmio.data, 0xff); // No devices are memory-mapped.
+    assert(mmio.len >= 1 and mmio.len <= 8);
+    const data = mmio.data[0..mmio.len];
+    const index = vm.disk_index(mmio.phys_addr) orelse {
+        if (mmio.is_write == 0) @memset(data, 0xff); // Nothing else is memory-mapped.
+        return;
+    };
+    const block = &vm.blocks[index];
+    const offset = mmio.phys_addr - VirtioBlock.address_base - index * VirtioBlock.address_size;
+    if (mmio.is_write == 0) return block.read(offset, data);
+    if (block.write(offset, data, vm.memory)) {
+        try vm.trace("disk", index);
+        try vm.irq_pulse(VirtioBlock.irq);
+    }
+}
+
+fn disk_index(vm: *const VM, address: u64) ?u32 {
+    const base = VirtioBlock.address_base;
+    if (address < base) return null;
+    const index = (address - base) / VirtioBlock.address_size;
+    if (index >= vm.block_count) return null;
+    return @intCast(index);
+}
+
+/// Kernel parameters announcing `count` disks to the guest's virtio_mmio driver.
+pub fn disks_cmdline(arena: std.mem.Allocator, count: u32) ![]const u8 {
+    assert(count <= disks_max);
+    var parts: [disks_max][]const u8 = undefined;
+    for (parts[0..count], 0..) |*part, index| {
+        const address = VirtioBlock.address_base + index * VirtioBlock.address_size;
+        part.* = try std.fmt.allocPrint(arena, "virtio_mmio.device=4K@0x{x}:{d}", .{
+            address, VirtioBlock.irq,
+        });
+    }
+    return std.mem.join(arena, " ", parts[0..count]);
 }
 
 fn handle_io(vm: *VM) !?Outcome {

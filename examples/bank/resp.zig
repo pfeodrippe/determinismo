@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! A minimal Redis (RESP2) client over a blocking TCP socket to 127.0.0.1, with fixed buffers.
+//! A minimal Redis (RESP2) client over a blocking TCP socket, with fixed buffers.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
 const buffer_size = 64 * 1024;
+/// A request that gets no answer for this long fails (ReadFailed) instead of waiting out TCP's
+/// retransmissions: under network faults, "unavailable" must be quick to observe.
+const timeout_ms = 1000;
 const command_size_max = 1024;
 pub const array_count_max = 64;
 
@@ -22,18 +25,34 @@ pub const Reply = union(enum) {
     bulk: ?[]const u8,
 };
 
-pub fn open(connection: *Connection, port: u16) !void {
+pub fn open(connection: *Connection, address: [4]u8, port: u16) !void {
     const socket = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
     connection.* = .{ .fd = @intCast(socket) };
-    const address = linux.sockaddr.in{
+    const target = linux.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .addr = @bitCast(address), // Already in network order.
     };
-    const result = linux.connect(connection.fd, &address, @sizeOf(linux.sockaddr.in));
-    if (linux.errno(result) != .SUCCESS) return error.ConnectFailed;
+    const timeout = linux.timeval{ .sec = 0, .usec = timeout_ms * std.time.us_per_ms };
+    for ([_]u32{ linux.SO.RCVTIMEO, linux.SO.SNDTIMEO }) |option| {
+        const size = @sizeOf(linux.timeval);
+        _ = linux.setsockopt(connection.fd, linux.SOL.SOCKET, option, @ptrCast(&timeout), size);
+    }
+    const result = linux.connect(connection.fd, &target, @sizeOf(linux.sockaddr.in));
+    if (linux.errno(result) != .SUCCESS) {
+        _ = linux.close(connection.fd);
+        return error.ConnectFailed;
+    }
     assert(connection.start == 0);
     assert(connection.end == 0);
+}
+
+/// Whether `err` means the server could not be reached (as opposed to a protocol error).
+pub fn is_unavailable(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectFailed, error.WriteFailed, error.ReadFailed, error.ConnectionClosed => true,
+        else => false,
+    };
 }
 
 pub fn close(connection: *Connection) void {

@@ -7,28 +7,39 @@
 //! (local runs) randomness comes from the OS and events go to stderr, so the same test binary
 //! works everywhere.
 //!
-//! A test is a struct of handlers named after test-command prefixes:
+//! A test program describes the system (typed nodes, built from profiles) and its scenarios,
+//! each a plain function that lists test commands:
 //!
-//!     const Test = struct {
-//!         pub fn setup(init: std.process.Init) !void { ... sdk.setup_complete(.{}); }
-//!         pub fn parallel_driver_transfer(init: std.process.Init) !void { ... }
-//!         pub fn finally_check(init: std.process.Init) !void { sdk.always(ok, "...", .{}); }
-//!     };
-//!     pub fn main(init: std.process.Init) !void { return sdk.run(Test, init); }
+//!     const Nodes = struct { redis: sdk.Node };
+//!     const System = sdk.System(Nodes);
 //!
-//! The runtime invokes `binary <handler>` (or a symlink named after the handler).
+//!     fn describe(d: *System.Describe) !void {
+//!         const profile = try d.profile("default");
+//!         profile.node(.redis, .{ .image = "redis:7.4", .ready = .{ .tcp = 6379 } });
+//!     }
+//!     fn bank(s: *System.Scenario) void {
+//!         s.setup("accounts", create_accounts);
+//!         s.parallel_driver("transfer", transfer); // fn transfer(ctx: *System.Context) !void
+//!         s.finally("conserved", check_total);
+//!     }
+//!     pub fn main(init: std.process.Init) !void {
+//!         return System.main(init, .{ .describe = describe, .scenarios = .{ .bank = bank } });
+//!     }
+//!
+//! Drivers are ordinary functions: share them between scenarios and programs like any code.
+//! See schema.zig for the two commands every test program answers.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
+pub const schema = @import("schema.zig");
+const system = @import("system.zig");
+pub const System = system.System;
+pub const Node = system.Node;
+
 pub const device_path = "/dev/determinismo";
 /// One event or one randomness pull per device call (the guest module's page size limit).
 pub const message_size_max = 4096 - 16;
-
-pub const command_prefixes = [_][]const u8{
-    "setup",             "first_",   "parallel_driver_", "serial_driver_",
-    "singleton_driver_", "anytime_", "eventually_",      "finally_",
-};
 
 /// The device, opened on first use. Not thread-safe: test commands are processes.
 var device: Device = .unopened;
@@ -168,48 +179,7 @@ fn device_get() Device {
     return device;
 }
 
-/// Runs the handler named by argv[1], or by the name the binary was invoked under. With
-/// `--list`, prints the handler names, one per line, for the runtime to discover.
-pub fn run(comptime Handlers: type, init: std.process.Init) !void {
-    const arguments = try init.minimal.args.toSlice(init.arena.allocator());
-    assert(arguments.len >= 1);
-    const command = if (arguments.len >= 2) arguments[1] else std.fs.path.basename(arguments[0]);
-    if (std.mem.eql(u8, command, "--list")) {
-        inline for (comptime handler_names(Handlers)) |name| {
-            _ = linux.write(1, name ++ "\n", name.len + 1);
-        }
-        return;
-    }
-    inline for (comptime handler_names(Handlers)) |name| {
-        if (std.mem.eql(u8, command, name)) return @field(Handlers, name)(init);
-    }
-    std.debug.print("unknown test command: {s}\n", .{command});
-    return error.UnknownCommand;
-}
-
-fn handler_names(comptime Handlers: type) []const []const u8 {
-    comptime {
-        var names: []const []const u8 = &.{};
-        for (std.meta.declarations(Handlers)) |declaration| {
-            for (command_prefixes) |prefix| {
-                if (std.mem.startsWith(u8, declaration, prefix)) {
-                    names = names ++ .{declaration};
-                    break;
-                }
-            }
-        }
-        assert(names.len > 0); // A test needs at least one command.
-        return names;
-    }
-}
-
-test handler_names {
-    const Handlers = struct {
-        pub fn setup(_: std.process.Init) !void {}
-        pub fn parallel_driver_a(_: std.process.Init) !void {}
-        pub fn helper() void {}
-    };
-    const names = comptime handler_names(Handlers);
-    try std.testing.expectEqual(@as(usize, 2), names.len);
-    try std.testing.expectEqualStrings("setup", names[0]);
+test {
+    _ = schema;
+    _ = system;
 }
