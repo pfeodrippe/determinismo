@@ -107,3 +107,24 @@ def event(name, details=None):
     """A structured event: {"event": name, "details": details}."""
     assert name
     _emit({"event": name, "details": details or {}})
+
+
+def coverage_start(paths=None):
+    """Code coverage for strategies (Python 3.12+): from now on, each line of code under `paths`
+    (prefixes of file names; None for every file but this SDK's) emits a "coverage" event the
+    first time this process runs it, as the C and Zig SDKs do for edges. Strategies such as
+    det-strategy-mutate keep the timelines that reach new code. A line costs nothing once
+    reported: sys.monitoring stops watching it."""
+    monitoring = sys.monitoring
+    tool = monitoring.COVERAGE_ID
+    monitoring.use_tool_id(tool, "determinismo")
+    prefixes = tuple(paths) if paths else None
+
+    def line(code, number):
+        file = code.co_filename
+        if file != __file__ and (prefixes is None or file.startswith(prefixes)):
+            event("coverage", {"name": f"line {file}:{number}"})
+        return monitoring.DISABLE
+
+    monitoring.register_callback(tool, monitoring.events.LINE, line)
+    monitoring.set_events(tool, monitoring.events.LINE)

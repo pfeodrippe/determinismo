@@ -686,13 +686,20 @@ fn handle_request(vm: *VM, address: u32) !void {
     try vm.trace("request", @as(u64, operation) << 32 | size);
     switch (operation) {
         request_operation_emit => {
+            // The writing process's name follows the data when the guest module had room.
+            const has_source = std.mem.readInt(u64, page[8..16], .little) == 1 and
+                size + source_size_max <= page_size - request_header_size;
+            const source = if (has_source)
+                source_trim(page[request_header_size + size ..][0..source_size_max])
+            else
+                "";
             // One event per line: SDKs that buffer may write several lines at once.
             const moment_now = try vm.moment();
             var lines = std.mem.tokenizeScalar(u8, data, '\n');
             while (lines.next()) |line| {
                 try vm.events.emit(moment_now, line);
                 try vm.checkpoint(moment_now);
-                if (vm.strategy) |strategy| try strategy.event(moment_now, line);
+                if (vm.strategy) |strategy| try strategy.event(moment_now, source, line);
                 if (vm.moment_printing) {
                     std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });
                 }
@@ -707,7 +714,11 @@ fn handle_request(vm: *VM, address: u32) !void {
         },
         request_operation_random => {
             if (size == 0) return error.BadGuestRequest;
-            try vm.decide_random(data);
+            // The guest module puts the asking process's name first; the answer replaces it.
+            var source_buffer: [source_size_max]u8 = undefined;
+            const source = source_trim(page[request_header_size..][0..source_size_max]);
+            @memcpy(source_buffer[0..source.len], source);
+            try vm.decide_random(data, source_buffer[0..source.len]);
         },
         else => return error.BadGuestRequest,
     }
@@ -730,8 +741,15 @@ fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
     };
 }
 
+/// The name of the process behind a request (Linux's TASK_COMM_LEN, without its NUL).
+const source_size_max = 16;
+
+fn source_trim(comm: *const [source_size_max]u8) []const u8 {
+    return comm[0 .. std.mem.indexOfScalar(u8, comm, 0) orelse source_size_max];
+}
+
 /// One randomness pull: the seeded default, unless a replayed tape or the strategy overrides it.
-fn decide_random(vm: *VM, value: []u8) !void {
+fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
     assert(value.len > 0);
     const pull = vm.decisions.pulls;
     vm.decisions.random(value);
@@ -741,7 +759,7 @@ fn decide_random(vm: *VM, value: []u8) !void {
         _ = try overrides.apply(pull, value);
     } else if (vm.strategy) |strategy| {
         if (value.len > Strategy.override_size_max) return; // Too large to override.
-        if (try strategy.random(pull, try vm.moment(), value)) {
+        if (try strategy.random(pull, try vm.moment(), source, value)) {
             if (vm.tape_fd) |fd| tape.write_override(fd, pull, value);
         }
     }

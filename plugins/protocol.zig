@@ -3,7 +3,8 @@
 //! dispatches them to a handler, writes responses to stdout. Fixed buffers only.
 //!
 //! A handler is a struct with `pub const name`, and optionally the methods `hello`, `branch`,
-//! `random`, `event` and `branch_end` (see `serve`). Missing methods answer the default.
+//! `random`, `event` (the event and its source) and `branch_end` (see `serve`). Missing methods
+//! answer the default.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -13,7 +14,8 @@ const parse_buffer_size = 256 * 1024;
 pub const override_size_max = 64;
 pub const failing_count_max = 64;
 
-pub const Random = struct { pull: u64, default: []const u8 };
+/// A decision: its pull number, default value, and source (the asking process's name, or "").
+pub const Random = struct { pull: u64, default: []const u8, source: []const u8 };
 
 pub const BranchEnd = struct {
     index: u32,
@@ -68,7 +70,9 @@ fn dispatch(
     } else if (eql(u8, method, "random")) {
         try dispatch_random(Handler, handler, request, writer);
     } else if (eql(u8, method, "event")) {
-        if (@hasDecl(Handler, "event")) handler.event(request.get("event").?);
+        if (@hasDecl(Handler, "event")) {
+            handler.event(request.get("event").?, string_field(request, "source"));
+        }
         try writer.writeAll("{}");
     } else if (eql(u8, method, "branch_end")) {
         const stop = if (@hasDecl(Handler, "branch_end"))
@@ -93,7 +97,12 @@ fn dispatch_random(
     const default_bytes = try std.fmt.hexToBytes(&default, default_hex);
     const pull: u64 = @intCast(request.get("pull").?.integer);
     if (!@hasDecl(Handler, "random")) return writer.writeAll("{}");
-    const answer: ?[]const u8 = handler.random(.{ .pull = pull, .default = default_bytes });
+    const source = string_field(request, "source");
+    const answer: ?[]const u8 = handler.random(.{
+        .pull = pull,
+        .default = default_bytes,
+        .source = source,
+    });
     const value = answer orelse return writer.writeAll("{}");
     assert(value.len == default_bytes.len);
     try writer.writeAll("{\"hex\":\"");
@@ -113,6 +122,12 @@ fn parse_branch_end(request: std.json.ObjectMap) !BranchEnd {
         .events = @intCast(request.get("events").?.integer),
         .failing = failing_buffer[0..count],
     };
+}
+
+/// A string field, or "" when it is missing (as from older versions of determinismo).
+fn string_field(object: std.json.ObjectMap, key: []const u8) []const u8 {
+    const value = object.get(key) orelse return "";
+    return if (value == .string) value.string else "";
 }
 
 fn hex_field(object: std.json.ObjectMap, key: []const u8) !u64 {

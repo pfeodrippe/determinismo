@@ -13,3 +13,4 @@ guest/module/.module-common.o
 # Claude Code local settings
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+__pycache__/

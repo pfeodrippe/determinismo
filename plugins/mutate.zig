@@ -8,14 +8,23 @@
 //! joins the corpus, when it covers something new: a behavioral feature never seen before (an
 //! event name with its categorical details, such as a fault's kind or a command's name, or an
 //! assertion's message with its outcome; numbers are left out so novelty stays finite), or a new
-//! signature (outcome, failing properties, event volume). Programs built with code coverage
-//! (the C SDK's DETERMINISMO_COVERAGE) also report each edge they reach, as "coverage" events:
-//! those are features too.
+//! signature (outcome, failing properties, event volume). Programs with code coverage (the C
+//! and Zig SDKs' edges, the Python SDK's lines) also report the code they reach, as "coverage"
+//! events: those are features too. Events of determinismo's own processes (faults injected,
+//! commands started) are the exploration's doing, not the system's behavior: not features.
+//!
+//! Parents: half the time the newest corpus entry (the latest progress), else the rarest of a
+//! few entries drawn at random, by how often the features they reached first have been hit.
 //!
 //! Most children of a timeline that reached something new change a single decision at its
-//! frontier: the decision before the newest feature, or one just after it. On the self-test maze
-//! (four digit checks, 1 in 10000 timelines by chance) this solves it within about 100 branches,
-//! where 300 random seeds do not.
+//! frontier, where the newest feature was reached. Decisions come from several processes at
+//! once (the fault injector, the composer, each test command), and determinismo says which
+//! process asked for each decision and wrote each event: the candidates are the decisions of
+//! the process that reached the feature, its last one before the frontier and its first one
+//! after (coverage of a check comes after the decision it checks, in edge coverage, or before
+//! the decision on its line, in line coverage). On the self-test maze (four digit checks, 1 in
+//! 10000 timelines by chance) this solves it within about 100 branches, where 300 random seeds
+//! do not; in Python under faults, within about 200.
 //!
 //! Parallel workers each run their own strategy process. With `--sync-dir <dir>` they share one
 //! corpus the way parallel fuzzers do: each writes the timelines it keeps to the directory, with
@@ -36,29 +45,48 @@ const mutations_max = 4;
 /// Behavioral features seen in any branch, as an open-addressing set of hashes.
 const features_max = 1 << 14;
 const detail_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
+/// determinismo's own processes in the guest: what they report (faults injected, commands
+/// started) is the exploration's doing, not the system's behavior, so it is not novelty.
+const runtime_sources = [_][]const u8{
+    "det-init", "det-nodes", "det-composer", "det-faults", "det-agent",
+};
 
 const Tape = struct {
     values: [pulls_max]u64 = undefined,
+    /// Which process asked for each decision (a hash of its name).
+    sources: [pulls_max]u32 = undefined,
     count: u32 = 0,
-    /// The last decision before this timeline last reached something new: the decision that
-    /// led there, or the one before the decision that comes next.
+    /// The decisions made before this timeline last reached something new, and which process
+    /// reached it.
     frontier: u32 = 0,
+    frontier_source: u32 = 0,
+    /// The features it reached first (its claim to a place in the corpus).
+    found: [found_max]u64 = undefined,
+    found_count: u32 = 0,
 };
-/// Mutations at the frontier: most children change one decision there or just after it (in a
-/// maze of checks: the check that failed, or the next one).
+/// Mutations at the frontier: most children change one decision around it (in a maze of
+/// checks: the check that failed, or the next one).
 const frontier_percent = 75;
-const frontier_window = 4;
-/// Parents: the newest corpus entry this often (it holds the deepest progress), else any.
+/// How far from the frontier candidates are looked for, and how many sources are told apart.
+const frontier_window = 64;
+const frontier_sources_max = 8;
+/// Of frontier mutations, those on the decisions of the process that reached the feature.
+const frontier_source_percent = 80;
+/// Parents: the newest corpus entry this often (it holds the latest progress), else the rarest
+/// of a few drawn at random (a tournament). An entry is as rare as the rarest feature it reached
+/// first, by how often features have been hit since: timelines that went where few others go.
 const newest_percent = 50;
+const tournament_size = 4;
 /// Files of other workers' corpus entries already imported (or skipped), by name hash.
 const synced_max = 4096;
 const imports_per_branch_max = 16;
 /// A branch's first-seen features, shared with its corpus entry.
 const found_max = 64;
-/// A corpus entry on disk, little endian: count, frontier, found count, 0 (u32 each), then the
-/// found features and the values (u64 each).
+/// A corpus entry on disk, little endian: count, frontier, found count, frontier source (u32
+/// each), then the
+/// found features and the values (u64 each), then the sources (u32 each).
 const entry_header_size = 16;
-var entry_buffer: [entry_header_size + (found_max + pulls_max) * 8]u8 = undefined;
+var entry_buffer: [entry_header_size + (found_max + pulls_max) * 8 + pulls_max * 4]u8 = undefined;
 
 const Mutate = struct {
     prng: std.Random.DefaultPrng = .init(0),
@@ -69,11 +97,11 @@ const Mutate = struct {
     signatures: [signatures_max]u64 = undefined,
     signature_count: u32 = 0,
     features: [features_max]u64 = @splat(0),
+    /// How often each feature was hit, in all branches.
+    feature_hits: [features_max]u32 = @splat(0),
     feature_count: u32 = 0,
-    /// Features the running branch saw first, and the first of them.
+    /// Features the running branch saw first.
     features_new: u32 = 0,
-    found: [found_max]u64 = undefined,
-    found_count: u32 = 0,
     /// The branch running now: its decisions so far, and how it was derived.
     current: Tape = .{},
     first_pull: ?u64 = null,
@@ -100,25 +128,20 @@ const Mutate = struct {
         strategy.parent = null;
         strategy.mutation_count = 0;
         strategy.features_new = 0;
-        strategy.found_count = 0;
+        strategy.current.found_count = 0;
         strategy.sync_import();
         const prng = strategy.prng.random();
         if (strategy.corpus_count == 0) return;
         if (prng.uintLessThan(u32, 100) < strategy.fresh_percent) return;
-        const parent = if (prng.uintLessThan(u32, 100) < newest_percent)
-            strategy.corpus_newest
-        else
-            prng.uintLessThan(u32, strategy.corpus_count);
+        const parent = strategy.parent_pick(prng);
         const parent_count = strategy.corpus[parent].count;
         if (parent_count == 0) return;
         strategy.parent = parent;
-        const frontier = strategy.corpus[parent].frontier;
-        if (frontier < parent_count and prng.uintLessThan(u32, 100) < frontier_percent) {
-            // Geometric: the frontier itself half the time, then the decisions after it.
-            var offset: u32 = 0;
-            while (offset + 1 < frontier_window and prng.boolean()) offset += 1;
+        var candidates: [2 * frontier_sources_max]u32 = undefined;
+        const candidate_count = frontier_candidates(&strategy.corpus[parent], prng, &candidates);
+        if (candidate_count > 0 and prng.uintLessThan(u32, 100) < frontier_percent) {
             strategy.mutation_count = 1;
-            strategy.mutated_positions[0] = @min(parent_count - 1, frontier + offset);
+            strategy.mutated_positions[0] = candidates[prng.uintLessThan(u32, candidate_count)];
             strategy.mutated_values[0] = value_random(prng);
         } else {
             strategy.mutation_count = 1 + prng.uintLessThan(u32, mutations_max);
@@ -137,14 +160,17 @@ const Mutate = struct {
         };
         assert(request.pull >= first);
         const position: u32 = @intCast(request.pull - first);
-        if (request.default.len != 8 or position >= pulls_max) return null;
-        const default = std.mem.readInt(u64, request.default[0..8], .little);
-        const value = strategy.choose(position) orelse default;
+        if (position >= pulls_max) return null;
+        // Pulls of other sizes keep their place in the tape, but are never changed.
+        const steerable = request.default.len == 8;
+        const default = if (steerable) std.mem.readInt(u64, request.default[0..8], .little) else 0;
+        const value = if (steerable) strategy.choose(position) orelse default else 0;
         if (position == strategy.current.count) {
             strategy.current.values[position] = value;
+            strategy.current.sources[position] = source_hash(request.source);
             strategy.current.count += 1;
         }
-        if (strategy.parent == null) return null;
+        if (!steerable or strategy.parent == null) return null;
         std.mem.writeInt(u64, &answer, value, .little);
         return &answer;
     }
@@ -161,8 +187,11 @@ const Mutate = struct {
     }
 
     /// Each event's features: what kind of thing happened, not the numbers it carried.
-    pub fn event(strategy: *Mutate, value: std.json.Value) void {
+    pub fn event(strategy: *Mutate, value: std.json.Value, source: []const u8) void {
         if (value != .object) return;
+        for (runtime_sources) |runtime| {
+            if (std.mem.eql(u8, source, runtime)) return;
+        }
         var hasher = std.hash.Wyhash.init(0x66656174);
         if (value.object.get("assert")) |assertion| {
             if (assertion != .object) return;
@@ -181,35 +210,71 @@ const Mutate = struct {
             if (lifecycle != .string) return;
             hasher.update(lifecycle.string);
         } else return;
-        strategy.feature(hasher.final());
+        strategy.feature(hasher.final(), source_hash(source));
     }
 
-    fn feature(strategy: *Mutate, hash: u64) void {
+    fn feature(strategy: *Mutate, hash: u64, source: u32) void {
         const key = hash | 1; // 0 marks an empty slot.
-        if (!strategy.feature_insert(key)) return;
+        const found = strategy.feature_insert(key) orelse return;
+        strategy.feature_hits[found.slot] +|= 1;
+        if (!found.new) return;
         strategy.features_new += 1;
-        strategy.current.frontier = strategy.current.count -| 1;
-        if (strategy.found_count < found_max) {
-            strategy.found[strategy.found_count] = key;
-            strategy.found_count += 1;
+        const current = &strategy.current;
+        current.frontier = current.count;
+        current.frontier_source = source;
+        if (current.found_count < found_max) {
+            current.found[current.found_count] = key;
+            current.found_count += 1;
         }
     }
 
-    /// Whether `key` was new (and is now in the set).
-    fn feature_insert(strategy: *Mutate, key: u64) bool {
+    /// The slot of `key` in the set, and whether it was new; null when the set is full.
+    fn feature_insert(strategy: *Mutate, key: u64) ?struct { slot: usize, new: bool } {
         assert(key != 0);
         var slot: usize = @intCast(key % features_max);
         for (0..features_max) |_| {
-            if (strategy.features[slot] == key) return false;
+            if (strategy.features[slot] == key) return .{ .slot = slot, .new = false };
             if (strategy.features[slot] == 0) {
-                if (strategy.feature_count == features_max / 2) return false; // Keep it sparse.
+                if (strategy.feature_count == features_max / 2) return null; // Keep it sparse.
                 strategy.features[slot] = key;
                 strategy.feature_count += 1;
-                return true;
+                return .{ .slot = slot, .new = true };
             }
             slot = (slot + 1) % features_max;
         }
-        return false;
+        return null;
+    }
+
+    fn parent_pick(strategy: *const Mutate, prng: std.Random) u32 {
+        assert(strategy.corpus_count > 0);
+        if (prng.uintLessThan(u32, 100) < newest_percent) return strategy.corpus_newest;
+        var best = prng.uintLessThan(u32, strategy.corpus_count);
+        var best_hits = strategy.entry_hits(best);
+        for (1..tournament_size) |_| {
+            const entry = prng.uintLessThan(u32, strategy.corpus_count);
+            const hits = strategy.entry_hits(entry);
+            if (hits < best_hits) {
+                best = entry;
+                best_hits = hits;
+            }
+        }
+        return best;
+    }
+
+    /// Hits of the rarest feature the entry reached first (the most for none).
+    fn entry_hits(strategy: *const Mutate, entry: u32) u32 {
+        const tape = &strategy.corpus[entry];
+        var hits: u32 = std.math.maxInt(u32);
+        for (tape.found[0..tape.found_count]) |key| {
+            var slot: usize = @intCast(key % features_max);
+            for (0..features_max) |_| {
+                if (strategy.features[slot] == key) break;
+                if (strategy.features[slot] == 0) break;
+                slot = (slot + 1) % features_max;
+            }
+            if (strategy.features[slot] == key) hits = @min(hits, strategy.feature_hits[slot]);
+        }
+        return hits;
     }
 
     pub fn branch_end(strategy: *Mutate, end: protocol.BranchEnd) bool {
@@ -238,7 +303,7 @@ const Mutate = struct {
             strategy.signature_count += 1;
         }
         strategy.corpus_add(&strategy.current);
-        if (strategy.found_count > 0) strategy.sync_export(&strategy.current);
+        if (strategy.current.found_count > 0) strategy.sync_export(&strategy.current);
     }
 
     fn corpus_add(strategy: *Mutate, tape: *const Tape) void {
@@ -265,13 +330,17 @@ const Mutate = struct {
         strategy.exported_count += 1;
         std.mem.writeInt(u32, entry_buffer[0..4], tape.count, .little);
         std.mem.writeInt(u32, entry_buffer[4..8], tape.frontier, .little);
-        std.mem.writeInt(u32, entry_buffer[8..12], strategy.found_count, .little);
-        std.mem.writeInt(u32, entry_buffer[12..16], 0, .little);
-        const found = std.mem.sliceAsBytes(strategy.found[0..strategy.found_count]);
+        std.mem.writeInt(u32, entry_buffer[8..12], tape.found_count, .little);
+        std.mem.writeInt(u32, entry_buffer[12..16], tape.frontier_source, .little);
+        const found = std.mem.sliceAsBytes(tape.found[0..tape.found_count]);
         const values = std.mem.sliceAsBytes(tape.values[0..tape.count]);
-        @memcpy(entry_buffer[entry_header_size..][0..found.len], found);
-        @memcpy(entry_buffer[entry_header_size + found.len ..][0..values.len], values);
-        const data = entry_buffer[0 .. entry_header_size + found.len + values.len];
+        const sources = std.mem.sliceAsBytes(tape.sources[0..tape.count]);
+        var end: usize = entry_header_size;
+        for ([_][]const u8{ found, values, sources }) |part| {
+            @memcpy(entry_buffer[end..][0..part.len], part);
+            end += part.len;
+        }
+        const data = entry_buffer[0..end];
         dir.writeFile(strategy.io, .{ .sub_path = temporary, .data = data }) catch return;
         dir.rename(temporary, dir, entry_name, strategy.io) catch return;
         _ = strategy.synced_add(entry_name); // Not to be imported back.
@@ -291,19 +360,27 @@ const Mutate = struct {
             const count = std.mem.readInt(u32, data[0..4], .little);
             const found_count = std.mem.readInt(u32, data[8..12], .little);
             if (count > pulls_max or found_count > found_max) continue;
-            if (data.len != entry_header_size + (found_count + count) * 8) continue;
+            if (data.len != entry_header_size + (found_count + count) * 8 + count * 4) continue;
             const found_end = entry_header_size + found_count * 8;
-            var novel = false;
+            const tape = &import_tape;
+            tape.found_count = 0;
             for (0..found_count) |index| {
                 const at = entry_header_size + index * 8;
                 const key = std.mem.readInt(u64, data[at..][0..8], .little);
-                if (key != 0 and strategy.feature_insert(key)) novel = true;
+                if (key == 0) continue;
+                const found = strategy.feature_insert(key) orelse continue;
+                if (!found.new) continue;
+                strategy.feature_hits[found.slot] = 1;
+                tape.found[tape.found_count] = key;
+                tape.found_count += 1;
             }
-            if (!novel) continue; // Nothing this worker had not reached itself.
-            const tape = &import_tape;
+            if (tape.found_count == 0) continue; // Nothing this worker had not reached itself.
             tape.count = count;
             tape.frontier = std.mem.readInt(u32, data[4..8], .little);
-            @memcpy(std.mem.sliceAsBytes(tape.values[0..count]), data[found_end..]);
+            tape.frontier_source = std.mem.readInt(u32, data[12..16], .little);
+            const values_end = found_end + count * 8;
+            @memcpy(std.mem.sliceAsBytes(tape.values[0..count]), data[found_end..values_end]);
+            @memcpy(std.mem.sliceAsBytes(tape.sources[0..count]), data[values_end..]);
             strategy.corpus_add(tape);
             imports += 1;
         }
@@ -324,6 +401,56 @@ const Mutate = struct {
         return true;
     }
 };
+
+/// The last decision before the frontier and the first one after, of the process that reached
+/// the newest feature (most of the time, when it made decisions near there), or of each source.
+fn frontier_candidates(
+    tape: *const Tape,
+    prng: std.Random,
+    out: *[2 * frontier_sources_max]u32,
+) u32 {
+    const frontier = @min(tape.frontier, tape.count);
+    if (prng.uintLessThan(u32, 100) < frontier_source_percent) {
+        var count: u32 = 0;
+        var before = frontier;
+        while (before > 0 and frontier - before < frontier_window) {
+            before -= 1;
+            if (tape.sources[before] != tape.frontier_source) continue;
+            out[count] = before;
+            count += 1;
+            break;
+        }
+        for (frontier..@min(tape.count, frontier + frontier_window)) |after| {
+            if (tape.sources[after] != tape.frontier_source) continue;
+            out[count] = @intCast(after);
+            count += 1;
+            break;
+        }
+        if (count > 0) return count;
+    }
+    var count: u32 = 0;
+    for ([_]bool{ false, true }) |after| {
+        var seen: [frontier_sources_max]u32 = undefined;
+        var seen_count: u32 = 0;
+        for (0..frontier_window) |step| {
+            const offset: u32 = @intCast(step);
+            const position = if (after) frontier + offset else frontier -% (offset + 1);
+            if (position >= tape.count) break; // Past the end, or (wrapped) before the start.
+            const source = tape.sources[position];
+            if (std.mem.indexOfScalar(u32, seen[0..seen_count], source) != null) continue;
+            seen[seen_count] = source;
+            seen_count += 1;
+            out[count] = position;
+            count += 1;
+            if (seen_count == frontier_sources_max) break;
+        }
+    }
+    return count;
+}
+
+fn source_hash(source: []const u8) u32 {
+    return @truncate(std.hash.Wyhash.hash(0, source));
+}
 
 fn value_random(prng: std.Random) u64 {
     return switch (prng.uintLessThan(u32, 8)) {

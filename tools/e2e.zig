@@ -154,58 +154,69 @@ fn check_tapes(context: *Context) !void {
     expect(context, refused, "tapes: a replay on different inputs is refused", .{});
 }
 
-/// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance) within 300
-/// branches, with coverage from the C SDK and from the Zig SDK, and with workers that share
-/// one corpus; the solving branch replays from its tape.
+/// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance): with coverage
+/// from the C, Zig and Python SDKs, one worker or several sharing one corpus, and in Python
+/// under faults (decisions and events of other processes interleaved). The solving branch
+/// replays from its tape.
 fn check_coverage(context: *Context) !void {
-    try check_coverage_profile(context, "maze", .one_worker);
-    try check_coverage_profile(context, "maze-zig", .one_worker);
-    try check_coverage_profile(context, "maze", .synced_workers);
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const c = [_][]const u8{ "--program", program, "--profile", "maze", "--scenario", "maze" };
+    const zig = [_][]const u8{
+        "--program", program, "--profile", "maze-zig", "--scenario", "maze",
+    };
+    const python = [_][]const u8{
+        "--compose", "examples/compose-python/compose.yaml", "--scenario", "maze",
+    };
+    const mazes = [_]Maze{
+        .{ .label = "C, one worker", .system = &c, .jobs = 1, .branches = 300 },
+        .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 300 },
+        .{ .label = "C, 4 synced workers", .system = &c, .jobs = 4, .branches = 300 },
+        .{ .label = "Python, 8 synced workers", .system = &python, .jobs = 8, .branches = 1000 },
+    };
+    for (mazes, 0..) |maze, index| try check_maze(context, maze, index);
 }
 
-fn check_coverage_profile(
-    context: *Context,
-    profile: []const u8,
-    workers: enum { one_worker, synced_workers },
-) !void {
-    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
-    const mutate = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
-    const label = try std.fmt.allocPrint(context.arena, "{s}, {t}", .{ profile, workers });
-    const tapes_name = try std.fmt.allocPrint(context.arena, "{s}-{t}-tapes", .{
-        profile, workers,
+const Maze = struct { label: []const u8, system: []const []const u8, jobs: u32, branches: u32 };
+
+fn check_maze(context: *Context, maze: Maze, index: usize) !void {
+    const arena = context.arena;
+    const mutate = try std.fs.path.join(arena, &.{ context.bin, "det-strategy-mutate" });
+    const tapes = try std.fmt.allocPrint(arena, "{s}/maze-{d}-tapes", .{ context.scratch, index });
+    const sync = try std.fmt.allocPrint(arena, "{s}/maze-{d}-sync", .{ context.scratch, index });
+    const strategy = if (maze.jobs == 1)
+        mutate
+    else
+        try std.fmt.allocPrint(arena, "{s} --sync-dir {s}", .{ mutate, sync });
+    var arguments: std.ArrayList([]const u8) = .empty;
+    try arguments.appendSlice(arena, maze.system);
+    try arguments.appendSlice(arena, &.{
+        "--seed",       "1",
+        "--branches",   try std.fmt.allocPrint(arena, "{d}", .{maze.branches}),
+        "--jobs",       try std.fmt.allocPrint(arena, "{d}", .{maze.jobs}),
+        "--strategy",   strategy,
+        "--tape-dir",   tapes,
     });
-    const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, tapes_name });
-    const sync = try std.fs.path.join(context.arena, &.{ context.scratch, "maze-sync" });
-    const strategy, const jobs = switch (workers) {
-        .one_worker => .{ mutate, "1" },
-        .synced_workers => .{ try std.fmt.allocPrint(context.arena, "{s} --sync-dir {s}", .{
-            mutate, sync,
-        }), "4" },
-    };
-    const common = [_][]const u8{
-        "--program", program, "--profile", profile, "--scenario", "maze",
-    };
-    const report = try explore(context, &(common ++ [_][]const u8{
-        "--seed", "1", "--branches", "300", "--jobs", jobs, "--strategy", strategy,
-        "--tape-dir", tapes,
-    }));
-    var branches: [300]Branch = undefined; // One line per branch.
-    const count = parse_branches(report, &branches);
+    const report = try explore(context, arguments.items);
+    const branches = try arena.alloc(Branch, maze.branches); // One line per branch.
+    const count = parse_branches(report, branches);
     const solved = for (branches[0..count]) |branch| {
         if (branch.failing) break branch;
     } else null;
     expect(context, solved != null, "coverage ({s}): guided exploration solves the maze", .{
-        label,
+        maze.label,
     });
     const branch = solved orelse return;
-    const tape_name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{branch.index});
-    const tape = try std.fs.path.join(context.arena, &.{ tapes, tape_name });
-    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
+    const tape_name = try std.fmt.allocPrint(arena, "branch-{d}.jsonl", .{branch.index});
+    const tape = try std.fs.path.join(arena, &.{ tapes, tape_name });
+    var replay_arguments: std.ArrayList([]const u8) = .empty;
+    try replay_arguments.appendSlice(arena, maze.system);
+    try replay_arguments.appendSlice(arena, &.{ "--tape", tape });
+    const replay = try explore(context, replay_arguments.items);
     var replayed: [1]Branch = undefined;
     const same = parse_branches(replay, &replayed) == 1 and replayed[0].failing and
         std.mem.eql(u8, replayed[0].events_hash, branch.events_hash);
     expect(context, same, "coverage ({s}): the solving branch {d} replays from its tape", .{
-        label, branch.index,
+        maze.label, branch.index,
     });
 }
 

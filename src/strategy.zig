@@ -83,15 +83,21 @@ pub fn branch(strategy: *Strategy, index: u32, seed: u64) !void {
 
 /// Offers the plugin a decision. Returns true when it overrode `value` (which on entry holds
 /// the default and on return holds the answer).
-pub fn random(strategy: *Strategy, pull: u64, moment: Events.Moment, value: []u8) !bool {
+pub fn random(
+    strategy: *Strategy,
+    pull: u64,
+    moment: Events.Moment,
+    source: []const u8,
+    value: []u8,
+) !bool {
     assert(value.len > 0);
     var writer: std.Io.Writer = .fixed(&strategy.request);
     try writer.print("{{\"method\":\"random\",\"pull\":{d},\"size\":{d},\"default\":\"", .{
         pull, value.len,
     });
     for (value) |byte| try writer.print("{x:0>2}", .{byte});
-    try writer.print("\",\"vtime_ns\":{d},\"branches\":{d}}}", .{
-        moment.vtime_ns, moment.branches,
+    try writer.print("\",\"source\":{f},\"vtime_ns\":{d},\"branches\":{d}}}", .{
+        std.json.fmt(source, .{}), moment.vtime_ns, moment.branches,
     });
     const reply = try strategy.call(writer.buffered());
     const hex = reply.get("hex") orelse return false;
@@ -102,14 +108,19 @@ pub fn random(strategy: *Strategy, pull: u64, moment: Events.Moment, value: []u8
     return true;
 }
 
-pub fn event(strategy: *Strategy, moment: Events.Moment, data: []const u8) !void {
+pub fn event(
+    strategy: *Strategy,
+    moment: Events.Moment,
+    source: []const u8,
+    data: []const u8,
+) !void {
     assert(data.len > 0);
     const object = data[0] == '{' and data[data.len - 1] == '}';
     if (!object) return; // Only structured events are forwarded.
     var writer: std.Io.Writer = .fixed(&strategy.request);
-    try writer.print("{{\"method\":\"event\",\"vtime_ns\":{d},\"branches\":{d},\"event\":", .{
-        moment.vtime_ns, moment.branches,
-    });
+    const format = "{{\"method\":\"event\",\"vtime_ns\":{d},\"branches\":{d},\"source\":{f}," ++
+        "\"event\":";
+    try writer.print(format, .{ moment.vtime_ns, moment.branches, std.json.fmt(source, .{}) });
     try writer.writeAll(data);
     try writer.writeAll("}");
     _ = try strategy.call(writer.buffered());

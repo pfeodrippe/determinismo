@@ -2,8 +2,10 @@
 /*
  * determinismo guest plumbing: /dev/determinismo.
  *
- *   write(fd, json, n)   one event (JSON object) for the platform: logs, assertions, lifecycle
- *   read(fd, buf, n)     n bytes of randomness chosen by the platform (a decision point)
+ *   write(fd, json, n)   one event (JSON object) for the platform: logs, assertions, lifecycle;
+ *                        with it, which process wrote it (its comm) when the page has room
+ *   read(fd, buf, n)     n bytes of randomness chosen by the platform (a decision point); the
+ *                        platform also learns which process asks (its comm), the decision's source
  *   ioctl(fd, DET_IOCTL_WAIT_ACTION, buf)
  *                        sleeps until the platform pushes an action (it raises DET_IRQ at the
  *                        moment it chose), then copies the action into buf and returns its size
@@ -17,6 +19,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -92,6 +95,13 @@ static ssize_t det_write(struct file *f, const char __user *buf, size_t n, loff_
 	}
 	req->op = DET_OP_EMIT;
 	req->len = n;
+	/* The source after the event, flagged in result, when it fits. */
+	req->result = 0;
+	if (n + TASK_COMM_LEN <= DET_MAX_DATA) {
+		memset(req->data + n, 0, TASK_COMM_LEN);
+		strscpy((char *)req->data + n, current->comm, TASK_COMM_LEN);
+		req->result = 1;
+	}
 	det_call();
 	mutex_unlock(&det_lock);
 	return n;
@@ -105,6 +115,9 @@ static ssize_t det_read(struct file *f, char __user *buf, size_t n, loff_t *off)
 	mutex_lock(&det_lock);
 	req->op = DET_OP_RANDOM;
 	req->len = n;
+	/* The source, in the data the VMM then overwrites with the answer. */
+	memset(req->data, 0, TASK_COMM_LEN);
+	strscpy((char *)req->data, current->comm, TASK_COMM_LEN);
 	det_call();
 	ret = copy_to_user(buf, req->data, n) ? -EFAULT : n;
 	mutex_unlock(&det_lock);

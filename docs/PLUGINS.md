@@ -18,8 +18,8 @@ Every request has a `method`. Every response is a JSON object; `{}` always means
 |---|---|---|
 | `{"method":"hello","protocol":1,"exploration_seed":"<hex>"}` | Once, at start. | `{"name":"<plugin name>"}` |
 | `{"method":"branch","index":I,"seed":"<hex>"}` | Before each branch, with the branch's seed. | `{}` |
-| `{"method":"random","pull":P,"size":N,"default":"<hex>","vtime_ns":T,"branches":C}` | The guest asked for `N` random bytes; pull `P` of this timeline (counted from boot). | `{}` to use `default`, or `{"hex":"<2N hex digits>"}` |
-| `{"method":"event","vtime_ns":T,"branches":C,"event":<guest event>}` | The guest emitted an event (assertions, lifecycle, logs). | `{}` |
+| `{"method":"random","pull":P,"size":N,"default":"<hex>","source":"<process>","vtime_ns":T,"branches":C}` | The guest asked for `N` random bytes; pull `P` of this timeline (counted from boot); `source` is the asking process's name (Linux's `comm`, e.g. `det-faults`, `det-composer`, a test command), so a strategy can tell decision streams apart. | `{}` to use `default`, or `{"hex":"<2N hex digits>"}` |
+| `{"method":"event","vtime_ns":T,"branches":C,"source":"<process>","event":<guest event>}` | The guest emitted an event (assertions, lifecycle, logs); `source` is the writing process's name, as for decisions ("" for events near the size limit). | `{}` |
 | `{"method":"branch_end","index":I,"outcome":"<outcome>","events":E,"failing":["<property>",...]}` | The branch ended. | `{}` to continue, `{"stop":true}` to end the exploration early |
 
 Seeds are 64-bit and travel as 16 hex digits, since JSON numbers lose precision past 2^53.
@@ -52,22 +52,34 @@ plugin that exits or writes a malformed line ends the exploration with an error.
 
 ## Coverage
 
-Strategies see every event, so behavior is coverage: event names, fault kinds, assertion
-outcomes. For code coverage, build a C (or C-compatible) program with
-`-fsanitize-coverage=trace-pc-guard` and `#define DETERMINISMO_COVERAGE` next to
-`DETERMINISMO_IMPLEMENTATION`: each edge then emits `{"event":"coverage","details":{"name":"edge
-N"}}` the first time a process runs it. In Zig, set `sanitize_coverage_trace_pc_guard = true`
-and `use_llvm = true` on the program's compile step and reference `sdk.coverage` (`comptime { _
-= sdk.coverage; }`); the whole compilation is instrumented, the standard library included.
-`plugins/mutate.zig` keeps timelines that reach new
-features and mutates them at their frontier; `tests/selftest/maze.c` and `maze.zig` are the
-benchmark (`zig build
-e2e` checks that it is solved and that the solving branch replays from its tape). Each worker
-runs its own strategy process; `mutate --sync-dir <dir>` makes them share one corpus (each
-writes the timelines it keeps, with the features they reached first, and imports the others'),
-as parallel fuzzers do. On the maze, 8 synced workers solve it in about as many branches as one
-worker (mean first solve 86 vs 80 over 6 seeds; 170 unsynced), at 8 branches at a time. Give
-each exploration a fresh directory.
+Strategies see every event, so behavior is coverage: event names, assertion outcomes. Every
+decision and event also says which guest process it came from (`source`), so a strategy can
+tell the system's behavior from determinismo's own (`det-faults`, `det-composer`, ...) and the
+decision streams of concurrent processes apart.
+
+For code coverage:
+
+- **C** (or anything C-compatible): build with `-fsanitize-coverage=trace-pc-guard` and
+  `#define DETERMINISMO_COVERAGE` next to `DETERMINISMO_IMPLEMENTATION`. Each edge emits
+  `{"event":"coverage","details":{"name":"edge N"}}` the first time a process runs it.
+- **Zig**: set `sanitize_coverage_trace_pc_guard = true` and `use_llvm = true` on the program's
+  compile step and reference `sdk.coverage` (`comptime { _ = sdk.coverage; }`); the whole
+  compilation is instrumented, the standard library included.
+- **Python** (3.12+): `determinismo.coverage_start(paths=[...])` reports each line under those
+  prefixes the first time it runs (`"line <file>:<n>"`), through `sys.monitoring`; a reported
+  line costs nothing afterwards.
+
+`plugins/mutate.zig` keeps timelines that reach new features and mutates the decisions of the
+process that reached them, around where it did. The benchmark is a maze (four digit checks, 1
+in 10000 timelines by chance) in C and Zig (`tests/selftest/maze.c`, `maze.zig`) and in Python
+under faults (`examples/compose-python`, template `maze`); `zig build e2e` checks each is
+solved and that the solving branch replays from its tape. First solving branch, 6 seeds, 8
+synced workers: C 24 to 211, Zig 24 to 225 (300 branches), Python 116 to 352 (1000 branches).
+
+Each worker runs its own strategy process; `mutate --sync-dir <dir>` makes them share one corpus
+(each writes the timelines it keeps, with the features they reached first, and imports the
+others'), as parallel fuzzers do: synced workers need about as many branches as one worker, run
+8 at a time (unsynced, about twice as many). Give each exploration a fresh directory.
 
 ## Two levels of strategy
 
