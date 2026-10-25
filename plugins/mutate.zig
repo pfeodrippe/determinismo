@@ -5,7 +5,10 @@
 //! replays the parent's decisions exactly, except at a few mutated pulls (random or boundary
 //! values). After a mutated pull the timeline diverges, but it keeps the parent's prefix, so the
 //! exploration concentrates around timelines that were interesting. A branch is interesting, and
-//! joins the corpus, when its signature is new: outcome, failing properties and event volume.
+//! joins the corpus, when it covers something new: a behavioral feature never seen before (an
+//! event name with its categorical details, such as a fault's kind or a command's name, or an
+//! assertion's message with its outcome; numbers are left out so novelty stays finite), or a new
+//! signature (outcome, failing properties, event volume). Coverage without instrumenting code.
 //!
 //! Usage: mutate [--fresh-percent <n>]   (default 25)
 const std = @import("std");
@@ -16,6 +19,9 @@ const corpus_max = 64;
 const pulls_max = 16 * 1024;
 const signatures_max = 4096;
 const mutations_max = 4;
+/// Behavioral features seen in any branch, as an open-addressing set of hashes.
+const features_max = 1 << 14;
+const detail_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
 
 const Tape = struct {
     values: [pulls_max]u64 = undefined,
@@ -29,6 +35,10 @@ const Mutate = struct {
     corpus_count: u32 = 0,
     signatures: [signatures_max]u64 = undefined,
     signature_count: u32 = 0,
+    features: [features_max]u64 = @splat(0),
+    feature_count: u32 = 0,
+    /// Features the running branch saw first.
+    features_new: u32 = 0,
     /// The branch running now: its decisions so far, and how it was derived.
     current: Tape = .{},
     first_pull: ?u64 = null,
@@ -49,6 +59,7 @@ const Mutate = struct {
         strategy.current.count = 0;
         strategy.parent = null;
         strategy.mutation_count = 0;
+        strategy.features_new = 0;
         const prng = strategy.prng.random();
         if (strategy.corpus_count == 0) return;
         if (prng.uintLessThan(u32, 100) < strategy.fresh_percent) return;
@@ -98,21 +109,62 @@ const Mutate = struct {
         return null; // Past the parent's end: the branch's own default.
     }
 
+    /// Each event's features: what kind of thing happened, not the numbers it carried.
+    pub fn event(strategy: *Mutate, value: std.json.Value) void {
+        if (value != .object) return;
+        var hasher = std.hash.Wyhash.init(0x66656174);
+        if (value.object.get("assert")) |assertion| {
+            if (assertion != .object) return;
+            hash_field(&hasher, assertion.object, "type");
+            hash_field(&hasher, assertion.object, "message");
+            hash_field(&hasher, assertion.object, "condition");
+        } else if (value.object.get("event")) |event_name| {
+            if (event_name != .string) return;
+            hasher.update(event_name.string);
+            if (value.object.get("details")) |details| {
+                if (details == .object) {
+                    for (detail_keys) |key| hash_field(&hasher, details.object, key);
+                }
+            }
+        } else if (value.object.get("lifecycle")) |lifecycle| {
+            if (lifecycle != .string) return;
+            hasher.update(lifecycle.string);
+        } else return;
+        strategy.feature(hasher.final());
+    }
+
+    fn feature(strategy: *Mutate, hash: u64) void {
+        const key = hash | 1; // 0 marks an empty slot.
+        var slot: usize = @intCast(key % features_max);
+        for (0..features_max) |_| {
+            if (strategy.features[slot] == key) return;
+            if (strategy.features[slot] == 0) {
+                if (strategy.feature_count == features_max / 2) return; // Keep the set sparse.
+                strategy.features[slot] = key;
+                strategy.feature_count += 1;
+                strategy.features_new += 1;
+                return;
+            }
+            slot = (slot + 1) % features_max;
+        }
+    }
+
     pub fn branch_end(strategy: *Mutate, end: protocol.BranchEnd) bool {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(end.outcome);
         for (end.failing) |property| hasher.update(property);
         hasher.update(std.mem.asBytes(&@as(u64, std.math.log2_int_ceil(u64, end.events + 1))));
         const signature = hasher.final();
-        const novel = for (strategy.signatures[0..strategy.signature_count]) |seen| {
+        const new_signature = for (strategy.signatures[0..strategy.signature_count]) |seen| {
             if (seen == signature) break false;
         } else true;
+        const novel = new_signature or strategy.features_new > 0;
         if (novel) strategy.remember(signature);
-        const format = "[mutate] branch {d}: parent={?d} mutations={d} failing={d} novel={} " ++
-            "corpus={d}\n";
+        const format = "[mutate] branch {d}: parent={?d} mutations={d} failing={d} " ++
+            "new_features={d} coverage={d} corpus={d}\n";
         std.debug.print(format, .{
-            end.index,             strategy.parent, strategy.mutation_count, end.failing.len, novel,
-            strategy.corpus_count,
+            end.index,             strategy.parent,       strategy.mutation_count, end.failing.len,
+            strategy.features_new, strategy.feature_count, strategy.corpus_count,
         });
         return false;
     }
@@ -130,6 +182,16 @@ const Mutate = struct {
         assert(strategy.corpus_count <= corpus_max);
     }
 };
+
+fn hash_field(hasher: *std.hash.Wyhash, object: std.json.ObjectMap, key: []const u8) void {
+    const value = object.get(key) orelse return;
+    hasher.update(key);
+    switch (value) {
+        .string => |text| hasher.update(text),
+        .bool => |flag| hasher.update(if (flag) "true" else "false"),
+        else => {}, // Numbers and structures: not features.
+    }
+}
 
 var answer: [8]u8 = undefined;
 
