@@ -71,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     try check_controller(&context);
     try check_clojure(&context);
     try check_script(&context);
+    try check_tla(&context, try std.fs.path.join(arena, &.{ home, "opt", "tla", "tla2tools.jar" }));
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -188,6 +189,41 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// TLA+ trace validation: the buggy service's trace is not a behavior of the spec; once its
+/// transfer is patched through the REPL, it is. Needs Java and tla2tools.jar.
+fn check_tla(context: *Context, jar: []const u8) !void {
+    std.Io.Dir.cwd().access(context.io, jar, .{}) catch {
+        std.debug.print("SKIP tla: no {s}\n", .{jar});
+        return;
+    };
+    const common = [_][]const u8{
+        "--compose", "examples/clojure-bank/compose.yaml", "--scenario", "bank", "--seed", "5",
+    };
+    const spec = "examples/clojure-bank/tla/Bank.tla";
+    const scratch = context.scratch;
+    const buggy_events = try std.fs.path.join(context.arena, &.{ scratch, "tla-buggy.jsonl" });
+    const buggy = [_][]const u8{ "--branch", "1", "--events", buggy_events };
+    _ = try explore(context, &(common ++ buggy));
+    const fixed_events = try std.fs.path.join(context.arena, &.{ scratch, "tla-fixed.jsonl" });
+    _ = try explore(context, &(common ++ [_][]const u8{
+        "--from-branch", "1",        "--from-vtime-ms", "3000",
+        "--from-exec",   "det-nodes exec bank /app/patch.sh", "--branch", "2",
+        "--events",      fixed_events,
+    }));
+    var statuses: [2]u8 = undefined;
+    for ([_][]const u8{ buggy_events, fixed_events }, &statuses) |events, *status| {
+        const result = try std.process.run(context.arena, context.io, .{ .argv = &.{
+            context.determinismo, "tla", "--spec", spec, "--events", events, "--tla2tools", jar,
+        } });
+        status.* = switch (result.term) {
+            .exited => |code| code,
+            else => 255,
+        };
+    }
+    const message = "tla: the buggy trace is rejected, the patched one is a behavior of the spec";
+    expect(context, statuses[0] == 3 and statuses[1] == 0, message, .{});
 }
 
 /// A failing branch's script (its commands and faults) makes other seeds fail too.

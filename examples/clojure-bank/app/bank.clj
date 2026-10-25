@@ -11,13 +11,26 @@
 
 (def accounts (atom (into (sorted-map) (for [account (range 10)] [account 100]))))
 
+;; The abstract state for TLA+ trace validation (tla/Bank.tla): each write and its event happen
+;; under one lock, so the trace is in the order the writes happened.
+(def trace-lock (Object.))
+
+(defn trace! []
+  (Determinismo/event "tla" (str "{\"state\":{\"accounts\":["
+                                 (string/join "," (vals @accounts)) "]}}")))
+
+(defn write! [f & arguments]
+  (locking trace-lock
+    (apply swap! accounts f arguments)
+    (trace!)))
+
 (defn transfer! [from to amount]
   (let [from-balance (get @accounts from)
         to-balance (get @accounts to)]
     (when (>= from-balance amount)
       (Thread/sleep 2) ; Work between the reads and the writes (a lookup, a log): the window.
-      (swap! accounts assoc from (- from-balance amount))
-      (swap! accounts assoc to (+ to-balance amount))
+      (write! assoc from (- from-balance amount))
+      (write! assoc to (+ to-balance amount))
       ;; An invariant the service itself checks (it holds even with the bug: no overdraft).
       (Determinismo/always (every? #(>= % 0) (vals @accounts))
                            "balances never go negative" nil))))
@@ -36,6 +49,7 @@
         "total" (.println out (str (total)))
         (.println out "unknown")))))
 
+(trace!) ; The initial state.
 (let [server (ServerSocket. 7000)]
   (loop []
     (let [socket (.accept server)]

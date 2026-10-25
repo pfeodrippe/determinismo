@@ -132,6 +132,11 @@ Regression scripts: `determinismo script <events of a failing branch>` writes th
 `explore --script <file>` makes new seeds follow it, also on later builds where tapes no longer
 apply (bank: 16 of 16 seeds fail with the script, 5 of 16 without, on a different build).
 
+TLA+ trace validation: a system emits its abstract states (`event "tla"`), and
+`determinismo tla --spec Spec.tla --events <branch events>` asks TLC whether they are a behavior
+of the spec; it reports the first state the spec cannot reach
+([examples/clojure-bank/tla](examples/clojure-bank/tla)).
+
 Mutation testing: give mutants as profiles (`--profile default,mutant` or `--profile all`) and
 see which ones the tests catch; or apply a runtime mutant after setup with `--from-exec`, so
 every mutant shares one snapshot.

@@ -18,6 +18,7 @@ const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
 const merge = @import("merge.zig");
 const script = @import("script.zig");
+const tla = @import("tla.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -33,6 +34,7 @@ const usage =
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
+    \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -115,6 +117,15 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "tla")) {
+        const status = tla.check(arena, init.io, argv[2..]) catch |err| {
+            const message = "{s}\nusage: determinismo tla --spec <Spec.tla> " ++
+                "--events <events.jsonl> [--tla2tools <jar>]\n";
+            std.debug.print(message, .{@errorName(err)});
+            std.process.exit(2);
+        };
+        std.process.exit(status);
+    }
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "script")) {
         return script.extract(arena, init.io, argv[2]);
     }
@@ -1044,6 +1055,7 @@ test {
     _ = @import("mcp.zig");
     _ = @import("merge.zig");
     _ = @import("script.zig");
+    _ = @import("tla.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }
