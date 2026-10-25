@@ -9,23 +9,34 @@ Strategy plugins: [docs/PLUGINS.md](docs/PLUGINS.md). Agents: [docs/AGENTS.md](d
 
 ## What works today
 
-- A Zig VMM on a patched KVM where guest time is a function of retired branches; idle time is
-  skipped, and every timeline replays bit-identically.
-- Systems described in code: a test program's `describe` returns typed profiles whose nodes come
-  from OCI images (pulled and flattened by podman on the host), Dockerfiles, directories or
-  binaries. In the guest, each node runs in its own namespaces on a read-only disk with a tmpfs
-  overlay, linked to every other node and to the tests.
-- Tests as scenarios: functions listing test commands (setup, `first`, parallel, serial and
-  singleton drivers, `anytime`, `eventually`, `finally`), with assertions (`always`, `sometimes`,
-  `reachable`, ...) and platform randomness from the Zig SDK. Any language can implement the
-  two-command protocol (`--describe`, `run <scenario> <command>`).
-- `determinismo explore`: boot once, snapshot at `setup_complete`, run many copy-on-write branches,
-  report properties across the multiverse, replay any branch with `--branch N`.
-- Faults as decisions: pause, isolate, partition and restart nodes, skip clocks.
-- Strategy plugins in any language over a JSON-lines protocol, with tapes for exact replay
-  (refused if the kernel, initramfs, command line or disks changed).
-- Multiverse debugging: run a command in the guest, or inside a node with `det-nodes exec`, at an
-  exact virtual time of a branch.
+Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
+
+- **A deterministic machine**: a Zig VMM on a patched KVM where guest time is a function of
+  retired branches; idle time is skipped, timer interrupts land at exact points, and every
+  timeline replays bit-identically (checked from fresh boots, under an adversarial stress guest).
+  A whole system (boot, Postgres, tests) runs at 1.31x plain KVM.
+- **Systems described in code or Compose**: typed profiles whose nodes come from OCI images,
+  Dockerfiles, directories or binaries, run in the guest by our own node runtime (namespaces, a
+  read-only disk with a tmpfs overlay, a veth mesh, a cgroup per node); or a Compose file with
+  Antithesis test templates.
+- **Tests as scenarios**: functions listing test commands (Antithesis's rules), assertions and
+  steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK;
+  built-in properties (nodes do not exit unexpectedly, the guest finishes its scenario).
+- **Exploration**: snapshot at `setup_complete`, copy-on-write branches on every CPU, shards across
+  hosts, branching from any moment of a branch, strategy plugins in any language (decisions and
+  events) and outer-loop control through MCP or HTTP.
+- **Faults as decisions**: pause, isolate, partition and restart nodes; delay, loss, duplication,
+  corruption, reordering and congestion per link direction; CPU throttling; process pauses;
+  clock skips.
+- **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
+  that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
+  scripts that carry a failure's shape to new seeds and new builds.
+- **Debugging in the multiverse**: run a command in the guest or inside a node at an exact moment;
+  let the branch continue after a change (`--continue`), or explore futures of a changed system
+  (`--from-exec`), e.g. a function redefined through a service's REPL.
+- **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
+  mutation testing with mutant profiles.
+- **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.
 
 ## A test program
 
