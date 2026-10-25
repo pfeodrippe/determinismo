@@ -46,6 +46,7 @@ action_pending: ?[]const u8,
 /// Whether the armed branch-count target is the moment (true) or the PIT deadline (false).
 target_is_moment: bool,
 deterministic: bool,
+builtin_properties: bool,
 tsc_per_branch: u32,
 timer_slack_tsc: u64,
 serial: Serial,
@@ -101,6 +102,8 @@ pub const Options = struct {
     moment_vtime_ns: ?u64 = null,
     moment_command: ?[]const u8 = null,
     disks: []const Disk = &.{},
+    /// The guest runs determinismo's runtime: check the built-in properties when a timeline ends.
+    builtin_properties: bool = false,
 };
 
 /// A read-only disk image, open for the whole process (branches share it).
@@ -204,6 +207,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .action_pending = null,
         .target_is_moment = false,
         .deterministic = options.deterministic,
+        .builtin_properties = options.builtin_properties,
         .tsc_per_branch = options.tsc_per_branch,
         .timer_slack_tsc = options.timer_slack_ns * tsc_per_ns,
         .serial = .{},
@@ -341,8 +345,19 @@ fn init_boot(vm: *VM, options: *const Options) !void {
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.SET_REGS, @intFromPtr(&regs));
 }
 
-/// The VM's event loop: it ends only when the guest powers off, reboots or fails.
+/// Runs the VM until it powers off, reboots, fails or reaches a requested stop; then checks the
+/// built-in properties of a timeline that ended (not of one stopped at setup or at a moment).
 pub fn run_until_exit(vm: *VM) !Outcome {
+    const outcome = try vm.run_loop();
+    if (vm.builtin_properties and outcome != .setup_complete) {
+        const cut_short = outcome == .moment_reached or outcome == .command_done;
+        try vm.events.finish(try vm.moment(), if (cut_short) .cut_short else .ended);
+    }
+    return outcome;
+}
+
+/// The VM's event loop: it ends only when the guest powers off, reboots or fails.
+fn run_loop(vm: *VM) !Outcome {
     assert(!vm.frozen);
     defer vm.serial.flush();
     while (true) {

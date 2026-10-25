@@ -106,9 +106,14 @@ pub fn assert_unreachable(message: []const u8, details: anytype) void {
 
 /// The system is ready: the platform snapshots here and starts exploring.
 pub fn setup_complete(details: anytype) void {
+    lifecycle("setup_complete", details);
+}
+
+/// A lifecycle point the platform acts on (`setup_complete`; `guest_done` from the runtime).
+pub fn lifecycle(comptime name: []const u8, details: anytype) void {
     var buffer: [message_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    writer.writeAll("{\"lifecycle\":\"setup_complete\",\"details\":") catch unreachable;
+    writer.writeAll("{\"lifecycle\":\"" ++ name ++ "\",\"details\":") catch unreachable;
     json_write(&writer, details);
     writer.writeAll("}") catch unreachable;
     emit_raw(writer.buffered());

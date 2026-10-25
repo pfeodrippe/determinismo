@@ -110,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
+        .builtin_properties = arguments.program_path != null,
     };
     const context = Context{ .arena = arena, .io = init.io };
     const base_cmdline = arguments.cmdline;

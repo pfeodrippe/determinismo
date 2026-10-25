@@ -8,7 +8,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const directories = [_][]const u8{
-    "src", "sdk", "guest/runtime", "examples", "workload", "plugins", "tools",
+    "src", "sdk", "guest/runtime", "examples", "workload", "plugins", "tools", "tests",
 };
 const columns_max = 100;
 const function_lines_max = 70;

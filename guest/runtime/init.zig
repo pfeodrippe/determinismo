@@ -36,6 +36,10 @@ pub fn main(init: std.process.Init) !void {
     _ = spawn(&.{bin ++ "det-agent"}); // Multiverse debugging; asleep unless pushed to.
     const status = run(arena, cmdline);
     std.debug.print("[guest] done, status {d}\n", .{status});
+    for (node_names) |name| {
+        if (nodes.pid_of(name) != null) sdk.always(true, node_exit_property, .{ .node = name });
+    }
+    sdk.lifecycle("guest_done", .{ .status = status });
     reap_all();
     _ = linux.sync();
     _ = linux.reboot(.MAGIC1, .MAGIC2, .RESTART, null);
@@ -48,6 +52,11 @@ fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
         if (parameter(cmdline, "det.exec")) |command| return shell(arena, command);
         return 1;
     }
+    if (nodes.system_load(arena)) |system| {
+        const names = arena.alloc([]const u8, system.nodes.len) catch return 1;
+        for (system.nodes, names) |node, *name| name.* = node.name;
+        node_names = names;
+    } else |_| {}
     const pid_up = spawn(&.{ bin ++ "det-nodes", "up" });
     const status_up = wait_for(pid_up);
     if (status_up != 0) {
@@ -197,10 +206,27 @@ fn wait_for(pid: linux.pid_t) u32 {
         const result = linux.wait4(-1, &status, 0, null);
         if (linux.errno(result) == .INTR) continue;
         if (linux.errno(result) != .SUCCESS) return 127;
-        if (@as(linux.pid_t, @intCast(result)) != pid) continue;
         const bits: u32 = @bitCast(status);
+        if (@as(linux.pid_t, @intCast(result)) != pid) {
+            orphan_reaped(@intCast(result), bits);
+            continue;
+        }
         if (bits & 0x7f == 0) return (bits >> 8) & 0xff;
         return 128 + (bits & 0x7f);
+    }
+}
+
+/// Built-in property: a node's main process never exits on its own. Faults that kill a node
+/// remove its pidfile first, so an exit of the process a pidfile names is unexpected.
+const node_exit_property = "nodes do not exit unexpectedly";
+var node_names: []const []const u8 = &.{};
+
+fn orphan_reaped(pid: linux.pid_t, status: u32) void {
+    for (node_names) |name| {
+        if (nodes.pid_recorded(name) != pid) continue;
+        const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
+        sdk.always(false, node_exit_property, .{ .node = name, .status = code });
+        return;
     }
 }
 

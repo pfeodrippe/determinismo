@@ -41,6 +41,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-agent", .path = "guest/runtime/agent.zig" },
         .{ .name = "bank-test", .path = "examples/bank/bank_test.zig" },
         .{ .name = "shop-test", .path = "examples/shop/shop_test.zig" },
+        .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
+        .{ .name = "det-selftest-node", .path = "tests/selftest/node.zig" },
     };
     for (guest_programs) |program| {
         const guest_exe = b.addExecutable(.{

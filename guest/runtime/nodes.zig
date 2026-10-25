@@ -152,12 +152,13 @@ pub fn kill(name: []const u8) !void {
     var paths: Paths = undefined;
     try paths.init(name);
     if (pid_read(name) == null) return; // Not running.
+    // The pidfile goes first: an exit of a process it names is unexpected (see det-init).
+    _ = linux.unlink(paths.pid);
     try file_write(paths.cgroup_kill, "1");
     for (0..stop_attempts_max) |_| {
         if (!try cgroup_populated(&paths)) break;
         sleep_ns(poll_interval_ns);
     } else return error.NodeDidNotStop;
-    _ = linux.unlink(paths.pid);
     sdk.event("node_kill", .{ .node = name });
 }
 
@@ -227,6 +228,15 @@ pub const Netem = netlink.Netem;
 pub fn pid_of(name: []const u8) ?linux.pid_t {
     if (std.mem.eql(u8, name, schema.runner_name)) return 1;
     return pid_read(name);
+}
+
+/// The PID the node's pidfile names, alive or not.
+pub fn pid_recorded(name: []const u8) ?linux.pid_t {
+    var paths: Paths = undefined;
+    paths.init(name) catch return null;
+    var buffer: [32]u8 = undefined;
+    const text = read_small(paths.pid, &buffer) orelse return null;
+    return std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
 }
 
 fn pid_read(name: []const u8) ?linux.pid_t {

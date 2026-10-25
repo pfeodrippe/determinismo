@@ -48,6 +48,8 @@ hash: std.hash.Wyhash = .init(0),
 properties: [property_count_max]Property = undefined,
 property_count: u32 = 0,
 setup_complete: ?Moment = null,
+/// The guest runtime reported the end of its scenario (it neither crashed nor hung).
+guest_done: bool = false,
 parse_buffer: []u8,
 /// The `event` name of the most recent structured event (`{"event": name, ...}`), if any.
 last_event_name: [32]u8 = undefined,
@@ -96,6 +98,7 @@ fn on_lifecycle(events: *Events, moment: Moment, lifecycle: std.json.Value) void
     if (std.mem.eql(u8, lifecycle.string, "setup_complete")) {
         if (events.setup_complete == null) events.setup_complete = moment;
     }
+    if (std.mem.eql(u8, lifecycle.string, "guest_done")) events.guest_done = true;
     if (events.setup_complete) |setup| assert(setup.branches <= moment.branches);
 }
 
@@ -142,6 +145,21 @@ fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Prope
     assert(events.property_count <= property_count_max);
     return property;
 }
+
+/// Built-in property, checked when a timeline ends: the guest finished its scenario, rather than
+/// panicking (the kernel reboots on panic), halting for good, or failing to start.
+pub fn finish(events: *Events, moment: Moment, outcome: enum { ended, cut_short }) !void {
+    if (outcome == .cut_short) return; // Stopped at a moment on purpose.
+    const assertion = if (events.guest_done)
+        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ finish_property ++
+            "\",\"condition\":true,\"details\":{}}}"
+    else
+        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ finish_property ++
+            "\",\"condition\":false,\"details\":{}}}";
+    try events.emit(moment, assertion);
+}
+
+const finish_property = "the guest finishes its scenario (no panic, hang or crash)";
 
 pub fn last_event_is(events: *const Events, name: []const u8) bool {
     assert(name.len > 0);

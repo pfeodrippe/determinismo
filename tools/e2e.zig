@@ -62,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     try check_example(&context, .{ .program = "bank-test", .scenario = "bank", .branches = 12 });
     try check_example(&context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
     try check_tapes(&context);
+    try check_builtin_properties(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -141,6 +142,21 @@ fn check_tapes(context: *Context) !void {
     });
     const refused = std.mem.indexOf(u8, elsewhere, "the tape was recorded with inputs") != null;
     expect(context, refused, "tapes: a replay on different inputs is refused", .{});
+}
+
+/// The built-in properties pass on a steady system and catch a node that exits by itself.
+fn check_builtin_properties(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const steady = try explore(context, &.{
+        "--program", program, "--scenario", "steady", "--seed", "1", "--branches", "2",
+    });
+    const passes = std.mem.indexOf(u8, steady, "2 branches, 0 with failing properties") != null;
+    expect(context, passes, "built-in properties pass on a steady system", .{});
+    const crash = try explore(context, &.{
+        "--program", program, "--scenario", "node_exit", "--seed", "1", "--branches", "1",
+    });
+    const caught = std.mem.indexOf(u8, crash, "FAIL \"nodes do not exit unexpectedly\"") != null;
+    expect(context, caught, "built-in properties catch a node that exits", .{});
 }
 
 /// Runs `determinismo explore` with the machine options; returns its whole output.
