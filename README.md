@@ -82,6 +82,14 @@ determinismo explore ... --strategy zig-out/bin/det-strategy-mutate --tape-dir /
 determinismo explore ... --tape /tmp/tapes/branch-16.jsonl
 ```
 
+Branches run on every CPU (`--jobs`, same timelines as one worker). Explore from an interesting
+moment of a branch: it is replayed to that moment, snapshotted there, and branched again:
+
+```
+determinismo explore ... --program zig-out/bin/bank-test --seed 7 --from-branch 2 \
+  --from-vtime-ms 1200 --branches 32
+```
+
 Multiverse debugging: stop a branch at a moment and run a command there (output streams back,
 and is identical every time):
 

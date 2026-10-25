@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     try check_tapes(&context);
     try check_builtin_properties(&context);
     try check_parallel(&context);
+    try check_fork(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -174,6 +175,51 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// Branches from a moment of another branch (a nested snapshot) replay alone.
+fn check_fork(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "21" };
+    const parent = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+    const setup_s = number_after(parent, "snapshot at setup_complete: vtime=") orelse 0;
+    const branch_end_s = branch_vtime(parent) orelse 0;
+    const ok_times = setup_s > 0 and branch_end_s > setup_s;
+    expect(context, ok_times, "fork: the parent branch runs past its snapshot", .{});
+    if (!ok_times) return;
+    const middle_ms: u64 = @intFromFloat((setup_s + branch_end_s) / 2 * 1000);
+    const middle = try std.fmt.allocPrint(context.arena, "{d}", .{middle_ms});
+    const fork = common ++ [_][]const u8{ "--from-branch", "0", "--from-vtime-ms", middle };
+    const children = try explore(context, &(fork ++ [_][]const u8{ "--branches", "4" }));
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(children, &branches);
+    expect(context, count == 4, "fork: explored {d} branches from {d} ms of branch 0", .{
+        count, middle_ms,
+    });
+    if (count == 0) return;
+    const replay = try explore(context, &(fork ++ [_][]const u8{ "--branch", "2" }));
+    var replayed: [1]Branch = undefined;
+    const same = parse_branches(replay, &replayed) == 1 and
+        same_timelines(&replayed, branches[0..count]);
+    expect(context, same, "fork: a branch from the fork point replays alone", .{});
+}
+
+/// The end vtime (seconds) of the first branch line.
+fn branch_vtime(report: []const u8) ?f64 {
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch ")) continue;
+        return number_after(line, "vtime=");
+    }
+    return null;
+}
+
+/// The number (seconds, as printed with an `s`) right after `key` in `text`.
+fn number_after(text: []const u8, key: []const u8) ?f64 {
+    const start = (std.mem.indexOf(u8, text, key) orelse return null) + key.len;
+    var end = start;
+    while (end < text.len and (std.ascii.isDigit(text[end]) or text[end] == '.')) end += 1;
+    return std.fmt.parseFloat(f64, text[start..end]) catch null;
 }
 
 /// Whether every branch of `a` has a twin in `b` (same index) with the same event hash.

@@ -15,7 +15,12 @@ pub const Header = struct {
     exploration_seed: u64,
     branch: u32,
     branch_seed: u64,
+    /// Set for a branch explored from a moment of another branch (a nested snapshot).
+    fork: ?Fork = null,
 };
+
+/// A moment of a branch of the setup snapshot, where a nested snapshot is taken.
+pub const Fork = struct { branch: u32, vtime_ns: u64 };
 
 pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
 
@@ -41,13 +46,20 @@ pub const Overrides = struct {
 
 pub fn write_header(fd: linux.fd_t, header: Header) void {
     assert(fd >= 0);
-    var buffer: [192]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{{\"tape\":{d},\"inputs\":\"{x:0>16}\"," ++
-        "\"exploration_seed\":\"{x:0>16}\",\"branch\":{d},\"branch_seed\":\"{x:0>16}\"}}\n", .{
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("{{\"tape\":{d},\"inputs\":\"{x:0>16}\",\"exploration_seed\":\"{x:0>16}\"," ++
+        "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"", .{
         tape_version,  header.inputs,      header.exploration_seed,
         header.branch, header.branch_seed,
-    }) catch unreachable; // 192 bytes fit the keys and three 16-digit hashes.
-    write_all(fd, line);
+    }) catch unreachable; // 256 bytes fit the keys, three hashes and a fork.
+    if (header.fork) |fork| {
+        writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
+            fork.branch, fork.vtime_ns,
+        }) catch unreachable;
+    }
+    writer.writeAll("}\n") catch unreachable;
+    write_all(fd, writer.buffered());
 }
 
 pub fn write_override(fd: linux.fd_t, pull: u64, value: []const u8) void {
@@ -80,6 +92,11 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
         .exploration_seed = try hex_field(header.object, "exploration_seed"),
         .branch = @intCast((header.object.get("branch") orelse return error.BadTape).integer),
         .branch_seed = try hex_field(header.object, "branch_seed"),
+        .fork = if (header.object.get("from_branch")) |from_branch| .{
+            .branch = @intCast(from_branch.integer),
+            .vtime_ns = @intCast((header.object.get("from_vtime_ns") orelse
+                return error.BadTape).integer),
+        } else null,
     };
     while (lines.next()) |line| {
         fba.reset();

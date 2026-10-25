@@ -75,6 +75,47 @@ pub fn take(snapshot: *Snapshot, vm: *VM) !void {
     assert(snapshot.msrs.count > 0);
 }
 
+/// Freezes a branch: its memory is a private copy-on-write mapping, so it is first copied into a
+/// memfd of its own. Only resident pages that are not all zeros are copied (mincore), so memory
+/// the guest never touched costs nothing.
+pub fn take_copy(snapshot: *Snapshot, vm: *VM) !void {
+    assert(!vm.memory_fd_owned); // A branch: its memory belongs to the parent snapshot.
+    const fd = try memory_copy(vm.memory);
+    vm.memory_fd = fd;
+    vm.memory_fd_owned = true;
+    try snapshot.take(vm);
+    assert(snapshot.memory_fd == fd);
+}
+
+const chunk_pages = 4096;
+
+fn memory_copy(memory: []align(std.heap.page_size_min) u8) !std.os.linux.fd_t {
+    const linux = std.os.linux;
+    const page = std.heap.page_size_min;
+    assert(memory.len % page == 0);
+    const created = linux.memfd_create("guest-ram-branch", 0);
+    if (linux.errno(created) != .SUCCESS) return error.Memfd;
+    const fd: linux.fd_t = @intCast(created);
+    if (linux.errno(linux.ftruncate(fd, @intCast(memory.len))) != .SUCCESS) return error.Truncate;
+    var resident: [chunk_pages]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < memory.len) : (offset += chunk_pages * page) {
+        const size = @min(chunk_pages * page, memory.len - offset);
+        const chunk = memory[offset..][0..size];
+        const residency = linux.mincore(chunk.ptr, size, &resident);
+        if (linux.errno(residency) != .SUCCESS) return error.Mincore;
+        for (0..size / page) |index| {
+            if (resident[index] & 1 == 0) continue;
+            const bytes = chunk[index * page ..][0..page];
+            if (std.mem.allEqual(u8, bytes, 0)) continue; // A fresh memfd reads as zeros.
+            const position: i64 = @intCast(offset + index * page);
+            const written = linux.pwrite(fd, bytes.ptr, page, position);
+            if (linux.errno(written) != .SUCCESS or written != page) return error.Write;
+        }
+    }
+    return fd;
+}
+
 /// Loads everything but memory into a freshly created vCPU and VM.
 pub fn restore(snapshot: *const Snapshot, vm: *VM) !void {
     assert(vm.deterministic);

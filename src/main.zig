@@ -21,6 +21,7 @@ const usage =
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
+    \\                            [--from-branch <index> --from-vtime-ms <ms>]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  --program <test program> [--profile <name>] [--scenario <name>|all] [--cache <dir>]
@@ -62,6 +63,10 @@ const Arguments = struct {
     tape_directory: ?[]const u8 = null,
     /// Replay the branch recorded in this tape.
     tape_path: ?[]const u8 = null,
+    /// Explore from a moment of a branch: replay branch `from_branch` to `from_vtime_ms`,
+    /// snapshot there, and branch from that snapshot.
+    from_branch: ?u32 = null,
+    from_vtime_ms: ?u64 = null,
     /// Parallel workers for branches (default: one per available CPU).
     jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
@@ -220,6 +225,8 @@ const Context = struct { arena: std.mem.Allocator, io: std.Io };
 
 /// What drives the branches of one exploration besides the seed.
 const Exploration = struct {
+    /// Set when branching from a moment of another branch.
+    fork: ?tape.Fork = null,
     /// Identifies what the machine boots; recorded in tapes.
     inputs: u64 = 0,
     exploration_seed: u64,
@@ -262,6 +269,11 @@ fn command_explore(
         }
         exploration.exploration_seed = header.exploration_seed;
         exploration.replay = .{ .header = header, .overrides = overrides };
+        exploration.fork = header.fork;
+    }
+    if (arguments.from_branch) |branch| {
+        if (exploration.replay != null) return error.Usage; // The tape says where it forked.
+        exploration.fork = .{ .branch = branch, .vtime_ns = arguments.from_vtime_ms.? * 1_000_000 };
     }
     if (arguments.strategy_command != null and exploration.replay != null) {
         return error.ReplayWithStrategy; // Tapes replace plugins.
@@ -271,10 +283,15 @@ fn command_explore(
     const snapshot = try context.arena.create(Snapshot);
     try explore_snapshot(vm, options, snapshot);
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
+    const start = if (exploration.fork) |fork| try explore_fork(context, vm, options, .{
+        .from = snapshot,
+        .exploration = &exploration,
+        .fork = fork,
+    }) else snapshot;
     const multiverse = try context.arena.create(report.Multiverse);
     multiverse.* = .{};
     const branches = Branches{
-        .snapshot = snapshot,
+        .snapshot = start,
         .multiverse = multiverse,
         .exploration = &exploration,
         .arguments = arguments,
@@ -292,6 +309,35 @@ fn command_explore(
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
     return multiverse.failing_branches;
+}
+
+const Fork = struct { from: *const Snapshot, exploration: *const Exploration, fork: tape.Fork };
+
+/// Replays branch `fork.branch` of the setup snapshot to the moment and snapshots it there.
+fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*const Snapshot {
+    const time_start_ns = monotonic_ns();
+    options.seed = branch_seed(fork.exploration.exploration_seed, fork.fork.branch);
+    options.moment_vtime_ns = fork.fork.vtime_ns;
+    options.moment_command = null;
+    defer options.moment_vtime_ns = null;
+    try vm.init_from_snapshot(options, fork.from);
+    const outcome = try vm.run_until_exit();
+    if (outcome != .moment_reached) {
+        std.debug.print("[determinismo] branch {d} ended ({s}) before {d}ns\n", .{
+            fork.fork.branch, @tagName(outcome), fork.fork.vtime_ns,
+        });
+        vm.deinit();
+        return error.ForkPointNotReached;
+    }
+    const snapshot = try context.arena.create(Snapshot);
+    try snapshot.take_copy(vm);
+    vm.deinit();
+    std.debug.print("[determinismo] forked branch {d} at vtime={d}ns branches={d} " ++
+        "({d:.3}s wall); its branches follow\n", .{
+        fork.fork.branch, fork.fork.vtime_ns, snapshot.branches,
+        @as(f64, @floatFromInt(monotonic_ns() - time_start_ns)) / std.time.ns_per_s,
+    });
+    return snapshot;
 }
 
 fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
@@ -479,7 +525,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.seed = if (exploration.replay) |replay|
             replay.header.branch_seed
         else
-            branch_seed(exploration.exploration_seed, index);
+            branch_seed(seed_base(exploration), index);
         const moment_ms = branches.arguments.moment_vtime_ms;
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
         options.moment_command = branches.arguments.moment_command;
@@ -495,6 +541,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .exploration_seed = exploration.exploration_seed,
                 .branch = index,
                 .branch_seed = options.seed,
+                .fork = exploration.fork,
             });
         }
         defer if (vm.tape_fd) |fd| close(fd);
@@ -559,6 +606,14 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     return hasher.final();
 }
 
+/// The seed branches derive theirs from: the exploration's, or for branches from a fork point,
+/// one derived from it and the fork, so that every subtree has its own branches.
+fn seed_base(exploration: *const Exploration) u64 {
+    const fork = exploration.fork orelse return exploration.exploration_seed;
+    const key = [3]u64{ exploration.exploration_seed, fork.branch, fork.vtime_ns };
+    return std.hash.Wyhash.hash(0x666f726b, std.mem.asBytes(&key));
+}
+
 /// Each branch's decisions derive from the exploration seed and the branch index only, so any
 /// branch can be replayed alone with --branch.
 fn branch_seed(seed: u64, index: u32) u64 {
@@ -589,6 +644,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.branches == 0 or arguments.branches > branches_max) return error.Usage;
     if (arguments.command == .explore) arguments.deterministic = true;
     if (arguments.moment_command != null and arguments.moment_vtime_ms == null) return error.Usage;
+    if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
         arguments.cmdline = try std.mem.join(arena, " ", &parts);
@@ -641,6 +697,10 @@ fn parse_option(
         arguments.branches = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--branch")) {
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--from-branch")) {
+        arguments.from_branch = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--from-vtime-ms")) {
+        arguments.from_vtime_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--jobs")) {
         arguments.jobs = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--strategy")) {
