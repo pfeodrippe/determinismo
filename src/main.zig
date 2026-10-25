@@ -16,6 +16,7 @@ const tape = @import("tape.zig");
 const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
+const merge = @import("merge.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -26,7 +27,8 @@ const usage =
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
     \\                            [--from-branch <index> --from-vtime-ms <ms>]
-    \\                            [--record <results.jsonl>]
+    \\                            [--record <results.jsonl>] [--shard <k>/<n>]
+    \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>]
@@ -75,6 +77,10 @@ const Arguments = struct {
     /// snapshot there, and branch from that snapshot.
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
+    /// This host runs the branches whose index modulo `shard_count` is `shard_index`
+    /// (`--shard k/n`); `determinismo merge` combines the shards' records.
+    shard_index: u32 = 0,
+    shard_count: u32 = 1,
     /// Write results as JSON lines here (see report.record).
     record_path: ?[]const u8 = null,
     /// Parallel workers for branches (default: one per available CPU).
@@ -99,6 +105,11 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "merge")) {
+        const failing = try merge.merge(arena, init.io, argv[2..]);
+        if (failing > 0) std.process.exit(3);
+        return;
+    }
     var arguments = parse_arguments(arena, argv) catch {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
@@ -327,6 +338,7 @@ fn command_explore(
             .branches = arguments.branches,
             .from_branch = arguments.from_branch,
             .from_vtime_ms = arguments.from_vtime_ms,
+            .shard = &.{ arguments.shard_index, arguments.shard_count },
         } });
     }
     if (arguments.tape_path) |path| {
@@ -429,7 +441,9 @@ fn jobs_count(arguments: *const Arguments) u32 {
     const single = arguments.branch_only != null or arguments.tape_path != null;
     if (single or arguments.events_path != null) return 1;
     const jobs = arguments.jobs orelse cpus_available();
-    return @max(1, @min(jobs, arguments.branches, jobs_max));
+    const shard_branches = std.math.divCeil(u32, arguments.branches, arguments.shard_count) catch
+        unreachable;
+    return @max(1, @min(jobs, shard_branches, jobs_max));
 }
 
 fn cpus_available() u32 {
@@ -596,7 +610,10 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
     const count = if (single) 1 else branches.arguments.branches;
     for (first..first + count) |index_usize| {
         const index: u32 = @intCast(index_usize);
-        if (index % branches.jobs != branches.worker) continue;
+        const shards = if (single) 1 else branches.arguments.shard_count;
+        const shard = if (single) 0 else branches.arguments.shard_index;
+        if (index % shards != shard) continue;
+        if (index / shards % branches.jobs != branches.worker) continue;
         options.seed = if (exploration.replay) |replay|
             replay.header.branch_seed
         else
@@ -781,6 +798,13 @@ fn parse_option(
         arguments.from_branch = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-vtime-ms")) {
         arguments.from_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--shard")) {
+        const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.Usage;
+        arguments.shard_index = try std.fmt.parseInt(u32, value[0..slash], 10);
+        arguments.shard_count = try std.fmt.parseInt(u32, value[slash + 1 ..], 10);
+        if (arguments.shard_count == 0 or arguments.shard_index >= arguments.shard_count) {
+            return error.Usage;
+        }
     } else if (eql(u8, flag, "--record")) {
         arguments.record_path = value;
     } else if (eql(u8, flag, "--jobs")) {
@@ -885,6 +909,7 @@ test {
     _ = @import("prepare.zig");
     _ = @import("serve.zig");
     _ = @import("mcp.zig");
+    _ = @import("merge.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

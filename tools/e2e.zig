@@ -66,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     try check_parallel(&context);
     try check_fork(&context);
     try check_compose(&context);
+    try check_shards(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -176,6 +177,60 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// Two shards, merged, give the timelines of one exploration.
+fn check_shards(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const common = [_][]const u8{
+        "--program", program, "--scenario", "bank", "--seed", "21", "--branches", "6",
+    };
+    const whole = try explore(context, &common);
+    var records: [2][]const u8 = undefined;
+    for (&records, 0..) |*record, shard| {
+        record.* = try std.fmt.allocPrint(context.arena, "{s}/shard-{d}.jsonl", .{
+            context.scratch, shard,
+        });
+        const flag = try std.fmt.allocPrint(context.arena, "{d}/2", .{shard});
+        const shard_flags = [_][]const u8{ "--shard", flag, "--record", record.* };
+        _ = try explore(context, &(common ++ shard_flags));
+    }
+    const result = try std.process.run(context.arena, context.io, .{
+        .argv = &.{ context.determinismo, "merge", records[0], records[1] },
+    });
+    var unsharded: [branches_max]Branch = undefined;
+    const count = parse_branches(whole, &unsharded);
+    var merged: [branches_max]Branch = undefined;
+    const merged_count = merged_branches(result.stdout, &merged);
+    const same = count == 6 and merged_count == count and
+        same_timelines(unsharded[0..count], merged[0..merged_count]);
+    expect(context, same, "shards: two shards merged give the timelines of one run", .{});
+}
+
+/// The branches of a merged record (JSON lines).
+fn merged_branches(record: []const u8, branches: []Branch) u32 {
+    var count: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, record, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
+        if (count == branches.len) break;
+        const index_text = field_json(line, "\"index\":") orelse continue;
+        const hash = field_json(line, "\"events_hash\":\"") orelse continue;
+        branches[count] = .{
+            .index = std.fmt.parseInt(u32, index_text, 10) catch continue,
+            .events_hash = hash,
+            .failing = false,
+        };
+        count += 1;
+    }
+    return count;
+}
+
+fn field_json(line: []const u8, comptime key: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, line, key) orelse return null) + key.len;
+    var end = start;
+    while (end < line.len and line[end] != ',' and line[end] != '"') end += 1;
+    return line[start..end];
 }
 
 /// An Antithesis-style project (Compose file, test templates in an image, SDK-format
