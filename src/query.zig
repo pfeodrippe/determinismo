@@ -14,19 +14,24 @@
 //! A condition is terms joined by `and` and `or` (`or` binds loosest). A term is `path op value`
 //! over the event's JSON (`event=fault`, `details.kind=partition`, `output.text~refused`,
 //! `assert.condition=false`), or over `vtime` (seconds), `branch` and `seq`. Operators: `=`,
-//! `!=`, `~` (contains), `!~`, `<`, `<=`, `>`, `>=`, `?` (present), `!?` (absent). Values are
-//! words or "quoted strings"; numbers and booleans compare as such.
+//! `!=`, `~` (contains), `!~`, `=~` (matches a regular expression, see regex.zig), `!=~`, `<`,
+//! `<=`, `>`, `>=`, `?` (present), `!?` (absent). Values are words or "quoted strings" (where a
+//! backslash escapes the next character: `\\d` for a regex's `\d`); numbers and booleans compare
+//! as such.
 //!
 //! Temporal conditions look in the same timeline: before the event (preceded by), or after it
 //! (followed by), within a window of virtual seconds if given. Every match comes with its moment
 //! (`--from-branch <n> --from-vtime-ms <ms>`), to branch from or look at.
 const std = @import("std");
 const assert = std.debug.assert;
+const Regex = @import("regex.zig").Regex;
 
 const terms_max = 32;
 const temporal_max = 8;
 
 pub const Operator = enum {
+    matches,
+    not_matches,
     equal,
     not_equal,
     contains,
@@ -43,6 +48,8 @@ pub const Term = struct {
     path: []const []const u8,
     operator: Operator,
     value: []const u8 = "",
+    /// The compiled pattern of `=~` and `!=~`.
+    regex: ?*const Regex = null,
 };
 
 /// Alternatives (or) of conjunctions (and).
@@ -90,9 +97,12 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) !Condition {
 
 const operators = [_]struct { []const u8, Operator }{
     // Longest first, so that `<=` is not read as `<`.
-    .{ "!=", .not_equal }, .{ "!~", .excludes }, .{ "<=", .less_equal }, .{ ">=", .greater_equal },
-    .{ "!?", .absent },    .{ "=", .equal },     .{ "~", .contains },    .{ "<", .less },
-    .{ ">", .greater },    .{ "?", .present },
+    .{ "!=~", .not_matches }, .{ "=~", .matches },
+    .{ "!=", .not_equal },    .{ "!~", .excludes },
+    .{ "<=", .less_equal },   .{ ">=", .greater_equal },
+    .{ "!?", .absent },       .{ "=", .equal },
+    .{ "~", .contains },      .{ "<", .less },
+    .{ ">", .greater },       .{ "?", .present },
 };
 
 /// `path op value`, written as one token (`a.b=c`) or as several (`a.b = "c d"`).
@@ -106,8 +116,7 @@ fn term_parse(arena: std.mem.Allocator, first: []const u8, tokens: *Tokens) !Ter
             if (value_needed(entry[1]) and value.len == 0) {
                 value = tokens.next() orelse return error.TermWithoutValue;
             }
-            const path = try path_split(arena, path_text);
-            return .{ .path = path, .operator = entry[1], .value = value };
+            return term_make(arena, try path_split(arena, path_text), entry[1], value);
         }
     }
     // The operator in the next token: `path = value`.
@@ -118,9 +127,24 @@ fn term_parse(arena: std.mem.Allocator, first: []const u8, tokens: *Tokens) !Ter
             tokens.next() orelse return error.TermWithoutValue
         else
             "";
-        return .{ .path = try path_split(arena, first), .operator = entry[1], .value = value };
+        return term_make(arena, try path_split(arena, first), entry[1], value);
     }
     return error.UnknownOperator;
+}
+
+fn term_make(
+    arena: std.mem.Allocator,
+    path: []const []const u8,
+    operator: Operator,
+    value: []const u8,
+) !Term {
+    var term = Term{ .path = path, .operator = operator, .value = value };
+    if (operator == .matches or operator == .not_matches) {
+        const regex = try arena.create(Regex);
+        regex.* = try Regex.compile(arena, value);
+        term.regex = regex;
+    }
+    return term;
 }
 
 fn value_needed(operator: Operator) bool {
@@ -199,6 +223,8 @@ fn term_matches(term: *const Term, event: *const Event) bool {
     return switch (term.operator) {
         .equal => equals(value, term.value),
         .not_equal => !equals(value, term.value),
+        .matches => if (text_of(value)) |text| term.regex.?.matches(text) else false,
+        .not_matches => if (text_of(value)) |text| !term.regex.?.matches(text) else false,
         .contains => contains(value, term.value) orelse false,
         .excludes => if (contains(value, term.value)) |found| !found else false,
         .less, .less_equal, .greater, .greater_equal => compare(value, term.operator, term.value),

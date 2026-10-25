@@ -63,7 +63,7 @@ change that moves it.
 | Event log: every event with its moment (vtime, timeline) | events JSONL with vtime and branches clock | ✅ |
 | Container stdout/stderr as events | node and test command output, line by line, `{"output":{source, stream, text}}` | ✅ |
 | Events of every timeline, queryable | `explore --events-dir`: setup, fork, and every branch (serve and MCP record them) | ✅ |
-| Logs Explorer search: fields, operators, preceded by / followed by within N seconds | `determinismo query`, HTTP `POST /runs/<id>/query`, MCP `query`: paths, `= != ~ !~ < <= > >= ? !?`, and/or, (not) preceded/followed by, within | ✅ (no regex yet) |
+| Logs Explorer search: fields, operators, preceded by / followed by within N seconds | `determinismo query`, HTTP `POST /runs/<id>/query`, MCP `query`: paths, `= != ~ !~ =~ !=~ < <= > >= ? !?` (`=~` a regular expression), and/or, (not) preceded/followed by, within | ✅ |
 | Event sets: matches, contains, filter, union, up_to(moment) | conditions, `or`, `--branch`, `--up-to-vtime` | ✅ |
 | Event sets: map, fold, with_last, with_next, intersect, difference | `determinismo events` (HTTP, MCP): a JSON pipeline of filter, exclude, with_last, with_next (timeouts), union, intersect, difference, narrow, and `through`: any program as map, flatmap and fold | ✅ |
 | Logs Explorer / multiverse map UI | web UI: search with temporal conditions, a timeline's logs up to a moment, a map of every timeline with its faults and failures; run a command at any moment | ✅ |

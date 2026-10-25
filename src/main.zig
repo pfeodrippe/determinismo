@@ -1244,6 +1244,7 @@ test {
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
     _ = @import("profile.zig");
+    _ = @import("regex.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

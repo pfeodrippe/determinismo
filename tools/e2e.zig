@@ -333,9 +333,12 @@ fn check_query(context: *Context) !void {
     const after_fault = try query_count(context, &.{ events, violation, "--preceded-by", fault });
     const no_fault = try query_count(context, &.{ events, violation, "--not-preceded-by", fault });
     const output = try query_count(context, &.{ events, "output.source=redis" });
-    const found = failing_report and all > 0 and output > 0 and after_fault + no_fault == all;
+    // A regular expression finds the same lines.
+    const matched = try query_count(context, &.{ events, "output.source=~^re(d|x)i[s]$" });
+    const found = failing_report and all > 0 and output > 0 and after_fault + no_fault == all and
+        matched == output;
     expect(context, found, "query: {d} violations ({d} after a fault, {d} without), {d} redis " ++
-        "output lines", .{ all, after_fault, no_fault, output });
+        "output lines ({d} by a regex)", .{ all, after_fault, no_fault, output, matched });
     // Event sets: the same answers through a pipeline (with_last), and through a program.
     const arena = context.arena;
     const annotated = try std.fmt.allocPrint(arena, "[{{\"filter\": {f}}}, " ++
