@@ -9,10 +9,11 @@
 //! injected on the next entry: both happen at an exact point in the guest's instruction stream, so
 //! disk I/O is deterministic.
 const std = @import("std");
+const GuestMemory = @import("guest_memory.zig").GuestMemory;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
-/// Above the guest RAM limit (3 GiB) and below the 32-bit device area.
+/// In the hole between guest RAM below 3 GiB and RAM from 4 GiB (guest_memory.zig).
 pub const address_base: u64 = 0xd000_0000;
 pub const address_size: u64 = 0x1000;
 pub const irq: u32 = 6;
@@ -138,7 +139,7 @@ fn read_config(block: *const VirtioBlock, offset: u64, data: []u8) void {
 }
 
 /// Returns true when the guest should get an interrupt.
-pub fn write(block: *VirtioBlock, offset: u64, data: []const u8, memory: []u8) bool {
+pub fn write(block: *VirtioBlock, offset: u64, data: []const u8, memory: GuestMemory) bool {
     assert(offset < address_size);
     assert(data.len >= 1 and data.len <= 8);
     if (offset >= config_offset) return false; // Our config space is read-only.
@@ -184,7 +185,7 @@ fn reset(block: *VirtioBlock) void {
 }
 
 /// Serves every request the driver made available since the last notification.
-fn process(block: *VirtioBlock, memory: []u8) bool {
+fn process(block: *VirtioBlock, memory: GuestMemory) bool {
     if (!block.queue_ready) return false;
     assert(block.queue_size > 0 and block.queue_size <= queue_size_max);
     const available_index = load(u16, memory, block.queue_available + 2) orelse return false;
@@ -204,7 +205,7 @@ fn process(block: *VirtioBlock, memory: []u8) bool {
 
 const Descriptor = struct { address: u64, size: u32, flags: u16, next: u16 };
 
-fn descriptor(block: *const VirtioBlock, memory: []u8, index: u16) ?Descriptor {
+fn descriptor(block: *const VirtioBlock, memory: GuestMemory, index: u16) ?Descriptor {
     if (index >= block.queue_size) return null;
     const base = block.queue_descriptors + @as(u64, index) * descriptor_size;
     return .{
@@ -216,7 +217,7 @@ fn descriptor(block: *const VirtioBlock, memory: []u8, index: u16) ?Descriptor {
 }
 
 /// Runs one request (header, data buffers, status byte) and returns the bytes it wrote.
-fn serve(block: *VirtioBlock, memory: []u8, head: u16) u32 {
+fn serve(block: *VirtioBlock, memory: GuestMemory, head: u16) u32 {
     block.requests += 1;
     var chain: [chain_length_max]Descriptor = undefined;
     var length: u32 = 0;
@@ -248,7 +249,7 @@ fn serve(block: *VirtioBlock, memory: []u8, head: u16) u32 {
 
 fn serve_read(
     block: *VirtioBlock,
-    memory: []u8,
+    memory: GuestMemory,
     buffers: []const Descriptor,
     sector: u64,
     written: *u32,
@@ -267,7 +268,7 @@ fn serve_read(
     return status_ok;
 }
 
-fn serve_id(memory: []u8, buffers: []const Descriptor, written: *u32) u8 {
+fn serve_id(memory: GuestMemory, buffers: []const Descriptor, written: *u32) u8 {
     if (buffers.len != 1) return status_io_error;
     const size = @min(buffers[0].size, id_size);
     const target = guest_range(memory, buffers[0].address, size) orelse return status_io_error;
@@ -278,7 +279,7 @@ fn serve_id(memory: []u8, buffers: []const Descriptor, written: *u32) u8 {
     return status_ok;
 }
 
-fn complete(block: *VirtioBlock, memory: []u8, head: u16, written: u32) void {
+fn complete(block: *VirtioBlock, memory: GuestMemory, head: u16, written: u32) void {
     const slot = block.used_index % block.queue_size;
     const entry = block.queue_used + 4 + 8 * @as(u64, slot);
     store(u32, memory, entry, head);
@@ -301,17 +302,16 @@ fn pread_all(fd: linux.fd_t, target: []u8, offset: u64) bool {
     return true;
 }
 
-fn guest_range(memory: []u8, address: u64, size: u64) ?[]u8 {
-    if (address > memory.len or size > memory.len - address) return null;
-    return memory[@intCast(address)..][0..@intCast(size)];
+fn guest_range(memory: GuestMemory, address: u64, size: u64) ?[]u8 {
+    return memory.range(address, size);
 }
 
-fn load(comptime T: type, memory: []u8, address: u64) ?T {
+fn load(comptime T: type, memory: GuestMemory, address: u64) ?T {
     const bytes = guest_range(memory, address, @sizeOf(T)) orelse return null;
     return std.mem.readInt(T, bytes[0..@sizeOf(T)], .little);
 }
 
-fn store(comptime T: type, memory: []u8, address: u64, value: T) void {
+fn store(comptime T: type, memory: GuestMemory, address: u64, value: T) void {
     const bytes = guest_range(memory, address, @sizeOf(T)) orelse return;
     std.mem.writeInt(T, bytes[0..@sizeOf(T)], value, .little);
 }
@@ -343,7 +343,7 @@ test "reads a sector through the ring" {
         fn set(device: *VirtioBlock, mem: []u8, which: Register, value: u32) void {
             var bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &bytes, value, .little);
-            _ = device.write(@intFromEnum(which), &bytes, mem);
+            _ = device.write(@intFromEnum(which), &bytes, .{ .bytes = mem });
         }
     }.set;
     register(&block, &memory, .queue_size, 8);
@@ -369,7 +369,9 @@ test "reads a sector through the ring" {
     std.mem.writeInt(u16, memory[0x2004..][0..2], 0, .little); // ring[0] = head 0
     std.mem.writeInt(u16, memory[0x2002..][0..2], 1, .little); // idx = 1
     var notify: [4]u8 = @splat(0);
-    try std.testing.expect(block.write(@intFromEnum(Register.queue_notify), &notify, &memory));
+    const guest = GuestMemory{ .bytes = &memory };
+    const notified = block.write(@intFromEnum(Register.queue_notify), &notify, guest);
+    try std.testing.expect(notified);
     try std.testing.expectEqual(@as(u8, status_ok), memory[0x6000]);
     try std.testing.expectEqual(@as(u8, 2), memory[0x5000]);
     const used_index = std.mem.readInt(u16, memory[0x3002..][0..2], .little);

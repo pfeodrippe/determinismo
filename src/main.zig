@@ -52,7 +52,7 @@ const usage =
 const cmdline_default = "console=ttyS0 earlyprintk=serial,ttyS0 acpi=off pci=off nokaslr " ++
     "reboot=t panic=-1 i8042.nokbd i8042.noaux tsc=reliable no_timer_check";
 const memory_mib_min = 64;
-const memory_mib_max = 3072;
+const memory_mib_max = VM.memory_size_max >> 20;
 const arguments_max = 64;
 const branches_max = 100_000;
 
@@ -1065,6 +1065,7 @@ test {
     _ = @import("merge.zig");
     _ = @import("script.zig");
     _ = @import("tla.zig");
+    _ = @import("guest_memory.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

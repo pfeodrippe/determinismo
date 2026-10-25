@@ -2,6 +2,8 @@
 //! Loads a Linux bzImage (and initramfs) into guest memory with the 64-bit boot protocol
 //! (Documentation/arch/x86/boot.rst) and describes the initial vCPU state.
 const std = @import("std");
+const guest_memory = @import("guest_memory.zig");
+const GuestMemory = guest_memory.GuestMemory;
 const assert = std.debug.assert;
 const kvm = @import("kvm.zig");
 
@@ -52,7 +54,9 @@ pub const Entry = struct { rip: u64, rsi: u64 };
 
 pub const Error = error{ NotBzImage, ProtocolTooOld, Not64Bit, TooBig, CmdlineTooLong };
 
-pub fn load(memory: []u8, options: *const Options) Error!Entry {
+/// Everything goes in RAM below the hole; the e820 map also announces RAM above it.
+pub fn load(guest: GuestMemory, options: *const Options) Error!Entry {
+    const memory = guest.bytes[0..@intCast(guest.low_size())];
     assert(memory.len >= 64 << 20);
     assert(memory.len % 4096 == 0);
     const bz = options.kernel;
@@ -66,7 +70,7 @@ pub fn load(memory: []u8, options: *const Options) Error!Entry {
     if (kernel_address + kernel.len > memory.len) return error.TooBig;
     @memcpy(memory[kernel_address..][0..kernel.len], kernel);
 
-    try load_boot_params(memory, options);
+    try load_boot_params(memory, guest.high_size(), options);
     if (options.initrd) |initrd| {
         try load_initrd(memory, initrd, .{ .kernel_end = kernel_address + kernel.len });
     }
@@ -78,7 +82,7 @@ pub fn load(memory: []u8, options: *const Options) Error!Entry {
 }
 
 /// The "zero page": the kernel's setup header plus what the loader tells the kernel.
-fn load_boot_params(memory: []u8, options: *const Options) Error!void {
+fn load_boot_params(memory: []u8, high_size: u64, options: *const Options) Error!void {
     const bz = options.kernel;
     const zero_page = memory[zero_page_address..][0..4096];
     @memset(zero_page, 0);
@@ -104,15 +108,20 @@ fn load_boot_params(memory: []u8, options: *const Options) Error!void {
     @memcpy(memory[setup_data_address + 16 ..][0..options.rng_seed.len], &options.rng_seed);
     write(u64, zero_page, 0x250, setup_data_address);
 
-    // E820: low RAM below the EBDA, then everything from 1 MiB up.
-    const e820 = [_][3]u64{ .{ 0, 0x9fc00, 1 }, .{ 0x100000, memory.len - 0x100000, 1 } };
-    for (e820, 0..) |entry, index| {
+    // E820: low RAM below the EBDA, then from 1 MiB up to the hole, then above 4 GiB.
+    const e820 = [_][3]u64{
+        .{ 0, 0x9fc00, 1 },
+        .{ 0x100000, memory.len - 0x100000, 1 },
+        .{ guest_memory.high_start, high_size, 1 },
+    };
+    const e820_count: u8 = if (high_size > 0) 3 else 2;
+    for (e820[0..e820_count], 0..) |entry, index| {
         const offset = 0x2d0 + index * 20;
         write(u64, zero_page, offset, entry[0]);
         write(u64, zero_page, offset + 8, entry[1]);
         write(u32, zero_page, offset + 16, @intCast(entry[2]));
     }
-    zero_page[0x1e8] = e820.len;
+    zero_page[0x1e8] = e820_count;
 }
 
 fn load_initrd(memory: []u8, initrd: []const u8, layout: struct { kernel_end: u64 }) Error!void {

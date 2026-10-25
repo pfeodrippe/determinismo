@@ -258,7 +258,7 @@ fn check_python_strategy(context: *Context) !void {
 fn check_k3s(context: *Context) !void {
     const common = [_][]const u8{
         "--compose", "examples/k3s/compose.yaml", "--scenario", "cluster", "--seed", "1",
-        "--memory-mib", "3072",
+        "--memory-mib", "4096",
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4" }));
     const passes = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;

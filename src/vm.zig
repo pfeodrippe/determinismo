@@ -6,6 +6,8 @@
 //! exact branch counts. The VMM owns the only timer (the PIT), fires it at the branch count where
 //! its deadline falls, and skips idle time when the guest halts.
 const std = @import("std");
+const guest_memory = @import("guest_memory.zig");
+const GuestMemory = guest_memory.GuestMemory;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const kvm = @import("kvm.zig");
@@ -160,6 +162,8 @@ const request_operation_action: u32 = 3;
 const irq_action: u32 = 5;
 const request_header_size = 16;
 const page_size = 4096;
+/// Guest RAM, reserved lazily (a branch costs what it touches).
+pub const memory_size_max: u64 = 32 << 30;
 const cpuid_entries_max = 256;
 
 /// A fresh machine that boots the kernel in `options`.
@@ -290,7 +294,7 @@ fn init_chipset(vm: *VM) !void {
 /// Guest RAM lives in a memfd so that snapshots can map it copy-on-write.
 fn init_memory_fresh(vm: *VM, memory_size: u64) !void {
     assert(memory_size >= 64 << 20);
-    assert(memory_size <= 3 << 30); // Below the 32-bit PCI hole: one flat region.
+    assert(memory_size <= memory_size_max);
     vm.memory_fd = @intCast(try syscall(linux.memfd_create("guest-ram", 0)));
     vm.memory_fd_owned = true;
     _ = try syscall(linux.ftruncate(vm.memory_fd, @intCast(memory_size)));
@@ -313,14 +317,28 @@ fn init_memory_map(vm: *VM, sharing: linux.MAP_TYPE, memory_size: u64) !void {
         .NORESERVE = true,
     }, vm.memory_fd, 0));
     vm.memory = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(address))[0..memory_size];
-    var region = kvm.UserspaceMemoryRegion{
-        .slot = 0,
-        .flags = 0,
-        .guest_phys_addr = 0,
-        .memory_size = memory_size,
-        .userspace_addr = address,
+    // One mapping, two guest ranges: below the 32-bit hole, and from 4 GiB (GuestMemory).
+    const guest = GuestMemory{ .bytes = vm.memory };
+    var regions = [_]kvm.UserspaceMemoryRegion{
+        .{
+            .slot = 0,
+            .flags = 0,
+            .guest_phys_addr = 0,
+            .memory_size = guest.low_size(),
+            .userspace_addr = address,
+        },
+        .{
+            .slot = 1,
+            .flags = 0,
+            .guest_phys_addr = guest_memory.high_start,
+            .memory_size = guest.high_size(),
+            .userspace_addr = address + guest.low_size(),
+        },
     };
-    _ = try kvm.ioctl(vm.vm_fd, kvm.SET_USER_MEMORY_REGION, @intFromPtr(&region));
+    for (&regions) |*region| {
+        if (region.memory_size == 0) continue;
+        _ = try kvm.ioctl(vm.vm_fd, kvm.SET_USER_MEMORY_REGION, @intFromPtr(region));
+    }
 }
 
 fn init_cpuid(vm: *VM) !void {
@@ -344,7 +362,7 @@ fn init_boot(vm: *VM, options: *const Options) !void {
     };
     var prng: std.Random.DefaultPrng = .init(options.seed);
     prng.random().bytes(&boot_options.rng_seed);
-    const entry = try boot.load(vm.memory, &boot_options);
+    const entry = try boot.load(.{ .bytes = vm.memory }, &boot_options);
     var sregs: kvm.Sregs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_SREGS, @intFromPtr(&sregs));
     boot.long_mode_sregs(&sregs);
@@ -570,7 +588,7 @@ fn handle_mmio(vm: *VM) !void {
     const block = &vm.blocks[index];
     const offset = mmio.phys_addr - VirtioBlock.address_base - index * VirtioBlock.address_size;
     if (mmio.is_write == 0) return block.read(offset, data);
-    if (block.write(offset, data, vm.memory)) {
+    if (block.write(offset, data, .{ .bytes = vm.memory })) {
         try vm.trace("disk", index);
         try vm.irq_pulse(VirtioBlock.irq);
     }
@@ -677,7 +695,9 @@ fn moment(vm: *VM) !Events.Moment {
 /// One request from the guest module: a page holding { op: u32, len: u32, result: u64, data }.
 fn handle_request(vm: *VM, address: u32) !void {
     if (address % page_size != 0) return error.BadGuestRequest;
-    if (address + page_size > vm.memory.len) return error.BadGuestRequest;
+    // The guest module's page is below 4 GiB (its doorbell carries 32 bits): low RAM.
+    const guest = GuestMemory{ .bytes = vm.memory };
+    if (address + page_size > guest.low_size()) return error.BadGuestRequest;
     const page = vm.memory[address..][0..page_size];
     const operation = std.mem.readInt(u32, page[0..4], .little);
     const size = std.mem.readInt(u32, page[4..8], .little);
