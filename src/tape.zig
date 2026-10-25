@@ -25,10 +25,29 @@ pub const Fork = struct { branch: u32, vtime_ns: u64 };
 pub const Override = struct { pull: u64, size: u8, bytes: [Strategy.override_size_max]u8 };
 
 /// Overrides of one branch, ordered by pull. A replay consumes them in order.
+/// The state of a branch at an event count: a replay that differs there has diverged.
+pub const Checkpoint = struct { events: u64, branches: u64, events_hash: u64 };
+pub const checkpoint_interval = 64;
+pub const checkpoint_count_max = 1 << 14;
+
 pub const Overrides = struct {
     entries: [override_count_max]Override,
     count: u32,
     cursor: u32,
+    checkpoints: [checkpoint_count_max]Checkpoint = undefined,
+    checkpoint_count: u32 = 0,
+    checkpoint_cursor: u32 = 0,
+
+    /// Compares the replay with the tape's checkpoint at this event count, if there is one.
+    pub fn check(overrides: *Overrides, now: Checkpoint) !void {
+        if (overrides.checkpoint_cursor == overrides.checkpoint_count) return;
+        const expected = overrides.checkpoints[overrides.checkpoint_cursor];
+        if (expected.events != now.events) return;
+        overrides.checkpoint_cursor += 1;
+        if (expected.branches != now.branches or expected.events_hash != now.events_hash) {
+            return error.ReplayDiverged;
+        }
+    }
 
     /// Replaces `value` if pull `pull` was overridden. Pulls arrive in increasing order.
     pub fn apply(overrides: *Overrides, pull: u64, value: []u8) !bool {
@@ -98,9 +117,15 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
                 return error.BadTape).integer),
         } else null,
     };
+    overrides.checkpoint_count = 0;
+    overrides.checkpoint_cursor = 0;
     while (lines.next()) |line| {
         fba.reset();
         const value = try std.json.parseFromSliceLeaky(Value, fba.allocator(), line, .{});
+        if (value.object.get("checkpoint")) |checkpoint| {
+            try checkpoint_parse(overrides, checkpoint);
+            continue;
+        }
         if (overrides.count == override_count_max) return error.TapeTooLong;
         const entry = &overrides.entries[overrides.count];
         entry.pull = @intCast((value.object.get("pull") orelse return error.BadTape).integer);
@@ -113,6 +138,26 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
         overrides.count += 1;
     }
     return result;
+}
+
+fn checkpoint_parse(overrides: *Overrides, value: std.json.Value) !void {
+    if (value != .object) return error.BadTape;
+    if (overrides.checkpoint_count == checkpoint_count_max) return error.TapeTooLong;
+    overrides.checkpoints[overrides.checkpoint_count] = .{
+        .events = @intCast((value.object.get("events") orelse return error.BadTape).integer),
+        .branches = @intCast((value.object.get("branches") orelse return error.BadTape).integer),
+        .events_hash = try hex_field(value.object, "events_hash"),
+    };
+    overrides.checkpoint_count += 1;
+}
+
+pub fn write_checkpoint(fd: linux.fd_t, checkpoint: Checkpoint) void {
+    var buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{{\"checkpoint\":{{\"events\":{d},\"branches\":{d}," ++
+        "\"events_hash\":\"{x:0>16}\"}}}}\n", .{
+        checkpoint.events, checkpoint.branches, checkpoint.events_hash,
+    }) catch unreachable;
+    write_all(fd, line);
 }
 
 fn hex_field(object: std.json.ObjectMap, key: []const u8) !u64 {

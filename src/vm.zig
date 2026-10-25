@@ -675,6 +675,7 @@ fn handle_request(vm: *VM, address: u32) !void {
             var lines = std.mem.tokenizeScalar(u8, data, '\n');
             while (lines.next()) |line| {
                 try vm.events.emit(moment_now, line);
+                try vm.checkpoint(moment_now);
                 if (vm.strategy) |strategy| try strategy.event(moment_now, line);
                 if (vm.moment_reached) {
                     std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });
@@ -694,6 +695,23 @@ fn handle_request(vm: *VM, address: u32) !void {
         },
         else => return error.BadGuestRequest,
     }
+}
+
+/// Every `checkpoint_interval` events: recorded in the tape being written, or compared with
+/// the tape being replayed (a mismatch ends the replay where it diverged).
+fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
+    if (vm.events.count % tape.checkpoint_interval != 0) return;
+    const now = tape.Checkpoint{
+        .events = vm.events.count,
+        .branches = moment_now.branches,
+        .events_hash = vm.events.hash.final(),
+    };
+    if (vm.tape_fd) |fd| tape.write_checkpoint(fd, now);
+    if (vm.overrides) |overrides| overrides.check(now) catch |err| {
+        const message = "[determinismo] replay diverged from its tape at event {d}\n";
+        std.debug.print(message, .{now.events});
+        return err;
+    };
 }
 
 /// One randomness pull: the seeded default, unless a replayed tape or the strategy overrides it.

@@ -34,7 +34,12 @@ plugin, which may not be deterministic itself (ARCHITECTURE.md §7):
 ```
 {"tape":2,"inputs":"<hex>","exploration_seed":"<hex>","branch":I,"branch_seed":"<hex>"}
 {"pull":P,"hex":"..."}
+{"checkpoint":{"events":N,"branches":B,"events_hash":"<hex>"}}
 ```
+
+A checkpoint every 64 events records the branch's state (event count, branch count, running hash
+of its events); a replay compares them as it goes and stops at the first that differs ("replay
+diverged from its tape at event N").
 
 `determinismo explore ... --tape <file>` replays one branch from its tape. `inputs` identifies what
 the machine booted (kernel and initramfs bytes, command line, disks): a replay with different
