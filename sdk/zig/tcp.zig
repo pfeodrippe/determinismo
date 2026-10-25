@@ -100,6 +100,12 @@ pub const Connection = struct {
         return bytes;
     }
 
+    /// The next byte, left unread.
+    pub fn peek(connection: *Connection) !u8 {
+        if (connection.end == connection.start) try connection.fill();
+        return connection.buffer[connection.start];
+    }
+
     /// Everything until the server closes the connection (at most the buffer).
     pub fn read_all(connection: *Connection) ![]const u8 {
         while (true) {

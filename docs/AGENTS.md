@@ -10,8 +10,16 @@ determinismo mcp --kernel <vmlinuz> --initrd <base.cpio> --memory-mib 2048 --cac
 ```
 
 Tools: `describe`, `explore`, `replay`, `fork`, `query`, `events`, `causality` (schemas in
-`src/mcp_tools.json`). Without MCP, use `explore --record results.jsonl --events-dir events/`
+`src/mcp_tools.json`). `explore ... --serve <host:port>` runs the exploration in a `determinismo
+serve` instead, so people can follow it in the web UI (it prints the run's address). Without MCP, use `explore --record results.jsonl --events-dir events/`
 with `determinismo query` and `determinismo events`, or the HTTP API (`determinismo serve`).
+
+## Skills
+
+Claude Code skills in `.claude/skills/` (as Antithesis's antithesis-skills):
+`determinismo-properties` finds what a system must guarantee, `determinismo-workload` writes its
+test program, `determinismo-debug` investigates a failure. Copy them to `~/.claude/skills/` to
+use them in other repositories.
 
 ## A debugging loop that works
 

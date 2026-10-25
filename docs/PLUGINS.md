@@ -13,7 +13,16 @@ determinismo's environment (so a strategy that asks a model can read its API key
 ```
 determinismo explore ... --strategy "det-strategy-mutate --sync-dir /tmp/corpus"
 determinismo explore ... --strategy "python3 plugins/python/extremes.py"
+determinismo explore ... --strategy "python3 plugins/python/llm.py"     # Claude Haiku 5.5
+determinismo explore ... --strategy tcp://127.0.0.1:9000                # a plugin elsewhere
 ```
+
+A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
+connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
+plugin command that way, and an SSH tunnel brings it to the host from a laptop:
+`ssh -N -R 9000:127.0.0.1:9000 det@<host>`. `plugins/python/llm.py` asks a language model
+(Claude Haiku 5.5, through the `claude` command line) every few branches which labeled decisions
+to favor, from what recent branches did; run it where `claude` is logged in.
 
 ## Messages
 
@@ -23,7 +32,7 @@ Every request has a `method`. Every response is a JSON object; `{}` always means
 |---|---|---|
 | `{"method":"hello","protocol":1,"exploration_seed":"<hex>"}` | Once, at start. | `{"name":"<plugin name>"}` |
 | `{"method":"branch","index":I,"seed":"<hex>"}` | Before each branch, with the branch's seed. | `{}` |
-| `{"method":"random","pull":P,"size":N,"default":"<hex>","source":"<process>","vtime_ns":T,"branches":C}` | The guest asked for `N` random bytes; pull `P` of this timeline (counted from boot); `source` is the asking process's name (Linux's `comm`, e.g. `det-faults`, `det-composer`, a test command), so a strategy can tell decision streams apart. | `{}` to use `default`, or `{"hex":"<2N hex digits>"}` |
+| `{"method":"random","pull":P,"size":N,"default":"<hex>","source":"<process>","vtime_ns":T,"branches":C[,"decision":{...}]}` | The guest asked for `N` random bytes; pull `P` of this timeline (counted from boot); `source` is the asking process's name (Linux's `comm`, e.g. `det-faults`, `det-composer`, a test command), so a strategy can tell decision streams apart. `decision` labels it when the guest named it (the SDKs' `decide` and `random_below_named`): `{"name":"fault","options":["pause raft-2","partition raft-1 raft-3",...]}` (answer the index, little endian) or `{"name":"fault.duration_ns","range":R}`. det-faults names its faults, waits and durations. | `{}` to use `default`, or `{"hex":"<2N hex digits>"}` |
 | `{"method":"event","vtime_ns":T,"branches":C,"source":"<process>","event":<guest event>}` | The guest emitted an event (assertions, lifecycle, logs); `source` is the writing process's name, as for decisions ("" for events near the size limit). | `{}` |
 | `{"method":"branch_end","index":I,"outcome":"<outcome>","events":E,"failing":["<property>",...]}` | The branch ended. | `{}` to continue, `{"stop":true}` to end the exploration early |
 

@@ -36,6 +36,14 @@ void det_random_bytes(void *target, size_t count);
 uint64_t det_random_u64(void);
 uint64_t det_random_below(uint64_t count); /* Uniform in [0, count). */
 
+/* Which evaluations become events: every one (0, the default: queries see each), or, as
+   Antithesis's SDKs do, each assertion's first pass and first failure in this process (1: for
+   hot paths, the same verdict with far fewer events). Set it once, at the start. */
+extern int det_first_pass_first_failure;
+
+/* An assertion with its place in the code (what the DET_* macros call). */
+void det_assert_at(const char *kind, int condition, const char *message, const char *details,
+                   const char *file, int line, const char *function);
 void det_always(int condition, const char *message, const char *details);
 void det_always_or_unreachable(int condition, const char *message, const char *details);
 void det_sometimes(int condition, const char *message, const char *details);
@@ -44,6 +52,23 @@ void det_unreachable(const char *message, const char *details);
 
 void det_setup_complete(const char *details); /* The platform snapshots here. */
 void det_event(const char *name, const char *details);
+
+/* Guidance assertions: the compared values in the details, and a guidance event telling
+   strategies how far the timeline is from the interesting outcome (lower is closer). `always`
+   is 1 for an always, 0 for a sometimes; `relation` is one of DET_GREATER, ... */
+enum det_relation { DET_GREATER, DET_GREATER_OR_EQUAL, DET_LESS, DET_LESS_OR_EQUAL };
+void det_compare(int always, enum det_relation relation, double left, double right,
+                 const char *message, const char *details);
+/* Named conditions (all evaluated): at least one holds every time, or all hold at least once. */
+void det_always_some(const char *const *names, const int *values, size_t count,
+                     const char *message, const char *details);
+void det_sometimes_all(const char *const *names, const int *values, size_t count,
+                       const char *message, const char *details);
+
+/* Labeled decisions, for strategies: the index of the option chosen (a platform decision),
+   announced with the options' names; or a range, named. */
+size_t det_decide(const char *name, const char *const *options, size_t count);
+uint64_t det_random_below_named(const char *name, uint64_t count);
 
 /* The assertion catalog: one entry per call site, in the det_catalog section (the layout the Zig
    SDK uses too); the magic tells entries from the linker's padding. */
@@ -76,27 +101,50 @@ struct det_catalog_entry {
 #define DET_ALWAYS(condition, message, details)                                                \
   do {                                                                                         \
     DET_CATALOG_SITE("always", message);                                                       \
-    det_always((condition), (message), (details));                                             \
+    det_assert_at("always", (condition), (message), (details), __FILE__, __LINE__, __func__);  \
   } while (0)
 #define DET_ALWAYS_OR_UNREACHABLE(condition, message, details)                                 \
   do {                                                                                         \
     DET_CATALOG_SITE("always_or_unreachable", message);                                        \
-    det_always_or_unreachable((condition), (message), (details));                              \
+    det_assert_at("always_or_unreachable", (condition), (message), (details), __FILE__,          \
+                  __LINE__, __func__);                                                         \
   } while (0)
 #define DET_SOMETIMES(condition, message, details)                                             \
   do {                                                                                         \
     DET_CATALOG_SITE("sometimes", message);                                                    \
-    det_sometimes((condition), (message), (details));                                          \
+    det_assert_at("sometimes", (condition), (message), (details), __FILE__, __LINE__,          \
+                  __func__);                                                                   \
   } while (0)
 #define DET_REACHABLE(message, details)                                                        \
   do {                                                                                         \
     DET_CATALOG_SITE("reachable", message);                                                    \
-    det_reachable((message), (details));                                                       \
+    det_assert_at("reachable", 1, (message), (details), __FILE__, __LINE__, __func__);         \
   } while (0)
+#define DET_ALWAYS_GREATER_THAN(left, right, message, details)                                \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_compare(1, DET_GREATER, (left), (right), (message), (details));                        \
+  } while (0)
+#define DET_ALWAYS_LESS_THAN(left, right, message, details)                                   \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_compare(1, DET_LESS, (left), (right), (message), (details));                           \
+  } while (0)
+#define DET_SOMETIMES_GREATER_THAN_OR_EQUAL(left, right, message, details)                     \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_compare(0, DET_GREATER_OR_EQUAL, (left), (right), (message), (details));               \
+  } while (0)
+#define DET_SOMETIMES_LESS_THAN_OR_EQUAL(left, right, message, details)                        \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_compare(0, DET_LESS_OR_EQUAL, (left), (right), (message), (details));                  \
+  } while (0)
+
 #define DET_UNREACHABLE(message, details)                                                      \
   do {                                                                                         \
     DET_CATALOG_SITE("unreachable", message);                                                  \
-    det_unreachable((message), (details));                                                     \
+    det_assert_at("unreachable", 1, (message), (details), __FILE__, __LINE__, __func__);       \
   } while (0)
 
 #ifdef __cplusplus
@@ -180,11 +228,28 @@ static void det_emit(const char *line, size_t length) {
   }
 }
 
-static void det_assert(const char *kind, int condition, const char *message, const char *details) {
+static int det_repeated(const char *message, int condition);
+
+static void det_assert_located(const char *kind, int condition, const char *message,
+                               const char *details, const char *file, int line_number,
+                               const char *function) {
+  if (det_repeated(message, condition)) return;
   char line[DET_MESSAGE_SIZE_MAX];
   size_t used = (size_t)snprintf(line, sizeof line, "{\"assert\":{\"type\":\"%s\",\"message\":", kind);
   used = det_json_string(line, used, sizeof line, message);
   if (used >= sizeof line) return;
+  if (file) {
+    used += (size_t)snprintf(line + used, sizeof line - used, ",\"location\":{\"file\":");
+    if (used >= sizeof line) return;
+    used = det_json_string(line, used, sizeof line, file);
+    if (used >= sizeof line) return;
+    used += (size_t)snprintf(line + used, sizeof line - used, ",\"line\":%d,\"function\":",
+                             line_number);
+    if (used >= sizeof line) return;
+    used = det_json_string(line, used, sizeof line, function ? function : "");
+    if (used + 1 >= sizeof line) return;
+    line[used++] = '}';
+  }
   int written = snprintf(line + used, sizeof line - used, ",\"condition\":%s,\"details\":%s}}",
                          condition ? "true" : "false", details ? details : "{}");
   if (written < 0 || used + (size_t)written >= sizeof line) {
@@ -193,6 +258,15 @@ static void det_assert(const char *kind, int condition, const char *message, con
                        condition ? "true" : "false");
   }
   det_emit(line, used + (size_t)written);
+}
+
+static void det_assert(const char *kind, int condition, const char *message, const char *details) {
+  det_assert_located(kind, condition, message, details, NULL, 0, NULL);
+}
+
+void det_assert_at(const char *kind, int condition, const char *message, const char *details,
+                   const char *file, int line, const char *function) {
+  det_assert_located(kind, condition, message, details, file, line, function);
 }
 
 void det_always(int condition, const char *message, const char *details) {
@@ -222,6 +296,140 @@ static void det_declare(const char *kind, const char *message, size_t message_si
   if (used + sizeof(",\"hit\":false}}") > sizeof line) return;
   memcpy(line + used, ",\"hit\":false}}", sizeof(",\"hit\":false}}") - 1);
   det_emit(line, used + sizeof(",\"hit\":false}}") - 1);
+}
+
+int det_first_pass_first_failure = 0;
+
+/* Small open-addressing tables keyed by a message's hash: what this process already sent. */
+#define DET_SEEN_SIZE 4096
+static uint64_t det_seen[DET_SEEN_SIZE];      /* hash | 1, with the condition in bit 1 */
+static uint64_t det_best_keys[DET_SEEN_SIZE];  /* hash | 1 */
+static double det_best_values[DET_SEEN_SIZE];
+
+static uint64_t det_hash(const char *text) {
+  uint64_t hash = 1469598103934665603ull; /* FNV-1a */
+  for (const char *c = text; *c; c++) hash = (hash ^ (uint8_t)*c) * 1099511628211ull;
+  return hash;
+}
+
+/* Whether (message, condition) was sent already (and marks it); full tables send everything. */
+static int det_repeated(const char *message, int condition) {
+  if (!det_first_pass_first_failure) return 0;
+  uint64_t key = ((det_hash(message) << 2) | ((uint64_t)(condition != 0) << 1)) | 1;
+  for (size_t probe = 0; probe < DET_SEEN_SIZE; probe++) {
+    uint64_t *slot = &det_seen[(key + probe) % DET_SEEN_SIZE];
+    if (*slot == key) return 1;
+    if (*slot == 0) {
+      *slot = key;
+      return 0;
+    }
+  }
+  return 0;
+}
+
+static void det_guidance(const char *message, double distance) {
+  /* Only improvements: all a strategy needs. */
+  uint64_t key = det_hash(message) | 1;
+  for (size_t probe = 0; probe < DET_SEEN_SIZE; probe++) {
+    size_t at = (key + probe) % DET_SEEN_SIZE;
+    if (det_best_keys[at] == key) {
+      if (!(distance < det_best_values[at])) return;
+      det_best_values[at] = distance;
+      break;
+    }
+    if (det_best_keys[at] == 0) {
+      det_best_keys[at] = key;
+      det_best_values[at] = distance;
+      break;
+    }
+  }
+  char line[DET_MESSAGE_SIZE_MAX];
+  size_t used = (size_t)snprintf(line, sizeof line, "{\"guidance\":{\"message\":");
+  used = det_json_string(line, used, sizeof line, message);
+  if (used >= sizeof line) return;
+  int written = snprintf(line + used, sizeof line - used, ",\"distance\":%.17g}}", distance);
+  if (written > 0 && used + (size_t)written < sizeof line) det_emit(line, used + (size_t)written);
+}
+
+void det_compare(int always, enum det_relation relation, double left, double right,
+                 const char *message, const char *details) {
+  int holds = relation == DET_GREATER ? left > right
+              : relation == DET_GREATER_OR_EQUAL ? left >= right
+              : relation == DET_LESS ? left < right
+              : left <= right;
+  double margin = relation <= DET_GREATER_OR_EQUAL ? left - right : right - left;
+  char merged[DET_MESSAGE_SIZE_MAX];
+  snprintf(merged, sizeof merged, "{\"left\":%.17g,\"right\":%.17g,\"details\":%s}", left,
+           right, details ? details : "{}");
+  det_assert(always ? "always" : "sometimes", holds, message, merged);
+  det_guidance(message, always ? margin : -margin);
+}
+
+static void det_conditions(int always, const char *const *names, const int *values, size_t count,
+                           const char *message, const char *details) {
+  char merged[DET_MESSAGE_SIZE_MAX];
+  size_t used = (size_t)snprintf(merged, sizeof merged, "{\"conditions\":{");
+  size_t held = 0;
+  for (size_t index = 0; index < count && used < sizeof merged; index++) {
+    held += values[index] != 0;
+    if (index > 0) merged[used++] = ',';
+    used = det_json_string(merged, used, sizeof merged, names[index]);
+    if (used >= sizeof merged) break;
+    used += (size_t)snprintf(merged + used, sizeof merged - used, ":%s",
+                             values[index] ? "true" : "false");
+  }
+  if (used < sizeof merged) {
+    snprintf(merged + used, sizeof merged - used, "},\"details\":%s}", details ? details : "{}");
+  }
+  if (always) {
+    det_assert("always", held > 0, message, merged);
+    det_guidance(message, (double)held);
+  } else {
+    det_assert("sometimes", held == count, message, merged);
+    det_guidance(message, (double)(count - held));
+  }
+}
+
+void det_always_some(const char *const *names, const int *values, size_t count,
+                     const char *message, const char *details) {
+  det_conditions(1, names, values, count, message, details);
+}
+
+void det_sometimes_all(const char *const *names, const int *values, size_t count,
+                       const char *message, const char *details) {
+  det_conditions(0, names, values, count, message, details);
+}
+
+size_t det_decide(const char *name, const char *const *options, size_t count) {
+  if (det_device_fd() >= 0) {
+    char line[DET_MESSAGE_SIZE_MAX];
+    size_t used = (size_t)snprintf(line, sizeof line, "{\"decision\":{\"name\":");
+    used = det_json_string(line, used, sizeof line, name);
+    if (used + 12 < sizeof line) {
+      used += (size_t)snprintf(line + used, sizeof line - used, ",\"options\":[");
+      for (size_t index = 0; index < count && used < sizeof line; index++) {
+        if (index > 0) line[used++] = ',';
+        used = det_json_string(line, used, sizeof line, options[index]);
+      }
+      if (used + 3 < sizeof line) {
+        memcpy(line + used, "]}}", 3);
+        det_emit(line, used + 3);
+      }
+    }
+  }
+  return (size_t)det_random_below(count);
+}
+
+uint64_t det_random_below_named(const char *name, uint64_t count) {
+  if (det_device_fd() >= 0) {
+    char line[DET_MESSAGE_SIZE_MAX];
+    size_t used = (size_t)snprintf(line, sizeof line, "{\"decision\":{\"name\":");
+    used = det_json_string(line, used, sizeof line, name);
+    int written = snprintf(line + used, sizeof line - used, ",\"range\":%llu}}",
+                           (unsigned long long)count);
+    if (written > 0 && used + (size_t)written < sizeof line) det_emit(line, used + (size_t)written);
+  }
+  return det_random_below(count);
 }
 
 /* Present only when the program has catalogued assertions (weak: no section, no symbols). */

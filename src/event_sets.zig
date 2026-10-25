@@ -559,6 +559,13 @@ fn write(out: *std.Io.Writer, universe: *const Universe, items: []const Item, sh
 /// is (as grep), 2 on usage errors.
 pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8) !u8 {
     if (arguments.len < 2) return error.Usage;
+    // `events <dir> '{"pipeline": [...], ...}'`: the HTTP API's request, and its answer.
+    if (arguments.len == 2 and std.mem.startsWith(u8, arguments[1], "{\"pipeline\"")) {
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const asked = try std.json.parseFromSliceLeaky(Request, arena, arguments[1], options);
+        try std.Io.File.stdout().writeStreamingAll(io, try answer(arena, io, arguments[0], asked));
+        return 0;
+    }
     var show = Show{ .limit = std.math.maxInt(u64), .output = .events, .json = false };
     var branch: ?u32 = null;
     var index: usize = 2;

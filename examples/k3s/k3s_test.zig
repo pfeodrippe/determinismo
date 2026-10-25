@@ -83,12 +83,15 @@ fn ready(context: *System.Context) !void {
 
 /// Requests through the Service, as clients would; failures are expected under faults.
 fn get(context: *System.Context) !void {
-    const server = &context.nodes.server;
-    var answered: u32 = 0;
-    for (0..requests_per_driver) |_| {
-        service_answers(server) catch continue;
-        answered += 1;
-    }
+    // One shell in the node looks the Service up once and sends every request: each command
+    // started in the guest costs CPU the system under test would rather have.
+    const script = "address=$(" ++ kubectl ++ " get service web -o jsonpath='{.spec.clusterIP}')" ++
+        "; answered=0; for i in $(seq " ++ std.fmt.comptimePrint("{d}", .{requests_per_driver}) ++
+        "); do wget -qO- -T 2 \"http://$address\" 2>/dev/null | grep -q ok && " ++
+        "answered=$((answered + 1)); done; echo $answered";
+    var buffer: [64]u8 = undefined;
+    const result = try context.nodes.server.exec_output(&.{ "sh", "-c", script }, &buffer);
+    const answered = std.fmt.parseInt(u32, std.mem.trim(u8, result.output, " \n"), 10) catch 0;
     sdk.sometimes(answered == requests_per_driver, "every request of a client is answered", .{});
     sdk.sometimes(answered < requests_per_driver, "faults keep some requests unanswered", .{});
 }
@@ -117,18 +120,11 @@ fn rolled_out(server: *const sdk.Node) !void {
     if (status != 0) return error.NotRolledOut;
 }
 
-/// One request to the Service's cluster address, from inside the cluster; it answers "ok".
+/// One request to the Service's cluster address, from inside the cluster (one shell: the
+/// lookup and the request); it answers "ok".
 fn service_answers(server: *const sdk.Node) !void {
-    var address_buffer: [64]u8 = undefined;
-    const address = try server.exec_output(&.{
-        kubectl, "get", "service", "web", "-o", "jsonpath={.spec.clusterIP}",
-    }, &address_buffer);
-    if (address.status != 0 or address.output.len == 0) return error.NoService;
-    var url_buffer: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buffer, "http://{s}", .{address.output});
-    var body_buffer: [256]u8 = undefined;
-    const body = try server.exec_output(&.{ "wget", "-qO-", "-T", "2", url }, &body_buffer);
-    if (body.status != 0 or std.mem.indexOf(u8, body.output, "ok") == null) {
-        return error.NotServed;
-    }
+    const script = "wget -qO- -T 2 \"http://$(" ++ kubectl ++
+        " get service web -o jsonpath='{.spec.clusterIP}')\" | grep -q ok";
+    const status = try server.exec(&.{ "sh", "-c", script });
+    if (status != 0) return error.NotServed;
 }

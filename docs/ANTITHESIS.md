@@ -25,8 +25,8 @@ change that moves it.
 | Randomness (SDK random) | SDK random, `rng()`, `prng()`; kernel reseeded per branch | ✅ |
 | Lifecycle | `setup_complete`, `guest_done` | ✅ |
 | Coverage instrumentation | C, Zig (edges), Python, JVM (lines); used by `mutate` | 🟡 opt-in per language (build flags, `coverage_start`, a Java agent); edges never map back to source lines |
-| Guidance assertions (`alwaysGreaterThan`, `sometimesLessThan`, ..., `alwaysSome`, `sometimesAll`) | none: plain conditions only | ❌ |
-| Assertion locations and ids; first pass and first failure per process | messages only; every evaluation is sent | ❌ |
+| Guidance assertions (`alwaysGreaterThan`, `sometimesLessThan`, ..., `alwaysSome`, `sometimesAll`) | In every SDK (Zig, C, Python, JVM, Clojure): the compared values in the details, and a guidance event with the distance to the interesting outcome; det-strategy-mutate keeps timelines that come closer (the sum maze: solved guided, missed in 300 random timelines) | ✅ |
+| Assertion locations and ids; first pass and first failure per process | locations (file, line, function) from C (macros), Python (the caller's frame), the JVM and Clojure (StackWalker, once per assertion), in the report, the record and the UI | 🟡 no location from Zig yet (needs the return address and debug info); first pass and first failure per process opt-in in every SDK (Zig `assertion_events = .first`, C `det_first_pass_first_failure`, Python `assertion_events = "first"`, JVM `firstPassFirstFailure`, Clojure `first-pass-first-failure!`); guidance sent only when it improves |
 | Fallback SDK (JSONL to a file) | `ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo` | ✅ |
 
 ## Faults

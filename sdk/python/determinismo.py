@@ -112,10 +112,41 @@ def _emit(message):
     os.write(fd, data)  # One write, one event.
 
 
+_located = set()  # Assertions whose location this process already sent.
+
+# Which evaluations become events: "every" one (the default: queries see each), or, as
+# Antithesis's SDKs do, each assertion's "first" pass and first failure in this process (for hot
+# paths: the same verdict, far fewer events). Set it once, at the start.
+assertion_events = "every"
+_seen = set()  # (message, condition) already sent, in "first" mode.
+_best = {}  # Guidance: the smallest distance sent per message.
+
+
+def _location():
+    """Where the SDK was called from: the first frame outside this file."""
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if frame is None:
+        return None
+    return {"file": frame.f_code.co_filename, "line": frame.f_lineno,
+            "function": frame.f_code.co_name}
+
+
 def _assert(kind, condition, message, details):
     assert message
-    _emit({"assert": {"type": kind, "message": message, "condition": bool(condition),
-                      "details": details or {}}})
+    if assertion_events == "first":
+        if (message, bool(condition)) in _seen:
+            return
+        _seen.add((message, bool(condition)))
+    assertion = {"type": kind, "message": message, "condition": bool(condition),
+                 "details": details or {}}
+    if message not in _located:  # Its location once per process: the platform keeps it.
+        _located.add(message)
+        location = _location()
+        if location:
+            assertion["location"] = location
+    _emit({"assert": assertion})
 
 
 def always(condition, message, details=None):
@@ -136,6 +167,89 @@ def reachable(message, details=None):
 
 def unreachable(message, details=None):
     _assert("unreachable", True, message, details)
+
+
+# Guidance assertions: the compared values in the details, and a guidance event telling
+# strategies how far the timeline is from the interesting outcome (an `always` violated, a
+# `sometimes` true): `distance`, lower is closer, 0 or less is there.
+
+def _guidance(message, distance):
+    # Only improvements: all a strategy needs.
+    if distance >= _best.get(message, float("inf")):
+        return
+    _best[message] = distance
+    _emit({"guidance": {"message": message, "distance": distance}})
+
+
+def _compare(kind, holds, margin, left, right, message, details):
+    merged = {"left": left, "right": right, "details": details or {}}
+    _assert(kind, holds, message, merged)
+    _guidance(message, margin if kind == "always" else -margin)
+
+
+def always_greater_than(left, right, message, details=None):
+    _compare("always", left > right, left - right, left, right, message, details)
+
+
+def always_greater_than_or_equal(left, right, message, details=None):
+    _compare("always", left >= right, left - right, left, right, message, details)
+
+
+def always_less_than(left, right, message, details=None):
+    _compare("always", left < right, right - left, left, right, message, details)
+
+
+def always_less_than_or_equal(left, right, message, details=None):
+    _compare("always", left <= right, right - left, left, right, message, details)
+
+
+def sometimes_greater_than(left, right, message, details=None):
+    _compare("sometimes", left > right, left - right, left, right, message, details)
+
+
+def sometimes_greater_than_or_equal(left, right, message, details=None):
+    _compare("sometimes", left >= right, left - right, left, right, message, details)
+
+
+def sometimes_less_than(left, right, message, details=None):
+    _compare("sometimes", left < right, right - left, left, right, message, details)
+
+
+def sometimes_less_than_or_equal(left, right, message, details=None):
+    _compare("sometimes", left <= right, right - left, left, right, message, details)
+
+
+def always_some(conditions, message, details=None):
+    """At least one of the named conditions (a dict of bools, all evaluated) holds, every time."""
+    held = sum(1 for value in conditions.values() if value)
+    _assert("always", held > 0, message, {"conditions": conditions, "details": details or {}})
+    _guidance(message, held)
+
+
+def sometimes_all(conditions, message, details=None):
+    """All the named conditions hold together, at least once."""
+    held = sum(1 for value in conditions.values() if value)
+    _assert("sometimes", held == len(conditions), message,
+            {"conditions": conditions, "details": details or {}})
+    _guidance(message, len(conditions) - held)
+
+
+# Labeled decisions: the platform's strategies see the name and the options.
+
+def decide(name, options):
+    """A named decision among options (which fault, which account, which node): returns the
+    index chosen, a platform decision announced with the options' names."""
+    assert options
+    if _device_fd() is not None:
+        _emit({"decision": {"name": name, "options": [str(option) for option in options]}})
+    return random_below(len(options))
+
+
+def random_below_named(name, count):
+    """`random_below`, named for strategies ("retry.jitter_ms")."""
+    if _device_fd() is not None:
+        _emit({"decision": {"name": name, "range": count}})
+    return random_below(count)
 
 
 def setup_complete(details=None):
@@ -173,6 +287,13 @@ def coverage_start(paths=None):
 # The assertion catalog ---------------------------------------------------------------------
 
 _KINDS = ("always", "always_or_unreachable", "sometimes", "reachable", "unreachable")
+# Guidance assertions: their kind, and where their message is among the arguments.
+_GUIDED = {name: ("always" if name.startswith("always") else "sometimes", position)
+           for name, position in [(f"{kind}_{relation}", 2)
+                                  for kind in ("always", "sometimes")
+                                  for relation in ("greater_than", "greater_than_or_equal",
+                                                   "less_than", "less_than_or_equal")]
+           + [("always_some", 1), ("sometimes_all", 1)]}
 _declared = set()
 _scanned = set()
 
@@ -203,7 +324,8 @@ def _catalog_source(filename):
         if isinstance(node, ast.Import):
             modules.update(a.asname or a.name for a in node.names if a.name == "determinismo")
         elif isinstance(node, ast.ImportFrom) and node.module == "determinismo":
-            direct.update((a.asname or a.name, a.name) for a in node.names if a.name in _KINDS)
+            direct.update((a.asname or a.name, a.name) for a in node.names
+                          if a.name in _KINDS or a.name in _GUIDED)
     if not modules and not direct:
         return
     for node in ast.walk(tree):
@@ -211,13 +333,19 @@ def _catalog_source(filename):
             continue
         function = node.func
         if (isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name)
-                and function.value.id in modules and function.attr in _KINDS):
-            kind = function.attr
+                and function.value.id in modules):
+            called = function.attr
         elif isinstance(function, ast.Name) and function.id in direct:
-            kind = direct[function.id]
+            called = direct[function.id]
         else:
             continue
-        position = 0 if kind in ("reachable", "unreachable") else 1
+        if called in _GUIDED:
+            kind, position = _GUIDED[called]
+        elif called in _KINDS:
+            kind = called
+            position = 0 if kind in ("reachable", "unreachable") else 1
+        else:
+            continue
         message = node.args[position] if len(node.args) > position else next(
             (keyword.value for keyword in node.keywords if keyword.arg == "message"), None)
         if isinstance(message, ast.Constant) and isinstance(message.value, str):

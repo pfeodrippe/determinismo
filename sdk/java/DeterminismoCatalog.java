@@ -64,9 +64,14 @@ public final class DeterminismoCatalog {
   /** The assertion kind of a call to Determinismo, or null. */
   private static String kind(String method) {
     switch (method) {
-      case "always": return "always";
+      case "always": case "alwaysSome": case "alwaysGreaterThan":
+      case "alwaysGreaterThanOrEqual": case "alwaysLessThan": case "alwaysLessThanOrEqual":
+        return "always";
       case "alwaysOrUnreachable": return "always_or_unreachable";
-      case "sometimes": return "sometimes";
+      case "sometimes": case "sometimesAll": case "sometimesGreaterThan":
+      case "sometimesGreaterThanOrEqual": case "sometimesLessThan":
+      case "sometimesLessThanOrEqual":
+        return "sometimes";
       case "reachable": return "reachable";
       case "unreachable": return "unreachable";
       default: return null;

@@ -66,9 +66,7 @@ fn supervise() void {
         const result = linux.wait4(-1, &status, 0, null);
         if (linux.errno(result) == .INTR) continue;
         if (linux.errno(result) != .SUCCESS) return; // No children left.
-        // Only the workers mode reaches this; this one binary serves every self-test mode, so
-        // the assertion stays out of its catalog (a service's catalog is judged as a whole).
-        sdk.assert_computed(.reachable, true, "a killed worker is replaced", .{});
+        sdk.reachable("a killed worker is replaced", .{});
         worker_start();
     }
 }

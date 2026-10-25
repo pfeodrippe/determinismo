@@ -5,6 +5,7 @@
 //! No allocation: properties live in a fixed table, and JSON parsing uses a buffer the caller
 //! reserves once at startup (`parse_buffer_size`) and that is reset for every event.
 const std = @import("std");
+const query = @import("query.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
@@ -23,10 +24,14 @@ pub const Property = struct {
     hits: u64 = 0,
     trues: u64 = 0,
     first_failure: ?Moment = null,
-    /// Declared by a test program's catalog (`"scope": "program"`): the program holds several
-    /// scenarios, so whether it must be reached is judged over all of them (main.zig), not in
-    /// one scenario's multiverse.
-    program_scoped: bool = false,
+    /// Where the assertion is in the code ("file:line function"), from the first event (or
+    /// catalog entry) that said; empty when none did.
+    location: [location_size_max]u8 = undefined,
+    location_size: u8 = 0,
+
+    pub fn where(property: *const Property) []const u8 {
+        return property.location[0..property.location_size];
+    }
 
     pub fn name(property: *const Property) []const u8 {
         assert(property.message_size > 0);
@@ -64,8 +69,18 @@ last_event_name_size: u8 = 0,
 /// rate the "logging output" property checks.
 output_bytes: u64 = 0,
 first_vtime_ns: ?u64 = null,
+/// The behaviors this timeline reached (query.behavior_hash: an assertion with its outcome, an
+/// event with its categorical details; and how close a guidance assertion came, by powers of
+/// two), each with when it first did: where the tree explorer branches from (main.zig).
+behaviors: [behavior_count_max]Behavior = undefined,
+behavior_count: u32 = 0,
+behavior_slots: [behavior_slot_count]u64 = @splat(0),
 
 const Events = @This();
+
+pub const Behavior = struct { hash: u64, vtime_ns: u64 };
+pub const behavior_count_max = 512;
+const behavior_slot_count = 2 * behavior_count_max; // Open addressing, at most half full.
 
 pub const InitOptions = struct { log_fd: ?linux.fd_t };
 
@@ -99,6 +114,7 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
             events.last_event_name_size = size;
         }
     }
+    events.behavior_note(moment, parsed);
     if (parsed.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
     if (parsed.object.get("output")) |output| try events.on_output(moment, output);
     if (parsed.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
@@ -111,6 +127,54 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
             events.on_lifecycle(moment, .{ .string = "setup_complete" });
         }
     }
+}
+
+fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
+    const hash = query.behavior_hash(value) orelse guidance_hash(value) orelse return;
+    if (events.behavior_count == behavior_count_max) return;
+    const key = hash | 1; // 0 marks an empty slot.
+    var slot = key % behavior_slot_count;
+    while (events.behavior_slots[slot] != 0) : (slot = (slot + 1) % behavior_slot_count) {
+        if (events.behavior_slots[slot] == key) return;
+    }
+    events.behavior_slots[slot] = key;
+    events.behaviors[events.behavior_count] = .{ .hash = key, .vtime_ns = moment.vtime_ns };
+    events.behavior_count += 1;
+}
+
+/// A guidance assertion's distance by power of two (0 or less: there): a timeline that came
+/// closer than any before reached a new behavior.
+fn guidance_hash(value: std.json.Value) ?u64 {
+    const guidance = value.object.get("guidance") orelse return null;
+    if (guidance != .object) return null;
+    const message = string_field(guidance.object, "message") orelse return null;
+    const distance: f64 = switch (guidance.object.get("distance") orelse return null) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => return null,
+    };
+    const bucket: i32 = if (!(distance > 0)) -1 else bucket: {
+        break :bucket @intFromFloat(@floor(@log2(@min(distance, 1e300))));
+    };
+    var hasher = std.hash.Wyhash.init(0x6775696465);
+    hasher.update(message);
+    hasher.update(std.mem.asBytes(&bucket));
+    return hasher.final();
+}
+
+test behavior_note {
+    var buffer: [parse_buffer_size]u8 = undefined;
+    var events: Events = undefined;
+    events.init(&buffer, .{ .log_fd = null });
+    const near = "{\"guidance\":{\"message\":\"sum\",\"distance\":5}}";
+    try events.emit(.{ .vtime_ns = 10, .branches = 1 }, near);
+    try events.emit(.{ .vtime_ns = 20, .branches = 2 }, near);
+    const closer = "{\"guidance\":{\"message\":\"sum\",\"distance\":1}}";
+    try events.emit(.{ .vtime_ns = 30, .branches = 3 }, closer);
+    // Same bucket once, closer is new; when each was first reached.
+    try std.testing.expectEqual(@as(u32, 2), events.behavior_count);
+    try std.testing.expectEqual(@as(u64, 10), events.behaviors[0].vtime_ns);
+    try std.testing.expectEqual(@as(u64, 30), events.behaviors[1].vtime_ns);
 }
 
 /// Language properties, from what processes print (Antithesis's "No panics (Go)" and others):
@@ -169,8 +233,7 @@ fn declaration(assertion: std.json.ObjectMap) bool {
 fn declare(events: *Events, kind: Kind, assertion: std.json.ObjectMap) !void {
     const message = string_field(assertion, "message") orelse return error.BadAssertion;
     const property = try events.property_get_or_put(kind, message);
-    const scope = string_field(assertion, "scope") orelse "";
-    if (std.mem.eql(u8, scope, "program")) property.program_scoped = true;
+    location_note(property, assertion);
 }
 
 /// An assertion from an Antithesis SDK (`{"antithesis_assert": {...}}`): its `display_type`
@@ -202,6 +265,7 @@ fn assertion_record(events: *Events, moment: Moment, kind: Kind, assertion: std.
 
     const property = try events.property_get_or_put(kind, message);
     assert(property.kind == kind);
+    location_note(property, assertion.object);
     property.hits += 1;
     if (condition) property.trues += 1;
     const failure = switch (kind) {
@@ -213,6 +277,29 @@ fn assertion_record(events: *Events, moment: Moment, kind: Kind, assertion: std.
         if (property.first_failure == null) property.first_failure = moment;
     }
     assert(property.trues <= property.hits);
+}
+
+const location_size_max = 120;
+
+/// `"location": {"file", "line", "function"}` (Antithesis's SDKs send `begin_line` and
+/// `class`): kept as "file:line function", once.
+fn location_note(property: *Property, assertion: std.json.ObjectMap) void {
+    if (property.location_size > 0) return;
+    const location = assertion.get("location") orelse return;
+    if (location != .object) return;
+    const file = string_field(location.object, "file") orelse
+        string_field(location.object, "file_name") orelse return;
+    const line_value = location.object.get("line") orelse location.object.get("begin_line");
+    const line: i64 = if (line_value) |value| switch (value) {
+        .integer => |integer| integer,
+        else => 0,
+    } else 0;
+    const function = string_field(location.object, "function") orelse
+        string_field(location.object, "function_name") orelse "";
+    var writer: std.Io.Writer = .fixed(&property.location);
+    writer.print("{s}:{d}", .{ std.fs.path.basename(file), line }) catch {};
+    if (function.len > 0) writer.print(" {s}", .{function}) catch {};
+    property.location_size = @intCast(writer.end);
 }
 
 fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Property {

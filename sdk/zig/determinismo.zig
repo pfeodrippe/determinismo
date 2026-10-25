@@ -146,30 +146,46 @@ pub fn prng() std.Random.DefaultPrng {
 // `always` that never ran. `assert_computed` takes a message computed at run time, outside the
 // catalog.
 
+/// Which evaluations become events: every one (the default: queries see each), or, as
+/// Antithesis's SDKs do, an assertion's first pass and first failure in each process (for hot
+/// paths: the verdict is the same, the event stream far smaller). Set it once, at the start.
+pub var assertion_events: enum { every, first } = .every;
+
 pub fn always(condition: bool, comptime message: []const u8, details: anytype) void {
-    catalog_site("always", message);
-    emit_assertion("always", .{ .condition = condition, .message = message }, details);
+    assert_at("always", condition, message, details, @returnAddress());
 }
 
 pub fn always_or_unreachable(condition: bool, comptime message: []const u8, details: anytype) void {
-    catalog_site("always_or_unreachable", message);
-    const assertion = Assertion{ .condition = condition, .message = message };
-    emit_assertion("always_or_unreachable", assertion, details);
+    assert_at("always_or_unreachable", condition, message, details, @returnAddress());
 }
 
 pub fn sometimes(condition: bool, comptime message: []const u8, details: anytype) void {
-    catalog_site("sometimes", message);
-    emit_assertion("sometimes", .{ .condition = condition, .message = message }, details);
+    assert_at("sometimes", condition, message, details, @returnAddress());
 }
 
 pub fn reachable(comptime message: []const u8, details: anytype) void {
-    catalog_site("reachable", message);
-    emit_assertion("reachable", .{ .condition = true, .message = message }, details);
+    assert_at("reachable", true, message, details, @returnAddress());
 }
 
 pub fn assert_unreachable(comptime message: []const u8, details: anytype) void {
-    catalog_site("unreachable", message);
-    emit_assertion("unreachable", .{ .condition = true, .message = message }, details);
+    assert_at("unreachable", true, message, details, @returnAddress());
+}
+
+/// `caller`: the return address into the code that asserted; its source place goes with the
+/// assertion's first event (as the other SDKs send theirs), from the program's debug info.
+fn assert_at(
+    comptime kind: [:0]const u8,
+    condition: bool,
+    comptime message: []const u8,
+    details: anytype,
+    caller: usize,
+) void {
+    const site = catalog_site(kind, message);
+    if (site.repeated(condition)) return;
+    const locate = !site.located;
+    site.located = true;
+    const assertion = Assertion{ .condition = condition, .message = message };
+    emit_assertion(kind, assertion, details, if (locate) caller else null);
 }
 
 // Guidance assertions -----------------------------------------------------------------------
@@ -184,7 +200,7 @@ pub fn always_greater_than(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.always, .greater, left, right, message, details);
+    compare(.always, .greater, left, right, message, details, @returnAddress());
 }
 pub fn always_greater_than_or_equal(
     left: anytype,
@@ -192,7 +208,7 @@ pub fn always_greater_than_or_equal(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.always, .greater_or_equal, left, right, message, details);
+    compare(.always, .greater_or_equal, left, right, message, details, @returnAddress());
 }
 pub fn always_less_than(
     left: anytype,
@@ -200,7 +216,7 @@ pub fn always_less_than(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.always, .less, left, right, message, details);
+    compare(.always, .less, left, right, message, details, @returnAddress());
 }
 pub fn always_less_than_or_equal(
     left: anytype,
@@ -208,7 +224,7 @@ pub fn always_less_than_or_equal(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.always, .less_or_equal, left, right, message, details);
+    compare(.always, .less_or_equal, left, right, message, details, @returnAddress());
 }
 pub fn sometimes_greater_than(
     left: anytype,
@@ -216,7 +232,7 @@ pub fn sometimes_greater_than(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.sometimes, .greater, left, right, message, details);
+    compare(.sometimes, .greater, left, right, message, details, @returnAddress());
 }
 pub fn sometimes_greater_than_or_equal(
     left: anytype,
@@ -224,7 +240,7 @@ pub fn sometimes_greater_than_or_equal(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.sometimes, .greater_or_equal, left, right, message, details);
+    compare(.sometimes, .greater_or_equal, left, right, message, details, @returnAddress());
 }
 pub fn sometimes_less_than(
     left: anytype,
@@ -232,7 +248,7 @@ pub fn sometimes_less_than(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.sometimes, .less, left, right, message, details);
+    compare(.sometimes, .less, left, right, message, details, @returnAddress());
 }
 pub fn sometimes_less_than_or_equal(
     left: anytype,
@@ -240,23 +256,27 @@ pub fn sometimes_less_than_or_equal(
     comptime message: []const u8,
     details: anytype,
 ) void {
-    compare(.sometimes, .less_or_equal, left, right, message, details);
+    compare(.sometimes, .less_or_equal, left, right, message, details, @returnAddress());
 }
 
 /// At least one of the named conditions holds, every time (all are evaluated: no short
 /// circuit). `conditions` is a struct of bools: `.{ .leader = a, .follower = b }`.
 pub fn always_some(conditions: anytype, comptime message: []const u8, details: anytype) void {
     const held = conditions_held(conditions);
-    always(held > 0, message, .{ .conditions = conditions, .details = details });
-    guidance(message, @floatFromInt(held)); // Violated when none holds.
+    const merged = .{ .conditions = conditions, .details = details };
+    assert_at("always", held > 0, message, merged, @returnAddress());
+    // Violated when none holds.
+    catalog_site("always", message).guide(message, @floatFromInt(held));
 }
 
 /// All the named conditions hold together, at least once.
 pub fn sometimes_all(conditions: anytype, comptime message: []const u8, details: anytype) void {
     const total = @typeInfo(@TypeOf(conditions)).@"struct".field_names.len;
     const held = conditions_held(conditions);
-    sometimes(held == total, message, .{ .conditions = conditions, .details = details });
-    guidance(message, @floatFromInt(total - held)); // Conditions still missing.
+    const merged = .{ .conditions = conditions, .details = details };
+    assert_at("sometimes", held == total, message, merged, @returnAddress());
+    // Conditions still missing.
+    catalog_site("sometimes", message).guide(message, @floatFromInt(total - held));
 }
 
 const Relation = enum { greater, greater_or_equal, less, less_or_equal };
@@ -268,6 +288,7 @@ fn compare(
     right: anytype,
     comptime message: []const u8,
     details: anytype,
+    caller: usize,
 ) void {
     const a = number(left);
     const b = number(right);
@@ -283,12 +304,10 @@ fn compare(
         .less, .less_or_equal => b - a,
     };
     const merged = .{ .left = left, .right = right, .details = details };
-    switch (kind) {
-        .always => always(holds, message, merged),
-        .sometimes => sometimes(holds, message, merged),
-    }
+    assert_at(@tagName(kind), holds, message, merged, caller);
     // An `always` is interesting where it breaks, a `sometimes` where it holds.
-    guidance(message, if (kind == .always) margin else -margin);
+    const site = catalog_site(@tagName(kind), message);
+    site.guide(message, if (kind == .always) margin else -margin);
 }
 
 fn number(value: anytype) f64 {
@@ -333,7 +352,7 @@ pub const Kind = enum { always, always_or_unreachable, sometimes, reachable, @"u
 pub fn assert_computed(kind: Kind, condition: bool, message: []const u8, details: anytype) void {
     const value = Assertion{ .condition = condition, .message = message };
     switch (kind) {
-        inline else => |known| emit_assertion(@tagName(known), value, details),
+        inline else => |known| emit_assertion(@tagName(known), value, details, null),
     }
 }
 
@@ -347,7 +366,31 @@ pub const CatalogEntry = extern struct {
 };
 const catalog_magic: u64 = 0x676f_6c61_7461_6364; // "dcatalog"
 
-fn catalog_site(comptime kind: [:0]const u8, comptime message: []const u8) void {
+/// What one assertion has sent in this process: for first-pass-first-failure events, and to
+/// send guidance only when it improves (all a strategy needs).
+const SiteState = struct {
+    passed: bool = false,
+    failed: bool = false,
+    located: bool = false,
+    best: f64 = std.math.inf(f64),
+
+    /// Whether this evaluation adds nothing the platform does not have (assertion_events = first).
+    fn repeated(site: *SiteState, condition: bool) bool {
+        if (assertion_events == .every) return false;
+        const seen = if (condition) &site.passed else &site.failed;
+        if (seen.*) return true;
+        seen.* = true;
+        return false;
+    }
+
+    fn guide(site: *SiteState, message: []const u8, distance: f64) void {
+        if (!(distance < site.best)) return;
+        site.best = distance;
+        guidance(message, distance);
+    }
+};
+
+fn catalog_site(comptime kind: [:0]const u8, comptime message: []const u8) *SiteState {
     comptime assert(message.len > 0);
     const Site = struct {
         const entry: CatalogEntry linksection("det_catalog") = .{
@@ -355,9 +398,11 @@ fn catalog_site(comptime kind: [:0]const u8, comptime message: []const u8) void 
             .message = message ++ "",
             .message_size = message.len,
         };
+        var state: SiteState = .{};
     };
     // A reference from the call site keeps its entry (and the section) in the linked program.
     std.mem.doNotOptimizeAway(&Site.entry);
+    return &Site.state;
 }
 
 extern const __start_det_catalog: u8;
@@ -384,7 +429,6 @@ fn catalog_announce() callconv(.c) void {
     if (!catalog_first()) return;
     const start = @intFromPtr(&__start_det_catalog);
     const stop = @intFromPtr(&__stop_det_catalog);
-    const program = catalog_has_mark(start, stop);
     var at = std.mem.alignForward(usize, start, @alignOf(CatalogEntry));
     while (at + @sizeOf(CatalogEntry) <= stop) {
         const entry: *const CatalogEntry = @ptrFromInt(at);
@@ -395,7 +439,7 @@ fn catalog_announce() callconv(.c) void {
         at += @sizeOf(CatalogEntry);
         if (entry.message_size == 0) continue; // The sentinel.
         const message = entry.message[0..entry.message_size];
-        declare_scoped(std.mem.span(entry.kind), message, program);
+        declare_runtime(std.mem.span(entry.kind), message);
     }
 }
 
@@ -432,38 +476,13 @@ pub fn declare(comptime kind: []const u8, message: []const u8) void {
     declare_runtime(kind, message);
 }
 
-/// In the catalog of test programs (System.main refers to it, so only they have it): their
-/// catalog covers all their scenarios, and is judged over them together (any one scenario
-/// reaches only its own).
-pub const test_program_mark: CatalogEntry linksection("det_catalog") = .{
-    .kind = test_program_kind,
-    .message = "",
-    .message_size = 0,
-};
-const test_program_kind = "test_program";
-
-fn catalog_has_mark(start: usize, stop: usize) bool {
-    var at = std.mem.alignForward(usize, start, @alignOf(CatalogEntry));
-    while (at + @sizeOf(CatalogEntry) <= stop) : (at += @alignOf(CatalogEntry)) {
-        const entry: *const CatalogEntry = @ptrFromInt(at);
-        if (entry.magic != catalog_magic) continue;
-        if (std.mem.eql(u8, std.mem.span(entry.kind), test_program_kind)) return true;
-    }
-    return false;
-}
-
 fn declare_runtime(kind: []const u8, message: []const u8) void {
-    declare_scoped(kind, message, false);
-}
-
-fn declare_scoped(kind: []const u8, message: []const u8, program: bool) void {
     assert(message.len > 0);
     var buffer: [message_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.print("{{\"assert\":{{\"type\":\"{s}\",\"message\":", .{kind}) catch unreachable;
     json_write(&writer, message);
-    const scope = if (program) ",\"scope\":\"program\"" else "";
-    writer.print("{s},\"hit\":false}}}}", .{scope}) catch unreachable;
+    writer.writeAll(",\"hit\":false}}") catch unreachable;
     emit_raw(writer.buffered());
 }
 
@@ -531,7 +550,12 @@ pub fn retry(
 
 const Assertion = struct { condition: bool, message: []const u8 };
 
-fn emit_assertion(comptime kind: []const u8, assertion: Assertion, details: anytype) void {
+fn emit_assertion(
+    comptime kind: []const u8,
+    assertion: Assertion,
+    details: anytype,
+    caller: ?usize,
+) void {
     assert(assertion.message.len > 0);
     var buffer: [message_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -539,8 +563,35 @@ fn emit_assertion(comptime kind: []const u8, assertion: Assertion, details: anyt
     json_write(&writer, assertion.message);
     writer.print(",\"condition\":{},\"details\":", .{assertion.condition}) catch unreachable;
     json_write(&writer, details);
+    if (caller) |address| location_write(&writer, address);
     writer.writeAll("}}") catch unreachable;
     emit_raw(writer.buffered());
+}
+
+/// `,"location":{"file","line","function"}` for a return address, from the program's own debug
+/// info; nothing when there is none (a stripped program) or it does not fit.
+fn location_write(writer: *std.Io.Writer, address: usize) void {
+    const info = std.debug.getSelfDebugInfo() catch return;
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    // The return address follows the call: one byte back is in it.
+    const io = std.Options.debug_io;
+    info.getSymbols(io, arena, arena, address -| 1, false, &symbols) catch return;
+    if (symbols.items.len == 0) return;
+    const symbol = symbols.items[0];
+    const source = symbol.source_location orelse return;
+    var buffer: [512]u8 = undefined;
+    var location: std.Io.Writer = .fixed(&buffer);
+    location.writeAll(",\"location\":{\"file\":") catch return;
+    std.json.Stringify.value(source.file_name, .{}, &location) catch return;
+    location.print(",\"line\":{d},\"function\":", .{source.line}) catch return;
+    std.json.Stringify.value(symbol.name orelse "", .{}, &location) catch return;
+    location.writeAll("}") catch return;
+    // Two bytes stay for the envelope's closing braces.
+    if (writer.end + location.end + 2 > writer.buffer.len) return;
+    writer.writeAll(location.buffered()) catch unreachable;
 }
 
 fn json_write(writer: *std.Io.Writer, value: anytype) void {

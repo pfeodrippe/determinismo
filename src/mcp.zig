@@ -30,7 +30,8 @@ const Arguments = struct {
     profile: ?[]const u8 = null,
     seed: u64 = 0,
     cpu_modulation: bool = false,
-    branches: u32 = 16,
+    branches: ?u32 = null,
+    time_budget: ?[]const u8 = null,
     branch: ?u32 = null,
     at_vtime_ms: ?u64 = null,
     exec: ?[]const u8 = null,
@@ -169,7 +170,11 @@ fn tool_call(
         return result.stdout;
     }
     if (!eql(u8, name, "explore") and !eql(u8, name, "fork")) return error.UnknownTool;
-    try argv.appendSlice(arena, &.{ "--branches", try number(arena, arguments.branches) });
+    if (arguments.time_budget) |budget| try argv.appendSlice(arena, &.{ "--time-budget", budget });
+    if (arguments.branches != null or arguments.time_budget == null) {
+        const branches = try number(arena, arguments.branches orelse 16);
+        try argv.appendSlice(arena, &.{ "--branches", branches });
+    }
     if (eql(u8, name, "fork")) {
         const branch = arguments.from_branch orelse return error.MissingBranch;
         const vtime_ms = arguments.from_vtime_ms orelse return error.MissingVtime;

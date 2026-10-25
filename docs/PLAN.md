@@ -31,19 +31,12 @@ build e2e` tests it.
 From Antithesis's Java SDK (antithesis-sdk-java) and blog (2024 to 2026); none of these is a row
 in ANTITHESIS.md yet.
 
-1. **Guidance assertions** (SDK): `always_greater_than`, `always_less_than` (and the "or equal"
-   forms), `sometimes_greater_than`, ..., with the compared values reported, and `always_some` /
-   `sometimes_all` over named conditions (no short circuit). Each also reports guidance (the
-   values and whether to maximize or minimize them) that strategies use to move timelines
-   toward a violation: a distance to fall below, a condition still false. In every SDK; the
-   strategy protocol forwards guidance to plugins (see "Strategy guidance").
-2. **Assertion locations and identity** (SDK): file, function, line and column, and an id per
-   assertion, in the events, the catalog and the report (Antithesis groups by message and shows
-   where). Zig gets them through the catalog entry (`@src()` at the call site), C through
-   `__FILE__`/`__LINE__`, Python and the JVM from the call stack or bytecode.
-3. **First pass, first failure** (SDK): Antithesis's SDKs send an assertion's first pass and
-   first failure per process, not every evaluation; ours send every one. Offer it (default for
-   hot paths), keeping counts, so busy drivers do not flood the event stream.
+1. **Guidance assertions**: done in every SDK, used by det-strategy-mutate and the LLM strategy.
+   Left: guidance-aware Go-Explore cells (see "Strategy guidance").
+2. **Assertion locations**: done for C, Python, the JVM and Clojure (report, record, UI). Left:
+   Zig, through the return address and the binary's debug info (the same symbolization as
+   coverage edges, below).
+3. **First pass, first failure**: done in every SDK (opt-in; guidance only when it improves).
 4. **Disk faults** (faults): Antithesis's mutation campaign turned on disk faults; find their
    documented forms (I/O errors, latency, lost unsynced writes at a crash, torn writes) and add
    them to det-faults through the nodes' disks.
@@ -51,10 +44,8 @@ in ANTITHESIS.md yet.
    black hole during exploration, not stored; replaying a branch regenerates it for the Logs
    view, a query, or a file. Antithesis measured virtual time per wall time going from 0.16 to
    1.01 on a verbose test.
-6. **Agent skills**: installable skills for coding agents (Antithesis's antithesis-skills:
-   research, workload, debug, mutation testing) as Claude Code skills in this repository, over
-   the CLI and MCP tools: infer a system's properties, write its test program, explore, debug a
-   failure at its moment, validate a fix.
+6. **Agent skills**: properties, workload and debug are in `.claude/skills/`. Left: a
+   mutation-testing skill (with item 7), and trying each on a system it has not seen.
 7. **Mutation testing campaigns** (antithesis.com/blog/2026/mutation-testing): an agent reads the
    code and writes subtle mutants (races, wrong ordering; not syntax that only panics), one
    patch each; determinismo explores each mutant and reports per property whether it was
@@ -71,10 +62,9 @@ fault and *where* to branch. Antithesis describes its guidance as reinforcement 
 "new and interesting states", every event a potential branch point, and `sometimes` assertions
 as hints of where bugs hide. To get there:
 
-1. **Labeled decisions.** A strategy sees each randomness pull as bytes from a process. Label
-   them: the SDK's `random_below(n)` sends its range and an optional name, and det-faults names
-   its pulls (`fault.delay`, `fault.kind`, `fault.duration`, `fault.target`). A strategy can then
-   ask for "a partition now, of the leader" instead of guessing bytes.
+1. **Labeled decisions**: done (`decide` and `random_below_named` in every SDK; det-faults names
+   its faults, waits and durations; strategies get the label with the pull). An LLM strategy
+   uses them (plugins/python/llm.py, Claude Haiku 5.5 through the `claude` CLI; remote over TCP).
 2. **Branching mid-timeline from the strategy.** Today the outer loop forks a branch at a moment
    (`fork`, replaying to it). Let a plugin answer an event with `{"branch_here": k}`: the VMM
    snapshots there (copy-on-write, as the setup snapshot) and runs k continuations from it. This

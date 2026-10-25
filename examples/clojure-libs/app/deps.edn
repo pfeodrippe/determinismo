@@ -1,0 +1,13 @@
+;; SPDX-License-Identifier: MIT
+;; The libraries under test, at their latest stable releases.
+{:paths ["src" "/app/sdk"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        org.clojure/core.async {:mvn/version "1.8.741"}
+        http-kit/http-kit {:mvn/version "2.8.1"}
+        cheshire/cheshire {:mvn/version "6.2.0"}
+        metosin/jsonista {:mvn/version "1.0.2"}
+        org.clojure/data.json {:mvn/version "2.5.1"}
+        com.taoensso/nippy {:mvn/version "3.9.0"}
+        clj-commons/clj-yaml {:mvn/version "1.0.30"}
+        metosin/malli {:mvn/version "0.20.3"}
+        manifold/manifold {:mvn/version "0.5.0"}}}

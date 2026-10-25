@@ -110,12 +110,18 @@ Every example is a test program like this one, written in Zig against the SDK (`
 [examples/bank](examples/bank) (Redis, a lost update), [examples/shop](examples/shop) (Postgres
 and Redis, a stale cache), [examples/clojure-bank](examples/clojure-bank) (a JVM service with
 the Clojure SDK, debugged by redefining a function through its REPL at a moment),
-[examples/k3s](examples/k3s) (Kubernetes: one node, or a three-node cluster) and
-[examples/raft](examples/raft) (HashiCorp Raft, three nodes replicating a chain of blocks).
+[examples/k3s](examples/k3s) (Kubernetes: one node, or a three-node cluster),
+[examples/raft](examples/raft) (HashiCorp Raft, three nodes replicating a chain of blocks),
+[examples/nrepl](examples/nrepl) (nREPL, the protocol Clojure editors speak, under concurrent
+sessions and interrupts) and [examples/clojure-libs](examples/clojure-libs) (Clojure's most used
+libraries: core.async, manifold, round trips through cheshire, jsonista, data.json, nippy,
+clj-yaml, and malli; one scenario per library).
 
 The services themselves use the SDK of their language for their own assertions, events and
 randomness (every SDK announces its program's assertions as the code loads, before they run, so
-one that no timeline reaches is judged too): Zig ([sdk/zig](sdk/zig)), C ([sdk/c](sdk/c), one header, for C, C++ and any FFI),
+one that no timeline reaches is judged too; guidance assertions such as `always_less_than` tell
+strategies how close a timeline came; `decide` names a decision and its options for them; and
+assertions carry their place in the code): Zig ([sdk/zig](sdk/zig)), C ([sdk/c](sdk/c), one header, for C, C++ and any FFI),
 Python ([sdk/python](sdk/python), one file), the JVM ([sdk/java](sdk/java), one file) and Clojure
 ([sdk/clojure](sdk/clojure), over the JVM one, with Clojure data), or any Antithesis SDK (see
 below).

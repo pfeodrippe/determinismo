@@ -198,8 +198,6 @@ pub fn System(comptime Nodes: type) type {
         /// `--describe` on the host, `run <scenario> <command>` in the guest. `definition` is
         /// `.{ .describe = fn (*Describe) !void, .scenarios = .{ .name = fn (*Scenario) void } }`.
         pub fn main(init: std.process.Init, comptime definition: anytype) !void {
-            // A test program: its assertion catalog spans all its scenarios.
-            std.mem.doNotOptimizeAway(&@import("determinismo.zig").test_program_mark);
             const arena = init.arena.allocator();
             const arguments = try init.minimal.args.toSlice(arena);
             if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "--describe")) {

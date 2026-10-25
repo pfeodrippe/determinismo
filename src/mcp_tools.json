@@ -39,7 +39,11 @@
         },
         "branches": {
           "type": "integer",
-          "description": "How many timelines (default 16)"
+          "description": "How many timelines (default 16; with time_budget, at most this many)"
+        },
+        "time_budget": {
+          "type": "string",
+          "description": "Explore as many timelines as fit in this wall time, boot included: 90s, 10m, 2h"
         },
         "compose": {
           "type": "string",

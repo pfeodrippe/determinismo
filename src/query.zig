@@ -408,7 +408,7 @@ const runtime_events = [_][]const u8{
 };
 const behavior_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
 
-fn behavior_hash(value: std.json.Value) ?u64 {
+pub fn behavior_hash(value: std.json.Value) ?u64 {
     if (value != .object) return null;
     var hasher = std.hash.Wyhash.init(0x6265686176696f72);
     if (value.object.get("assert")) |assertion| {
@@ -544,6 +544,13 @@ fn seconds_to_ns_float(seconds: f64) !u64 {
 /// The command: arguments after `query`. Exit status 0 when something matched, 1 when nothing
 /// did (as grep), 2 on usage errors.
 pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8) !u8 {
+    // `query <dir> '{"condition": ...}'`: the HTTP API's request, and its answer.
+    if (arguments.len == 2 and std.mem.startsWith(u8, arguments[1], "{")) {
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const asked = try std.json.parseFromSliceLeaky(Request, arena, arguments[1], options);
+        try std.Io.File.stdout().writeStreamingAll(io, try answer(arena, io, arguments[0], asked));
+        return 0;
+    }
     const request = try arguments_parse(arena, arguments);
     const timelines = try timelines_read(arena, io, request.directory, request.only_branch);
     var buffer: [64 * 1024]u8 = undefined;

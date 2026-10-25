@@ -17,7 +17,15 @@ pub const Header = struct {
     branch_seed: u64,
     /// Set for a branch explored from a moment of another branch (a nested snapshot).
     fork: ?Fork = null,
+    /// The tree explorer's path to where this branch starts, from the setup snapshot: each
+    /// ancestor (its index and seed) and the moment the next one left it. Empty: the snapshot.
+    chain: []const Segment = &.{},
 };
+
+/// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
+/// `vtime_ns`, where the next one branched from it.
+pub const Segment = struct { branch: u32, seed: u64, vtime_ns: u64 };
+pub const chain_length_max = 64;
 
 /// A moment of a branch of the setup snapshot, where a nested snapshot is taken.
 pub const Fork = struct {
@@ -70,13 +78,24 @@ pub const Overrides = struct {
 
 pub fn write_header(fd: linux.fd_t, header: Header) void {
     assert(fd >= 0);
-    var buffer: [256]u8 = undefined;
+    assert(header.chain.len <= chain_length_max);
+    var buffer: [512 + chain_length_max * 80]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.print("{{\"tape\":{d},\"inputs\":\"{x:0>16}\",\"exploration_seed\":\"{x:0>16}\"," ++
         "\"branch\":{d},\"branch_seed\":\"{x:0>16}\"", .{
         tape_version,  header.inputs,      header.exploration_seed,
         header.branch, header.branch_seed,
-    }) catch unreachable; // 256 bytes fit the keys, three hashes and a fork.
+    }) catch unreachable; // The keys, three hashes, a fork and a chain fit.
+    if (header.chain.len > 0) {
+        writer.writeAll(",\"chain\":[") catch unreachable;
+        for (header.chain, 0..) |segment, index| {
+            if (index > 0) writer.writeAll(",") catch unreachable;
+            writer.print("{{\"branch\":{d},\"seed\":\"{x:0>16}\",\"vtime_ns\":{d}}}", .{
+                segment.branch, segment.seed, segment.vtime_ns,
+            }) catch unreachable;
+        }
+        writer.writeAll("]") catch unreachable;
+    }
     if (header.fork) |fork| {
         writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
             fork.branch, fork.vtime_ns,
@@ -115,7 +134,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
     if ((header.object.get("tape") orelse return error.BadTape).integer != tape_version) {
         return error.UnsupportedTape;
     }
-    const result = Header{
+    var result = Header{
         .inputs = try hex_field(header.object, "inputs"),
         .exploration_seed = try hex_field(header.object, "exploration_seed"),
         .branch = @intCast((header.object.get("branch") orelse return error.BadTape).integer),
@@ -127,11 +146,27 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
             .exec = if (header.object.get("from_exec")) |command| command.string else null,
         } else null,
     };
+    if (header.object.get("chain")) |chain| {
+        if (chain != .array or chain.array.items.len > chain_length_max) return error.BadTape;
+        const segments = try fba.allocator().alloc(Segment, chain.array.items.len);
+        for (chain.array.items, segments) |item, *segment| {
+            if (item != .object) return error.BadTape;
+            segment.* = .{
+                .branch = @intCast((item.object.get("branch") orelse return error.BadTape).integer),
+                .seed = try hex_field(item.object, "seed"),
+                .vtime_ns = @intCast((item.object.get("vtime_ns") orelse
+                    return error.BadTape).integer),
+            };
+        }
+        result.chain = segments;
+    }
+    // What the header points into stays; the overrides are parsed after it.
+    var rest = std.heap.FixedBufferAllocator.init(scratch[fba.end_index..]);
     overrides.checkpoint_count = 0;
     overrides.checkpoint_cursor = 0;
     while (lines.next()) |line| {
-        fba.reset();
-        const value = try std.json.parseFromSliceLeaky(Value, fba.allocator(), line, .{});
+        rest.reset();
+        const value = try std.json.parseFromSliceLeaky(Value, rest.allocator(), line, .{});
         if (value.object.get("checkpoint")) |checkpoint| {
             try checkpoint_parse(overrides, checkpoint);
             continue;
@@ -206,4 +241,33 @@ test "a written tape parses back" {
     try std.testing.expect(!try overrides.apply(9, &value));
     try std.testing.expect(try overrides.apply(10, &value));
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &value);
+}
+
+test "a path round-trips through the header" {
+    const allocator = std.testing.allocator;
+    const overrides = try allocator.create(Overrides);
+    defer allocator.destroy(overrides);
+    const scratch = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(scratch);
+    var pipe: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe(&pipe));
+    defer _ = linux.close(pipe[0]);
+    const chain = [_]Segment{
+        .{ .branch = 0, .seed = 0xa, .vtime_ns = 1_200_000_000 },
+        .{ .branch = 17, .seed = 0xb, .vtime_ns = 3_410_000_000 },
+    };
+    write_header(pipe[1], .{
+        .inputs = 1,
+        .exploration_seed = 2,
+        .branch = 42,
+        .branch_seed = 3,
+        .chain = &chain,
+    });
+    _ = linux.close(pipe[1]);
+    var source: [4096]u8 = undefined;
+    const size = linux.read(pipe[0], &source, source.len);
+    const header = try parse(source[0..size], scratch, overrides);
+    try std.testing.expectEqual(@as(u32, 42), header.branch);
+    try std.testing.expectEqual(@as(usize, 2), header.chain.len);
+    try std.testing.expectEqual(chain[1], header.chain[1]);
 }

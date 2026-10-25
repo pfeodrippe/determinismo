@@ -49,12 +49,16 @@ pub const Options = struct {
     /// Run when a run finishes, through /bin/sh with {dir} and {id} replaced: long-term
     /// storage (e.g. `rclone copy {dir} s3:bucket/runs/{id}`). Null keeps runs local only.
     archive: ?[]const u8 = null,
+    /// Babashka, which evaluates notebooks (Clojure cells; notebook.clj).
+    bb: []const u8 = "bb",
 };
 
 const runs_max = 4096;
 const jobs_max = 256;
-const request_size_max = 64 * 1024;
-const response_size_max = 4 << 20;
+const request_size_max = 4 << 20; // A notebook with its actions' results.
+/// Responses (and the run files they are made of) grow as needed up to this: a query over a
+/// long run's every timeline is large.
+const response_size_max = 256 << 20;
 const arguments_max = 64;
 
 const Run = struct {
@@ -62,7 +66,11 @@ const Run = struct {
     pid: linux.pid_t,
     /// Exit status once finished: 0 all properties passed, 3 some failed, others errors.
     status: ?u32 = null,
+    /// Its babashka nREPL server, once started (notebook.clj's names, over this API).
+    nrepl_port: ?u16 = null,
 };
+
+const nrepl_port_base = 17000;
 
 /// A causality analysis (causality.zig) of a run's branch, in the background.
 const Job = struct {
@@ -81,7 +89,6 @@ const Server = struct {
     runs: [runs_max]Run = undefined,
     run_count: u32 = 0,
     request: [request_size_max]u8 = undefined,
-    response: []u8,
 };
 
 pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
@@ -90,7 +97,6 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
         .options = options,
         .io = io,
         .arena = arena,
-        .response = try arena.alloc(u8, response_size_max),
     };
     const runs_directory = try std.fs.path.join(arena, &.{ options.data_directory, "runs" });
     try std.Io.Dir.cwd().createDirPath(io, runs_directory);
@@ -145,9 +151,11 @@ fn handle(server: *Server, client: linux.fd_t) void {
     if (page and std.mem.eql(u8, request.method, "GET")) {
         return respond(client, 200, "text/html; charset=utf-8", ui_html);
     }
-    var writer: std.Io.Writer = .fixed(server.response);
-    const status = route(server, request, &writer) catch |err| blk: {
-        writer.end = 0;
+    var response: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer response.deinit();
+    const writer = &response.writer;
+    const status = route(server, request, writer) catch |err| blk: {
+        response.clearRetainingCapacity();
         writer.print("{{\"error\":\"{s}\"}}\n", .{@errorName(err)}) catch {};
         break :blk @as(u16, switch (err) {
             error.NotFound => 404,
@@ -176,6 +184,19 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
         if (!eql(u8, request.method, "GET")) return error.NotFound;
         return run_show(server, run, out);
     };
+    return run_route(server, run, action, &parts, request, out);
+}
+
+/// /runs/<id>/<action>[/...]: what one run offers.
+fn run_route(
+    server: *Server,
+    run: *const Run,
+    action: []const u8,
+    parts: *std.mem.TokenIterator(u8, .scalar),
+    request: Request,
+    out: *std.Io.Writer,
+) !u16 {
+    const eql = std.mem.eql;
     if (eql(u8, action, "output") and eql(u8, request.method, "GET")) {
         try out.writeAll(try run_file(server, run.id, "output.log"));
         return 200;
@@ -198,7 +219,14 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
         return findings_show(server, run, out);
     }
-    if (eql(u8, action, "notebook")) return notebook(server, run, request, out);
+    if (eql(u8, action, "notebook")) {
+        const what = parts.next() orelse return notebook(server, run, request, out);
+        if (!eql(u8, what, "evaluate") or !eql(u8, request.method, "POST")) return error.NotFound;
+        return notebook_evaluate(server, run, request.body, out);
+    }
+    if (eql(u8, action, "nrepl") and eql(u8, request.method, "POST")) {
+        return nrepl_start(server, @constCast(run), out);
+    }
     if (eql(u8, action, "causality")) {
         if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
         const index_text = parts.next() orelse return error.NotFound;
@@ -236,7 +264,12 @@ const RunRequest = struct {
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
-    branches: u32 = 16,
+    /// Timelines (at most, with a time budget).
+    branches: ?u32 = null,
+    /// Explore until then: "90s", "10m", "2h".
+    time_budget: ?[]const u8 = null,
+    /// "flat" or "tree" (explore's --branching).
+    branching: ?[]const u8 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
     from_branch: ?u32 = null,
@@ -262,8 +295,16 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     try argv.appendSlice(server.arena, server.options.machine);
     try system_arguments(server.arena, &argv, &asked);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed}) });
-    const branches = try print(server, "{d}", .{asked.branches});
-    try argv.appendSlice(server.arena, &.{ "--branches", branches });
+    if (asked.time_budget) |budget| {
+        try argv.appendSlice(server.arena, &.{ "--time-budget", budget });
+    }
+    if (asked.branching) |branching| {
+        try argv.appendSlice(server.arena, &.{ "--branching", branching });
+    }
+    if (asked.branches != null or asked.time_budget == null) {
+        const branches = try print(server, "{d}", .{asked.branches orelse 16});
+        try argv.appendSlice(server.arena, &.{ "--branches", branches });
+    }
     try argv.appendSlice(server.arena, &.{
         "--events-dir", try std.fs.path.join(server.arena, &.{ directory, "events" }),
     });
@@ -286,7 +327,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         });
     }
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
-    const pid = try spawn(server.arena, argv.items, output);
+    const pid = try spawn(server.arena, argv.items, output, &.{});
     server.runs[server.run_count] = .{ .id = id, .pid = pid };
     server.run_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{id});
@@ -315,6 +356,8 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
             try out.print(",\"run\":{s}", .{line["{\"run\":".len .. line.len - 1]});
         } else if (std.mem.startsWith(u8, line, "{\"summary\":")) {
             try out.print(",\"summary\":{s}", .{line["{\"summary\":".len .. line.len - 1]});
+        } else if (std.mem.startsWith(u8, line, "{\"snapshot\":")) {
+            try out.print(",\"snapshot\":{s}", .{line["{\"snapshot\":".len .. line.len - 1]});
         }
     }
     try out.writeAll(",\"branches\":[");
@@ -457,7 +500,7 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const directory = try run_directory(server, run.id);
     const output = try std.fs.path.join(server.arena, &.{ directory, name });
-    const pid = try spawn(server.arena, argv.items, output);
+    const pid = try spawn(server.arena, argv.items, output, &.{});
     server.jobs[server.job_count] = .{ .run = run.id, .index = index, .pid = pid };
     server.job_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{index});
@@ -711,7 +754,7 @@ fn archive(server: *Server, run: *const Run) !void {
     const with_dir = try std.mem.replaceOwned(u8, server.arena, template, "{dir}", directory);
     const command = try std.mem.replaceOwned(u8, server.arena, with_dir, "{id}", id);
     const log = try std.fs.path.join(server.arena, &.{ directory, "archive.log" });
-    _ = try spawn(server.arena, &.{ "/bin/sh", "-c", command }, log);
+    _ = try spawn(server.arena, &.{ "/bin/sh", "-c", command }, log, &.{});
 }
 
 fn state(run: *const Run) []const u8 {
@@ -727,9 +770,79 @@ fn run_directory(server: *Server, id: u32) ![]const u8 {
     return std.fmt.allocPrint(server.arena, "{s}/runs/{d}", .{ server.options.data_directory, id });
 }
 
+const notebook_clj = @embedFile("notebook.clj");
+
+fn notebook_script(server: *Server) ![]const u8 {
+    const script = try std.fs.path.join(server.arena, &.{
+        server.options.data_directory, "notebook.clj",
+    });
+    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = script, .data = notebook_clj });
+    return script;
+}
+
+/// A babashka nREPL server for the run (started once, on loopback): the notebook's names in
+/// `user`, over the run's events and record, with actions that run at once through this API.
+/// Editors connect through a tunnel to its port.
+fn nrepl_start(server: *Server, run: *Run, out: *std.Io.Writer) !u16 {
+    if (run.nrepl_port == null) {
+        const arena = server.arena;
+        const port: u16 = nrepl_port_base + @as(u16, @intCast(run.id % 1000));
+        const directory = try run_directory(server, run.id);
+        const address = try print(server, "127.0.0.1:{d}", .{port});
+        const argv = [_][]const u8{
+            server.options.bb, "--init", try notebook_script(server), "nrepl-server", address,
+        };
+        const environment = [_][]const u8{
+            try print(server, "DETERMINISMO={s}", .{server.options.self}),
+            try print(server, "DETERMINISMO_EVENTS={s}/events", .{directory}),
+            try print(server, "DETERMINISMO_RECORD={s}/record.jsonl", .{directory}),
+            try print(server, "DETERMINISMO_API=http://{s}", .{server.options.listen}),
+            try print(server, "DETERMINISMO_RUN={d}", .{run.id}),
+        };
+        const log = try std.fs.path.join(arena, &.{ directory, "nrepl.log" });
+        _ = try spawn(arena, &argv, log, &environment);
+        run.nrepl_port = port;
+    }
+    try out.print("{{\"port\":{d}}}\n", .{run.nrepl_port.?});
+    return 200;
+}
+
+/// Evaluates a notebook's cells (Clojure, with babashka: notebook.clj), the request's body as
+/// its input: {"cells": [...], "results": {...}}; answers each cell's outputs.
+fn notebook_evaluate(
+    server: *Server,
+    run: *const Run,
+    body: []const u8,
+    out: *std.Io.Writer,
+) !u16 {
+    const arena = server.arena;
+    const directory = try run_directory(server, run.id);
+    const cwd = std.Io.Dir.cwd();
+    const script = try notebook_script(server);
+    const input = try std.fs.path.join(server.arena, &.{ directory, "notebook-input.json" });
+    try cwd.writeFile(server.io, .{ .sub_path = input, .data = body });
+    var environment = std.process.Environ.Map.init(server.arena);
+    try environment.put("DETERMINISMO", server.options.self);
+    const events = try std.fs.path.join(arena, &.{ directory, "events" });
+    const record = try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
+    try environment.put("DETERMINISMO_EVENTS", events);
+    try environment.put("DETERMINISMO_RECORD", record);
+    try environment.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    const result = try std.process.run(server.arena, server.io, .{
+        .argv = &.{ server.options.bb, script, input },
+        .environ_map = &environment,
+    });
+    if (result.stdout.len == 0) {
+        try out.print("{{\"error\":{f}}}\n", .{std.json.fmt(result.stderr, .{})});
+        return 500;
+    }
+    try out.writeAll(result.stdout);
+    return 200;
+}
+
 fn run_file(server: *Server, id: u32, name: []const u8) ![]const u8 {
     const path = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), name });
-    const limit: std.Io.Limit = .limited(response_size_max / 2);
+    const limit: std.Io.Limit = .limited(response_size_max);
     return std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, limit);
 }
 
@@ -738,12 +851,21 @@ fn print(server: *Server, comptime format: []const u8, arguments: anytype) ![]co
 }
 
 /// Starts `argv` in the background with its output (both streams) in `output_path`.
-fn spawn(arena: std.mem.Allocator, argv: []const []const u8, output_path: []const u8) !linux.pid_t {
+/// Starts `argv` in the background, its output to `output_path`; `extra` adds "NAME=value"
+/// to its environment.
+fn spawn(
+    arena: std.mem.Allocator,
+    argv: []const []const u8,
+    output_path: []const u8,
+    extra: []const []const u8,
+) !linux.pid_t {
     assert(argv.len > 0 and argv.len < arguments_max);
     const argv_z = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, argv_z) |argument, *slot| slot.* = try arena.dupeSentinel(u8, argument, 0);
     const output_z = try arena.dupeSentinel(u8, output_path, 0);
-    const environment = [_:null]?[*:0]const u8{"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"};
+    const environment = try arena.allocSentinel(?[*:0]const u8, extra.len + 1, null);
+    environment[0] = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    for (extra, environment[1..]) |entry, *slot| slot.* = try arena.dupeSentinel(u8, entry, 0);
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
@@ -754,7 +876,7 @@ fn spawn(arena: std.mem.Allocator, argv: []const []const u8, output_path: []cons
             _ = linux.dup2(@intCast(fd), 2);
         }
         _ = linux.setsid(); // Not killed with the server's terminal.
-        _ = linux.execve(argv_z[0].?, argv_z.ptr, &environment);
+        _ = linux.execve(argv_z[0].?, argv_z.ptr, environment.ptr);
         linux.exit_group(127);
     }
     return @intCast(pid);

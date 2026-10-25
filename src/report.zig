@@ -5,6 +5,7 @@ const assert = std.debug.assert;
 const VM = @import("vm.zig");
 const Snapshot = @import("snapshot.zig");
 const Events = @import("events.zig");
+const tape = @import("tape.zig");
 const cpuid = @import("cpuid.zig");
 
 const print = std.debug.print;
@@ -29,7 +30,7 @@ fn hex(value: u64) [16]u8 {
     _ = std.fmt.bufPrint(&text, "{x:0>16}", .{value}) catch unreachable;
     return text;
 }
-const tsc_per_ns = cpuid.tsc_hz / std.time.ns_per_s;
+pub const tsc_per_ns = cpuid.tsc_hz / std.time.ns_per_s;
 
 pub fn run(vm: *VM, result: struct { outcome: VM.Outcome, wall_ns: u64 }) !void {
     assert(vm.events.property_count <= vm.events.properties.len);
@@ -98,7 +99,7 @@ pub fn snapshot_taken(snapshot: *const Snapshot, wall_ns: u64) void {
     });
 }
 
-/// A test program's catalog across the scenarios explored: an assertion must be reached (made
+/// The catalog across the scenarios explored: an assertion must be reached (made
 /// true, for a `sometimes`) in some timeline of some scenario, as in an Antithesis run, which
 /// explores every test template together.
 pub const Catalog = struct {
@@ -130,7 +131,7 @@ pub const Catalog = struct {
             if (!must) continue;
             if (!header) {
                 const scope = if (every_scenario) "any scenario" else "the scenarios explored";
-                print("[determinismo] test program assertions not reached in {s}:\n", .{scope});
+                print("[determinismo] assertions not reached in {s}:\n", .{scope});
                 header = true;
             }
             const status = if (every_scenario) "FAIL" else "----";
@@ -140,6 +141,23 @@ pub const Catalog = struct {
         return failing;
     }
 };
+
+test Catalog {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var catalog = Catalog{ .arena = arena_state.allocator() };
+    // Scenario one reaches the first; scenario two reaches the second.
+    try catalog.note(.sometimes, "reached in one", true);
+    try catalog.note(.sometimes, "reached in two", false);
+    try catalog.note(.sometimes, "reached in one", false);
+    try catalog.note(.sometimes, "reached in two", true);
+    try catalog.note(.reachable, "reached nowhere", false);
+    try catalog.note(.@"unreachable", "never reached, rightly", false);
+    // Only what no scenario reached, of the kinds that must be reached, and only when every
+    // scenario was explored.
+    try std.testing.expectEqual(@as(u32, 1), catalog.judge(true));
+    try std.testing.expectEqual(@as(u32, 0), catalog.judge(false));
+}
 
 /// Whether a property fails across the multiverse (Antithesis's semantics): an `always` fails
 /// where a timeline made it false or if no timeline hit it; `always_or_unreachable` and
@@ -192,6 +210,9 @@ pub const Multiverse = struct {
         wall_ns: u64,
         /// Where the branch started: its snapshot's virtual TSC.
         start_tsc: u64,
+        /// Its path from the setup snapshot (the tree explorer's; empty: it starts there).
+        path: []const tape.Segment = &.{},
+        generation: u32 = 0,
     };
 
     const Aggregate = struct {
@@ -204,14 +225,15 @@ pub const Multiverse = struct {
         first_failing_branch: ?u32 = null,
         first_failure: ?Events.Moment = null,
 
-        /// A test program's assertion no timeline of this scenario reached: judged across the
-        /// program's scenarios (main.zig), not here.
+        /// An assertion no timeline of this scenario reached (known from a catalog): a test
+        /// program or a service may serve several scenarios, so it is judged across the
+        /// scenarios explored (main.zig), not here.
         fn unreached_here(aggregate: *const Aggregate) bool {
             const must_hit = switch (aggregate.property.kind) {
                 .always, .sometimes, .reachable => true,
                 .always_or_unreachable, .@"unreachable" => false,
             };
-            return must_hit and aggregate.property.program_scoped and aggregate.branches_hit == 0;
+            return must_hit and aggregate.branches_hit == 0;
         }
 
         fn failing(aggregate: *const Aggregate) bool {
@@ -273,6 +295,8 @@ pub const Multiverse = struct {
             .events = vm.events.count,
             .events_hash = &hex(vm.events.hash.final()),
             .failing = failing_names[0..failing_count],
+            .path = branch.path,
+            .generation = branch.generation,
         } });
         line.writeAll("\n") catch {
             line.end = line_buffer.len - 1;
@@ -296,6 +320,7 @@ pub const Multiverse = struct {
     fn merge(multiverse: *Multiverse, property: *const Events.Property, branch: u32) !void {
         assert(property.trues <= property.hits);
         const aggregate = try multiverse.aggregate_find(property);
+        location_adopt(&aggregate.property, property);
         if (property.hits > 0) aggregate.branches_hit += 1;
         if (property.trues > 0) aggregate.branches_true += 1;
         if (!property.passing()) {
@@ -318,6 +343,7 @@ pub const Multiverse = struct {
         multiverse.wall_ns += other.wall_ns;
         for (other.aggregates[0..other.aggregate_count]) |*incoming| {
             const aggregate = try multiverse.aggregate_find(&incoming.property);
+            location_adopt(&aggregate.property, &incoming.property);
             aggregate.branches_hit += incoming.branches_hit;
             aggregate.branches_true += incoming.branches_true;
             aggregate.branches_failing += incoming.branches_failing;
@@ -329,6 +355,13 @@ pub const Multiverse = struct {
             }
         }
         assert(multiverse.failing_branches <= multiverse.branches);
+    }
+
+    /// A property's location, from whichever branch or worker reported one.
+    fn location_adopt(into: *Events.Property, from: *const Events.Property) void {
+        if (into.location_size > 0 or from.location_size == 0) return;
+        into.location = from.location;
+        into.location_size = from.location_size;
     }
 
     pub fn summarize(multiverse: *const Multiverse, wall_ns: u64) void {
@@ -349,6 +382,8 @@ pub const Multiverse = struct {
             if (aggregate.first_failing_branch) |branch| {
                 print("  (e.g. --branch {d})", .{branch});
             }
+            const where = aggregate.property.where();
+            if (where.len > 0) print("  at {s}", .{where});
             print("\n", .{});
         }
         print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots\n", .{
@@ -362,11 +397,10 @@ pub const Multiverse = struct {
         multiverse.record_summary(wall_ns);
     }
 
-    /// The test program's catalog as this multiverse saw it: each program-scoped assertion, and
-    /// whether a timeline reached it.
+    /// The catalog as this multiverse saw it: each assertion, and whether a timeline reached it
+    /// (made it true, for a `sometimes`).
     pub fn catalog_reached(multiverse: *const Multiverse, catalog: *Catalog) !void {
         for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
-            if (!aggregate.property.program_scoped) continue;
             const reached = aggregate.branches_hit > 0 and !property_failing(
                 aggregate.property.kind,
                 .{
@@ -395,6 +429,7 @@ pub const Multiverse = struct {
             branches_true: u32,
             branches_failing: u32,
             example_branch: ?u32,
+            location: ?[]const u8,
         };
         var lines: [Events.property_count_max]Line = undefined;
         for (multiverse.aggregates[0..multiverse.aggregate_count], 0..) |*aggregate, index| {
@@ -406,6 +441,10 @@ pub const Multiverse = struct {
                 .branches_true = aggregate.branches_true,
                 .branches_failing = aggregate.branches_failing,
                 .example_branch = aggregate.first_failing_branch,
+                .location = if (aggregate.property.location_size > 0)
+                    aggregate.property.where()
+                else
+                    null,
             };
         }
         record(.{ .summary = .{

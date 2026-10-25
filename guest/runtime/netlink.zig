@@ -13,6 +13,7 @@ const flag_exclusive: u16 = 0x200;
 const flag_create: u16 = 0x400;
 const message_error: u16 = 2;
 const rtm_newlink: u16 = 16;
+const rtm_dellink: u16 = 17;
 const rtm_newaddr: u16 = 20;
 const rtm_newroute: u16 = 24;
 const rtm_newqdisc: u16 = 36;
@@ -84,6 +85,19 @@ pub const Socket = struct {
         message.nest_end(info_data);
         message.nest_end(link_info);
         try socket.send(&message);
+    }
+
+    /// Removes the interface (both ends, for a veth); nothing when there is none.
+    pub fn link_delete(socket: *Socket, name: []const u8) !void {
+        const interface = socket.index(name) catch return; // Already gone.
+        var message: Message = .init(rtm_dellink, 0);
+        var info: [ifinfo_size]u8 = @splat(0);
+        std.mem.writeInt(i32, info[4..8], interface, .little);
+        message.append_bytes(&info);
+        socket.send(&message) catch |err| switch (err) {
+            error.NetlinkRequestFailed => {}, // Gone meanwhile.
+            else => return err,
+        };
     }
 
     pub fn link_set(socket: *Socket, name: []const u8, state: LinkState) !void {

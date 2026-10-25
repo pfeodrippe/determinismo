@@ -116,6 +116,57 @@
    (declare! "unreachable" message)
    `(Determinismo/unreachable ~(message-form message) (details-json ~data))))
 
+;; Guidance assertions: the compared values in the details, and a guidance event telling
+;; strategies how far the timeline is from the interesting outcome (lower is closer).
+
+(defmacro ^:private defcompare [name method kind]
+  `(defmacro ~name
+     ~(str "Guidance assertion: " kind ", Determinismo." method " (left, right, message).")
+     ([~'left ~'right ~'message] `(~'~name ~~'left ~~'right ~~'message nil))
+     ([~'left ~'right ~'message ~'data]
+      (declare! ~kind ~'message)
+      `(~'~(symbol "Determinismo" method) (double ~~'left) (double ~~'right)
+        ~(message-form ~'message) (details-json ~~'data)))))
+
+(defcompare always-greater-than "alwaysGreaterThan" "always")
+(defcompare always-greater-than-or-equal "alwaysGreaterThanOrEqual" "always")
+(defcompare always-less-than "alwaysLessThan" "always")
+(defcompare always-less-than-or-equal "alwaysLessThanOrEqual" "always")
+(defcompare sometimes-greater-than "sometimesGreaterThan" "sometimes")
+(defcompare sometimes-greater-than-or-equal "sometimesGreaterThanOrEqual" "sometimes")
+(defcompare sometimes-less-than "sometimesLessThan" "sometimes")
+(defcompare sometimes-less-than-or-equal "sometimesLessThanOrEqual" "sometimes")
+
+(defn conditions-map
+  "Named conditions as the JVM SDK takes them. Used by the macros' expansions."
+  ^java.util.Map [conditions]
+  (into {} (map (fn [[k v]] [(key-text k) (boolean v)])) conditions))
+
+(defmacro always-some
+  "At least one of the named conditions (a map of name to boolean, all evaluated) holds."
+  ([conditions message] `(always-some ~conditions ~message nil))
+  ([conditions message data]
+   (declare! "always" message)
+   `(Determinismo/alwaysSome (conditions-map ~conditions) ~(message-form message)
+                             (details-json ~data))))
+
+(defmacro sometimes-all
+  "All the named conditions hold together, at least once."
+  ([conditions message] `(sometimes-all ~conditions ~message nil))
+  ([conditions message data]
+   (declare! "sometimes" message)
+   `(Determinismo/sometimesAll (conditions-map ~conditions) ~(message-form message)
+                               (details-json ~data))))
+
+;; Event volume ------------------------------------------------------------------------------
+
+(defn first-pass-first-failure!
+  "From now on each assertion sends only its first pass and its first failure in this process (as
+  Antithesis's SDKs do), instead of every evaluation: for hot paths, the same verdict with far
+  fewer events."
+  []
+  (set! Determinismo/firstPassFirstFailure true))
+
 ;; Events and lifecycle --------------------------------------------------------------------
 
 (defn event
@@ -138,6 +189,18 @@
   "A uniformly random integer in [0, n)."
   [n]
   (Determinismo/randomBelow (long n)))
+
+(defn decide
+  "A named decision among options (which fault, which account, which node): returns the chosen
+  option, a platform decision announced with the options' names, for strategies."
+  [name options]
+  (let [items (vec options)]
+    (nth items (Determinismo/decide name (mapv str items)))))
+
+(defn random-below-named
+  "random-below, named for strategies (\"retry.jitter-ms\")."
+  [name n]
+  (Determinismo/randomBelowNamed name (long n)))
 
 (defn choice
   "A random element of a non-empty collection."

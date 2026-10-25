@@ -305,18 +305,52 @@ fn check_k3s_profile(
         "--program",    program,    "--profile", profile, "--scenario", "cluster", "--seed", "1",
         "--memory-mib", memory_mib,
     };
-    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4" }));
+    const arena = context.arena;
+    const explored = try std.fmt.allocPrint(arena, "{s}/k3s-{s}", .{ context.scratch, profile });
+    const report = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "4", "--events-dir", explored,
+    }));
     const passes = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
     expect(context, passes, "k3s ({s}): the workload survives faults in 4 branches", .{label});
     var branches: [4]Branch = undefined;
     const count = parse_branches(report, &branches);
     if (count == 0) return;
-    const index = try std.fmt.allocPrint(context.arena, "{d}", .{branches[0].index});
-    const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+    const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
+    const replayed_events = try std.fmt.allocPrint(arena, "{s}-replay.jsonl", .{explored});
+    const replay = try explore(context, &(common ++ [_][]const u8{
+        "--branch", index, "--events", replayed_events,
+    }));
     var replayed: [1]Branch = undefined;
     const same = parse_branches(replay, &replayed) == 1 and
         std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
     expect(context, same, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
+    if (!same) {
+        const original = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{
+            explored, branches[0].index,
+        });
+        first_difference(context, original, replayed_events);
+    }
+}
+
+/// Prints where two event logs part: what a replay did differently.
+fn first_difference(context: *Context, a_path: []const u8, b_path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    const limit: std.Io.Limit = .limited(1 << 28);
+    const a = cwd.readFileAlloc(context.io, a_path, context.arena, limit) catch return;
+    const b = cwd.readFileAlloc(context.io, b_path, context.arena, limit) catch return;
+    var a_lines = std.mem.splitScalar(u8, a, '\n');
+    var b_lines = std.mem.splitScalar(u8, b, '\n');
+    var line: u32 = 1;
+    while (true) : (line += 1) {
+        const left = a_lines.next() orelse "<end>";
+        const right = b_lines.next() orelse "<end>";
+        if (std.mem.eql(u8, left, "<end>") and std.mem.eql(u8, right, "<end>")) return;
+        if (std.mem.eql(u8, left, right)) continue;
+        std.debug.print("  first difference, line {d}:\n    explored: {s}\n    replayed: {s}\n", .{
+            line, left[0..@min(left.len, 400)], right[0..@min(right.len, 400)],
+        });
+        return;
+    }
 }
 
 /// Every branch's events, queried as Antithesis's Logs Explorer does: the failing timelines are
@@ -880,6 +914,11 @@ fn check_catalog(context: *Context) !void {
         "below its bound\",\"hit\":false") != null;
     expect(context, failed and declared_c, "catalog: an assertion no timeline evaluates fails " ++
         "from the catalog alone; the C node announces its own", .{});
+    // Zig assertions carry their place in the code, from the program's debug info.
+    const place = "catalog_test.zig\",\"line\":26,\"function\":";
+    const located = std.mem.indexOf(u8, log, place) != null;
+    expect(context, located, "catalog: a Zig assertion's event says where it is (file, line)", .{});
+    if (!located or !failed or !declared_c) std.debug.print("{s}\n", .{report});
 }
 
 /// Guidance: four digits must add up to 35 (5 timelines in 10000), one comparison that coverage

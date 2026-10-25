@@ -31,6 +31,10 @@ const usage =
     \\                            <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
+    \\                            [--time-budget <duration>]   (e.g. 90s, 10m, 2h: timelines until
+    \\                            then, --branches at most)
+    \\                            [--branching flat|tree]   (tree: also from moments of earlier
+    \\                            branches that reached new behaviors; replay one by its tape)
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms>] [--until '<condition>' [--rewind-ms <ms>]]
@@ -40,6 +44,7 @@ const usage =
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\                            [--cpu-modulation]   (branches run at varying speeds)
+    \\                            [--serve <host:port>]   (a run of that serve, in its web UI)
     \\                            [--events-dir <dir>]   (every branch's events, for query)
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
@@ -105,6 +110,13 @@ const Arguments = struct {
     events_directory: ?[]const u8 = null,
     trace_path: ?[]const u8 = null,
     branches: u32 = 16,
+    branches_given: bool = false,
+    /// flat: every branch from the setup snapshot; tree: from moments of earlier branches too.
+    branching: enum { flat, tree } = .flat,
+    /// Explore until this much wall time has passed (from the start, boot included), at most
+    /// `branches` timelines: as many as fit, as an Antithesis run's duration.
+    time_budget_ns: ?u64 = null,
+    time_budget_text: ?[]const u8 = null,
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
@@ -120,6 +132,9 @@ const Arguments = struct {
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
     cpu_modulation: bool = false,
+    /// Run the exploration in a `determinismo serve` at this address (host:port) instead of
+    /// here: it then shows in the web UI, with its record, events, tapes and notebook.
+    serve_address: ?[]const u8 = null,
     /// This host runs the branches whose index modulo `shard_count` is `shard_index`
     /// (`--shard k/n`); `determinismo merge` combines the shards' records.
     shard_index: u32 = 0,
@@ -169,6 +184,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
+    if (arguments.serve_address) |address| return submit(arena, arguments, address);
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     const profile = arguments.profile orelse "";
     const all = std.mem.eql(u8, profile, "all");
@@ -294,11 +310,70 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
             },
         }
     }
-    // A test program's assertions are its scenarios' together: judged once all ran.
+    // Catalogs span scenarios (a test program's, a service serving several): an assertion
+    // must be reached in some scenario, judged once all ran.
     const every_scenario = if (prepared) |known| scenarios.len == known.system.scenarios.len else
         true;
     if (catalog.judge(every_scenario) > 0) failing_scenarios += 1;
     return failing_scenarios;
+}
+
+/// `explore --serve <host:port>`: the exploration becomes a run of that `serve` (its machine
+/// options apply), so it shows in the web UI. Prints the run's address.
+fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const u8) !void {
+    if (arguments.command != .explore) return error.Usage;
+    const colon = std.mem.lastIndexOfScalar(u8, address_text, ':') orelse return error.Usage;
+    const port = try std.fmt.parseInt(u16, address_text[colon + 1 ..], 10);
+    const host = address_text[0..colon];
+    var address: [4]u8 = .{ 127, 0, 0, 1 };
+    if (!std.mem.eql(u8, host, "localhost")) {
+        var parts = std.mem.splitScalar(u8, host, '.');
+        for (&address) |*byte| byte.* = try std.fmt.parseInt(u8, parts.next() orelse "", 10);
+    }
+    const Request = struct {
+        program: ?[]const u8,
+        compose: ?[]const u8,
+        scenario: ?[]const u8,
+        profile: ?[]const u8,
+        seed: u64,
+        branches: ?u32,
+        time_budget: ?[]const u8,
+        branching: []const u8,
+        jobs: ?u32,
+        strategy: ?[]const u8,
+        from_branch: ?u32,
+        from_vtime_ms: ?u64,
+        cpu_modulation: bool,
+    };
+    const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
+        .program = arguments.program_path,
+        .compose = arguments.compose_path,
+        .scenario = arguments.scenario,
+        .profile = arguments.profile,
+        .seed = arguments.seed,
+        .branches = if (arguments.branches_given) arguments.branches else null,
+        .time_budget = arguments.time_budget_text,
+        .branching = @tagName(arguments.branching),
+        .jobs = arguments.jobs,
+        .strategy = arguments.strategy_command,
+        .from_branch = arguments.from_branch,
+        .from_vtime_ms = arguments.from_vtime_ms,
+        .cpu_modulation = arguments.cpu_modulation,
+    }, .{})});
+    var buffer: [256]u8 = undefined;
+    const tcp = @import("determinismo").tcp;
+    const response = try tcp.http(address, port, "POST", "/runs", body, &buffer);
+    if (response.status != 201) {
+        std.debug.print("[determinismo] serve refused the run ({d}): {s}\n", .{
+            response.status, response.body,
+        });
+        return error.ServeRefused;
+    }
+    const Created = struct { id: u32 };
+    const created = try std.json.parseFromSliceLeaky(Created, arena, response.body, .{});
+    std.debug.print("[determinismo] run {d}: http://{s}/#{d}\n", .{
+        created.id, address_text, created.id,
+    });
 }
 
 /// `determinismo serve [--listen <address:port>] [--data <dir>] <machine options>`: the HTTP
@@ -309,6 +384,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var data: []const u8 = ".determinismo-data";
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
+    var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
@@ -326,6 +402,9 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--bb")) {
+            bb = value;
+            index += 1;
         } else {
             try machine.append(arena, flag);
         }
@@ -339,6 +418,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .machine = machine.items,
         .self = explorer orelse self_buffer[0..self_size],
         .archive = archive,
+        .bb = bb,
     });
 }
 
@@ -502,6 +582,10 @@ fn command_explore(
             .from_branch = arguments.from_branch,
             .from_vtime_ms = arguments.from_vtime_ms,
             .shard = &.{ arguments.shard_index, arguments.shard_count },
+            .time_budget_s = if (arguments.time_budget_ns) |ns| ns / std.time.ns_per_s else null,
+            .jobs = jobs_count(arguments),
+            .strategy = arguments.strategy_command,
+            .branching = @tagName(arguments.branching),
         } });
     }
     if (arguments.tape_path) |path| {
@@ -541,6 +625,10 @@ fn command_explore(
     }
     try explore_snapshot(vm, options, snapshot);
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
+    report.record(.{ .snapshot = .{
+        .vtime_ns = snapshot.tsc / report.tsc_per_ns,
+        .wall_ns = monotonic_ns() - time_start_ns,
+    } });
     if (arguments.events_directory) |directory| {
         close(options.events_fd.?);
         options.events_fd = if (exploration.fork != null)
@@ -548,11 +636,19 @@ fn command_explore(
         else
             null;
     }
-    const start = if (exploration.fork) |fork| try explore_fork(context, vm, options, .{
+    var start = if (exploration.fork) |fork| try explore_fork(context, vm, options, .{
         .from = snapshot,
         .exploration = &exploration,
         .fork = fork,
     }) else snapshot;
+    // A tree explorer's branch replays along its path: each ancestor to the moment the next
+    // branched from it, snapshotted there as the exploration did.
+    if (exploration.replay) |replay| {
+        for (replay.header.chain) |segment| {
+            const arena = context.arena;
+            start = try node_make(arena, vm, options, start, segment.seed, segment.vtime_ns);
+        }
+    }
     if (arguments.events_directory != null) {
         if (options.events_fd) |fd| close(fd);
         options.events_fd = null; // Each branch writes its own file.
@@ -564,16 +660,25 @@ fn command_explore(
         .multiverse = multiverse,
         .exploration = &exploration,
         .arguments = arguments,
+        .deadline_ns = if (arguments.time_budget_ns) |ns| time_start_ns + ns else null,
     };
     const jobs = jobs_count(arguments);
-    if (jobs == 1) {
+    if (arguments.branching == .tree) {
+        try explore_tree(context, vm, options, branches, jobs);
+    } else if (jobs == 1) {
         try strategy_start(context, arguments, &exploration);
         defer if (exploration.strategy) |strategy| strategy.stop();
         try explore_branches(context, vm, options, branches);
     } else {
-        std.debug.print("[determinismo] {d} branches on {d} workers\n", .{
-            arguments.branches, jobs,
-        });
+        if (arguments.time_budget_text) |budget| {
+            std.debug.print("[determinismo] branches for {s} (at most {d}) on {d} workers\n", .{
+                budget, arguments.branches, jobs,
+            });
+        } else {
+            std.debug.print("[determinismo] {d} branches on {d} workers\n", .{
+                arguments.branches, jobs,
+            });
+        }
         try explore_parallel(context, vm, options, branches, jobs);
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
@@ -646,6 +751,34 @@ fn jobs_count(arguments: *const Arguments) u32 {
     return @max(1, @min(jobs, shard_branches, jobs_max));
 }
 
+/// A duration: a number of seconds, or with a unit (`500ms`, `90s`, `10m`, `2h`).
+fn duration_parse(text: []const u8) !u64 {
+    const units = [_]struct { suffix: []const u8, ns: u64 }{
+        .{ .suffix = "ms", .ns = std.time.ns_per_ms },
+        .{ .suffix = "s", .ns = std.time.ns_per_s },
+        .{ .suffix = "m", .ns = std.time.ns_per_min },
+        .{ .suffix = "h", .ns = std.time.ns_per_hour },
+    };
+    for (units) |unit| {
+        if (!std.mem.endsWith(u8, text, unit.suffix)) continue;
+        const number = text[0 .. text.len - unit.suffix.len];
+        // "10ms" also ends in "s": the longer suffix is tried first.
+        if (number.len > 0 and std.ascii.isDigit(number[number.len - 1])) {
+            return try std.math.mul(u64, try std.fmt.parseInt(u64, number, 10), unit.ns);
+        }
+    }
+    return try std.math.mul(u64, try std.fmt.parseInt(u64, text, 10), std.time.ns_per_s);
+}
+
+test duration_parse {
+    try std.testing.expectEqual(@as(u64, 500 * std.time.ns_per_ms), try duration_parse("500ms"));
+    try std.testing.expectEqual(@as(u64, 90 * std.time.ns_per_s), try duration_parse("90s"));
+    try std.testing.expectEqual(@as(u64, 90 * std.time.ns_per_s), try duration_parse("90"));
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_min), try duration_parse("10m"));
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_hour), try duration_parse("2h"));
+    try std.testing.expectError(error.InvalidCharacter, duration_parse("ten"));
+}
+
 fn cpus_available() u32 {
     var set: linux.cpu_set_t = undefined;
     const result = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set);
@@ -687,7 +820,18 @@ fn explore_parallel(
     }
     const results = try context.arena.create(report.Multiverse);
     for (readers[0..jobs], pids[0..jobs]) |reader, pid| {
-        const received = read_exact(reader, std.mem.asBytes(results));
+        var received = read_exact(reader, std.mem.asBytes(results));
+        // Then a tree generation's summaries: their count, and each.
+        if (branches.summaries) |summaries| {
+            var count: u32 = 0;
+            received = received and read_exact(reader, std.mem.asBytes(&count));
+            received = received and summaries.count + count <= summaries.items.len;
+            if (received) {
+                const into = summaries.items[summaries.count..][0..count];
+                received = read_exact(reader, std.mem.sliceAsBytes(into));
+                summaries.count += count;
+            }
+        }
         _ = linux.close(reader);
         var status: i32 = 0;
         _ = linux.waitpid(pid, &status, 0);
@@ -712,8 +856,17 @@ fn worker_run(
     mine.worker = worker.worker;
     mine.jobs = worker.jobs;
     mine.multiverse.* = .{};
+    var summaries: Summaries = undefined;
+    if (branches.summaries) |all| {
+        summaries = .{ .items = all.items };
+        mine.summaries = &summaries;
+    }
     const ok = worker_explore(context, vm, options, mine, &exploration);
     if (ok) write_all(worker.results_fd, std.mem.asBytes(mine.multiverse));
+    if (ok and branches.summaries != null) {
+        write_all(worker.results_fd, std.mem.asBytes(&summaries.count));
+        write_all(worker.results_fd, std.mem.sliceAsBytes(summaries.items[0..summaries.count]));
+    }
     linux.exit_group(if (ok) 0 else 1);
 }
 
@@ -805,6 +958,13 @@ const Branches = struct {
     multiverse: *report.Multiverse,
     exploration: *const Exploration,
     arguments: *const Arguments,
+    /// No branch starts after this (monotonic_ns): the time budget.
+    deadline_ns: ?u64 = null,
+    /// The tree explorer's generation: which branches run, and where each starts. Null: the
+    /// branches `0..arguments.branches`, all from `snapshot`.
+    plan: ?[]const Planned = null,
+    /// Where the branches of a plan tell how they went (behaviors, for the next generation).
+    summaries: ?*Summaries = null,
     /// This process runs the branches whose index modulo `jobs` is `worker`.
     worker: u32 = 0,
     jobs: u32 = 1,
@@ -821,16 +981,14 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
     if (branches.arguments.moment_vtime_ms) |ms| {
         try moment_after_snapshot(branches.snapshot, ms * std.time.ns_per_ms);
     }
-    for (first..first + count) |index_usize| {
-        const index: u32 = @intCast(index_usize);
-        const shards = if (single) 1 else branches.arguments.shard_count;
-        const shard = if (single) 0 else branches.arguments.shard_index;
-        if (index % shards != shard) continue;
-        if (index / shards % branches.jobs != branches.worker) continue;
-        options.seed = if (exploration.replay) |replay|
-            replay.header.branch_seed
-        else
-            branch_seed(seed_base(exploration), index);
+    const total = if (branches.plan) |plan| plan.len else count;
+    for (0..total) |position| {
+        const place = branch_place(branches, first + position, single, position) orelse continue;
+        const index = place.index;
+        if (branches.deadline_ns) |deadline| {
+            if (monotonic_ns() >= deadline) break;
+        }
+        options.seed = place.seed;
         const moment_ms = branches.arguments.moment_vtime_ms;
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
         options.moment_command = branches.arguments.moment_command;
@@ -839,7 +997,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (branches.arguments.rewind_ms) |ms| {
             try rewind(vm, options, branches.snapshot, exploration, ms * std.time.ns_per_ms);
         }
-        try vm.init_from_snapshot(options, branches.snapshot);
+        try vm.init_from_snapshot(options, place.snapshot);
         defer vm.deinit();
         if (branches.arguments.events_directory) |directory| {
             const name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{index});
@@ -857,6 +1015,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .branch = index,
                 .branch_seed = options.seed,
                 .fork = exploration.fork,
+                .chain = place.path,
             });
         }
         defer if (vm.tape_fd) |fd| close(fd);
@@ -867,13 +1026,276 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .seed = options.seed,
             .outcome = outcome,
             .wall_ns = monotonic_ns() - time_start_ns,
-            .start_tsc = branches.snapshot.tsc,
+            .start_tsc = place.snapshot.tsc,
+            .path = place.path,
+            .generation = place.generation,
         });
+        if (branches.summaries) |summaries| summaries.note(vm, place);
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };
             if (try strategy_branch_end(strategy, vm, end)) break;
         }
     }
+}
+
+/// Where the branch at `position` starts, if this worker (and shard) runs it: the snapshot, or
+/// (a tree explorer's branch) a moment of another.
+fn branch_place(branches: Branches, index_flat: usize, single: bool, position: usize) ?Planned {
+    if (branches.plan) |plan| {
+        if (position % branches.jobs != branches.worker) return null;
+        return plan[position];
+    }
+    const index: u32 = @intCast(index_flat);
+    const shards = if (single) 1 else branches.arguments.shard_count;
+    const shard = if (single) 0 else branches.arguments.shard_index;
+    if (index % shards != shard) return null;
+    if (index / shards % branches.jobs != branches.worker) return null;
+    const exploration = branches.exploration;
+    const replay = exploration.replay;
+    return .{
+        .index = index,
+        .seed = if (replay) |tape_replay|
+            tape_replay.header.branch_seed
+        else
+            branch_seed(seed_base(exploration), index),
+        .snapshot = branches.snapshot,
+        .path = if (replay) |tape_replay| tape_replay.header.chain else &.{},
+    };
+}
+
+/// Where a branch starts and with what: the tree explorer plans these, a generation at a time.
+const Planned = struct {
+    index: u32,
+    seed: u64,
+    snapshot: *const Snapshot,
+    /// From the setup snapshot to `snapshot`: the ancestors and the moments they branched.
+    path: []const tape.Segment = &.{},
+    generation: u32 = 0,
+};
+
+/// How a branch went, for planning the next generation: the behaviors it reached first, when.
+const Summary = struct {
+    index: u32,
+    start_ns: u64,
+    end_ns: u64,
+    behavior_count: u32,
+    behaviors: [Events.behavior_count_max]Events.Behavior,
+};
+
+const Summaries = struct {
+    items: []Summary,
+    count: u32 = 0,
+
+    fn note(summaries: *Summaries, vm: *VM, place: Planned) void {
+        assert(summaries.count < summaries.items.len);
+        const summary = &summaries.items[summaries.count];
+        summaries.count += 1;
+        summary.index = place.index;
+        summary.start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
+        summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
+        summary.behavior_count = vm.events.behavior_count;
+        @memcpy(
+            summary.behaviors[0..summary.behavior_count],
+            vm.events.behaviors[0..vm.events.behavior_count],
+        );
+    }
+};
+
+/// Antithesis's exploration, as a tree: every branch is a potential branch point. The first
+/// generation starts from the setup snapshot; after each, the branches that reached behaviors
+/// no branch before them had are returned to (Go-Explore): a snapshot at the moment just after
+/// the new behavior (replaying the branch to it), and new branches from there, with their own
+/// seeds. Some branches of every generation start from the setup snapshot again. A generation
+/// is planned only from the ones before it, so the tree is the same whatever the workers.
+const tree = struct {
+    const generation_size = 16;
+    /// From the setup snapshot, in every generation after the first.
+    const roots = 4;
+    /// Moments returned to per generation, and branches from each.
+    const nodes = 3;
+    const children = (generation_size - roots) / nodes;
+    comptime {
+        assert(roots + nodes * children == generation_size);
+    }
+};
+
+fn explore_tree(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    jobs: u32,
+) !void {
+    const arena = context.arena;
+    const exploration = branches.exploration;
+    const total = branches.arguments.branches;
+    const base = seed_base(exploration);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var plan: std.ArrayList(Planned) = .empty;
+    var next_index: u32 = 0;
+    while (next_index < total and plan.items.len < tree.generation_size) : (next_index += 1) {
+        try plan.append(arena, .{
+            .index = next_index,
+            .seed = branch_seed(base, next_index),
+            .snapshot = branches.snapshot,
+        });
+    }
+    var generation: u32 = 0;
+    const items = try arena.alloc(Summary, tree.generation_size);
+    while (plan.items.len > 0) : (generation += 1) {
+        if (branches.deadline_ns) |deadline| {
+            if (monotonic_ns() >= deadline) break;
+        }
+        var summaries = Summaries{ .items = items };
+        var mine = branches;
+        mine.plan = plan.items;
+        mine.summaries = &summaries;
+        const workers: u32 = @intCast(@min(jobs, plan.items.len));
+        if (workers == 1) {
+            try explore_branches(context, vm, options, mine);
+        } else {
+            try explore_parallel(context, vm, options, mine, workers);
+        }
+        // In index order (workers finish in any): what each reached that none before it had.
+        const done = summaries.items[0..summaries.count];
+        std.mem.sort(Summary, done, {}, summary_before);
+        var candidates: [tree.generation_size]Candidate = undefined;
+        var candidate_count: u32 = 0;
+        const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
+        var random: std.Random.DefaultPrng = .init(generation_seed);
+        for (done) |*summary| {
+            var novel: u32 = 0;
+            var moment: ?u64 = null;
+            // The frontier (Go-Explore): its latest new behavior that leaves room to go on (in
+            // its first four fifths); the branches return just after it.
+            const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
+            for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+                const known = try seen.getOrPut(arena, behavior.hash);
+                if (known.found_existing) continue;
+                novel += 1;
+                if (behavior.vtime_ns <= room_end) moment = behavior.vtime_ns;
+            }
+            candidates[candidate_count] = .{ .summary = summary, .novel = novel, .moment = moment };
+            candidate_count += 1;
+        }
+        const chosen = candidates[0..candidate_count];
+        std.mem.sort(Candidate, chosen, {}, candidate_before);
+        var next: std.ArrayList(Planned) = .empty;
+        var made: u32 = 0;
+        for (chosen) |candidate| {
+            if (made == tree.nodes or next_index >= total) break;
+            const summary = candidate.summary;
+            const parent = for (plan.items) |entry| {
+                if (entry.index == summary.index) break entry;
+            } else unreachable;
+            // Just after a new behavior, else (nothing new) anywhere in the branch.
+            const span = summary.end_ns -| summary.start_ns;
+            if (span < 2 * std.time.ns_per_ms) continue;
+            const after = if (candidate.moment) |moment| moment + std.time.ns_per_us else
+                summary.start_ns + random.random().uintLessThan(u64, span);
+            const at = std.math.clamp(
+                after,
+                summary.start_ns + std.time.ns_per_ms,
+                summary.end_ns - std.time.ns_per_ms,
+            );
+            const from = parent.snapshot;
+            const snapshot = node_make(arena, vm, options, from, parent.seed, at) catch |err| {
+                std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
+                    at, parent.index, @errorName(err),
+                });
+                continue;
+            };
+            made += 1;
+            const path = try arena.alloc(tape.Segment, parent.path.len + 1);
+            @memcpy(path[0..parent.path.len], parent.path);
+            path[parent.path.len] = .{
+                .branch = parent.index,
+                .seed = parent.seed,
+                .vtime_ns = at,
+            };
+            for (0..tree.children) |_| {
+                if (next_index >= total) break;
+                try next.append(arena, .{
+                    .index = next_index,
+                    .seed = branch_seed(base, next_index),
+                    .snapshot = snapshot,
+                    .path = path,
+                    .generation = generation + 1,
+                });
+                next_index += 1;
+            }
+        }
+        // This generation's snapshots served their branches, and their children's snapshots.
+        for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+        // The rest of the generation starts over from the setup snapshot.
+        while (next_index < total and next.items.len < tree.generation_size) : (next_index += 1) {
+            try next.append(arena, .{
+                .index = next_index,
+                .seed = branch_seed(base, next_index),
+                .snapshot = branches.snapshot,
+                .generation = generation + 1,
+            });
+        }
+        std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
+            "({d} known); {d} moments returned to\n", .{
+            generation, done.len, new_behaviors(chosen), seen.count(), made,
+        });
+        plan = next;
+    }
+    for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+}
+
+const Candidate = struct { summary: *const Summary, novel: u32, moment: ?u64 };
+
+fn candidate_before(_: void, a: Candidate, b: Candidate) bool {
+    if (a.novel != b.novel) return a.novel > b.novel;
+    return a.summary.index < b.summary.index;
+}
+
+fn summary_before(_: void, a: Summary, b: Summary) bool {
+    return a.index < b.index;
+}
+
+fn new_behaviors(candidates: []const Candidate) u32 {
+    var sum: u32 = 0;
+    for (candidates) |candidate| sum += candidate.novel;
+    return sum;
+}
+
+/// A snapshot at `vtime_ns` of the branch that starts at `from` with `seed`: replays it there.
+fn node_make(
+    arena: std.mem.Allocator,
+    vm: *VM,
+    options: *const VM.Options,
+    from: *const Snapshot,
+    seed: u64,
+    vtime_ns: u64,
+) !*const Snapshot {
+    try moment_after_snapshot(from, vtime_ns);
+    var probe = options.*;
+    probe.seed = seed;
+    probe.moment_vtime_ns = vtime_ns;
+    probe.moment_command = null;
+    probe.moment_continue = false;
+    probe.until = null;
+    probe.events_fd = null;
+    try vm.init_from_snapshot(&probe, from);
+    const outcome = try vm.run_until_exit();
+    if (outcome != .moment_reached) {
+        vm.deinit();
+        return error.MomentNotReached;
+    }
+    const snapshot = try arena.create(Snapshot);
+    try snapshot.take_copy(vm);
+    vm.deinit();
+    return snapshot;
+}
+
+/// Releases a tree node's memory (never the setup snapshot's), once its branches ran.
+fn node_free(snapshot: *const Snapshot, root: *const Snapshot) void {
+    if (snapshot == root or snapshot.memory_fd < 0) return;
+    close(snapshot.memory_fd);
+    @constCast(snapshot).memory_fd = -1;
 }
 
 /// Antithesis's rewind: runs the branch to the first event matching --until, then moves the
@@ -1032,9 +1454,13 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         index += 1;
     }
     assert(index == argv.len);
-    if (arguments.kernel_path.len == 0) return error.Usage;
+    // A run submitted to `serve` boots with serve's machine options.
+    if (arguments.kernel_path.len == 0 and arguments.serve_address == null) return error.Usage;
     if (arguments.memory_mib < memory_mib_min) return error.Usage;
     if (arguments.memory_mib > memory_mib_max) return error.Usage;
+    if (arguments.time_budget_ns != null and !arguments.branches_given) {
+        arguments.branches = branches_max;
+    }
     if (arguments.branches == 0 or arguments.branches > branches_max) return error.Usage;
     if (arguments.command == .explore) arguments.deterministic = true;
     // A command runs at a moment: a virtual time, or the first event matching --until.
@@ -1045,6 +1471,14 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         return error.Usage;
     }
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
+    if (arguments.branching == .tree) {
+        // The tree explorer plans its own branches; strategies plan theirs. One of its
+        // branches replays from its tape (which holds its path).
+        const planned = arguments.strategy_command != null or arguments.branch_only != null or
+            arguments.tape_path != null or arguments.from_branch != null or
+            arguments.shard_count > 1;
+        if (planned or moment or commands) return error.Usage;
+    }
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
     if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
     if (arguments.deterministic) {
@@ -1105,6 +1539,13 @@ fn parse_option(
         arguments.trace_path = value;
     } else if (eql(u8, flag, "--branches")) {
         arguments.branches = try std.fmt.parseInt(u32, value, 10);
+        arguments.branches_given = true;
+    } else if (eql(u8, flag, "--branching")) {
+        arguments.branching = std.meta.stringToEnum(@TypeOf(arguments.branching), value) orelse
+            return error.Usage;
+    } else if (eql(u8, flag, "--time-budget")) {
+        arguments.time_budget_ns = try duration_parse(value);
+        arguments.time_budget_text = value;
     } else if (eql(u8, flag, "--branch")) {
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--from-branch")) {
@@ -1132,6 +1573,8 @@ fn parse_option(
         arguments.tape_path = value;
     } else if (eql(u8, flag, "--at-vtime-ms")) {
         arguments.moment_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--serve")) {
+        arguments.serve_address = value;
     } else if (eql(u8, flag, "--rewind-ms")) {
         arguments.rewind_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec")) {

@@ -570,12 +570,17 @@ fn link_create(a: Endpoint, b: Endpoint) !void {
         .{ .name = interface_a, .mac = mac(a.address, b.address), .pid = a.pid },
         .{ .name = interface_b, .mac = mac(b.address, a.address), .pid = b.pid },
     };
-    // After a restart, the dead namespace's links disappear asynchronously: wait for them.
-    // Created from inside a's namespace: one end local, the peer moved to b's.
+    // After a restart, the dead namespace's links disappear when the kernel gets to it (a
+    // worker, later under load): the peer's old end is removed instead of waited for (both ends
+    // of a veth go together). Created from inside a's namespace: one end local, the peer moved
+    // to b's.
     for (0..link_attempts_max) |_| {
         const create = netlink.Socket.veth_create;
         netlink.in_namespace_of(a.pid, create, .{ends}) catch |err| switch (err) {
             error.Exists => {
+                const delete = netlink.Socket.link_delete;
+                netlink.in_namespace_of(b.pid, delete, .{interface_b}) catch {};
+                netlink.in_namespace_of(a.pid, delete, .{interface_a}) catch {};
                 sleep_ns(poll_interval_ns);
                 continue;
             },

@@ -131,6 +131,124 @@ public final class Determinismo {
   private static final java.util.Set<String> declared =
       java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+  // Guidance assertions: the compared values in the details, and a guidance event telling
+  // strategies how far the timeline is from the interesting outcome (an always violated, a
+  // sometimes true): distance, lower is closer, 0 or less is there.
+
+  public static void alwaysGreaterThan(double left, double right, String message, String details) {
+    compare(true, left > right, left - right, left, right, message, details);
+  }
+
+  public static void alwaysGreaterThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(true, left >= right, left - right, left, right, message, details);
+  }
+
+  public static void alwaysLessThan(double left, double right, String message, String details) {
+    compare(true, left < right, right - left, left, right, message, details);
+  }
+
+  public static void alwaysLessThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(true, left <= right, right - left, left, right, message, details);
+  }
+
+  public static void sometimesGreaterThan(double left, double right, String message,
+      String details) {
+    compare(false, left > right, left - right, left, right, message, details);
+  }
+
+  public static void sometimesGreaterThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(false, left >= right, left - right, left, right, message, details);
+  }
+
+  public static void sometimesLessThan(double left, double right, String message,
+      String details) {
+    compare(false, left < right, right - left, left, right, message, details);
+  }
+
+  public static void sometimesLessThanOrEqual(double left, double right, String message,
+      String details) {
+    compare(false, left <= right, right - left, left, right, message, details);
+  }
+
+  /** At least one of the named conditions holds, every time (all evaluated by the caller). */
+  public static void alwaysSome(java.util.Map<String, Boolean> conditions, String message,
+      String details) {
+    int held = held(conditions);
+    assertion("always", held > 0, message, conditionsDetails(conditions, details));
+    guidance(message, held);
+  }
+
+  /** All the named conditions hold together, at least once. */
+  public static void sometimesAll(java.util.Map<String, Boolean> conditions, String message,
+      String details) {
+    int held = held(conditions);
+    assertion("sometimes", held == conditions.size(), message,
+        conditionsDetails(conditions, details));
+    guidance(message, conditions.size() - held);
+  }
+
+  private static void compare(boolean always, boolean holds, double margin, double left,
+      double right, String message, String details) {
+    String merged = "{\"left\":" + left + ",\"right\":" + right + ",\"details\":"
+        + orEmpty(details) + "}";
+    assertion(always ? "always" : "sometimes", holds, message, merged);
+    guidance(message, always ? margin : -margin);
+  }
+
+  private static int held(java.util.Map<String, Boolean> conditions) {
+    int held = 0;
+    for (Boolean value : conditions.values()) if (Boolean.TRUE.equals(value)) held++;
+    return held;
+  }
+
+  private static String conditionsDetails(java.util.Map<String, Boolean> conditions,
+      String details) {
+    StringBuilder out = new StringBuilder("{\"conditions\":{");
+    boolean first = true;
+    for (java.util.Map.Entry<String, Boolean> entry : conditions.entrySet()) {
+      if (!first) out.append(',');
+      first = false;
+      out.append(quote(entry.getKey())).append(':').append(Boolean.TRUE.equals(entry.getValue()));
+    }
+    return out.append("},\"details\":").append(orEmpty(details)).append('}').toString();
+  }
+
+  private static void guidance(String message, double distance) {
+    // Only improvements: all a strategy needs.
+    Double known = best.get(message);
+    if (known != null && distance >= known) return;
+    best.put(message, distance);
+    emit("{\"guidance\":{\"message\":" + quote(message) + ",\"distance\":" + distance + "}}");
+  }
+
+  /**
+   * A named decision among options (which fault, which account, which node): the index chosen,
+   * a platform decision announced with the options' names, for strategies.
+   */
+  public static int decide(String name, java.util.List<String> options) {
+    if (options.isEmpty()) throw new IllegalArgumentException("no options");
+    if (device != null) {
+      StringBuilder list = new StringBuilder("[");
+      for (int index = 0; index < options.size(); index++) {
+        if (index > 0) list.append(',');
+        list.append(quote(options.get(index)));
+      }
+      emit("{\"decision\":{\"name\":" + quote(name) + ",\"options\":" + list + "]}}");
+    }
+    return (int) randomBelow(options.size());
+  }
+
+  /** randomBelow, named for strategies ("retry.jitterMs"). */
+  public static long randomBelowNamed(String name, long count) {
+    if (device != null) {
+      emit("{\"decision\":{\"name\":" + quote(name) + ",\"range\":" + count + "}}");
+    }
+    return randomBelow(count);
+  }
+
   /** The system is ready: the platform snapshots here. */
   public static void setupComplete(String details) {
     emit("{\"lifecycle\":\"setup_complete\",\"details\":" + orEmpty(details) + "}");
@@ -140,12 +258,40 @@ public final class Determinismo {
     emit("{\"event\":" + quote(name) + ",\"details\":" + orEmpty(details) + "}");
   }
 
+  /**
+   * Which evaluations become events: every one (false, the default: queries see each), or, as
+   * Antithesis's SDKs do, each assertion's first pass and first failure in this process (true:
+   * for hot paths, the same verdict with far fewer events). Set it once, at the start.
+   */
+  public static volatile boolean firstPassFirstFailure = false;
+
+  private static final java.util.Set<String> seen =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private static final java.util.Map<String, Double> best =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
   private static void assertion(String kind, boolean condition, String message, String details) {
+    if (firstPassFirstFailure && !seen.add(condition + "\u0000" + message)) return;
     String head = "{\"assert\":{\"type\":\"" + kind + "\",\"message\":" + quote(message)
-        + ",\"condition\":" + condition + ",\"details\":";
+        + ",\"condition\":" + condition + location(message) + ",\"details\":";
     String line = head + orEmpty(details) + "}}";
     if (line.getBytes(StandardCharsets.UTF_8).length > MESSAGE_SIZE_MAX) line = head + "{}}}";
     emit(line);
+  }
+
+  private static final java.util.Set<String> located =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+  /** The caller's place (the first frame outside this SDK), the first time an assertion runs. */
+  private static String location(String message) {
+    if (!located.add(message)) return "";
+    return StackWalker.getInstance().walk(frames -> frames
+        .filter(frame -> !frame.getClassName().equals("Determinismo"))
+        .findFirst()
+        .map(frame -> ",\"location\":{\"file\":" + quote(String.valueOf(frame.getFileName()))
+            + ",\"line\":" + frame.getLineNumber() + ",\"function\":"
+            + quote(frame.getClassName() + "." + frame.getMethodName()) + "}")
+        .orElse(""));
   }
 
   private static synchronized void emit(String line) {
