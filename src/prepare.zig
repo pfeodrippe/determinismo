@@ -38,7 +38,7 @@ const path_default = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
 pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared {
     const context = Context{ .arena = arena, .io = io, .cache = options.cache_directory };
     const cwd = std.Io.Dir.cwd();
-    for ([_][]const u8{ "images", "systems", "staging" }) |directory| {
+    for ([_][]const u8{ "images", "systems", "staging", "profiles" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ context.cache, directory }));
     }
     const output = try tool(context, &.{ options.program, "--describe" });
@@ -66,6 +66,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     hasher.update(program);
     const hash = hasher.final();
     disk_paths[0] = try system_disk(context, system_json, options.program, hash);
+    try profile_remember(context, options.program, &system, system_json);
     return .{
         .disk_paths = disk_paths,
         .system = system,
@@ -187,6 +188,88 @@ fn image_disk(
     defer std.Io.Dir.cwd().deleteFile(context.io, tar) catch {};
     try erofs_build(context, disk, &.{ "--tar=f", tar });
     return disk;
+}
+
+/// Keeps the resolved system of each program and profile, and reports what changed since the
+/// last run of the same pair: snapshots and tapes from before do not apply to the new one.
+fn profile_remember(
+    context: Context,
+    program: []const u8,
+    system: *const schema.System,
+    system_json: []const u8,
+) !void {
+    const name = try std.fmt.allocPrint(context.arena, "{s}--{s}.json", .{
+        std.fs.path.basename(program), system.profile,
+    });
+    const path = try path_join(context, &.{ context.cache, "profiles", name });
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.readFileAlloc(context.io, path, context.arena, .limited(1 << 20))) |previous_json| {
+        if (!std.mem.eql(u8, previous_json, system_json)) {
+            const previous = try schema.parse(schema.System, context.arena, previous_json);
+            std.debug.print("[determinismo] profile {s} changed since the last run:\n", .{
+                system.profile,
+            });
+            try profile_diff(context.arena, &previous, system);
+        }
+    } else |_| {}
+    try cwd.writeFile(context.io, .{ .sub_path = path, .data = system_json });
+}
+
+fn profile_diff(
+    arena: std.mem.Allocator,
+    old: *const schema.System,
+    new: *const schema.System,
+) !void {
+    for (old.nodes) |node| {
+        if (new.node(node.name) == null) std.debug.print("  - node {s}\n", .{node.name});
+    }
+    for (new.nodes) |node| {
+        const before = old.node(node.name) orelse {
+            std.debug.print("  + node {s}\n", .{node.name});
+            continue;
+        };
+        try changed(arena, node.name, "digest", before.digest, node.digest);
+        try changed(arena, node.name, "address", before.address, node.address);
+        try changed(arena, node.name, "command", before.command, node.command);
+        try changed(arena, node.name, "env", before.env, node.env);
+        try changed(arena, node.name, "workdir", before.workdir, node.workdir);
+        try changed(arena, node.name, "user", before.user, node.user);
+        try changed(arena, node.name, "ready", before.ready, node.ready);
+        try changed(arena, node.name, "after", before.after, node.after);
+        try changed(arena, node.name, "faults", before.faults, node.faults);
+    }
+    for (old.scenarios) |scenario| {
+        if (new.scenario(scenario.name) == null) {
+            std.debug.print("  - scenario {s}\n", .{scenario.name});
+        }
+    }
+    for (new.scenarios) |scenario| {
+        const before = old.scenario(scenario.name) orelse {
+            std.debug.print("  + scenario {s}\n", .{scenario.name});
+            continue;
+        };
+        try changed(arena, "scenario", scenario.name, before.*, scenario);
+    }
+}
+
+/// Prints `owner.field: old -> new` when the two differ (compared as JSON).
+fn changed(
+    arena: std.mem.Allocator,
+    owner: []const u8,
+    field: []const u8,
+    old: anytype,
+    new: @TypeOf(old),
+) !void {
+    const old_json = try json(arena, old);
+    const new_json = try json(arena, new);
+    if (std.mem.eql(u8, old_json, new_json)) return;
+    std.debug.print("  ~ {s}.{s}: {s} -> {s}\n", .{ owner, field, old_json, new_json });
+}
+
+fn json(arena: std.mem.Allocator, value: anytype) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(value, .{}, &writer.writer);
+    return writer.written();
 }
 
 /// Builds the image (podman reuses its layer cache) and returns its ID.
