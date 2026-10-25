@@ -13,6 +13,7 @@ const Events = @import("events.zig");
 const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
+const fd_pass = @import("fd_pass.zig");
 const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
@@ -1302,13 +1303,19 @@ fn explore_tree(
         const chosen = candidates[0..candidate_count];
         std.sort.insertion(Candidate, chosen, {}, candidate_before);
         const returns = try tree_returns(arena, exploration.strategy, generation, chosen, &random);
-        var next: std.ArrayList(Planned) = .empty;
-        var made: u32 = 0;
+        // The nodes are made at once, each replay in a child process (`jobs` at a time); then
+        // their branches are numbered in the returns' order, as if made one after the other.
+        const makings = try arena.alloc(NodeMaking, returns.len);
+        var making_count: u32 = 0;
+        var finished: u32 = 0;
         for (returns) |back| {
-            if (next_index >= total) break;
             const parent = for (plan.items) |entry| {
                 if (entry.index == back.branch) break entry;
             } else continue;
+            if (making_count - finished == jobs) {
+                node_make_finish(arena, &makings[finished]);
+                finished += 1;
+            }
             // A strategy's decisions in the parent are in its tape: replayed to the moment.
             const overrides = if (exploration.strategy != null) try tape_overrides(
                 context,
@@ -1316,15 +1323,24 @@ fn explore_tree(
                 parent.index,
                 tape_buffer,
             ) else null;
-            const from = parent.snapshot;
-            const at = back.vtime_ns;
-            const seed = parent.seed;
-            const snapshot = node_make(arena, vm, options, from, seed, at, overrides) catch |err| {
-                std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
-                    at, parent.index, @errorName(err),
-                });
+            makings[making_count] = .{ .back = back, .parent = parent };
+            try node_make_start(arena, vm, options, &makings[making_count], overrides);
+            making_count += 1;
+        }
+        while (finished < making_count) : (finished += 1) {
+            node_make_finish(arena, &makings[finished]);
+        }
+        var next: std.ArrayList(Planned) = .empty;
+        var made: u32 = 0;
+        for (makings[0..making_count]) |*making| {
+            const snapshot = making.snapshot orelse continue;
+            if (next_index >= total) {
+                node_free(snapshot, branches.snapshot); // Not needed after all.
                 continue;
-            };
+            }
+            const parent = making.parent;
+            const back = making.back;
+            const at = back.vtime_ns;
             made += 1;
             const path = try arena.alloc(tape.Segment, parent.path.len + 1);
             @memcpy(path[0..parent.path.len], parent.path);
@@ -1499,6 +1515,73 @@ fn node_make(
     try snapshot.take_copy(vm);
     vm.deinit();
     return snapshot;
+}
+
+/// A tree node in the making: a child process replays its parent to the moment, freezes it and
+/// hands the snapshot over (its memory's memfd through the socket, fd_pass).
+const NodeMaking = struct {
+    back: TreeReturn,
+    parent: Planned,
+    pid: linux.pid_t = 0,
+    socket: linux.fd_t = -1,
+    /// Null when the moment could not be reached (the child said why).
+    snapshot: ?*const Snapshot = null,
+};
+
+fn node_make_start(
+    arena: std.mem.Allocator,
+    vm: *VM,
+    options: *const VM.Options,
+    making: *NodeMaking,
+    overrides: ?*tape.Overrides,
+) !void {
+    var pair: [2]i32 = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &pair)) != .SUCCESS) {
+        return error.Socketpair;
+    }
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.Fork;
+    if (pid == 0) {
+        close(pair[0]);
+        const parent = making.parent;
+        const at = making.back.vtime_ns;
+        const from = parent.snapshot;
+        const seed = parent.seed;
+        const snapshot = node_make(arena, vm, options, from, seed, at, overrides) catch |err| {
+            std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
+                at, parent.index, @errorName(err),
+            });
+            linux.exit_group(1);
+        };
+        fd_pass.send(pair[1], snapshot.memory_fd) catch linux.exit_group(1);
+        // Everything else is plain data, or set up before the fork (the same in the explorer).
+        write_all(pair[1], std.mem.asBytes(snapshot));
+        linux.exit_group(0);
+    }
+    close(pair[1]);
+    making.pid = @intCast(pid);
+    making.socket = pair[0];
+}
+
+fn node_make_finish(arena: std.mem.Allocator, making: *NodeMaking) void {
+    assert(making.pid > 0);
+    defer {
+        close(making.socket);
+        var status: i32 = 0;
+        _ = linux.wait4(making.pid, &status, 0, null);
+    }
+    const fd = fd_pass.receive(making.socket) catch return; // It failed, and said why.
+    const snapshot = arena.create(Snapshot) catch {
+        close(fd);
+        return;
+    };
+    if (!read_exact(making.socket, std.mem.asBytes(snapshot))) {
+        close(fd);
+        return;
+    }
+    snapshot.memory_fd = fd;
+    making.snapshot = snapshot;
 }
 
 /// Releases a tree node's memory (never the setup snapshot's), once its branches ran.
@@ -1898,6 +1981,7 @@ test {
     _ = @import("decisions.zig");
     _ = @import("events.zig");
     _ = @import("tape.zig");
+    _ = @import("fd_pass.zig");
     _ = @import("virtio_block.zig");
     _ = @import("prepare.zig");
     _ = @import("serve.zig");
