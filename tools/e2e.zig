@@ -70,6 +70,7 @@ pub fn main(init: std.process.Init) !void {
     try check_stress(&context);
     try check_controller(&context);
     try check_clojure(&context);
+    try check_script(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -187,6 +188,48 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// A failing branch's script (its commands and faults) makes other seeds fail too.
+fn check_script(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank" };
+    const exploration = [_][]const u8{ "--seed", "7", "--branches", "8" };
+    const found = try explore(context, &(common ++ exploration));
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(found, &branches);
+    const failing = for (branches[0..count]) |branch| {
+        if (branch.failing) break branch;
+    } else return expect(context, false, "script: a failing branch to start from", .{});
+    const index = try std.fmt.allocPrint(context.arena, "{d}", .{failing.index});
+    const events_name = "script-events.jsonl";
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, events_name });
+    _ = try explore(context, &(common ++ [_][]const u8{
+        "--seed", "7", "--branch", index, "--events", events,
+    }));
+    const extracted = try std.process.run(context.arena, context.io, .{
+        .argv = &.{ context.determinismo, "script", events },
+    });
+    const script_path = try std.fs.path.join(context.arena, &.{ context.scratch, "script.json" });
+    const script_file: std.Io.Dir.WriteFileOptions = .{
+        .sub_path = script_path,
+        .data = extracted.stdout,
+    };
+    try std.Io.Dir.cwd().writeFile(context.io, script_file);
+    const others = common ++ [_][]const u8{ "--seed", "99", "--branches", "8" };
+    const without = failing_count(try explore(context, &others));
+    const scripted = others ++ [_][]const u8{ "--script", script_path };
+    const with = failing_count(try explore(context, &scripted));
+    expect(context, with > 0 and with >= without, "script: other seeds fail with it ({d} of 8, " ++
+        "{d} without)", .{ with, without });
+}
+
+fn failing_count(report: []const u8) u32 {
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var failing: u32 = 0;
+    for (branches[0..count]) |branch| failing += @intFromBool(branch.failing);
+    return failing;
 }
 
 /// A JVM service, patched through its REPL at a moment: its futures stop losing money; and a

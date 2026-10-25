@@ -82,6 +82,13 @@ const Composer = struct {
         composer.started_count += 1;
     }
 
+    fn find(composer: *const Composer, name: []const u8) ?*const Command {
+        for (composer.commands[0..composer.command_count]) |*command| {
+            if (std.mem.eql(u8, command.name, name)) return command;
+        }
+        return null;
+    }
+
     /// Waits for one running command to exit and reports how it ended.
     fn wait_one(composer: *Composer) void {
         assert(composer.running_count > 0);
@@ -129,9 +136,12 @@ const Composer = struct {
 
     fn run_to_completion(composer: *Composer, command: *const Command) void {
         assert(composer.running_count == 0);
+        announce(command, "complete");
         composer.start(command);
         composer.wait_all();
     }
+
+
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -167,8 +177,10 @@ pub fn main(init: std.process.Init) !void {
     if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
 
     sdk.event("composer_start", .{ .commands = composer.command_count });
+    if (script_read(arena)) |script| return run_script(&composer, &script);
     if (composer.kind_count(.first) > 0) composer.run_to_completion(composer.pick(.first));
     const singleton_timeline = singletons > 0 and (drivers == 0 or sdk.random_below(2) == 0);
+    sdk.event("faults_phase", .{ .state = "start" });
     composer.faults_start();
     if (singleton_timeline) {
         run_singleton(&composer);
@@ -177,8 +189,92 @@ pub fn main(init: std.process.Init) !void {
     }
     composer.wait_all();
     composer.faults_stop();
+    sdk.event("faults_phase", .{ .state = "stop" });
     run_ending(&composer);
     sdk.event("composer_done", .{ .commands_started = composer.started_count });
+}
+
+/// A timeline's shape, extracted from a branch's events (`determinismo script`): commands by
+/// their start offset from composer_start, faults by theirs from the start of the fault phase.
+/// Everything inside (scheduling, test inputs) is still decided by the seed.
+pub const Script = struct {
+    script: u32 = 1,
+    commands: []const ScriptCommand = &.{},
+    faults_start_ns: ?u64 = null,
+    faults_stop_ns: ?u64 = null,
+    faults: []const std.json.Value = &.{},
+};
+
+pub const ScriptCommand = struct { at_ns: u64, name: []const u8, mode: []const u8 };
+
+pub const script_path = "/det/script.json";
+
+fn script_read(arena: std.mem.Allocator) ?Script {
+    const fd = linux.open(script_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const buffer = arena.alloc(u8, 1 << 20) catch return null;
+    const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return sdk.schema.parse(Script, arena, buffer[0..size]) catch null;
+}
+
+/// What a script (determinismo script) is made of: which command started, and how.
+fn announce(command: *const Command, mode: []const u8) void {
+    sdk.event("command_start", .{ .name = command.name, .mode = mode });
+}
+
+fn run_script(composer: *Composer, script: *const Script) void {
+    const start_ns = now_ns();
+    var phase: enum { before, faults, after } = .before;
+    for (script.commands) |item| {
+        if (phase == .before and script.faults_start_ns != null and
+            script.faults_start_ns.? <= item.at_ns)
+        {
+            sleep_until(start_ns + script.faults_start_ns.?);
+            sdk.event("faults_phase", .{ .state = "start" });
+            composer.faults_start();
+            phase = .faults;
+        }
+        if (phase == .faults and script.faults_stop_ns != null and
+            script.faults_stop_ns.? <= item.at_ns)
+        {
+            composer.wait_all(); // As without a script: drivers end before faults stop.
+            composer.faults_stop();
+            sdk.event("faults_phase", .{ .state = "stop" });
+            phase = .after;
+        }
+        sleep_until(start_ns + item.at_ns);
+        const command = composer.find(item.name) orelse continue; // Gone in this build.
+        if (std.mem.eql(u8, item.mode, "complete")) {
+            composer.wait_all();
+            composer.run_to_completion(command);
+        } else {
+            while (composer.running_count >= running_max) composer.wait_one();
+            announce(command, "start");
+            composer.start(command);
+        }
+    }
+    composer.wait_all();
+    if (phase == .faults) composer.faults_stop();
+    sdk.event("composer_done", .{ .commands_started = composer.started_count, .script = true });
+}
+
+fn now_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+}
+
+fn sleep_until(deadline_ns: u64) void {
+    const now = now_ns();
+    if (now >= deadline_ns) return;
+    const wait = deadline_ns - now;
+    const request = linux.timespec{
+        .sec = @intCast(wait / std.time.ns_per_s),
+        .nsec = @intCast(wait % std.time.ns_per_s),
+    };
+    _ = linux.nanosleep(&request, null);
 }
 
 fn run_singleton(composer: *Composer) void {
@@ -213,7 +309,9 @@ fn run_drivers(composer: *Composer) void {
             },
             .parallel_driver, .anytime => {
                 while (composer.running_count >= parallelism) composer.wait_one();
-                composer.start(composer.pick(kind));
+                const command = composer.pick(kind);
+                announce(command, "start");
+                composer.start(command);
             },
             else => unreachable,
         }

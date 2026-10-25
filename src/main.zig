@@ -17,6 +17,7 @@ const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
 const merge = @import("merge.zig");
+const script = @import("script.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -31,10 +32,11 @@ const usage =
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
+    \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
-    \\  [--scenario <name>|all] [--cache <dir>]
+    \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
     \\
     \\machine options:
     \\  --kernel <bzImage> [--initrd <file>] [--memory-mib <n>] [--disk <image>]...
@@ -101,6 +103,8 @@ const Arguments = struct {
     program_path: ?[]const u8 = null,
     /// Or a Compose file: services become nodes, Antithesis test templates scenarios.
     compose_path: ?[]const u8 = null,
+    /// Commands and faults follow this script (determinismo script) instead of choosing.
+    script_path: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     cache_directory: []const u8 = ".determinismo-cache",
@@ -111,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
+    if (argv.len == 3 and std.mem.eql(u8, argv[1], "script")) {
+        return script.extract(arena, init.io, argv[2]);
+    }
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "merge")) {
         const failing = try merge.merge(arena, init.io, argv[2..]);
         if (failing > 0) std.process.exit(3);
@@ -272,6 +279,7 @@ fn system_prepare(
     const prepared = try prepare.prepare(arena, io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .script = arguments.script_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
     });
@@ -891,6 +899,8 @@ fn parse_option(
         arguments.disk_count += 1;
     } else if (eql(u8, flag, "--program")) {
         arguments.program_path = value;
+    } else if (eql(u8, flag, "--script")) {
+        arguments.script_path = value;
     } else if (eql(u8, flag, "--compose")) {
         arguments.compose_path = value;
     } else if (eql(u8, flag, "--profile")) {
@@ -1033,6 +1043,7 @@ test {
     _ = @import("serve.zig");
     _ = @import("mcp.zig");
     _ = @import("merge.zig");
+    _ = @import("script.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

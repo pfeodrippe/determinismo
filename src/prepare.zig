@@ -19,6 +19,8 @@ pub const Options = struct {
     /// nodes and whose images' Antithesis test templates become the scenarios.
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
+    /// A script for the composer and the fault injector (/det/script.json on the system disk).
+    script: ?[]const u8 = null,
     /// The profile to resolve; null takes the first one.
     profile: ?[]const u8 = null,
     cache_directory: []const u8,
@@ -74,11 +76,21 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         try cwd.readFileAlloc(io, path, arena, .unlimited)
     else
         "";
+    const script = if (options.script) |path|
+        try cwd.readFileAlloc(io, path, arena, .limited(1 << 20))
+    else
+        null;
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(system_json);
     hasher.update(program);
+    if (script) |text| hasher.update(text);
     const hash = hasher.final();
-    disk_paths[0] = try system_disk(context, system_json, options.program, hash);
+    disk_paths[0] = try system_disk(context, .{
+        .system_json = system_json,
+        .program = options.program,
+        .script = script,
+        .hash = hash,
+    });
     const source = options.program orelse options.compose.?;
     try profile_remember(context, source, &system, system_json);
     return .{
@@ -417,12 +429,17 @@ fn binary_disk(
 }
 
 /// Disk 0: the program and the resolved system, cached by their hash.
-fn system_disk(
-    context: Context,
+const SystemFiles = struct {
     system_json: []const u8,
     program: ?[]const u8,
+    script: ?[]const u8,
     hash: u64,
-) ![]const u8 {
+};
+
+fn system_disk(context: Context, files: SystemFiles) ![]const u8 {
+    const system_json = files.system_json;
+    const program = files.program;
+    const hash = files.hash;
     const io = context.io;
     const cwd = std.Io.Dir.cwd();
     const name = try std.fmt.allocPrint(context.arena, "{x:0>16}.erofs", .{hash});
@@ -438,6 +455,12 @@ fn system_disk(
         .sub_path = try path_join(context, &.{ staging, "system.json" }),
         .data = system_json,
     });
+    if (files.script) |text| {
+        try cwd.writeFile(io, .{
+            .sub_path = try path_join(context, &.{ staging, "script.json" }),
+            .data = text,
+        });
+    }
     try erofs_build(context, disk, &.{ "--all-root", "--ignore-mtime", staging });
     return disk;
 }

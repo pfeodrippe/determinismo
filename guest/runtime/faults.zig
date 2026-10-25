@@ -71,13 +71,96 @@ pub fn main(init: std.process.Init) !void {
     _ = linux.sigaction(.TERM, &action, null);
 
     sdk.event("faults_start", .{ .faults = count });
+    if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
     var injections: u32 = 0;
     while (injections < injections_max) : (injections += 1) {
         sleep_ns(delay_ns_min + sdk.random_below(delay_ns_max - delay_ns_min));
         if (stopping.load(.acquire)) break;
-        inject(arena, &system, &sdk.random_choice(Fault, faults[0..count]));
+        const applied = draw(&sdk.random_choice(Fault, faults[0..count]));
+        apply(arena, &system, &applied);
     }
     sdk.event("faults_stop", .{ .injections = injections });
+}
+
+/// One fault as applied: everything needed to apply it again. A script's fault entries are
+/// these, with `at_ns` their offset from the start of the fault phase (0 in events).
+const Applied = struct {
+    at_ns: u64 = 0,
+    kind: Kind,
+    node: []const u8 = "",
+    peer: []const u8 = "",
+    duration_ns: u64,
+    cpu_percent: u8 = 0,
+    process_index: u32 = 0,
+    flavor: ?Degradation = null,
+    netem: ?nodes.Netem = null,
+    forward: bool = false,
+    skip_ns: u64 = 0,
+};
+
+/// A fault's parameters, drawn from platform randomness.
+fn draw(fault: *const Fault) Applied {
+    var applied = Applied{
+        .kind = fault.kind,
+        .node = fault.node,
+        .peer = fault.peer,
+        .duration_ns = sdk.random_below(duration_ns_max),
+    };
+    switch (fault.kind) {
+        .throttle => {
+            const range = throttle_percent_max - throttle_percent_min;
+            applied.cpu_percent = @intCast(throttle_percent_min + sdk.random_below(range + 1));
+        },
+        .process_pause => applied.process_index = @intCast(sdk.random_below(processes_max)),
+        .degrade => {
+            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            applied.flavor = flavor;
+            applied.netem = degradation(flavor);
+        },
+        .clock_skip => {
+            applied.forward = sdk.random_below(2) == 0;
+            applied.skip_ns = sdk.random_below(clock_skip_ns_max);
+        },
+        else => {},
+    }
+    return applied;
+}
+
+fn script_faults(arena: std.mem.Allocator) ?[]const Applied {
+    const Script = struct { faults: []const Applied = &.{} };
+    const fd = linux.open("/det/script.json", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const buffer = arena.alloc(u8, 1 << 20) catch return null;
+    const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    const script = sdk.schema.parse(Script, arena, buffer[0..size]) catch return null;
+    return script.faults;
+}
+
+/// The script's faults at their offsets (until stopped), instead of drawn ones.
+fn run_script(
+    arena: std.mem.Allocator,
+    system: *const schema.System,
+    faults: []const Applied,
+) void {
+    const start_ns = monotonic_ns();
+    var injections: u32 = 0;
+    for (faults) |*fault| {
+        const now_ns = monotonic_ns();
+        if (start_ns + fault.at_ns > now_ns) sleep_ns(start_ns + fault.at_ns - now_ns);
+        if (stopping.load(.acquire)) break;
+        if (system.node(fault.node) == null and fault.kind != .clock_skip) continue; // Gone.
+        apply(arena, system, fault);
+        injections += 1;
+    }
+    sdk.event("faults_stop", .{ .injections = injections, .script = true });
+}
+
+fn monotonic_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
 
 fn faults_collect(
@@ -137,113 +220,77 @@ fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
     count.* += 1;
 }
 
-/// Applies one fault for a random duration and undoes it, even when stopped meanwhile.
-fn inject(arena: std.mem.Allocator, system: *const schema.System, fault: *const Fault) void {
-    const duration_ns = sdk.random_below(duration_ns_max);
-    switch (fault.kind) {
-        .pause, .restart, .throttle, .process_pause => {
-            inject_node(arena, system, fault, duration_ns);
-        },
-        .isolate, .partition, .degrade => inject_link(system, fault, duration_ns),
-        .clock_skip => inject_clock(duration_ns),
-    }
-}
-
-fn inject_node(
-    arena: std.mem.Allocator,
-    system: *const schema.System,
-    fault: *const Fault,
-    duration_ns: u64,
-) void {
-    const details = .{
-        .kind = @tagName(fault.kind),
-        .node = fault.node,
-        .duration_ns = duration_ns,
-    };
-    switch (fault.kind) {
+/// Applies one fault for its duration and undoes it, even when stopped meanwhile. The event
+/// carries everything about it, so that `determinismo script` can put it in a script.
+fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const Applied) void {
+    switch (applied.kind) {
         .pause => {
-            nodes.freeze(fault.node, .frozen) catch return;
-            sdk.event("fault", details);
-            sleep_ns(duration_ns);
-            nodes.freeze(fault.node, .thawed) catch {};
+            nodes.freeze(applied.node, .frozen) catch return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            nodes.freeze(applied.node, .thawed) catch {};
         },
         .restart => {
-            nodes.kill(fault.node) catch return;
-            sdk.event("fault", details);
-            sleep_ns(duration_ns);
-            const node = system.node(fault.node).?;
+            nodes.kill(applied.node) catch return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            const node = system.node(applied.node) orelse return;
             nodes.start(arena, system, node) catch |err| {
-                sdk.event("fault_restart_failed", .{ .node = fault.node, .err = @errorName(err) });
+                const details = .{ .node = applied.node, .err = @errorName(err) };
+                sdk.event("fault_restart_failed", details);
             };
         },
         .throttle => {
-            const range = throttle_percent_max - throttle_percent_min;
-            const percent: u8 = @intCast(throttle_percent_min + sdk.random_below(range + 1));
-            nodes.cpu_limit(fault.node, percent) catch return;
-            sdk.event("fault", .{ .kind = "throttle", .node = fault.node, .cpu_percent = percent });
-            sleep_ns(duration_ns);
-            nodes.cpu_limit(fault.node, null) catch {};
+            nodes.cpu_limit(applied.node, applied.cpu_percent) catch return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            nodes.cpu_limit(applied.node, null) catch {};
         },
-        .process_pause => {
-            var pids: [processes_max]linux.pid_t = undefined;
-            const count = nodes.processes(fault.node, &pids) catch return;
-            if (count == 0) return;
-            const pid = sdk.random_choice(linux.pid_t, pids[0..count]);
-            _ = linux.kill(pid, .STOP);
-            sdk.event("fault", .{ .kind = "process_pause", .node = fault.node, .pid = pid });
-            sleep_ns(duration_ns);
-            _ = linux.kill(pid, .CONT);
+        .process_pause => apply_process_pause(applied),
+        .isolate, .partition, .degrade => apply_link(system, applied),
+        .clock_skip => {
+            sdk.event("fault", applied.*);
+            clock_shift(applied.skip_ns, .{ .forward = applied.forward });
+            sleep_ns(applied.duration_ns);
+            clock_shift(applied.skip_ns, .{ .forward = !applied.forward }); // Skips are temporary.
         },
-        else => unreachable,
     }
 }
 
-fn inject_link(system: *const schema.System, fault: *const Fault, duration_ns: u64) void {
-    const details = .{
-        .kind = @tagName(fault.kind),
-        .node = fault.node,
-        .peer = fault.peer,
-        .duration_ns = duration_ns,
-    };
-    switch (fault.kind) {
+fn apply_process_pause(applied: *const Applied) void {
+    var pids: [processes_max]linux.pid_t = undefined;
+    const count = nodes.processes(applied.node, &pids) catch return;
+    if (count == 0) return;
+    const pid = pids[applied.process_index % count];
+    _ = linux.kill(pid, .STOP);
+    sdk.event("fault", applied.*);
+    sleep_ns(applied.duration_ns);
+    _ = linux.kill(pid, .CONT);
+}
+
+fn apply_link(system: *const schema.System, applied: *const Applied) void {
+    switch (applied.kind) {
         .isolate => {
-            if (!links_set(system, fault.node, .down)) return;
-            sdk.event("fault", details);
-            sleep_ns(duration_ns);
-            _ = links_set(system, fault.node, .up);
+            if (!links_set(system, applied.node, .down)) return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            _ = links_set(system, applied.node, .up);
         },
         .partition => {
-            nodes.link_set(system, fault.node, fault.peer, .down) catch return;
-            sdk.event("fault", details);
-            sleep_ns(duration_ns);
-            nodes.link_set(system, fault.node, fault.peer, .up) catch {};
+            nodes.link_set(system, applied.node, applied.peer, .down) catch return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            nodes.link_set(system, applied.node, applied.peer, .up) catch {};
         },
         .degrade => {
-            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
-            const netem = degradation(flavor);
-            nodes.link_degrade(fault.node, fault.peer, netem) catch return;
-            sdk.event("fault", .{
-                .kind = "degrade",
-                .flavor = @tagName(flavor),
-                .from = fault.node,
-                .to = fault.peer,
-                .netem = netem,
-                .duration_ns = duration_ns,
-            });
-            sleep_ns(duration_ns);
-            nodes.link_degrade(fault.node, fault.peer, null) catch {};
+            const netem = applied.netem orelse return;
+            nodes.link_degrade(applied.node, applied.peer, netem) catch return;
+            sdk.event("fault", applied.*);
+            sleep_ns(applied.duration_ns);
+            nodes.link_degrade(applied.node, applied.peer, null) catch {};
         },
         else => unreachable,
     }
-}
-
-fn inject_clock(duration_ns: u64) void {
-    const forward = sdk.random_below(2) == 0;
-    const skip_ns = sdk.random_below(clock_skip_ns_max);
-    sdk.event("fault", .{ .kind = "clock_skip", .forward = forward, .skip_ns = skip_ns });
-    clock_shift(skip_ns, .{ .forward = forward });
-    sleep_ns(duration_ns);
-    clock_shift(skip_ns, .{ .forward = !forward }); // Skips are temporary.
 }
 
 /// netem settings for one flavor of degradation, every parameter a platform decision.
