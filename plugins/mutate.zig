@@ -8,7 +8,14 @@
 //! joins the corpus, when it covers something new: a behavioral feature never seen before (an
 //! event name with its categorical details, such as a fault's kind or a command's name, or an
 //! assertion's message with its outcome; numbers are left out so novelty stays finite), or a new
-//! signature (outcome, failing properties, event volume). Coverage without instrumenting code.
+//! signature (outcome, failing properties, event volume). Programs built with code coverage
+//! (the C SDK's DETERMINISMO_COVERAGE) also report each edge they reach, as "coverage" events:
+//! those are features too.
+//!
+//! Most children of a timeline that reached something new change a single decision at its
+//! frontier: the decision before the newest feature, or one just after it. On the self-test maze
+//! (four digit checks, 1 in 10000 timelines by chance) this solves it within about 100 branches,
+//! where 300 random seeds do not.
 //!
 //! Usage: mutate [--fresh-percent <n>]   (default 25)
 const std = @import("std");
@@ -26,13 +33,23 @@ const detail_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "pe
 const Tape = struct {
     values: [pulls_max]u64 = undefined,
     count: u32 = 0,
+    /// The last decision before this timeline last reached something new: the decision that
+    /// led there, or the one before the decision that comes next.
+    frontier: u32 = 0,
 };
+/// Mutations at the frontier: most children change one decision there or just after it (in a
+/// maze of checks: the check that failed, or the next one).
+const frontier_percent = 75;
+const frontier_window = 4;
+/// Parents: the newest corpus entry this often (it holds the deepest progress), else any.
+const newest_percent = 50;
 
 const Mutate = struct {
     prng: std.Random.DefaultPrng = .init(0),
     fresh_percent: u32 = 25,
     corpus: [corpus_max]Tape = undefined,
     corpus_count: u32 = 0,
+    corpus_newest: u32 = 0,
     signatures: [signatures_max]u64 = undefined,
     signature_count: u32 = 0,
     features: [features_max]u64 = @splat(0),
@@ -57,24 +74,34 @@ const Mutate = struct {
         _ = index;
         _ = seed;
         strategy.current.count = 0;
+        strategy.current.frontier = 0;
         strategy.parent = null;
         strategy.mutation_count = 0;
         strategy.features_new = 0;
         const prng = strategy.prng.random();
         if (strategy.corpus_count == 0) return;
         if (prng.uintLessThan(u32, 100) < strategy.fresh_percent) return;
-        const parent = prng.uintLessThan(u32, strategy.corpus_count);
+        const parent = if (prng.uintLessThan(u32, 100) < newest_percent)
+            strategy.corpus_newest
+        else
+            prng.uintLessThan(u32, strategy.corpus_count);
         const parent_count = strategy.corpus[parent].count;
         if (parent_count == 0) return;
         strategy.parent = parent;
-        strategy.mutation_count = 1 + prng.uintLessThan(u32, mutations_max);
-        for (0..strategy.mutation_count) |index_mutation| {
-            strategy.mutated_positions[index_mutation] = prng.uintLessThan(u32, parent_count);
-            strategy.mutated_values[index_mutation] = switch (prng.uintLessThan(u32, 4)) {
-                0 => 0, // Boundary values make choices take their extremes.
-                1 => std.math.maxInt(u64),
-                else => prng.int(u64),
-            };
+        const frontier = strategy.corpus[parent].frontier;
+        if (frontier < parent_count and prng.uintLessThan(u32, 100) < frontier_percent) {
+            // Geometric: the frontier itself half the time, then the decisions after it.
+            var offset: u32 = 0;
+            while (offset + 1 < frontier_window and prng.boolean()) offset += 1;
+            strategy.mutation_count = 1;
+            strategy.mutated_positions[0] = @min(parent_count - 1, frontier + offset);
+            strategy.mutated_values[0] = value_random(prng);
+        } else {
+            strategy.mutation_count = 1 + prng.uintLessThan(u32, mutations_max);
+            for (0..strategy.mutation_count) |index_mutation| {
+                strategy.mutated_positions[index_mutation] = prng.uintLessThan(u32, parent_count);
+                strategy.mutated_values[index_mutation] = value_random(prng);
+            }
         }
         assert(strategy.mutation_count <= mutations_max);
     }
@@ -143,6 +170,7 @@ const Mutate = struct {
                 strategy.features[slot] = key;
                 strategy.feature_count += 1;
                 strategy.features_new += 1;
+                strategy.current.frontier = strategy.current.count -| 1;
                 return;
             }
             slot = (slot + 1) % features_max;
@@ -179,9 +207,18 @@ const Mutate = struct {
             break :slot strategy.corpus_count - 1;
         } else strategy.prng.random().uintLessThan(u32, corpus_max); // Full: replace one.
         strategy.corpus[slot] = strategy.current;
+        strategy.corpus_newest = slot;
         assert(strategy.corpus_count <= corpus_max);
     }
 };
+
+fn value_random(prng: std.Random) u64 {
+    return switch (prng.uintLessThan(u32, 8)) {
+        0 => 0, // Boundary values make choices take their extremes.
+        1 => std.math.maxInt(u64),
+        else => prng.int(u64),
+    };
+}
 
 fn hash_field(hasher: *std.hash.Wyhash, object: std.json.ObjectMap, key: []const u8) void {
     const value = object.get(key) orelse return;

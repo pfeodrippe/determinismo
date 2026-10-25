@@ -10,6 +10,11 @@
  * their moment; random values are platform decisions, steerable and replayable). Outside it,
  * randomness comes from the OS and events go to stderr, so the same binary runs everywhere.
  * `details` arguments are JSON objects as strings ("{}" or NULL for none).
+ *
+ * Code coverage for strategies: build with `-fsanitize-coverage=trace-pc-guard` and define
+ * DETERMINISMO_COVERAGE next to DETERMINISMO_IMPLEMENTATION. Each edge reports itself the first
+ * time it runs (a "coverage" event), which strategies such as det-strategy-mutate use to keep
+ * timelines that reach new code.
  */
 #ifndef DETERMINISMO_H
 #define DETERMINISMO_H
@@ -39,6 +44,11 @@ void det_event(const char *name, const char *details);
 #endif
 
 #ifdef DETERMINISMO_IMPLEMENTATION
+
+/* The SDK itself is never instrumented for coverage: only the program's own edges count. */
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((no_sanitize("coverage"))), apply_to = function)
+#endif
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -154,6 +164,28 @@ void det_event(const char *name, const char *details) {
   int written = snprintf(line + used, sizeof line - used, ",\"details\":%s}", details ? details : "{}");
   if (written > 0 && used + (size_t)written < sizeof line) det_emit(line, used + (size_t)written);
 }
+
+#ifdef DETERMINISMO_COVERAGE
+/* The callbacks clang's trace-pc-guard instrumentation calls. Guards hold an edge's number,
+   0 once reported (so each edge costs one event, the first time). */
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+  static uint32_t next = 1;
+  if (start == stop || *start) return; /* Already numbered. */
+  for (uint32_t *guard = start; guard < stop; guard++) *guard = next++;
+}
+
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+  if (!*guard) return;
+  char details[48];
+  snprintf(details, sizeof details, "{\"name\":\"edge %u\"}", *guard);
+  *guard = 0;
+  det_event("coverage", details);
+}
+#endif /* DETERMINISMO_COVERAGE */
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#endif
 
 #endif /* DETERMINISMO_IMPLEMENTATION */
 #endif /* DETERMINISMO_H */

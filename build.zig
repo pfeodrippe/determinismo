@@ -98,6 +98,20 @@ pub fn build(b: *std.Build) void {
     c_node.root_module.addIncludePath(b.path("sdk/c"));
     b.installArtifact(c_node);
 
+    // A maze for coverage-guided exploration, instrumented for edge coverage.
+    const maze = b.addExecutable(.{
+        .name = "det-maze",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    maze.root_module.addCSourceFile(.{
+        .file = b.path("tests/selftest/maze.c"),
+        .flags = &.{
+            "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize-coverage=trace-pc-guard",
+        },
+    });
+    maze.root_module.addIncludePath(b.path("sdk/c"));
+    b.installArtifact(maze);
+
     // The guest's base initramfs, built on the host from the guest runtime above.
     const initramfs = b.addExecutable(.{
         .name = "det-initramfs",

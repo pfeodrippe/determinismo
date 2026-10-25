@@ -50,6 +50,18 @@ inputs is refused, since it would be a different universe.
 Overridden values are at most 64 bytes (SDK pulls are 8). A plugin must answer every request; a
 plugin that exits or writes a malformed line ends the exploration with an error.
 
+## Coverage
+
+Strategies see every event, so behavior is coverage: event names, fault kinds, assertion
+outcomes. For code coverage, build a C (or C-compatible) program with
+`-fsanitize-coverage=trace-pc-guard` and `#define DETERMINISMO_COVERAGE` next to
+`DETERMINISMO_IMPLEMENTATION`: each edge then emits `{"event":"coverage","details":{"name":"edge
+N"}}` the first time a process runs it. `plugins/mutate.zig` keeps timelines that reach new
+features and mutates them at their frontier; `tests/selftest/maze.c` is the benchmark (`zig build
+e2e` checks that it is solved and that the solving branch replays from its tape). Each worker
+runs its own strategy process, with its own corpus; `--jobs 1` gives one corpus for the whole
+exploration.
+
 ## Two levels of strategy
 
 A plugin (this protocol) decides inside a run: it sees every event with its moment and may

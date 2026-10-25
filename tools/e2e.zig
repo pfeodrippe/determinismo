@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     try check_example(&context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
     try check_tapes(&context);
     try check_builtin_properties(&context);
+    try check_coverage(&context);
     try check_parallel(&context);
     try check_fork(&context);
     try check_compose(&context);
@@ -151,6 +152,35 @@ fn check_tapes(context: *Context) !void {
     });
     const refused = std.mem.indexOf(u8, elsewhere, "the tape was recorded with inputs") != null;
     expect(context, refused, "tapes: a replay on different inputs is refused", .{});
+}
+
+/// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance) within 300
+/// branches, and its solving branch replays from its tape.
+fn check_coverage(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const strategy = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
+    const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "maze-tapes" });
+    const common = [_][]const u8{ "--program", program, "--profile", "maze", "--scenario", "maze" };
+    const report = try explore(context, &(common ++ [_][]const u8{
+        "--seed", "1", "--branches", "300", "--jobs", "1", "--strategy", strategy,
+        "--tape-dir", tapes,
+    }));
+    var branches: [300]Branch = undefined; // One line per branch.
+    const count = parse_branches(report, &branches);
+    const solved = for (branches[0..count]) |branch| {
+        if (branch.failing) break branch;
+    } else null;
+    expect(context, solved != null, "coverage: guided exploration solves the maze", .{});
+    const branch = solved orelse return;
+    const tape_name = try std.fmt.allocPrint(context.arena, "branch-{d}.jsonl", .{branch.index});
+    const tape = try std.fs.path.join(context.arena, &.{ tapes, tape_name });
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
+    var replayed: [1]Branch = undefined;
+    const same = parse_branches(replay, &replayed) == 1 and replayed[0].failing and
+        std.mem.eql(u8, replayed[0].events_hash, branch.events_hash);
+    expect(context, same, "coverage: the solving branch {d} replays from its tape", .{
+        branch.index,
+    });
 }
 
 /// The built-in properties pass on a steady system and catch a node that exits by itself.

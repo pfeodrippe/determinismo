@@ -34,6 +34,9 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 - **Debugging in the multiverse**: run a command in the guest or inside a node at an exact moment;
   let the branch continue after a change (`--continue`), or explore futures of a changed system
   (`--from-exec`), e.g. a function redefined through a service's REPL.
+- **Coverage-guided exploration**: strategies see behavior (events) and, for programs built with
+  coverage, code edges; `mutate` keeps timelines that reach something new and changes decisions
+  at their frontier (it solves a 1-in-10000 maze in about 100 branches).
 - **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
   mutation testing with mutant profiles.
 - **For people, CI and agents**: CLI, HTTP API (`serve`), MCP server (`mcp`), CI workflow.
