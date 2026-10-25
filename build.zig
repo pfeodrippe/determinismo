@@ -85,6 +85,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(redis_workload);
 
+    // The guest's base initramfs, built on the host from the guest runtime above.
+    const initramfs = b.addExecutable(.{
+        .name = "det-initramfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/initramfs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(initramfs);
+
     // End-to-end checks: real VMs through the command line, on the Linux host.
     const e2e = b.addExecutable(.{
         .name = "e2e",
@@ -125,6 +136,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/composer.zig",
         "examples/shop/pg.zig",
         "tools/e2e.zig",
+        "tools/initramfs.zig",
     };
     for (test_roots) |root| {
         const unit_tests = b.addTest(.{ .root_module = b.createModule(.{

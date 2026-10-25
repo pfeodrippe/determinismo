@@ -83,13 +83,13 @@ infra/host/build-kvm.sh                   # KVM with kernel/patches/*.patch
 sudo infra/host/load-kvm.sh               # swap in our KVM modules
 guest/kernel/build.sh ~/guest             # the guest kernel and det_guest.ko
 zig build -Drelease                       # the VMM, the guest runtime, the examples
-guest/build-initramfs.sh zig-out/bin ~/guest/det_guest.ko ~/guest/base.cpio.zst
+zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko --busybox /usr/bin/busybox --out ~/guest/base.cpio
 ```
 
 Then explore a system (images are pulled and cached under `--cache` on first use):
 
 ```
-determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio.zst --memory-mib 2048 \
+determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memory-mib 2048 \
   --program zig-out/bin/bank-test --scenario all --seed 7 --branches 40
 determinismo explore ... --program zig-out/bin/bank-test --scenario bank --seed 7 --branch 0
 determinismo explore ... --strategy zig-out/bin/det-strategy-mutate --tape-dir /tmp/tapes

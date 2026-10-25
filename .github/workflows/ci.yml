@@ -31,5 +31,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: zig build -Drelease
-      - run: guest/build-initramfs.sh zig-out/bin ~/guest/det_guest.ko ~/guest/base.cpio.zst
+      - run: zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko --busybox /usr/bin/busybox --out ~/guest/base.cpio
       - run: zig build -Drelease e2e

@@ -35,5 +35,5 @@ page records how we apply it here and the few places where we knowingly differ.
 |---|---|---|
 | KVM patch, `det_guest.ko` | Linux kernel style (C, tabs, `WARN_ON_ONCE` for invariants) | It is kernel code; reviewers and tools expect kernel style. |
 | Guest `/init` and scenario scripts | POSIX `sh` | They run inside the guest before anything else exists. |
-| Host tooling (`infra/`, `guest/*.sh`) | Bash today | Being moved to Zig (`zig build` steps) as each script is touched, per TigerStyle's tooling rule. |
+| Host tooling | Zig where it is ours (`tools/`: tidy, e2e, det-initramfs) | Shell remains only where it drives other build systems or runs before Zig exists on a machine: `guest/kernel/build.sh` (make), `infra/` (installimage, provisioning, KVM module build and load). |
 | Standard library calls | `std.os.linux` syscalls directly in hot or early paths | Fewer layers, explicit error handling, no hidden allocation. |

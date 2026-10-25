@@ -7,7 +7,7 @@
 //! strategy, and a tape refuses to replay on different inputs.
 //!
 //! Usage: e2e [--bin <dir>] [--guest <dir>] [--cache <dir>]
-//!   --bin    built programs (zig-out/bin)       --guest  vmlinuz and base.cpio.zst ($HOME/guest)
+//!   --bin    built programs (zig-out/bin)       --guest  vmlinuz and base.cpio ($HOME/guest)
 //!   --cache  determinismo's cache ($HOME/cache)
 const std = @import("std");
 const assert = std.debug.assert;
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
         .machine = &.{
             "--kernel",     try std.fs.path.join(arena, &.{ guest, "vmlinuz" }),
-            "--initrd",     try std.fs.path.join(arena, &.{ guest, "base.cpio.zst" }),
+            "--initrd",     try std.fs.path.join(arena, &.{ guest, "base.cpio" }),
             "--memory-mib", "2048",
             "--append",     "quiet",
             "--cache",      cache,

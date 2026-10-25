@@ -6,7 +6,7 @@ exactly, results are JSON, and a Model Context Protocol server exposes the main 
 ## Connect
 
 ```
-determinismo mcp --kernel <vmlinuz> --initrd <base.cpio.zst> --memory-mib 2048 --cache <dir>
+determinismo mcp --kernel <vmlinuz> --initrd <base.cpio> --memory-mib 2048 --cache <dir>
 ```
 
 Tools: `describe`, `explore`, `replay`, `fork` (schemas in `src/mcp_tools.json`). Without MCP, use
