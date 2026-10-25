@@ -48,7 +48,7 @@ change that moves it.
 | Triage report: environment, utilization, findings, properties | web UI (`determinismo serve`, at `/`): runs, live progress, findings, utilization, properties; text report, JSONL record (and Environment: the resolved system recorded with each run) | ✅ |
 | Properties grouped (setup, efficiency, performance, correctness, SDK kinds, test composer), examples with passing/failing moments | grouped (determinismo's, always, sometimes, reachability), All/Passed/Failed, filter, failing and passing examples at their moments, each opening its logs | ✅ |
 | Findings across runs (new, ongoing, resolved, rare) | `GET /runs/<id>/findings` and the UI's Findings section: against the previous finished run of the same system and scenario; rare when one timeline showed it | ✅ (not yet statistical, as Antithesis's "resolved") |
-| New behavior discovery curve | ❌ | ❌ |
+| New behavior discovery curve | `GET /runs/<id>/discovery`, in the UI's Utilization: distinct behaviors (assertion outcomes, events, coverage) after each branch | ✅ |
 | Default properties: no unexpected container exits | nodes do not exit unexpectedly | ✅ |
 | Default: commands finish with zero exit code | test commands exit successfully | ✅ |
 | Default: all commands started / completed at least once | "test command started: X", "test command completed: X", declared for every command | ✅ |
@@ -78,7 +78,8 @@ change that moves it.
 | `wait_until(event set, timeout)` | `--until '<condition>'` (CLI, HTTP replay, MCP replay): the moment is the first matching event; with `--exec`, a command runs there | ✅ (no timeout yet) |
 | bash on a branch (`run`, `run_in_background`), process output | `--exec` at a moment (in a node with `det-nodes exec`), `--continue` | ✅ |
 | Counterfactuals (change something, see if the bug recurs) | `--from-exec` explores futures of a changed system | ✅ |
-| `extract_file`, `inject_file` | ❌ | ❌ |
+| `extract_file` | `determinismo extract` (and HTTP, the UI's "Extract the file" at any moment): a node's file at a moment, exact bytes | ✅ |
+| `inject_file` | a command at a moment (`--exec`, `--continue`) can write it | 🟡 no direct upload |
 | Profiler, core dumps, debuggers (gdb, delve, jdb) | possible through `--exec` with the tools in the image | 🟡 no helpers |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
 | Notebook | web UI (logs, search, run a command at a moment), MCP tools, HTTP API, CLI | 🟡 no scripting notebook |

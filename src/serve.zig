@@ -18,6 +18,8 @@
 //!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until?, exec?} -> its output, as text
 //!   POST /runs/<id>/causality {branch, property, points?, futures?} -> {id} (in the background)
 //!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
+//!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
+//!   GET  /runs/<id>/discovery  {points: [[branches, behaviors], ...]}: new behavior discovery
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
 //!                             since the previous finished run of the same system and scenario
 //!   POST /runs/<id>/query    {condition, preceded_by?, followed_by?, not_preceded_by?,
@@ -29,6 +31,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
+const extract = @import("extract.zig");
 
 pub const Options = struct {
     /// "address:port", e.g. 127.0.0.1:7878. Bind to loopback unless the network is trusted.
@@ -174,6 +177,18 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     }
     if (eql(u8, action, "replay") and eql(u8, request.method, "POST")) {
         return run_replay(server, run, request.body, out);
+    }
+    if (eql(u8, action, "extract") and eql(u8, request.method, "POST")) {
+        return run_extract(server, run, request.body, out);
+    }
+    if (eql(u8, action, "discovery") and eql(u8, request.method, "GET")) {
+        const events = try std.fs.path.join(server.arena, &.{
+            try run_directory(server, run.id), "events",
+        });
+        const timelines = try query.timelines_read(server.arena, server.io, events, null);
+        const points = try query.discovery(server.arena, timelines);
+        try out.print("{{\"points\":{f}}}\n", .{std.json.fmt(points, .{})});
+        return 200;
     }
     if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
         return findings_show(server, run, out);
@@ -340,6 +355,39 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     const result = try std.process.run(server.arena, server.io, .{ .argv = argv.items });
     try out.writeAll(result.stdout);
     try out.writeAll(result.stderr);
+    return 200;
+}
+
+const ExtractRequest = struct { branch: u32, at_vtime_ms: u64, node: []const u8, path: []const u8 };
+
+/// A node's file at a moment of a branch (extract.zig), replayed from the branch's tape.
+fn run_extract(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
+    const asked = try std.json.parseFromSliceLeaky(ExtractRequest, server.arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+    const original = try std.json.parseFromSliceLeaky(
+        RunRequest,
+        server.arena,
+        try run_file(server, run.id, "request.json"),
+        .{ .ignore_unknown_fields = true },
+    );
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(server.arena, server.options.machine);
+    try system_arguments(server.arena, &argv, &original);
+    if (original.scenario) |scenario| {
+        try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
+    }
+    if (original.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
+    const tape = try std.fmt.allocPrint(server.arena, "{s}/tapes/branch-{d}.jsonl", .{
+        try run_directory(server, run.id), asked.branch,
+    });
+    try argv.appendSlice(server.arena, &.{
+        "--tape",        tape,
+        "--at-vtime-ms", try print(server, "{d}", .{asked.at_vtime_ms}),
+    });
+    const file = try print(server, "{s}:{s}", .{ asked.node, asked.path });
+    const bytes = try extract.read(server.arena, server.io, server.options.self, argv.items, file);
+    try out.writeAll(bytes);
     return 200;
 }
 

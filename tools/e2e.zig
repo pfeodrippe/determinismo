@@ -344,7 +344,9 @@ fn check_serve(context: *Context) !void {
     }
     const asked = "{\"condition\":\"output.source=redis\",\"output\":\"count\"}";
     const answer = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs/1/query" });
-    const ui = std.mem.indexOf(u8, page, "<title>determinismo</title>") != null;
+    const discovery = try curl(context, &.{url ++ "/runs/1/discovery"});
+    const curve = std.mem.indexOf(u8, discovery, "[8,") != null; // A point after 8 branches.
+    const ui = std.mem.indexOf(u8, page, "<title>determinismo</title>") != null and curve;
     const finished = std.mem.indexOf(u8, run, "\"summary\"") != null;
     const queried = std.mem.indexOf(u8, answer, "\"events\":") != null and
         std.mem.indexOf(u8, answer, "\"events\":0,") == null;
@@ -412,6 +414,21 @@ fn check_until_and_causality(context: *Context) !void {
     }
     expect(context, points == 4 and last == 1, "causality: {d} moments, certain at the " ++
         "failure ({d:.2})", .{ points, last });
+    // extract_file: a node's file at that moment, byte for byte (Redis's own config here).
+    const extracted = try std.fs.path.join(arena, &.{ context.scratch, "extracted" });
+    var extract_argv: std.ArrayList([]const u8) = .empty;
+    try extract_argv.appendSlice(arena, &.{ context.determinismo, "extract" });
+    try extract_argv.appendSlice(arena, context.machine);
+    try extract_argv.appendSlice(arena, &system);
+    try extract_argv.appendSlice(arena, &.{
+        "--branch", "4",              "--until", violation, "--file", "redis:/etc/hostname",
+        "--to",     extracted,
+    });
+    _ = try std.process.run(arena, context.io, .{ .argv = extract_argv.items });
+    const cwd = std.Io.Dir.cwd();
+    const hostname = cwd.readFileAlloc(context.io, extracted, arena, .limited(64)) catch "";
+    expect(context, std.mem.eql(u8, hostname, "redis\n"), "extract: a node's file at a moment " ++
+        "({d} bytes)", .{hostname.len});
 }
 
 /// The lines of `text` containing any of `keys`, joined.

@@ -16,6 +16,9 @@ const output_chunk_size = 1024;
 const ioctl_wait_action = 0xde01;
 const actions_max = 1_000_000;
 const output_chunks_max = 1 << 20;
+/// Exists while a command runs: det-init waits for it before ending the timeline, so that a
+/// command at a moment near the end still finishes.
+pub const busy_path = "/run/det-agent-busy";
 
 pub fn main() !void {
     const device = linux.open(sdk.device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
@@ -36,6 +39,10 @@ pub fn main() !void {
 /// Runs one command line through /bin/sh, streaming its output as events.
 fn run(command: [:0]const u8) void {
     assert(command.len > 0);
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true };
+    const busy = linux.open(busy_path, flags, 0o644);
+    if (linux.errno(busy) == .SUCCESS) _ = linux.close(@intCast(busy));
+    defer _ = linux.unlink(busy_path);
     sdk.event("exec_start", .{ .command = command });
     var pipe: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) {

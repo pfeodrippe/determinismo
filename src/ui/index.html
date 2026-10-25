@@ -208,11 +208,13 @@ function render() {
     section.classList.toggle("closed");
     if (section.classList.contains("closed")) state.open.delete(section.id); else state.open.add(section.id);
     if (section.id === "map" && !section.classList.contains("closed")) mapDraw();
+    if (section.id === "utilization" && !section.classList.contains("closed")) discoveryDraw();
   }));
   propertiesWire();
   searchWire();
   mapDraw();
   findingsLoad();
+  discoveryDraw();
   logsWire();
 }
 
@@ -255,7 +257,25 @@ function utilizationBody() {
     ["Virtual per wall", wall ? (vtime / wall).toFixed(2) + "×" : "–"],
     ["Exact stops", run.summary ? `largest skid ${run.summary.skid_max} branches, ${run.summary.overshoots} overshoots` : "–"],
   ];
-  return `<dl class="kv">${rows.map(([key, value]) => `<dt>${key}</dt><dd>${escape(value)}</dd>`).join("")}</dl>`;
+  return `<dl class="kv">${rows.map(([key, value]) => `<dt>${key}</dt><dd>${escape(value)}</dd>`).join("")}</dl>
+    <div class="group-title">New behavior discovery</div><div id="discovery" class="muted">Loading…</div>
+    <div class="muted" style="max-width:720px">Distinct behaviors seen as branches accumulate. A curve still climbing says: run longer.
+      One flat for long says: these tests found what they can; strengthen them (more drivers, assertions, faults) to find more.</div>`;
+}
+async function discoveryDraw() {
+  const box = $("#discovery");
+  if (!box || $("#utilization").classList.contains("closed")) return;
+  let points;
+  try { points = (await apiJson(`/runs/${state.runId}/discovery`)).points; } catch { box.textContent = "No events recorded."; return; }
+  if (!points.length) { box.textContent = "No timelines yet."; return; }
+  const width = 520, height = 150, left = 40, bottom = 22;
+  const maxX = points[points.length - 1][0], maxY = Math.max(1, ...points.map((p) => p[1]));
+  const x = (v) => left + (width - left - 10) * v / maxX, y = (v) => height - bottom - (height - bottom - 10) * v / maxY;
+  const path = points.map(([b, n], i) => `${i ? "L" : "M"}${x(b).toFixed(1)},${y(n).toFixed(1)}`).join(" ");
+  box.innerHTML = `<svg width="${width}" height="${height}"><path d="${path}" fill="none" stroke="#8f7cf7" stroke-width="2"/>
+    <text x="${left - 6}" y="${y(maxY) + 4}" fill="#9a9eab" font-size="10" text-anchor="end">${maxY}</text>
+    <text x="${left - 6}" y="${y(0) + 4}" fill="#9a9eab" font-size="10" text-anchor="end">0</text>
+    <text x="${x(maxX)}" y="${height - 6}" fill="#9a9eab" font-size="10" text-anchor="end">${maxX} branches</text></svg>`;
 }
 
 // Properties: from the summary, or (while running) from the failing branches so far.
@@ -555,7 +575,11 @@ function logsBody() {
         <button class="primary" id="moment-run">Run at this moment</button></div>
       <div class="muted" style="margin-top:4px">Replays the branch exactly to this moment and runs the command in the guest (or a node, with det-nodes exec).
         Or branch from here: <span class="mono">explore … --from-branch ${logs.branch} --from-vtime-ms ${Math.floor(logs.vtime_ns / 1e6)}</span></div>
-      <pre class="output" id="moment-output" hidden></pre></div>`;
+      <pre class="output" id="moment-output" hidden></pre>
+      <div style="display:flex;gap:8px;margin-top:8px"><input id="extract-node" style="width:140px" placeholder="node">
+        <input id="extract-path" style="flex:1" placeholder="/path/in/the/node">
+        <button id="extract-run">Extract the file</button></div>
+      <div class="muted" id="extract-status"></div></div>`;
 }
 function logsWire() {
   const apply = $("#logs-apply");
@@ -563,6 +587,22 @@ function logsWire() {
   const filter = () => { state.logs.filter = $("#logs-filter").value.trim(); state.logs.events = null; logsLoad(); };
   apply.addEventListener("click", filter);
   $("#logs-filter").addEventListener("keydown", (event) => { if (event.key === "Enter") filter(); });
+  $("#extract-run").addEventListener("click", async () => {
+    const node = $("#extract-node").value.trim(), path = $("#extract-path").value.trim();
+    if (!node || !path) return;
+    $("#extract-status").textContent = "Replaying to the moment…";
+    const response = await fetch(`/runs/${state.runId}/extract`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ branch: state.logs.branch, at_vtime_ms: Math.floor(state.logs.vtime_ns / 1e6), node, path }),
+    });
+    if (!response.ok) { $("#extract-status").textContent = await response.text(); return; }
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = path.split("/").pop() || "file";
+    link.click();
+    $("#extract-status").textContent = `${blob.size} bytes, as they were at this moment.`;
+  });
   $("#moment-run").addEventListener("click", async () => {
     const output = $("#moment-output");
     output.hidden = false;

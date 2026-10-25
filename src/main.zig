@@ -21,6 +21,7 @@ const script = @import("script.zig");
 const tla = @import("tla.zig");
 const query = @import("query.zig");
 const causality = @import("causality.zig");
+const extract = @import("extract.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -40,6 +41,8 @@ const usage =
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
     \\       determinismo query   <events-dir> '<condition>' [temporal conditions] (see query.zig)
     \\       determinismo causality <options> --branch <n> --property '<message>' [--points <k>]
+    \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
+    \\                            --file <node>:<path> --to <local file>
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -185,6 +188,8 @@ fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8
     const rest = argv[2..];
     const result = if (eql(u8, name, "causality"))
         causality.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "extract"))
+        extract.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "query"))
         query.run(arena, io, rest)
     else if (eql(u8, name, "tla"))
@@ -1143,6 +1148,7 @@ test {
     _ = @import("guest_memory.zig");
     _ = @import("query.zig");
     _ = @import("causality.zig");
+    _ = @import("extract.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

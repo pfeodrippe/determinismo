@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
         if (nodes.pid_of(name) != null) sdk.always(true, node_exit_property, .{ .node = name });
     }
     kernel_check();
+    agent_wait();
     sdk.lifecycle("guest_done", .{ .status = status });
     reap_all();
     _ = linux.sync();
@@ -305,6 +306,20 @@ fn kernel_problem(text: []const u8) ?KernelProblem {
     }
     return null;
 }
+
+/// A command pushed at a moment may still run when the scenario ends: let it finish (each
+/// check sleeps 10ms of virtual time; idle time costs nothing).
+const agent_wait_checks_max = 60_000;
+
+fn agent_wait() void {
+    for (0..agent_wait_checks_max) |_| {
+        const result = linux.access(agent_busy_path, linux.F_OK);
+        if (linux.errno(result) != .SUCCESS) return;
+        nodes.sleep_ns(10 * std.time.ns_per_ms);
+    }
+}
+
+const agent_busy_path = "/run/det-agent-busy"; // agent.zig's busy_path.
 
 fn reap_all() void {
     while (true) {

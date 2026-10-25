@@ -358,6 +358,60 @@ fn events_parse(
     }
 }
 
+/// New behavior discovery (Antithesis's utilization chart): after each branch, in index order,
+/// how many distinct behaviors the exploration has seen. A behavior is an assertion with its
+/// outcome, an event with its categorical details (a code coverage edge or line included);
+/// not numbers, not what determinismo itself reports (commands, faults, lifecycle).
+pub fn discovery(arena: std.mem.Allocator, timelines: []const Timeline) ![]const [2]u64 {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    const points = try arena.alloc([2]u64, timelines.len);
+    for (timelines, points, 1..) |timeline, *point, count| {
+        for (timeline.events) |*event| {
+            const behavior = behavior_hash(event.value) orelse continue;
+            try seen.put(arena, behavior, {});
+        }
+        point.* = .{ count, seen.count() };
+    }
+    return points;
+}
+
+const runtime_events = [_][]const u8{
+    "composer_start", "composer_done", "command_start", "command_exit", "faults_phase",
+    "faults_start",   "faults_stop",   "fault",         "nodes_up",     "node_start",
+    "node_ready",     "node_kill",     "exec_start",    "exec_output",  "exec_done",
+};
+const behavior_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
+
+fn behavior_hash(value: std.json.Value) ?u64 {
+    if (value != .object) return null;
+    var hasher = std.hash.Wyhash.init(0x6265686176696f72);
+    if (value.object.get("assert")) |assertion| {
+        if (assertion != .object) return null;
+        for ([_][]const u8{ "type", "message", "condition" }) |key| {
+            hash_field(&hasher, assertion.object, key);
+        }
+        return hasher.final();
+    }
+    const name = value.object.get("event") orelse return null;
+    if (name != .string) return null;
+    for (runtime_events) |runtime| if (std.mem.eql(u8, name.string, runtime)) return null;
+    hasher.update(name.string);
+    if (value.object.get("details")) |details| {
+        if (details == .object) for (behavior_keys) |key| hash_field(&hasher, details.object, key);
+    }
+    return hasher.final();
+}
+
+fn hash_field(hasher: *std.hash.Wyhash, object: std.json.ObjectMap, key: []const u8) void {
+    const value = object.get(key) orelse return;
+    hasher.update(key);
+    switch (value) {
+        .string => |text| hasher.update(text),
+        .bool => |flag| hasher.update(if (flag) "true" else "false"),
+        else => {}, // Numbers and structures: not behaviors.
+    }
+}
+
 /// Whether every temporal condition holds for event `index` of the timeline.
 pub fn temporal_holds(temporals: []const Temporal, events: []const Event, index: usize) bool {
     const event = &events[index];
