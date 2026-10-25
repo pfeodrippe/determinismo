@@ -4,7 +4,8 @@
 //! service would. With DET_MUTANT set it answers in uppercase: a mutant the tests must catch.
 //! `det-selftest-node hog` instead touches memory until the kernel kills it (the node's memory
 //! limit makes that an OOM kill). With DET_WORKERS=<n> it also supervises n worker processes,
-//! replacing any that dies (what process_kill faults test).
+//! replacing any that dies (what process_kill faults test). `det-selftest-node custom-fault` is
+//! a custom fault: it draws a number and reports it, with where the node finds det-stop-faults.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -21,6 +22,12 @@ pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "hog")) return hog();
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
+    if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "custom-fault")) {
+        const stop_faults = init.environ_map.get("ANTITHESIS_STOP_FAULTS") orelse "";
+        const draw = sdk.random_below(1000);
+        sdk.event("custom_fault_ran", .{ .draw = draw, .stop_faults = stop_faults });
+        return;
+    }
     mutant = init.environ_map.get("DET_MUTANT") != null;
     if (init.environ_map.get("DET_WORKERS")) |text| {
         const workers = try std.fmt.parseInt(u32, text, 10);

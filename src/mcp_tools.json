@@ -83,6 +83,10 @@
         "until": {
           "type": "string",
           "description": "A condition: the moment is the first event matching it"
+        },
+        "rewind_ms": {
+          "type": "integer",
+          "description": "With until: the moment this many milliseconds of virtual time before the condition holds (Antithesis's rewind)"
         }
       },
       "required": [
@@ -184,6 +188,44 @@
       "required": [
         "events_dir",
         "condition"
+      ]
+    }
+  },
+  {
+    "name": "events",
+    "description": "Event sets over an exploration's events (its events_dir), as Antithesis's: a pipeline (JSON array) of operations, each an object with one key. filter/exclude take a condition (the query tool's syntax). with_last {name: condition} adds last_<name>, the nearest earlier event of the timeline matching. with_next {name: condition} (+ timeout seconds) gives, for each event, the nearest later matching event with last_event and with_next_type (or a 'timeout' event). union/intersect take a list of pipelines, difference one pipeline. narrow takes field paths. through takes a shell command that reads the set as JSON lines {branch,index,vtime_ns,event} and writes the new set the same way: map, flatmap and fold in any language. Example: [{\"filter\":\"event=request details.ok=false\"},{\"with_last\":{\"fault\":\"event=fault\"}},{\"filter\":\"last_fault.event.details.kind=partition\"}].",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "pipeline": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "branch": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Events to return (default 100)"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "events",
+            "count",
+            "branches"
+          ]
+        }
+      },
+      "required": [
+        "events_dir",
+        "pipeline"
       ]
     }
   },

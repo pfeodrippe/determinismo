@@ -7,6 +7,7 @@ timelines from a snapshot, inject faults, and replay any timeline exactly.
 Design: [ARCHITECTURE.md](ARCHITECTURE.md). Style: [docs/STYLE.md](docs/STYLE.md).
 Strategy plugins: [docs/PLUGINS.md](docs/PLUGINS.md). Agents: [docs/AGENTS.md](docs/AGENTS.md).
 Where we stand against Antithesis, feature by feature: [docs/ANTITHESIS.md](docs/ANTITHESIS.md).
+Databases, cloud services and other dependencies inside the machine: [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
 ## What works today
 
@@ -24,23 +25,31 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   the same faults (partitions between Kubernetes nodes included), replayed exactly.
 - **Tests as scenarios**: functions listing test commands (Antithesis's rules), assertions and
   steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK;
-  built-in properties (nodes do not exit unexpectedly, the guest finishes its scenario, the
-  kernel kills nothing for lack of memory and reports no warnings, BUGs or hung tasks).
+  Antithesis's default properties built in (nodes do not exit unexpectedly, no process crashes,
+  no OOM kills, kernel warnings, panics or uncaught exceptions, test commands start, finish and
+  exit 0, peak memory under 95%, logging under 200 MB per virtual hour, the fault injector
+  started), and virtual time per wall time.
 - **Exploration**: snapshot at `setup_complete`, copy-on-write branches on every CPU, shards across
   hosts, branching from any moment of a branch, strategy plugins in any language (decisions and
   events) and outer-loop control through MCP or HTTP.
-- **Faults as decisions**: pause, isolate, partition and restart nodes; delay, loss, duplication,
-  corruption, reordering and congestion per link direction; CPU throttling; process pauses and
-  kills (a crash for a supervisor or kubelet to recover from); clock skips.
+- **Faults as decisions**: pause, isolate, clog, partition (into groups too: stopped, slowed or
+  jammed) and restart nodes; delay, loss, duplication,
+  corruption, reordering and congestion per link direction; CPU throttling; process and thread
+  pauses; process kills (a crash for a supervisor or kubelet to recover from); clock skips, some
+  permanent; custom faults (your programs, run in a node at random times); quiet periods
+  requested from any node or command (`$DETERMINISMO_STOP_FAULTS <seconds>`, or the Antithesis
+  name `$ANTITHESIS_STOP_FAULTS`).
 - **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
   that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
   scripts that carry a failure's shape to new seeds and new builds.
 - **Debugging in the multiverse**: causality analysis (how likely the bug was at each moment
   of a failing timeline, from forked futures: where it jumps is where it was decided); stop a
-  branch at the first event matching a condition (`--until`); run a command in the guest or
+  branch at the first event matching a condition (`--until`), or some time before it
+  (`--rewind-ms`); run a command in the guest or
   inside a node at an exact moment;
   let the branch continue after a change (`--continue`), or explore futures of a changed system
-  (`--from-exec`), e.g. a function redefined through a service's REPL.
+  (`--from-exec`), e.g. a function redefined through a service's REPL; take a node's file out at
+  any moment (`determinismo extract`) or put one in (`determinismo inject`).
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
   event and decision) and code coverage (C and Zig edges, Python and JVM lines); `mutate` keeps
   timelines that reach something new and changes the decisions of the process that got there
@@ -49,7 +58,9 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 - **Searching the multiverse**: every branch's events, node and command output included, with
   `determinismo query` (HTTP, MCP too): conditions on any field, and Antithesis-style temporal
   ones, "failures preceded by a fault within 1s", "with no fault before", each match with the
-  moment to branch from.
+  moment to branch from; Antithesis's event sets with `determinismo events` (filter, with_last,
+  with_next with timeouts, union, intersect, difference, narrow, and any program as map or
+  fold).
 - **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
   mutation testing with mutant profiles.
 - **A web UI** (`determinismo serve`, then open it): runs live, properties with their failing

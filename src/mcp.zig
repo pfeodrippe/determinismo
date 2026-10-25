@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
+const event_sets = @import("event_sets.zig");
 
 pub const Options = struct {
     machine: []const []const u8,
@@ -36,6 +37,7 @@ const Arguments = struct {
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
     until: ?[]const u8 = null,
+    rewind_ms: ?u64 = null,
     property: ?[]const u8 = null,
     points: u32 = 8,
     futures: u32 = 16,
@@ -106,6 +108,14 @@ fn tool_call(
         const asked = try std.json.parseFromValueLeaky(query.Request, arena, value, options_json);
         return query.answer(arena, io, where.events_dir, asked);
     }
+    if (eql(u8, name, "events")) {
+        const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const Where = struct { events_dir: []const u8 };
+        const where = try std.json.parseFromValueLeaky(Where, arena, value, options_json);
+        const asked = try std.json.parseFromValueLeaky(event_sets.Request, arena, value,
+            options_json);
+        return event_sets.answer(arena, io, where.events_dir, asked);
+    }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
     });
@@ -132,6 +142,9 @@ fn tool_call(
             try argv.appendSlice(arena, &.{ "--at-vtime-ms", try number(arena, ms) });
         } else if (arguments.until) |condition| {
             try argv.appendSlice(arena, &.{ "--until", condition });
+            if (arguments.rewind_ms) |ms| {
+                try argv.appendSlice(arena, &.{ "--rewind-ms", try number(arena, ms) });
+            }
         }
         if (arguments.at_vtime_ms != null or arguments.until != null) {
             if (arguments.exec) |exec| try argv.appendSlice(arena, &.{ "--exec", exec });

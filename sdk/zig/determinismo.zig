@@ -184,9 +184,10 @@ fn emit_assertion(comptime kind: []const u8, assertion: Assertion, details: anyt
 }
 
 fn json_write(writer: *std.Io.Writer, value: anytype) void {
+    const start = writer.end;
     std.json.Stringify.value(value, .{}, writer) catch {
         // Details that don't fit are replaced: the assertion itself must never be lost.
-        writer.end = 0;
+        writer.end = start;
         writer.writeAll("\"<details too large>\"") catch unreachable;
     };
 }

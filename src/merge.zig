@@ -50,8 +50,17 @@ const Summary = struct {
     wall_ns: u64,
     skid_max: u64,
     overshoots: u64,
+    /// Virtual time simulated, and per wall time on one core (absent from older records).
+    vtime_ns: u64 = 0,
+    vtime_per_wall: f64 = 0,
     properties: []const Property,
 };
+
+/// The wall time on one core a summary's virtual time took.
+fn core_wall_ns(summary: *const Summary) f64 {
+    if (summary.vtime_per_wall <= 0) return 0;
+    return @as(f64, @floatFromInt(summary.vtime_ns)) / summary.vtime_per_wall;
+}
 
 const Line = struct { run: ?Run = null, branch: ?Branch = null, summary: ?Summary = null };
 
@@ -140,6 +149,12 @@ fn summary_add(
     total.wall_ns = @max(total.wall_ns, summary.wall_ns); // Shards run side by side.
     total.skid_max = @max(total.skid_max, summary.skid_max);
     total.overshoots += summary.overshoots;
+    const core_wall = core_wall_ns(total) + core_wall_ns(&summary);
+    total.vtime_ns += summary.vtime_ns;
+    total.vtime_per_wall = if (core_wall > 0)
+        @as(f64, @floatFromInt(total.vtime_ns)) / core_wall
+    else
+        0;
     for (summary.properties) |incoming| {
         const property = for (properties.items) |*known| {
             if (std.mem.eql(u8, known.message, incoming.message)) break known;
@@ -197,6 +212,11 @@ fn summary_print(total: *const Summary, run: Run) void {
         });
         if (property.example_branch) |branch| print("  (e.g. --branch {d})", .{branch});
         print("\n", .{});
+    }
+    if (total.vtime_per_wall > 0) {
+        print("[determinismo] virtual time per wall time: {d:.2} (one core)\n", .{
+            total.vtime_per_wall,
+        });
     }
     if (total.branches < run.branches) {
         print("[determinismo] {d} branches missing: was every shard merged?\n", .{

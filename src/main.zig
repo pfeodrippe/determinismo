@@ -22,6 +22,7 @@ const tla = @import("tla.zig");
 const query = @import("query.zig");
 const causality = @import("causality.zig");
 const extract = @import("extract.zig");
+const event_sets = @import("event_sets.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
@@ -31,7 +32,8 @@ const usage =
     \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
-    \\                            [--at-vtime-ms <ms> | --until '<condition>'] [--exec "<cmd>"]
+    \\                            [--at-vtime-ms <ms> | --until '<condition>' [--rewind-ms <ms>]]
+    \\                            [--exec "<cmd>" | --exec-script <file>]
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
@@ -40,9 +42,13 @@ const usage =
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
     \\       determinismo query   <events-dir> '<condition>' [temporal conditions] (see query.zig)
+    \\       determinismo events  <events-dir> '<pipeline>' (event sets, see event_sets.zig)
     \\       determinismo causality <options> --branch <n> --property '<message>' [--points <k>]
     \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --to <local file>
+    \\       determinismo inject  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
+    \\                            --file <node>:<path> --from <local file> [--mode <octal>]
+    \\                            [--then '<command>'] [--continue]
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
     \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
@@ -115,7 +121,11 @@ const Arguments = struct {
     jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
     moment_vtime_ms: ?u64 = null,
+    /// With --until: the moment this long (virtual time) before the condition first holds.
+    rewind_ms: ?u64 = null,
     moment_command: ?[]const u8 = null,
+    /// Commands for the moment, one per line, run one after the other (instead of --exec).
+    moment_script_path: ?[]const u8 = null,
     /// Read-only disk images, in guest order (/dev/vda first).
     disk_paths: [VM.disks_max][]const u8 = undefined,
     disk_count: u32 = 0,
@@ -190,8 +200,12 @@ fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8
         causality.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "extract"))
         extract.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "inject"))
+        extract.inject_run(arena, io, argv[0], rest)
     else if (eql(u8, name, "query"))
         query.run(arena, io, rest)
+    else if (eql(u8, name, "events"))
+        event_sets.run(arena, io, rest)
     else if (eql(u8, name, "tla"))
         tla.check(arena, io, rest)
     else
@@ -217,6 +231,10 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const has_system = arguments.program_path != null or arguments.compose_path != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
+    if (arguments.moment_script_path) |path| {
+        const lines = try cwd.readFileAlloc(init.io, path, arena, .unlimited);
+        arguments.moment_command = try commands_join(arena, lines);
+    }
     const kernel = try cwd.readFileAlloc(init.io, arguments.kernel_path, arena, .unlimited);
     const initrd = if (arguments.initrd_path) |path|
         try cwd.readFileAlloc(init.io, path, arena, .unlimited)
@@ -797,6 +815,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.moment_command = branches.arguments.moment_command;
         options.moment_continue = branches.arguments.moment_continue;
         options.until = branches.arguments.until;
+        if (branches.arguments.rewind_ms) |ms| {
+            try rewind(vm, options, branches.snapshot, exploration, ms * std.time.ns_per_ms);
+        }
         try vm.init_from_snapshot(options, branches.snapshot);
         defer vm.deinit();
         if (branches.arguments.events_directory) |directory| {
@@ -825,12 +846,46 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .seed = options.seed,
             .outcome = outcome,
             .wall_ns = monotonic_ns() - time_start_ns,
+            .start_tsc = branches.snapshot.tsc,
         });
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };
             if (try strategy_branch_end(strategy, vm, end)) break;
         }
     }
+}
+
+/// Antithesis's rewind: runs the branch to the first event matching --until, then moves the
+/// moment `ns` of virtual time before it. Decisions come from the seed (or the replayed tape), so
+/// the rerun reaches the earlier moment on the same path.
+fn rewind(
+    vm: *VM,
+    options: *VM.Options,
+    snapshot: *const Snapshot,
+    exploration: *const Exploration,
+    ns: u64,
+) !void {
+    assert(options.until != null);
+    assert(exploration.strategy == null);
+    var probe = options.*;
+    probe.moment_command = null;
+    probe.moment_continue = false;
+    try vm.init_from_snapshot(&probe, snapshot);
+    defer vm.deinit();
+    if (exploration.replay) |replay| vm.overrides = replay.overrides;
+    const outcome = try vm.run_until_exit();
+    if (outcome != .moment_reached) {
+        std.debug.print("[determinismo] rewind: the condition never holds in this branch\n", .{});
+        return;
+    }
+    const at = (try vm.moment()).vtime_ns;
+    const target = at -| ns;
+    try moment_after_snapshot(snapshot, target);
+    std.debug.print("[determinismo] rewind: the condition holds at {d}ns; the moment is {d}ns\n", .{
+        at, target,
+    });
+    options.until = null;
+    options.moment_vtime_ns = target;
 }
 
 fn events_file(arena: std.mem.Allocator, directory: []const u8, name: []const u8) !linux.fd_t {
@@ -958,8 +1013,14 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.command == .explore) arguments.deterministic = true;
     // A command runs at a moment: a virtual time, or the first event matching --until.
     const moment = arguments.moment_vtime_ms != null or arguments.until != null;
-    if (arguments.moment_command != null and !moment) return error.Usage;
+    const commands = arguments.moment_command != null or arguments.moment_script_path != null;
+    if (commands and !moment) return error.Usage;
+    if (arguments.moment_command != null and arguments.moment_script_path != null) {
+        return error.Usage;
+    }
     if (arguments.moment_vtime_ms != null and arguments.until != null) return error.Usage;
+    if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
+    if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
     if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
@@ -1046,8 +1107,12 @@ fn parse_option(
         arguments.tape_path = value;
     } else if (eql(u8, flag, "--at-vtime-ms")) {
         arguments.moment_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--rewind-ms")) {
+        arguments.rewind_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec")) {
         arguments.moment_command = value;
+    } else if (eql(u8, flag, "--exec-script")) {
+        arguments.moment_script_path = value;
     } else if (eql(u8, flag, "--until")) {
         const condition = try arena.create(query.Condition);
         condition.* = try query.parse(arena, value);
@@ -1107,6 +1172,20 @@ fn scenario_of(cmdline: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A script's non-empty lines as one moment command: separated by NUL bytes, which the VMM runs
+/// one after the other.
+fn commands_join(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var joined: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOfScalar(u8, line, 0) != null) return error.BadScript;
+        if (joined.items.len > 0) try joined.append(arena, 0);
+        try joined.appendSlice(arena, line);
+    }
+    if (joined.items.len == 0) return error.BadScript;
+    return joined.items;
+}
+
 fn open_for_writing(arena: std.mem.Allocator, path: []const u8) !linux.fd_t {
     assert(path.len > 0);
     const path_z = try arena.dupeSentinel(u8, path, 0);
@@ -1149,6 +1228,7 @@ test {
     _ = @import("query.zig");
     _ = @import("causality.zig");
     _ = @import("extract.zig");
+    _ = @import("event_sets.zig");
     _ = @import("compose.zig");
     _ = @import("yaml.zig");
 }

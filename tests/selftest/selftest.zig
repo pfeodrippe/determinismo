@@ -10,6 +10,9 @@
 //!              built-in property "the kernel kills no process for lack of memory" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report
 //!              what they observe as events: any nondeterminism changes the event hash
+//!   quiet      (profile "workers") a driver asks for a 2 second quiet period from inside the
+//!              echo node (det-stop-faults, as Antithesis's ANTITHESIS_STOP_FAULTS): no fault
+//!              but clock skips may start during it
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -46,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
             .oom = oom,
             .crash = crash,
             .stress = stress,
+            .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
             .maze = maze,
         },
@@ -78,6 +82,7 @@ fn describe(d: *System.Describe) !void {
     const workers = try d.profile("workers");
     var kills = quiet;
     kills.process_kill = true;
+    kills.custom = &.{"/bin/det-selftest-node custom-fault"};
     workers.node(.echo, .{
         .binary = "zig-out/bin/det-selftest-node",
         .env = &.{"DET_WORKERS=3"},
@@ -118,6 +123,21 @@ fn steady(s: *System.Scenario) void {
     s.first("entropy", entropy);
     s.parallel_driver("ping", ping);
     s.finally("ping_after", ping);
+}
+
+fn quiet_scenario(s: *System.Scenario) void {
+    s.singleton_driver("quiet_period", quiet_period);
+}
+
+/// Faults for a while, a quiet period requested from inside the node, then past its end.
+fn quiet_period(context: *System.Context) !void {
+    const node = context.nodes.echo orelse return error.NoEchoNode;
+    const second = linux.timespec{ .sec = 1, .nsec = 0 };
+    _ = linux.nanosleep(&second, null);
+    sdk.event("quiet_request", .{ .seconds = 2 });
+    _ = try node.exec(&.{ "/opt/determinismo/bin/det-stop-faults", "2" });
+    const after = linux.timespec{ .sec = 3, .nsec = 0 };
+    _ = linux.nanosleep(&after, null);
 }
 
 fn node_exit(s: *System.Scenario) void {

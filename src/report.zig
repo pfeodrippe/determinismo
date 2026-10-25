@@ -137,8 +137,19 @@ pub const Multiverse = struct {
     /// Exactness of the stops at branch-count targets, over all branches.
     skid_max: u64 = 0,
     overshoots: u64 = 0,
+    /// Virtual time the branches simulated (from their snapshot on), and the wall time they
+    /// took, each on one core: Antithesis's "virtual time per wall time".
+    vtime_ns: u64 = 0,
+    wall_ns: u64 = 0,
 
-    pub const Branch = struct { index: u32, seed: u64, outcome: VM.Outcome, wall_ns: u64 };
+    pub const Branch = struct {
+        index: u32,
+        seed: u64,
+        outcome: VM.Outcome,
+        wall_ns: u64,
+        /// Where the branch started: its snapshot's virtual TSC.
+        start_tsc: u64,
+    };
 
     const Aggregate = struct {
         property: Events.Property, // Identity (kind, message) of the first branch that hit it.
@@ -177,6 +188,8 @@ pub const Multiverse = struct {
         const state = try vm.det_state();
         multiverse.skid_max = @max(multiverse.skid_max, state.skid_max);
         multiverse.overshoots += state.overshoots;
+        multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
+        multiverse.wall_ns += branch.wall_ns;
         // One write per line: parallel workers share the terminal.
         var line_buffer: [4096]u8 = undefined;
         var line: std.Io.Writer = .fixed(&line_buffer);
@@ -247,6 +260,8 @@ pub const Multiverse = struct {
         multiverse.failing_branches += other.failing_branches;
         multiverse.skid_max = @max(multiverse.skid_max, other.skid_max);
         multiverse.overshoots += other.overshoots;
+        multiverse.vtime_ns += other.vtime_ns;
+        multiverse.wall_ns += other.wall_ns;
         for (other.aggregates[0..other.aggregate_count]) |*incoming| {
             const aggregate = try multiverse.aggregate_find(&incoming.property);
             aggregate.branches_hit += incoming.branches_hit;
@@ -283,8 +298,18 @@ pub const Multiverse = struct {
         print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots\n", .{
             multiverse.skid_max, multiverse.overshoots,
         });
+        print("[determinismo] virtual time per wall time: {d:.2} (one core; {d:.3}s virtual " ++
+            "in {d:.3}s)\n", .{
+            multiverse.vtime_per_wall(), seconds(multiverse.vtime_ns), seconds(multiverse.wall_ns),
+        });
         overshoot_warn(multiverse.overshoots);
         multiverse.record_summary(wall_ns);
+    }
+
+    fn vtime_per_wall(multiverse: *const Multiverse) f64 {
+        if (multiverse.wall_ns == 0) return 0;
+        const vtime: f64 = @floatFromInt(multiverse.vtime_ns);
+        return vtime / @as(f64, @floatFromInt(multiverse.wall_ns));
     }
 
     fn record_summary(multiverse: *const Multiverse, wall_ns: u64) void {
@@ -316,6 +341,8 @@ pub const Multiverse = struct {
             .wall_ns = wall_ns,
             .skid_max = multiverse.skid_max,
             .overshoots = multiverse.overshoots,
+            .vtime_ns = multiverse.vtime_ns,
+            .vtime_per_wall = multiverse.vtime_per_wall(),
             .properties = lines[0..multiverse.aggregate_count],
         } });
     }

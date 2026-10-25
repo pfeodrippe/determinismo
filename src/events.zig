@@ -56,6 +56,10 @@ parse_buffer: []u8,
 /// The `event` name of the most recent structured event (`{"event": name, ...}`), if any.
 last_event_name: [32]u8 = undefined,
 last_event_name_size: u8 = 0,
+/// Output the nodes and commands printed, and since when (the first event seen): the logging
+/// rate the "logging output" property checks.
+output_bytes: u64 = 0,
+first_vtime_ns: ?u64 = null,
 
 const Events = @This();
 
@@ -71,17 +75,18 @@ pub fn init(events: *Events, parse_buffer: []u8, options: InitOptions) void {
 pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     assert(data.len <= 4096);
     events.count += 1;
+    if (events.first_vtime_ns == null) events.first_vtime_ns = moment.vtime_ns;
     events.hash.update(std.mem.asBytes(&moment));
     events.hash.update(data);
     if (events.log_fd) |fd| {
         write_log_line(fd, .{ .sequence = events.count, .moment = moment, .data = data });
     }
 
+    events.last_event_name_size = 0;
     var fba = std.heap.FixedBufferAllocator.init(events.parse_buffer);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), data, .{}) catch {
         return; // Not JSON: kept in the log, but carries no properties.
     };
-    events.last_event_name_size = 0;
     if (parsed != .object) return;
     if (parsed.object.get("event")) |name| {
         if (name == .string) {
@@ -118,6 +123,7 @@ const language_signs = [_]struct { prefix: []const u8, property: []const u8 }{
 fn on_output(events: *Events, moment: Moment, output: std.json.Value) !void {
     if (output != .object) return;
     const text = string_field(output.object, "text") orelse return;
+    events.output_bytes += text.len;
     for (language_signs) |sign| {
         if (!std.mem.startsWith(u8, text, sign.prefix)) continue;
         // Rust's panic line: "thread 'main' panicked at src/main.rs:4:5:".
@@ -233,9 +239,26 @@ pub fn finish(events: *Events, moment: Moment, outcome: enum { ended, cut_short 
         "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ finish_property ++
             "\",\"condition\":false,\"details\":{}}}";
     try events.emit(moment, assertion);
+    try events.emit(moment, if (events.logging_limited(moment))
+        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ logging_property ++
+            "\",\"condition\":true,\"details\":{}}}"
+    else
+        "{\"assert\":{\"type\":\"always\",\"message\":\"" ++ logging_property ++
+            "\",\"condition\":false,\"details\":{}}}");
 }
 
 const finish_property = "the guest finishes its scenario (no panic, hang or crash)";
+/// Antithesis's "Logging output was limited": 200 MB per core-hour (one vCPU: virtual hours).
+const logging_property = "logging output stays under 200 MB per hour of virtual time";
+const logging_bytes_per_hour_max = 200 * 1000 * 1000;
+
+fn logging_limited(events: *const Events, moment: Moment) bool {
+    const start_ns = events.first_vtime_ns orelse return true;
+    const span_ns = moment.vtime_ns -| start_ns;
+    if (span_ns < std.time.ns_per_s) return true; // Too short to judge a rate.
+    const limit: u128 = @as(u128, logging_bytes_per_hour_max) * span_ns;
+    return @as(u128, events.output_bytes) * std.time.ns_per_hour < limit;
+}
 
 pub fn last_event_is(events: *const Events, name: []const u8) bool {
     assert(name.len > 0);

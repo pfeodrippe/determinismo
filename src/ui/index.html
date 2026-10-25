@@ -254,7 +254,8 @@ function utilizationBody() {
     ["Branches", `${run.branches.length} of ${(run.run || {}).branches || "?"}`],
     ["Virtual time", seconds(vtime)],
     ["Wall time", seconds(wall)],
-    ["Virtual per wall", wall ? (vtime / wall).toFixed(2) + "×" : "–"],
+    ["Virtual per wall (one core)", run.summary && run.summary.vtime_per_wall
+      ? run.summary.vtime_per_wall.toFixed(2) + "×" : "–"],
     ["Exact stops", run.summary ? `largest skid ${run.summary.skid_max} branches, ${run.summary.overshoots} overshoots` : "–"],
   ];
   return `<dl class="kv">${rows.map(([key, value]) => `<dt>${key}</dt><dd>${escape(value)}</dd>`).join("")}</dl>
@@ -572,6 +573,7 @@ function logsBody() {
     ${logs.error ? `<div class="fail-text">${escape(logs.error)}</div>` : ""}
     <div style="margin-top:12px"><div class="group-title">At this moment (branch ${logs.branch}, ${seconds(logs.vtime_ns)})</div>
       <div style="display:flex;gap:8px"><input id="moment-command" style="flex:1" placeholder="A command to run there, e.g. det-nodes exec redis redis-cli get balance:0">
+        <label class="muted" style="display:flex;align-items:center;gap:4px">rewind <input id="moment-rewind" type="number" min="0" value="0" style="width:72px"> ms</label>
         <button class="primary" id="moment-run">Run at this moment</button></div>
       <div class="muted" style="margin-top:4px">Replays the branch exactly to this moment and runs the command in the guest (or a node, with det-nodes exec).
         Or branch from here: <span class="mono">explore … --from-branch ${logs.branch} --from-vtime-ms ${Math.floor(logs.vtime_ns / 1e6)}</span></div>
@@ -608,8 +610,9 @@ function logsWire() {
     output.hidden = false;
     output.textContent = "Replaying to the moment…";
     try {
+      const rewind = Math.max(0, Number($("#moment-rewind").value) || 0);
       const text = await api(`/runs/${state.runId}/replay`, {
-        branch: state.logs.branch, at_vtime_ms: Math.floor(state.logs.vtime_ns / 1e6),
+        branch: state.logs.branch, at_vtime_ms: Math.max(0, Math.floor(state.logs.vtime_ns / 1e6) - rewind),
         exec: $("#moment-command").value || undefined,
       });
       output.textContent = momentOutput(text);

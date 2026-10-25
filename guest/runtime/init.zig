@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
         if (nodes.pid_of(name) != null) sdk.always(true, node_exit_property, .{ .node = name });
     }
     kernel_check();
+    memory_check();
     agent_wait();
     sdk.lifecycle("guest_done", .{ .status = status });
     reap_all();
@@ -170,7 +171,12 @@ fn disk_mount() bool {
 }
 
 fn read_cmdline(buffer: []u8) []const u8 {
-    const fd = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    return read_text("/proc/cmdline", buffer);
+}
+
+/// A small file's text (what fits in `buffer`), trimmed; empty if it cannot be read.
+fn read_text(path: [*:0]const u8, buffer: []u8) []const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return "";
     defer _ = linux.close(@intCast(fd));
     const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
@@ -227,7 +233,9 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
     for (node_names) |name| {
         if (nodes.pid_recorded(name) != pid) continue;
         const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
-        sdk.always(false, node_exit_property, .{ .node = name, .status = code });
+        // As Antithesis's "no unexpected container exits": 0, SIGKILL and SIGTERM are expected.
+        const expected = code == 0 or code == 128 + 9 or code == 128 + 15;
+        sdk.always(expected, node_exit_property, .{ .node = name, .status = code });
         return;
     }
 }
@@ -310,6 +318,37 @@ fn kernel_problem(text: []const u8) ?KernelProblem {
 /// A command pushed at a moment may still run when the scenario ends: let it finish (each
 /// check sleeps 10ms of virtual time; idle time costs nothing).
 const agent_wait_checks_max = 60_000;
+
+/// Built-in property, as Antithesis's "peak memory usage": the nodes' memory (their cgroups'
+/// peak: processes, page cache, tmpfs) stays under 95% of the machine's.
+const memory_property = "peak memory usage stays under 95% of the machine's memory";
+
+fn memory_check() void {
+    var peak_buffer: [32]u8 = undefined;
+    const peak_text = read_text("/sys/fs/cgroup/nodes/memory.peak", &peak_buffer);
+    const peak = std.fmt.parseInt(u64, peak_text, 10) catch return; // No nodes.
+    var meminfo_buffer: [256]u8 = undefined;
+    const meminfo = read_text("/proc/meminfo", &meminfo_buffer);
+    const total = meminfo_total(meminfo) orelse return;
+    const details = .{ .peak_mib = peak >> 20, .total_mib = total >> 20 };
+    sdk.always(peak * 100 < total * 95, memory_property, details);
+}
+
+/// MemTotal from /proc/meminfo's first line, in bytes.
+fn meminfo_total(meminfo: []const u8) ?u64 {
+    const prefix = "MemTotal:";
+    if (!std.mem.startsWith(u8, meminfo, prefix)) return null;
+    const line_end = std.mem.indexOfScalar(u8, meminfo, '\n') orelse meminfo.len;
+    var words = std.mem.tokenizeScalar(u8, meminfo[prefix.len..line_end], ' ');
+    const kib = std.fmt.parseInt(u64, words.next() orelse return null, 10) catch return null;
+    return kib * 1024;
+}
+
+test meminfo_total {
+    const meminfo = "MemTotal:        2014532 kB\nMemFree:  1 kB\n";
+    try std.testing.expectEqual(@as(?u64, 2014532 * 1024), meminfo_total(meminfo));
+    try std.testing.expectEqual(@as(?u64, null), meminfo_total("MemFree: 1 kB\n"));
+}
 
 fn agent_wait() void {
     for (0..agent_wait_checks_max) |_| {

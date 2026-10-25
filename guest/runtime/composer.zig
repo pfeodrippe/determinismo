@@ -122,6 +122,7 @@ const Composer = struct {
         assert(composer.faults_pid == null);
         if (!composer.faults) return;
         composer.faults_pid = spawn(&.{ faults_path, "--scenario", composer.scenario });
+        sdk.reachable(faults_property, .{});
     }
 
     fn faults_stop(composer: *Composer) void {
@@ -361,6 +362,8 @@ fn run_ending(composer: *Composer) void {
 const environment = [_:null]?[*:0]const u8{
     "PATH=/opt/determinismo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME=/root",
+    "DETERMINISMO_STOP_FAULTS=" ++ nodes.stop_faults_path,
+    "ANTITHESIS_STOP_FAULTS=" ++ nodes.stop_faults_path,
 };
 
 const spawn_arguments_max = 4;
@@ -406,7 +409,11 @@ const commands_log = "/run/det/commands.log";
 
 /// Built-in properties, as Antithesis's test composer has: every command is started, and runs
 /// to completion, in some timeline.
+/// Antithesis's "The Antithesis Fault Injector was started", for scenarios with faults.
+const faults_property = "the fault injector started";
+
 fn commands_declare(composer: *const Composer) void {
+    if (composer.faults) sdk.declare("reachable", faults_property);
     for (composer.commands[0..composer.command_count]) |*command| {
         var buffer: [256]u8 = undefined;
         sdk.declare("reachable", command_property(&buffer, "started", command.name));

@@ -54,6 +54,12 @@ until_hit: bool,
 moment_printing: bool,
 /// What the guest agent receives on its next action request.
 action_pending: ?[]const u8,
+/// The moment's commands after the one running: a moment command can be several, separated by
+/// NUL bytes (which no argument can contain), run one after the other (`--exec-script`).
+moment_commands_rest: []const u8,
+/// The event count at the last exec_done handled: later doorbells (with no event) keep exec_done
+/// as the last event, and must not finish the next command.
+exec_done_handled: u64,
 /// Whether the armed branch-count target is the moment (true) or the PIT deadline (false).
 target_is_moment: bool,
 deterministic: bool,
@@ -232,6 +238,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .until_hit = false,
         .moment_printing = false,
         .action_pending = null,
+        .moment_commands_rest = "",
+        .exec_done_handled = 0,
         .target_is_moment = false,
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
@@ -516,11 +524,21 @@ fn moment_arrive(vm: *VM) !?Outcome {
     std.debug.print("[determinismo] at moment vtime={d}ns branches={d}\n", .{
         moment_now.vtime_ns, moment_now.branches,
     });
-    const command = vm.moment_command orelse return .moment_reached;
+    const commands = vm.moment_command orelse return .moment_reached;
     vm.moment_printing = true;
-    vm.action_pending = command;
-    try vm.irq_pulse(irq_action);
+    vm.moment_commands_rest = commands;
+    try vm.moment_command_next();
     return null;
+}
+
+/// Pushes the next of the moment's commands to the guest agent.
+fn moment_command_next(vm: *VM) !void {
+    assert(vm.moment_commands_rest.len > 0);
+    const rest = vm.moment_commands_rest;
+    const end = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    vm.action_pending = rest[0..end];
+    vm.moment_commands_rest = if (end == rest.len) "" else rest[end + 1 ..];
+    try vm.irq_pulse(irq_action);
 }
 
 /// Arms (or with 0 cancels, together with any soft deadline) the exact branch-count stop.
@@ -662,7 +680,12 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
             if (vm.until_hit and !vm.moment_reached) {
                 if (try vm.moment_arrive()) |outcome| return outcome;
             }
-            if (vm.events.last_event_is("exec_done")) {
+            const command_finished = vm.events.last_event_is("exec_done") and
+                vm.events.count != vm.exec_done_handled;
+            if (command_finished) vm.exec_done_handled = vm.events.count;
+            if (command_finished and vm.moment_commands_rest.len > 0) {
+                try vm.moment_command_next();
+            } else if (command_finished) {
                 if (vm.moment_reached and vm.moment_command != null) {
                     vm.moment_printing = false;
                     if (!vm.moment_continue) return .command_done;
@@ -695,7 +718,7 @@ fn io_in(vm: *VM, port: u16, bytes: []u8) !void {
     }
 }
 
-fn moment(vm: *VM) !Events.Moment {
+pub fn moment(vm: *VM) !Events.Moment {
     if (!vm.deterministic) return .{ .vtime_ns = 0, .branches = 0 };
     const state = try vm.det_state();
     return .{

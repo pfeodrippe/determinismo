@@ -25,6 +25,14 @@ const system_size_max = 1 << 20;
 const path_size_max = 256;
 const arguments_max = 64;
 const environment_max = 128;
+/// The quiet-period command (det-stop-faults), at the same path in the runner and every node,
+/// whose /opt/determinismo is the runner's, read-only. Its environment variables name it, as
+/// Antithesis's ANTITHESIS_STOP_FAULTS does (scripts written for Antithesis work unchanged).
+pub const stop_faults_path = "/opt/determinismo/bin/det-stop-faults";
+const platform_environment = [_][:0]const u8{
+    "DETERMINISMO_STOP_FAULTS=" ++ stop_faults_path,
+    "ANTITHESIS_STOP_FAULTS=" ++ stop_faults_path,
+};
 const poll_interval_ns = 10 * std.time.ns_per_ms;
 const ready_attempts_max = 6000; // 60 s of virtual time.
 const stop_attempts_max = 3000;
@@ -613,15 +621,19 @@ const Launch = struct {
 
     fn init(arena: std.mem.Allocator, node: *const schema.Resolved, paths: *const Paths) !Launch {
         if (node.command.len == 0 or node.command.len >= arguments_max) return error.BadCommand;
-        if (node.env.len >= environment_max) return error.TooManyEnvironmentEntries;
+        if (node.env.len + platform_environment.len >= environment_max) {
+            return error.TooManyEnvironmentEntries;
+        }
         const argv = try arena.allocSentinel(?[*:0]const u8, node.command.len, null);
         for (node.command, argv) |argument, *slot| slot.* = try arena.dupeSentinel(u8, argument, 0);
-        const envp = try arena.allocSentinel(?[*:0]const u8, node.env.len, null);
+        const envp_count = node.env.len + platform_environment.len;
+        const envp = try arena.allocSentinel(?[*:0]const u8, envp_count, null);
         var path_value: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-        for (node.env, envp) |entry, *slot| {
+        for (node.env, envp[0..node.env.len]) |entry, *slot| {
             slot.* = try arena.dupeSentinel(u8, entry, 0);
             if (std.mem.startsWith(u8, entry, "PATH=")) path_value = entry["PATH=".len..];
         }
+        for (platform_environment, envp[node.env.len..]) |entry, *slot| slot.* = entry.ptr;
         const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
         return .{
             .root = paths.root,
@@ -688,6 +700,12 @@ const Launch = struct {
             const data: ?[*:0]const u8 = if (target.data) |d| d.ptr else null;
             try mount(target.fs, path, target.fs, target.flags, data);
         }
+        // The platform's binaries and the fault injector's control FIFO, read-only.
+        const platform = try print_z(&buffer, "{s}/opt/determinismo", .{launch.root});
+        try mkdir_all(platform);
+        try mount("/opt/determinismo", platform, null, linux.MS.BIND | linux.MS.REC, null);
+        const remount = linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY;
+        try mount(null, platform, null, remount, null);
         // What container runtimes add to /dev (bash process substitution needs /dev/fd).
         const links = [_]struct { path: []const u8, target: [:0]const u8 }{
             .{ .path = "dev/fd", .target = "/proc/self/fd" },

@@ -13,7 +13,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const runtime = [_][]const u8{ "det-init", "det-nodes", "det-composer", "det-faults", "det-agent" };
+const runtime = [_][]const u8{
+    "det-init", "det-nodes", "det-composer", "det-faults", "det-agent", "det-stop-faults",
+};
 const directories = [_][]const u8{
     "bin",                  "sbin",                     "etc", "proc", "sys", "dev",
     "run",                  "tmp",                      "det", "root", "opt", "opt/determinismo",

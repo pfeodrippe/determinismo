@@ -13,6 +13,8 @@ const sdk = @import("determinismo");
 const action_size_max = sdk.message_size_max;
 /// Output travels in events, which are JSON-escaped: keep chunks well under the event limit.
 const output_chunk_size = 1024;
+/// How much of a command its exec_start event shows.
+const command_shown_max = 512;
 const ioctl_wait_action = 0xde01;
 const actions_max = 1_000_000;
 const output_chunks_max = 1 << 20;
@@ -43,7 +45,9 @@ fn run(command: [:0]const u8) void {
     const busy = linux.open(busy_path, flags, 0o644);
     if (linux.errno(busy) == .SUCCESS) _ = linux.close(@intCast(busy));
     defer _ = linux.unlink(busy_path);
-    sdk.event("exec_start", .{ .command = command });
+    // Long commands (inject's base64 chunks) are cut: the event must fit in one message.
+    const shown = command[0..@min(command.len, command_shown_max)];
+    sdk.event("exec_start", .{ .command = shown, .size = command.len });
     var pipe: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) {
         sdk.event("exec_done", .{ .status = 126 });

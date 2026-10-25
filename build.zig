@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "det-composer", .path = "guest/runtime/composer.zig" },
         .{ .name = "det-faults", .path = "guest/runtime/faults.zig" },
         .{ .name = "det-agent", .path = "guest/runtime/agent.zig" },
+        .{ .name = "det-stop-faults", .path = "guest/runtime/stop_faults.zig" },
         .{ .name = "bank-test", .path = "examples/bank/bank_test.zig" },
         .{ .name = "shop-test", .path = "examples/shop/shop_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
@@ -148,6 +149,8 @@ pub fn build(b: *std.Build) void {
     const e2e_run = b.addRunArtifact(e2e);
     e2e_run.step.dependOn(b.getInstallStep());
     e2e_run.setCwd(b.path(".")); // Its defaults (zig-out/bin) and the examples' paths.
+    const e2e_only = b.option([]const u8, "only", "e2e: the checks whose names contain this");
+    if (e2e_only) |only| e2e_run.addArgs(&.{ "--only", only });
     b.step("e2e", "Boot real systems: exploration, exact replays, tapes (on the Linux host)")
         .dependOn(&e2e_run.step);
 

@@ -6,9 +6,9 @@
 //! branches replay from fresh boots with identical event hashes, tapes replay without their
 //! strategy, and a tape refuses to replay on different inputs.
 //!
-//! Usage: e2e [--bin <dir>] [--guest <dir>] [--cache <dir>]
+//! Usage: e2e [--bin <dir>] [--guest <dir>] [--cache <dir>] [--only <name>]
 //!   --bin    built programs (zig-out/bin)       --guest  vmlinuz and base.cpio ($HOME/guest)
-//!   --cache  determinismo's cache ($HOME/cache)
+//!   --cache  determinismo's cache ($HOME/cache) --only   the checks whose names contain <name>
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -34,13 +34,18 @@ pub fn main(init: std.process.Init) !void {
     var bin: []const u8 = "zig-out/bin";
     var guest: []const u8 = try std.fs.path.join(arena, &.{ home, "guest" });
     var cache: []const u8 = try std.fs.path.join(arena, &.{ home, "cache" });
+    var only: []const u8 = "";
     var index: usize = 1;
     while (index + 1 < arguments.len) : (index += 2) {
         const flag = arguments[index];
         const value = arguments[index + 1];
         if (std.mem.eql(u8, flag, "--bin")) bin = value else if (std.mem.eql(u8, flag, "--guest")) {
             guest = value;
-        } else if (std.mem.eql(u8, flag, "--cache")) cache = value else return error.Usage;
+        } else if (std.mem.eql(u8, flag, "--cache")) {
+            cache = value;
+        } else if (std.mem.eql(u8, flag, "--only")) {
+            only = value;
+        } else return error.Usage;
     }
     var context = Context{
         .arena = arena,
@@ -59,26 +64,12 @@ pub fn main(init: std.process.Init) !void {
     std.Io.Dir.cwd().deleteTree(init.io, context.scratch) catch {};
     try std.Io.Dir.cwd().createDirPath(init.io, context.scratch);
 
-    try check_example(&context, .{ .program = "bank-test", .scenario = "bank", .branches = 12 });
-    try check_example(&context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
-    try check_tapes(&context);
-    try check_python_strategy(&context);
-    try check_builtin_properties(&context);
-    try check_kernel_entropy(&context);
-    try check_query(&context);
-    try check_serve(&context);
-    try check_until_and_causality(&context);
-    try check_coverage(&context);
-    try check_parallel(&context);
-    try check_fork(&context);
-    try check_compose(&context);
-    try check_shards(&context);
-    try check_stress(&context);
-    try check_controller(&context);
-    try check_clojure(&context);
-    try check_k3s(&context);
-    try check_script(&context);
-    try check_tla(&context, try std.fs.path.join(arena, &.{ home, "opt", "tla", "tla2tools.jar" }));
+    const jar = try std.fs.path.join(arena, &.{ home, "opt", "tla", "tla2tools.jar" });
+    const ran = try checks_run(&context, only, jar);
+    if (ran == 0) {
+        std.debug.print("e2e: no check is named like '{s}'\n", .{only});
+        std.process.exit(2);
+    }
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -86,14 +77,51 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("e2e: all checks passed\n", .{});
 }
 
+/// Runs the checks whose names contain `only` (all when empty) and counts them.
+fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
+    const checks = .{
+        .{ "bank", check_bank },                     .{ "shop", check_shop },
+        .{ "tapes", check_tapes },                   .{ "python", check_python_strategy },
+        .{ "properties", check_builtin_properties }, .{ "entropy", check_kernel_entropy },
+        .{ "quiet", check_quiet_period },            .{ "query", check_query },
+        .{ "network", check_network_faults },        .{ "serve", check_serve },
+        .{ "until", check_until_and_causality },     .{ "coverage", check_coverage },
+        .{ "parallel", check_parallel },             .{ "fork", check_fork },
+        .{ "compose", check_compose },               .{ "shards", check_shards },
+        .{ "stress", check_stress },                 .{ "controller", check_controller },
+        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
+        .{ "script", check_script },
+    };
+    var ran: u32 = 0;
+    inline for (checks) |check| {
+        if (std.mem.indexOf(u8, check[0], only) != null) {
+            try check[1](context);
+            ran += 1;
+        }
+    }
+    if (std.mem.indexOf(u8, "tla", only) != null) {
+        try check_tla(context, jar);
+        ran += 1;
+    }
+    return ran;
+}
+
 const Example = struct { program: []const u8, scenario: []const u8, branches: u32 };
+
+fn check_bank(context: *Context) !void {
+    try check_example(context, .{ .program = "bank-test", .scenario = "bank", .branches = 12 });
+}
+
+fn check_shop(context: *Context) !void {
+    try check_example(context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
+}
 
 /// Explores, then replays the first failing branch (if any) and the first passing one alone.
 fn check_example(context: *Context, example: Example) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, example.program });
     const branches_text = try std.fmt.allocPrint(context.arena, "{d}", .{example.branches});
     const report = try explore(context, &.{
-        "--program", program, "--scenario", example.scenario, "--seed", "7",
+        "--program",  program,       "--scenario", example.scenario, "--seed", "7",
         "--branches", branches_text,
     });
     var branches: [branches_max]Branch = undefined;
@@ -110,7 +138,7 @@ fn check_example(context: *Context, example: Example) !void {
         } else continue;
         const index_text = try std.fmt.allocPrint(context.arena, "{d}", .{branch.index});
         const replay = try explore(context, &.{
-            "--program", program, "--scenario", example.scenario, "--seed", "7",
+            "--program", program,    "--scenario", example.scenario, "--seed", "7",
             "--branch",  index_text,
         });
         var replayed: [1]Branch = undefined;
@@ -134,7 +162,7 @@ fn check_tapes(context: *Context) !void {
     const strategy = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
     const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "tapes" });
     const report = try explore(context, &.{
-        "--program", program, "--scenario", "bank", "--seed", "11", "--branches", "4",
+        "--program",  program,  "--scenario", "bank", "--seed", "11", "--branches", "4",
         "--strategy", strategy, "--tape-dir", tapes,
     });
     var branches: [branches_max]Branch = undefined;
@@ -200,11 +228,11 @@ fn check_maze(context: *Context, maze: Maze, index: usize) !void {
     var arguments: std.ArrayList([]const u8) = .empty;
     try arguments.appendSlice(arena, maze.system);
     try arguments.appendSlice(arena, &.{
-        "--seed",       "1",
-        "--branches",   try std.fmt.allocPrint(arena, "{d}", .{maze.branches}),
-        "--jobs",       try std.fmt.allocPrint(arena, "{d}", .{maze.jobs}),
-        "--strategy",   strategy,
-        "--tape-dir",   tapes,
+        "--seed",     "1",
+        "--branches", try std.fmt.allocPrint(arena, "{d}", .{maze.branches}),
+        "--jobs",     try std.fmt.allocPrint(arena, "{d}", .{maze.jobs}),
+        "--strategy", strategy,
+        "--tape-dir", tapes,
     });
     const report = try explore(context, arguments.items);
     const branches = try arena.alloc(Branch, maze.branches); // One line per branch.
@@ -237,7 +265,7 @@ fn check_python_strategy(context: *Context) !void {
     const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "python-tapes" });
     const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
     const report = try explore(context, &(common ++ [_][]const u8{
-        "--branches", "12", "--jobs", "1", "--strategy", "python3 plugins/python/extremes.py",
+        "--branches", "12",  "--jobs", "1", "--strategy", "python3 plugins/python/extremes.py",
         "--tape-dir", tapes,
     }));
     var branches: [12]Branch = undefined;
@@ -246,8 +274,8 @@ fn check_python_strategy(context: *Context) !void {
     if (count == 0) return;
     // The bandit tries its rates in order: branch 1 overrides 5% of the decisions.
     const tape = try std.fs.path.join(context.arena, &.{ tapes, "branch-1.jsonl" });
-    const recorded = std.Io.Dir.cwd().readFileAlloc(context.io, tape, context.arena,
-        .limited(1 << 24)) catch "";
+    const cwd = std.Io.Dir.cwd();
+    const recorded = cwd.readFileAlloc(context.io, tape, context.arena, .limited(1 << 24)) catch "";
     const steered = std.mem.indexOf(u8, recorded, "\"pull\"") != null;
     expect(context, steered, "python strategy: it overrides decisions", .{});
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
@@ -294,7 +322,7 @@ fn check_query(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const events = try std.fs.path.join(context.arena, &.{ context.scratch, "query-events" });
     const report = try explore(context, &.{
-        "--program", program, "--scenario", "bank", "--seed", "3", "--branches", "16",
+        "--program",    program, "--scenario", "bank", "--seed", "3", "--branches", "16",
         "--events-dir", events,
     });
     const failing_report = std.mem.indexOf(u8, report, "with failing properties") != null;
@@ -307,6 +335,29 @@ fn check_query(context: *Context) !void {
     const found = failing_report and all > 0 and output > 0 and after_fault + no_fault == all;
     expect(context, found, "query: {d} violations ({d} after a fault, {d} without), {d} redis " ++
         "output lines", .{ all, after_fault, no_fault, output });
+    // Event sets: the same answers through a pipeline (with_last), and through a program.
+    const arena = context.arena;
+    const annotated = try std.fmt.allocPrint(arena, "[{{\"filter\": {f}}}, " ++
+        "{{\"with_last\": {{\"fault\": \"event=fault\"}}}}, {{\"filter\": \"last_fault?\"}}]", .{
+        std.json.fmt(violation, .{}),
+    });
+    const with_last = try events_count(context, &.{ events, annotated });
+    const piped = try std.fmt.allocPrint(arena, "[{{\"filter\": {f}}}, " ++
+        "{{\"through\": \"cat\"}}]", .{std.json.fmt(violation, .{})});
+    const through = try events_count(context, &.{ events, piped });
+    expect(context, with_last == after_fault and through == all, "event sets: with_last finds " ++
+        "{d} violations after a fault, a program passes {d} through", .{ with_last, through });
+}
+
+/// How many events `determinismo events` gives (its --count line).
+fn events_count(context: *Context, arguments: []const []const u8) !u64 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(context.arena, &.{ context.determinismo, "events" });
+    try argv.appendSlice(context.arena, arguments);
+    try argv.append(context.arena, "--count");
+    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const end = std.mem.indexOfScalar(u8, result.stdout, ' ') orelse return 0;
+    return std.fmt.parseInt(u64, result.stdout[0..end], 10) catch 0;
 }
 
 /// The HTTP API and its web UI: `serve` answers with the page, starts a run, records every
@@ -414,14 +465,41 @@ fn check_until_and_causality(context: *Context) !void {
     }
     expect(context, points == 4 and last == 1, "causality: {d} moments, certain at the " ++
         "failure ({d:.2})", .{ points, last });
+    try check_files(context, &system, violation);
+    try check_rewind(context, &system, violation);
+}
+
+/// Rewind: 5 ms of virtual time before the first violation, where it has not happened yet.
+fn check_rewind(context: *Context, system: []const []const u8, violation: []const u8) !void {
+    var extra: std.ArrayList([]const u8) = .empty;
+    try extra.appendSlice(context.arena, system);
+    try extra.appendSlice(context.arena, &.{
+        "--branch", "4", "--until", violation, "--rewind-ms", "5", "--exec", "echo rewound",
+    });
+    const report = try explore(context, extra.items);
+    const holds: u64 = @intFromFloat(number_after(report, "the condition holds at ") orelse 0);
+    const target: u64 = @intFromFloat(number_after(report, "; the moment is ") orelse 0);
+    const last = std.mem.lastIndexOf(u8, report, "at moment vtime=") orelse 0;
+    const reached: u64 = @intFromFloat(number_after(report[last..], "at moment vtime=") orelse 0);
+    const exact = holds > target and holds - target == 5 * std.time.ns_per_ms and
+        reached >= target and reached - target < std.time.ns_per_ms;
+    const ran = std.mem.indexOf(u8, report, "\"text\":\"rewound\\n\"") != null;
+    const before = std.mem.indexOf(u8, report, "failing=0") != null;
+    expect(context, exact and ran and before, "rewind: 5 ms before the violation " ++
+        "({d}ns, then {d}ns), not failing yet", .{ holds, reached });
+}
+
+/// extract_file and inject_file at the first violation of branch 4.
+fn check_files(context: *Context, system: []const []const u8, violation: []const u8) !void {
+    const arena = context.arena;
     // extract_file: a node's file at that moment, byte for byte (Redis's own config here).
     const extracted = try std.fs.path.join(arena, &.{ context.scratch, "extracted" });
     var extract_argv: std.ArrayList([]const u8) = .empty;
     try extract_argv.appendSlice(arena, &.{ context.determinismo, "extract" });
     try extract_argv.appendSlice(arena, context.machine);
-    try extract_argv.appendSlice(arena, &system);
+    try extract_argv.appendSlice(arena, system);
     try extract_argv.appendSlice(arena, &.{
-        "--branch", "4",              "--until", violation, "--file", "redis:/etc/hostname",
+        "--branch", "4",       "--until", violation, "--file", "redis:/etc/hostname",
         "--to",     extracted,
     });
     _ = try std.process.run(arena, context.io, .{ .argv = extract_argv.items });
@@ -429,6 +507,30 @@ fn check_until_and_causality(context: *Context) !void {
     const hostname = cwd.readFileAlloc(context.io, extracted, arena, .limited(64)) catch "";
     expect(context, std.mem.eql(u8, hostname, "redis\n"), "extract: a node's file at a moment " ++
         "({d} bytes)", .{hostname.len});
+    // inject_file: 10000 arbitrary bytes into the node at that moment (three moment commands
+    // of base64 and more), then a command there sees them, byte for byte.
+    var bytes: [10_000]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index *% 2654435761 >> 7);
+    const local = try std.fs.path.join(arena, &.{ context.scratch, "to-inject" });
+    try cwd.writeFile(context.io, .{ .sub_path = local, .data = &bytes });
+    var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+    std.crypto.hash.Md5.hash(&bytes, &digest, .{});
+    var inject_argv: std.ArrayList([]const u8) = .empty;
+    try inject_argv.appendSlice(arena, &.{ context.determinismo, "inject" });
+    try inject_argv.appendSlice(arena, context.machine);
+    try inject_argv.appendSlice(arena, system);
+    try inject_argv.appendSlice(arena, &.{
+        "--branch", "4", "--until", violation, "--file", "redis:/tmp/injected", "--from", local,
+    });
+    try inject_argv.appendSlice(arena, &.{
+        "--then", "md5sum /proc/$(cat /run/det/nodes/redis/pid)/root/tmp/injected",
+    });
+    const injected = try std.process.run(arena, context.io, .{ .argv = inject_argv.items });
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const seen = std.mem.indexOf(u8, injected.stderr, &hex) != null;
+    expect(context, seen, "inject: {d} bytes into a node at a moment, the same there", .{
+        bytes.len,
+    });
 }
 
 /// The lines of `text` containing any of `keys`, joined.
@@ -446,6 +548,47 @@ fn lines_with(arena: std.mem.Allocator, text: []const u8, keys: []const []const 
     return kept.items;
 }
 
+/// Antithesis's network faults: partitions into groups and clogs, with their disruption forms,
+/// recorded in full; a branch with one replays exactly.
+fn check_network_faults(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "shop-test" });
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "fault-events" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "prices", "--seed", "2" };
+    _ = try explore(context, &(system ++ [_][]const u8{
+        "--branches", "64", "--events-dir", events,
+    }));
+    const partition = "event=fault details.kind=partition_groups";
+    const groups = try query_count(context, &.{ events, partition });
+    const clogs = try query_count(context, &.{ events, "event=fault details.kind=clog" });
+    const threads = try query_count(context, &.{ events, "event=fault details.kind=thread_pause" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        context.determinismo, "query",  events, "event=fault details.kind=partition_groups",
+        "--branches",         "--json",
+    });
+    const found = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const First = struct { branch: u32 };
+    const line_end = std.mem.indexOfScalar(u8, found.stdout, '\n') orelse found.stdout.len;
+    const first = std.json.parseFromSliceLeaky(First, arena, found.stdout[0..line_end], .{
+        .ignore_unknown_fields = true,
+    }) catch null;
+    var same = false;
+    if (first) |branch_found| {
+        const index = try std.fmt.allocPrint(arena, "{d}", .{branch_found.branch});
+        var hashes: [2]Branch = undefined;
+        for (&hashes) |*hash| {
+            const report = try explore(context, &(system ++ [_][]const u8{ "--branch", index }));
+            var one: [1]Branch = undefined;
+            if (parse_branches(report, &one) == 1) hash.* = one[0];
+        }
+        same = std.mem.eql(u8, hashes[0].events_hash, hashes[1].events_hash);
+    }
+    const all = groups > 0 and clogs > 0 and threads > 0 and same;
+    expect(context, all, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses; a " ++
+        "branch with a partition replays exactly", .{ groups, clogs, threads });
+}
+
 /// How many events `determinismo query` finds (its --count line).
 fn query_count(context: *Context, arguments: []const []const u8) !u64 {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -455,6 +598,31 @@ fn query_count(context: *Context, arguments: []const []const u8) !u64 {
     const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
     const end = std.mem.indexOfScalar(u8, result.stdout, ' ') orelse return 0;
     return std.fmt.parseInt(u64, result.stdout[0..end], 10) catch 0;
+}
+
+/// Antithesis's pausing faults: a driver asks for a quiet period from inside a node, and no
+/// fault (but clock skips) starts during it, while faults happen before it.
+fn check_quiet_period(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "quiet-events" });
+    _ = try explore(context, &.{
+        "--program",  program, "--profile",    "workers", "--scenario", "quiet", "--seed", "1",
+        "--branches", "4",     "--events-dir", events,
+    });
+    const quiet = try query_count(context, &.{ events, "event=faults_quiet" });
+    // Custom faults ran in the node, which finds det-stop-faults in its environment.
+    const custom = try query_count(context, &.{
+        events, "event=custom_fault_ran details.stop_faults=/opt/determinismo/bin/det-stop-faults",
+    });
+    const faults = try query_count(context, &.{ events, "event=fault" });
+    const during = try query_count(context, &.{
+        events,               "event=fault details.kind!=clock_skip", "--preceded-by",
+        "event=faults_quiet", "--within",                             "1.9",
+    });
+    const counts = .{ quiet, faults, during, custom };
+    expect(context, quiet == 4 and faults > 0 and during == 0 and custom > 0, "quiet periods: " ++
+        "requested from a node in {d} of 4 timelines; {d} faults, {d} during them; {d} custom " ++
+        "faults", counts);
 }
 
 /// The guest kernel's random generator after the snapshot: different in every branch, the same
@@ -469,8 +637,13 @@ fn check_kernel_entropy(context: *Context) !void {
             "--program", program, "--scenario", "steady", "--seed", "1", "--branch", branch,
             "--events",  events,
         });
-        const log = std.Io.Dir.cwd().readFileAlloc(context.io, events, context.arena,
-            .limited(1 << 24)) catch "";
+        const cwd = std.Io.Dir.cwd();
+        const log = cwd.readFileAlloc(
+            context.io,
+            events,
+            context.arena,
+            .limited(1 << 24),
+        ) catch "";
         const key = "\"kernel_entropy\",\"details\":{\"value\":";
         const at = std.mem.indexOf(u8, log, key) orelse {
             value.* = "";
@@ -497,7 +670,7 @@ fn check_builtin_properties(context: *Context) !void {
     const passes = std.mem.indexOf(u8, steady, "2 branches, 0 with failing properties") != null;
     expect(context, passes, "built-in properties pass on a steady system", .{});
     const both = try explore(context, &.{
-        "--program", program, "--profile", "default,mutant", "--scenario", "steady",
+        "--program", program, "--profile",  "default,mutant", "--scenario", "steady",
         "--seed",    "1",     "--branches", "2",
     });
     const killed = std.mem.indexOf(u8, both, "PASS default") != null and
@@ -509,11 +682,11 @@ fn check_builtin_properties(context: *Context) !void {
     const caught = std.mem.indexOf(u8, crash, "FAIL \"nodes do not exit unexpectedly\"") != null;
     expect(context, caught, "built-in properties catch a node that exits", .{});
     const hog = try explore(context, &.{
-        "--program", program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
+        "--program",  program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
         "--branches", "1",
     });
     const workers = try explore(context, &.{
-        "--program", program, "--profile", "workers", "--scenario", "steady", "--seed", "1",
+        "--program",  program, "--profile", "workers", "--scenario", "steady", "--seed", "1",
         "--branches", "8",
     });
     const all_pass = "8 branches, 0 with failing properties";
@@ -564,8 +737,8 @@ fn check_tla(context: *Context, jar: []const u8) !void {
     _ = try explore(context, &(common ++ buggy));
     const fixed_events = try std.fs.path.join(context.arena, &.{ scratch, "tla-fixed.jsonl" });
     _ = try explore(context, &(common ++ [_][]const u8{
-        "--from-branch", "1",        "--from-vtime-ms", "3000",
-        "--from-exec",   "det-nodes exec bank /app/patch.sh", "--branch", "2",
+        "--from-branch", "1",                                 "--from-vtime-ms", "3000",
+        "--from-exec",   "det-nodes exec bank /app/patch.sh", "--branch",        "2",
         "--events",      fixed_events,
     }));
     var statuses: [2]u8 = undefined;
@@ -652,7 +825,7 @@ fn check_clojure(context: *Context) !void {
 fn check_controller(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const report = try explore(context, &.{
-        "--program", program, "--profile", "controller", "--scenario", "controller",
+        "--program", program, "--profile",  "controller", "--scenario", "controller",
         "--seed",    "2",     "--branches", "16",
     });
     const passes = std.mem.indexOf(u8, report, "16 branches, 0 with failing properties") != null;

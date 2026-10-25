@@ -102,6 +102,10 @@ pub const Faults = struct {
     /// Kill one of its processes other than its main one (SIGKILL), as a crash its supervisor
     /// must recover from (a worker, a pod's process under kubelet).
     process_kill: bool = false,
+    /// Commands in the node (an absolute path, then arguments, split at spaces: no shell) that
+    /// the fault injector runs at random times, as Antithesis's custom faults: calling an admin
+    /// API, forcing a compaction, a failover. They can draw from the SDK's randomness.
+    custom: []const []const u8 = &.{},
 };
 
 pub const Scenario = struct {

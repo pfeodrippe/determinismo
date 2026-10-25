@@ -15,7 +15,7 @@
 //!   GET  /runs               every run with its state
 //!   GET  /runs/<id>          its state and record (run, branches, summary)
 //!   GET  /runs/<id>/output   its output, as text
-//!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until?, exec?} -> its output, as text
+//!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec?} -> its output
 //!   POST /runs/<id>/causality {branch, property, points?, futures?} -> {id} (in the background)
 //!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
@@ -25,12 +25,15 @@
 //!   POST /runs/<id>/query    {condition, preceded_by?, followed_by?, not_preceded_by?,
 //!                             not_followed_by?, within?, branch?, up_to_vtime?, limit?,
 //!                             output?: events|count|branches} -> JSON lines (query.zig)
+//!   POST /runs/<id>/events   {pipeline, branch?, limit?, output?} -> JSON lines: an event set
+//!                             (event_sets.zig)
 //!
 //! One request at a time, with fixed buffers; runs proceed in the background meanwhile.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
+const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
 
 pub const Options = struct {
@@ -209,6 +212,16 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
         try out.writeAll(try query.answer(server.arena, server.io, events, asked));
         return 200;
     }
+    if (eql(u8, action, "events") and eql(u8, request.method, "POST")) {
+        const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const asked = try std.json.parseFromSliceLeaky(event_sets.Request, server.arena,
+            request.body, options_json);
+        const events = try std.fs.path.join(server.arena, &.{
+            try run_directory(server, run.id), "events",
+        });
+        try out.writeAll(try event_sets.answer(server.arena, server.io, events, asked));
+        return 200;
+    }
     return error.NotFound;
 }
 
@@ -316,6 +329,8 @@ const ReplayRequest = struct {
     at_vtime_ms: ?u64 = null,
     /// Or the moment is the first event matching this condition (query.zig).
     until: ?[]const u8 = null,
+    /// With until: this long (virtual time) before the condition holds.
+    rewind_ms: ?u64 = null,
     exec: ?[]const u8 = null,
 };
 
@@ -347,6 +362,10 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
         try argv.appendSlice(server.arena, &.{ "--at-vtime-ms", try print(server, "{d}", .{ms}) });
     } else if (asked.until) |condition| {
         try argv.appendSlice(server.arena, &.{ "--until", condition });
+        if (asked.rewind_ms) |ms| {
+            const text = try print(server, "{d}", .{ms});
+            try argv.appendSlice(server.arena, &.{ "--rewind-ms", text });
+        }
     }
     const moment = asked.at_vtime_ms != null or asked.until != null;
     if (asked.exec) |command| {
