@@ -20,13 +20,13 @@ change that moves it.
 | Antithesis | determinismo | Status |
 |---|---|---|
 | Test templates, test commands (first, parallel/serial/singleton drivers, anytime, eventually, finally) | composer follows the reference | ✅ |
-| Assertions: always, always-or-unreachable, sometimes, reachable, unreachable | Zig, C, Python, JVM SDKs; Antithesis SDK messages accepted. Judged as Antithesis does: a timeline violates only `always`-style properties and `unreachable`; `sometimes` (true in some timeline), `reachable`, and an `always` never hit are judged across the multiverse | 🟡 no guidance assertions (comparisons, some/all), no locations; no Go, Rust or JavaScript SDK |
+| Assertions: always, always-or-unreachable, sometimes, reachable, unreachable | Zig, C, Python, JVM SDKs; Antithesis SDK messages accepted. Judged as Antithesis does: a timeline violates only `always`-style properties and `unreachable`; `sometimes` (true in some timeline), `reachable`, and an `always` never hit are judged across the multiverse | 🟡 no Go, Rust or JavaScript SDK |
 | Assertion catalog (declared, not yet hit) | Automatic in every SDK, as code loads, before it runs: Zig (a section entry per call site, announced at startup), C (`DET_*` macros, same section, a constructor), JVM (a Java agent reads each class's bytecode as it loads: Java, Kotlin, Scala, AOT Clojure), Clojure (macros declare as the namespace compiles), Python (each module's syntax tree as it runs). A test program's catalog spans its scenarios and is judged over all of them; an assertion no timeline reaches fails | ✅ |
 | Randomness (SDK random) | SDK random, `rng()`, `prng()`; kernel reseeded per branch | ✅ |
 | Lifecycle | `setup_complete`, `guest_done` | ✅ |
 | Coverage instrumentation | C, Zig (edges), Python, JVM (lines); used by `mutate` | 🟡 opt-in per language (build flags, `coverage_start`, a Java agent); edges never map back to source lines |
 | Guidance assertions (`alwaysGreaterThan`, `sometimesLessThan`, ..., `alwaysSome`, `sometimesAll`) | In every SDK (Zig, C, Python, JVM, Clojure): the compared values in the details, and a guidance event with the distance to the interesting outcome; det-strategy-mutate keeps timelines that come closer (the sum maze: solved guided, missed in 300 random timelines) | ✅ |
-| Assertion locations and ids; first pass and first failure per process | locations (file, line, function) from C (macros), Python (the caller's frame), the JVM and Clojure (StackWalker, once per assertion), in the report, the record and the UI | 🟡 no location from Zig yet (needs the return address and debug info); first pass and first failure per process opt-in in every SDK (Zig `assertion_events = .first`, C `det_first_pass_first_failure`, Python `assertion_events = "first"`, JVM `firstPassFirstFailure`, Clojure `first-pass-first-failure!`); guidance sent only when it improves |
+| Assertion locations and ids; first pass and first failure per process | locations (file, line, function) in every SDK: C (macros), Python (the caller's frame), the JVM and Clojure (StackWalker, once per assertion), Zig (the return address and the program's debug info); in the report, the record and the UI. First pass and first failure per process, opt-in in every SDK (Zig `assertion_events = .first`, C `det_first_pass_first_failure`, Python `assertion_events = "first"`, JVM `firstPassFirstFailure`, Clojure `first-pass-first-failure!`); guidance sent only when it improves | ✅ |
 | Fallback SDK (JSONL to a file) | `ANTITHESIS_SDK_LOCAL_OUTPUT=/dev/determinismo` | ✅ |
 
 ## Faults
@@ -43,6 +43,14 @@ change that moves it.
 | Disk faults (the mutation campaign's) | none | ❌ |
 | Custom faults | `Faults.custom`: commands in a node the injector runs at random times (they can draw randomness); quiet periods hold them too | ✅ |
 | Pausing faults (quiet periods) | `$DETERMINISMO_STOP_FAULTS <seconds>` (also `$ANTITHESIS_STOP_FAULTS`) in every node and command: the fault under way ends, none but clock skips start, overlapping requests merge to the longest; faults only in the driver phase | ✅ |
+
+## Exploration
+
+| Antithesis | determinismo | Status |
+|---|---|---|
+| Branching from interesting states (every event a potential branch point; guidance toward new behavior) | `--branching tree` (default in the UI): generations of timelines; those that reached behaviors no timeline had are returned to just after them (a snapshot there) and branched with new seeds, Go-Explore style; every timeline's path in its record and tape (it replays alone); why each branch point was chosen, shown in the UI | 🟡 opt-in on the CLI; moments from coverage not yet; strategies cannot choose the moments yet |
+| Pluggable guidance | strategies over a JSON protocol, any language, local (`--strategy`), remote (`tcp://`) or uploaded to serve (`@name`): random, mutate (coverage and guidance), extremes (a bandit), an LLM (Claude Haiku 5.5); a strategy's reasons go with its decisions | ✅ |
+| Run duration | `--time-budget` (CLI, serve, MCP): timelines until then, `--branches` at most | ✅ |
 
 ## Results
 
@@ -70,7 +78,7 @@ change that moves it.
 | Logs Explorer search: fields, operators, preceded by / followed by within N seconds | `determinismo query`, HTTP `POST /runs/<id>/query`, MCP `query`: paths, `= != ~ !~ =~ !=~ < <= > >= ? !?` (`=~` a regular expression), and/or, (not) preceded/followed by, within | ✅ |
 | Event sets: matches, contains, filter, union, up_to(moment) | conditions, `or`, `--branch`, `--up-to-vtime` | ✅ |
 | Event sets: map, fold, with_last, with_next, intersect, difference | `determinismo events` (HTTP, MCP): a JSON pipeline of filter, exclude, with_last, with_next (timeouts), union, intersect, difference, narrow, and `through`: any program as map, flatmap and fold | ✅ |
-| Logs Explorer / multiverse map UI | web UI: search with temporal conditions, a timeline's logs up to a moment, a map of every timeline with its faults and failures; run a command at any moment | ✅ |
+| Logs Explorer / multiverse map UI | web UI: search with temporal conditions, a timeline's logs up to a moment (with what it shares with its ancestors), the multiverse as a tree (shared prefixes, branch points, forks) with its faults and failures and tooltips saying why; run a command at any moment, fork from it | ✅ |
 
 ## Debugging (multiverse)
 
@@ -89,7 +97,7 @@ change that moves it.
 | Core dumps | det-core (the kernel's core_pattern) keeps every crashed process's core in `/run/det/cores`, with a `core_dump` event; `extract --file runner:<path>` takes it out | ✅ |
 | Debuggers (gdb, delve, jdb) | `determinismo stacks`: every thread's named stack at a moment (`thread apply all bt`, jstack); gdb and the like through `--exec` with the tools in the image, on the process or a core dump | ✅ |
 | Causality analysis (bug probability over time) | `determinismo causality` (CLI, HTTP job, MCP tool), and a button on every failing example in the UI, with a chart whose bars open the logs | ✅ |
-| Notebook | the UI's Notebook view of a run: JavaScript cells run in order with shared names, `print`, `md`, `query`, `events`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`, `action`); kept with the run (`/runs/<id>/notebook`) | 🟡 no process objects, `run_in_background` or containers API in cells |
+| Notebook | the UI's Notebook view of a run: Clojure cells evaluated in order by babashka on the server (`serve --bb`), with shared names: `run`, `query`, `events`, `md`, and actions run on a click (`replay`, `stacks`, `profile`, `extract`); kept with the run (`/runs/<id>/notebook`). A babashka nREPL server per run (`POST /runs/<id>/nrepl`) with the same names, for editors; there actions run at once | 🟡 no process objects, `run_in_background` or containers API in cells |
 | Agent skills (research, workload, debug, mutation testing) | docs/AGENTS.md only | ❌ |
 | Mutation testing campaigns (agents write subtle mutants; caught, never ran, or ran unnoticed) | one hand-made mutant in the e2e | ❌ |
 | Targeted runs (a change's code, from a diff) | none | ❌ |

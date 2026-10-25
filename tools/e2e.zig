@@ -19,6 +19,8 @@ const Context = struct {
     machine: []const []const u8,
     bin: []const u8,
     scratch: []const u8,
+    /// Babashka, for notebooks ($DETERMINISMO_BB); without it their evaluation is skipped.
+    bb: ?[]const u8 = null,
     failures: u32 = 0,
 };
 
@@ -50,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var context = Context{
         .arena = arena,
         .io = init.io,
+        .bb = init.environ_map.get("DETERMINISMO_BB"),
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
         .machine = &.{
             "--kernel",     try std.fs.path.join(arena, &.{ guest, "vmlinuz" }),
@@ -410,6 +413,7 @@ fn check_serve(context: *Context) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address });
     try argv.appendSlice(arena, &.{ "--data", data });
+    if (context.bb) |bb| try argv.appendSlice(arena, &.{ "--bb", bb });
     try argv.appendSlice(arena, context.machine);
     var server = try std.process.spawn(context.io, .{
         .argv = argv.items,
@@ -453,6 +457,20 @@ fn check_serve(context: *Context) !void {
         std.mem.indexOf(u8, saved, "print(1)\\n// %%\\nprint(2)") != null;
     const in_page = std.mem.indexOf(u8, page, "notebookEvaluate") != null;
     expect(context, notebook and in_page, "serve: the notebook is kept with the run", .{});
+    // Clojure cells, evaluated with babashka: a query of the run's events, and a value.
+    if (context.bb == null) {
+        std.debug.print("SKIP serve: notebook evaluation ($DETERMINISMO_BB is not set)\n", .{});
+        return;
+    }
+    const evaluate = "{\"cells\":[\"(def failing (query \\\"assert.condition=false\\\"))\"," ++
+        "\"(pos? (count failing))\"],\"results\":{}}";
+    const evaluated = try curl(context, &.{
+        "-X", "POST", "-d", evaluate, url ++ "/runs/1/notebook/evaluate",
+    });
+    const found = std.mem.indexOf(u8, evaluated, "\"type\":\"edn\",\"text\":\"true\"") != null;
+    expect(context, found, "serve: a Clojure notebook queries the run ({s})", .{
+        evaluated[0..@min(evaluated.len, 300)],
+    });
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {

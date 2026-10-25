@@ -151,26 +151,32 @@ pub fn prng() std.Random.DefaultPrng {
 /// paths: the verdict is the same, the event stream far smaller). Set it once, at the start.
 pub var assertion_events: enum { every, first } = .every;
 
-pub fn always(condition: bool, comptime message: []const u8, details: anytype) void {
+pub noinline fn always(condition: bool, comptime message: []const u8, details: anytype) void {
     assert_at("always", condition, message, details, @returnAddress());
 }
 
-pub fn always_or_unreachable(condition: bool, comptime message: []const u8, details: anytype) void {
+pub noinline fn always_or_unreachable(
+    condition: bool,
+    comptime message: []const u8,
+    details: anytype,
+) void {
     assert_at("always_or_unreachable", condition, message, details, @returnAddress());
 }
 
-pub fn sometimes(condition: bool, comptime message: []const u8, details: anytype) void {
+pub noinline fn sometimes(condition: bool, comptime message: []const u8, details: anytype) void {
     assert_at("sometimes", condition, message, details, @returnAddress());
 }
 
-pub fn reachable(comptime message: []const u8, details: anytype) void {
+pub noinline fn reachable(comptime message: []const u8, details: anytype) void {
     assert_at("reachable", true, message, details, @returnAddress());
 }
 
-pub fn assert_unreachable(comptime message: []const u8, details: anytype) void {
+pub noinline fn assert_unreachable(comptime message: []const u8, details: anytype) void {
     assert_at("unreachable", true, message, details, @returnAddress());
 }
 
+/// (The public assertions are `noinline`: inlined, their `@returnAddress()` would be the return
+/// address of the function they were inlined into, one frame too far.)
 /// `caller`: the return address into the code that asserted; its source place goes with the
 /// assertion's first event (as the other SDKs send theirs), from the program's debug info.
 fn assert_at(
@@ -194,7 +200,7 @@ fn assert_at(
 // violated, a `sometimes` true): `distance`, lower is closer, 0 or less is there. Strategies keep
 // timelines that come closer (det-strategy-mutate does).
 
-pub fn always_greater_than(
+pub noinline fn always_greater_than(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -202,7 +208,7 @@ pub fn always_greater_than(
 ) void {
     compare(.always, .greater, left, right, message, details, @returnAddress());
 }
-pub fn always_greater_than_or_equal(
+pub noinline fn always_greater_than_or_equal(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -210,7 +216,7 @@ pub fn always_greater_than_or_equal(
 ) void {
     compare(.always, .greater_or_equal, left, right, message, details, @returnAddress());
 }
-pub fn always_less_than(
+pub noinline fn always_less_than(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -218,7 +224,7 @@ pub fn always_less_than(
 ) void {
     compare(.always, .less, left, right, message, details, @returnAddress());
 }
-pub fn always_less_than_or_equal(
+pub noinline fn always_less_than_or_equal(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -226,7 +232,7 @@ pub fn always_less_than_or_equal(
 ) void {
     compare(.always, .less_or_equal, left, right, message, details, @returnAddress());
 }
-pub fn sometimes_greater_than(
+pub noinline fn sometimes_greater_than(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -234,7 +240,7 @@ pub fn sometimes_greater_than(
 ) void {
     compare(.sometimes, .greater, left, right, message, details, @returnAddress());
 }
-pub fn sometimes_greater_than_or_equal(
+pub noinline fn sometimes_greater_than_or_equal(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -242,7 +248,7 @@ pub fn sometimes_greater_than_or_equal(
 ) void {
     compare(.sometimes, .greater_or_equal, left, right, message, details, @returnAddress());
 }
-pub fn sometimes_less_than(
+pub noinline fn sometimes_less_than(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -250,7 +256,7 @@ pub fn sometimes_less_than(
 ) void {
     compare(.sometimes, .less, left, right, message, details, @returnAddress());
 }
-pub fn sometimes_less_than_or_equal(
+pub noinline fn sometimes_less_than_or_equal(
     left: anytype,
     right: anytype,
     comptime message: []const u8,
@@ -261,7 +267,11 @@ pub fn sometimes_less_than_or_equal(
 
 /// At least one of the named conditions holds, every time (all are evaluated: no short
 /// circuit). `conditions` is a struct of bools: `.{ .leader = a, .follower = b }`.
-pub fn always_some(conditions: anytype, comptime message: []const u8, details: anytype) void {
+pub noinline fn always_some(
+    conditions: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
     const held = conditions_held(conditions);
     const merged = .{ .conditions = conditions, .details = details };
     assert_at("always", held > 0, message, merged, @returnAddress());
@@ -270,7 +280,11 @@ pub fn always_some(conditions: anytype, comptime message: []const u8, details: a
 }
 
 /// All the named conditions hold together, at least once.
-pub fn sometimes_all(conditions: anytype, comptime message: []const u8, details: anytype) void {
+pub noinline fn sometimes_all(
+    conditions: anytype,
+    comptime message: []const u8,
+    details: anytype,
+) void {
     const total = @typeInfo(@TypeOf(conditions)).@"struct".field_names.len;
     const held = conditions_held(conditions);
     const merged = .{ .conditions = conditions, .details = details };
