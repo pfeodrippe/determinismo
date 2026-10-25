@@ -13,6 +13,8 @@
 //! command, writes to the control FIFO. The fault under way ends there (the network heals, a
 //! node comes back), and no new faults start until the longest requested period is over,
 //! except clock skips, which go on.
+//!
+//! Network faults overlap (see "Network faults" below); node faults happen one at a time.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -46,6 +48,8 @@ const Kind = enum {
     clog,
     /// One of the node's own fault programs (Faults.custom), run to completion in the node.
     custom,
+    /// Every network fault under way ends (Antithesis's restore); skipped when none is.
+    restore,
     clock_skip,
 };
 /// How a disrupted link behaves (Antithesis's forms): packets dropped, delayed, or held for
@@ -96,6 +100,8 @@ fn on_terminate(_: linux.SIG) callconv(.c) void {
 /// ignore). Each request is a u64, little endian: the quiet period in nanoseconds.
 pub const control_path = "/opt/determinismo/faults-control";
 var control: linux.fd_t = -1;
+/// The system whose network faults sleeps expire (set once faults start).
+var system_active: ?*const schema.System = null;
 /// Until when (CLOCK_MONOTONIC) only clock skips are injected.
 var quiet_until_ns: u64 = 0;
 
@@ -116,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
     _ = linux.sigaction(.TERM, &action, null);
 
     control_open();
+    system_active = &system;
     sdk.event("faults_start", .{ .faults = count });
     baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
@@ -127,7 +134,16 @@ pub fn main(init: std.process.Init) !void {
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
+    network_stop(&system);
     sdk.event("faults_stop", .{ .injections = injections });
+}
+
+/// The stop: every network fault heals (what jammed links hold is delivered first).
+fn network_stop(system: *const schema.System) void {
+    network_heal(system);
+    if (network.count == 0) return;
+    nodes.sleep_ns(release_ns); // A stop ends sleep_ns: this one is plain.
+    network_expire(system, monotonic_ns() + release_ns);
 }
 
 /// One fault as applied: everything needed to apply it again. A script's fault entries are
@@ -247,6 +263,7 @@ fn run_script(
         apply(arena, system, fault);
         injections += 1;
     }
+    network_stop(system);
     sdk.event("faults_stop", .{ .injections = injections, .script = true });
 }
 
@@ -292,6 +309,11 @@ fn faults_collect(
         faults_add(faults, &count, .{ .kind = .partition_groups, .endpoints = endpoints });
     }
     if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
+    const networked = for (faults[0..count]) |fault| switch (fault.kind) {
+        .isolate, .partition, .degrade, .partition_groups, .clog => break true,
+        else => {},
+    } else false;
+    if (networked) faults_add(faults, &count, .{ .kind = .restore });
     assert(count <= faults_max);
     return count;
 }
@@ -351,7 +373,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
                 sdk.event("fault_restart_failed", details);
                 return;
             };
-            baseline_links(system, applied.node); // Its links are new.
+            network_node_new(system, applied.node); // Its links are new.
         },
         .throttle => {
             nodes.cpu_limit(applied.node, applied.cpu_percent) catch return;
@@ -362,7 +384,8 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .process_pause => apply_process_pause(applied),
         .thread_pause => apply_thread_pause(applied),
         .process_kill => apply_process_kill(applied),
-        .isolate, .partition, .degrade => apply_link(system, applied),
+        .isolate, .partition, .degrade, .partition_groups, .clog => network_start(system, applied),
+        .restore => network_restore(system, applied),
         .clock_skip => {
             sdk.event("fault", applied.*);
             clock_shift(applied.skip_ns, .{ .forward = applied.forward });
@@ -370,7 +393,6 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
             if (applied.permanent) return; // It stays, and later skips stack on it.
             clock_shift(applied.skip_ns, .{ .forward = !applied.forward });
         },
-        .partition_groups, .clog => apply_disruption(system, applied),
         .custom => apply_custom(arena, system, applied),
     }
 }
@@ -456,86 +478,219 @@ fn disrupted_links(
     links: *[directed_max]Directed,
 ) u32 {
     var count: u32 = 0;
-    const name = struct {
-        fn of(the_system: *const schema.System, index: usize) []const u8 {
-            return if (index == 0) schema.runner_name else the_system.nodes[index - 1].name;
-        }
-    }.of;
     const endpoints = system.nodes.len + 1;
     for (0..endpoints) |a| for (0..endpoints) |b| {
-        if (a == b) continue;
-        const from = name(system, a);
-        const to = name(system, b);
-        const cut = switch (applied.kind) {
-            .partition_groups => applied.groups[a] != group_none and
-                applied.groups[b] != group_none and applied.groups[a] != applied.groups[b],
-            .clog => switch (applied.direction.?) {
-                .outbound => std.mem.eql(u8, from, applied.node),
-                .inbound => std.mem.eql(u8, to, applied.node),
-                .both => std.mem.eql(u8, from, applied.node) or std.mem.eql(u8, to, applied.node),
-            },
-            else => unreachable,
-        };
-        if (!cut) continue;
-        links[count] = .{ .from = from, .to = to };
+        if (a == b or !disrupts(system, applied, a, b)) continue;
+        links[count] = .{ .from = endpoint_name(system, a), .to = endpoint_name(system, b) };
         count += 1;
     };
     return count;
 }
 
-/// Disrupts each direction of the chosen links for the fault's duration: dropped (stopped),
-/// delayed (slowed), or held until the fault ends and then delivered (jammed).
-fn apply_disruption(system: *const schema.System, applied: *const Applied) void {
-    var links: [directed_max]Directed = undefined;
-    const count = disrupted_links(system, applied, &links);
-    if (count == 0) return;
+/// Whether a partition into groups or a clog disrupts the direction from endpoint a to b.
+fn disrupts(system: *const schema.System, applied: *const Applied, a: usize, b: usize) bool {
+    if (a == b) return false;
+    return switch (applied.kind) {
+        .partition_groups => applied.groups[a] != group_none and
+            applied.groups[b] != group_none and applied.groups[a] != applied.groups[b],
+        .clog => blk: {
+            const node = endpoint_index(system, applied.node) orelse break :blk false;
+            break :blk switch (applied.direction.?) {
+                .outbound => a == node,
+                .inbound => b == node,
+                .both => a == node or b == node,
+            };
+        },
+        else => false,
+    };
+}
+
+// Network faults -------------------------------------------------------------------------
+// They overlap (Antithesis's): each is active until its end, and every link carries the most
+// aggressive of the faults on it (down; else the most loss, then the most delay), or the
+// baseline when none is. A restore, a quiet period or the stop heals them all. Only changes
+// reach the kernel.
+
+const active_max = 32;
+const release_ns = 10 * std.time.ns_per_ms;
+
+const Active = struct {
+    applied: Applied,
+    end_ns: u64,
+    /// A jammed fault that ended: its links let what they held go (delay 0) before they heal,
+    /// since removing netem drops its queue.
+    releasing: bool = false,
+};
+
+const Network = struct {
+    active: [active_max]Active = undefined,
+    count: u32 = 0,
+    /// Each link as the kernel has it: down (both directions, [low][high]), and the netem of
+    /// each direction (from, to).
+    down: [endpoints_max][endpoints_max]bool = @splat(@splat(false)),
+    netem: [endpoints_max][endpoints_max]?nodes.Netem = @splat(@splat(null)),
+};
+var network: Network = .{};
+
+fn network_start(system: *const schema.System, applied: *const Applied) void {
+    if (network.count == active_max) return; // Skipped, so not logged.
+    network.active[network.count] = .{
+        .applied = applied.*,
+        .end_ns = monotonic_ns() + applied.duration_ns,
+    };
+    network.count += 1;
+    network_refresh(system);
+    sdk.event("fault", applied.*);
+}
+
+/// Antithesis's restore: every network fault under way ends now.
+fn network_restore(system: *const schema.System, applied: *const Applied) void {
+    if (network.count == 0) return; // Nothing to restore: skipped, so not logged.
+    sdk.event("fault", applied.*);
+    network_heal(system);
+}
+
+/// Ends every network fault: jammed ones release what they hold first.
+fn network_heal(system: *const schema.System) void {
+    const now_ns = monotonic_ns();
+    for (network.active[0..network.count]) |*entry| entry.end_ns = now_ns;
+    network_expire(system, now_ns);
+}
+
+fn network_expire(system: *const schema.System, now_ns: u64) void {
+    var kept: u32 = 0;
+    var changed = false;
+    for (network.active[0..network.count]) |entry| {
+        var next = entry;
+        if (entry.end_ns <= now_ns) {
+            changed = true;
+            const jammed = entry.applied.disruption == .jammed and !entry.releasing;
+            if (!jammed) continue;
+            next.releasing = true;
+            next.end_ns = now_ns + release_ns;
+        }
+        network.active[kept] = next;
+        kept += 1;
+    }
+    network.count = kept;
+    if (changed) network_refresh(system);
+}
+
+fn network_next_end() ?u64 {
+    var next: ?u64 = null;
+    for (network.active[0..network.count]) |entry| {
+        next = if (next) |at| @min(at, entry.end_ns) else entry.end_ns;
+    }
+    return next;
+}
+
+/// The node's links are new (it restarted): up, with no netem.
+fn network_node_new(system: *const schema.System, name: []const u8) void {
+    const index = endpoint_index(system, name) orelse return;
+    for (0..endpoints_max) |other| {
+        network.down[@min(index, other)][@max(index, other)] = false;
+        network.netem[index][other] = null;
+        network.netem[other][index] = null;
+    }
+    network_refresh(system);
+}
+
+/// Brings every link to what the active faults (or the baseline) make it.
+fn network_refresh(system: *const schema.System) void {
+    const endpoints = system.nodes.len + 1;
+    for (0..endpoints) |a| for (a + 1..endpoints) |b| {
+        var down = false;
+        for (network.active[0..network.count]) |*entry| {
+            down = down or (!entry.releasing and cuts_link(system, &entry.applied, a, b));
+        }
+        if (down == network.down[a][b]) continue;
+        const state: nodes.LinkState = if (down) .down else .up;
+        const from = endpoint_name(system, a);
+        nodes.link_set(system, from, endpoint_name(system, b), state) catch continue;
+        network.down[a][b] = down;
+    };
+    for (0..endpoints) |a| for (0..endpoints) |b| {
+        if (a == b) continue;
+        var wanted: ?nodes.Netem = null;
+        for (network.active[0..network.count]) |*entry| {
+            const netem = link_netem(system, entry, a, b) orelse continue;
+            if (wanted == null or harsher(netem, wanted.?)) wanted = netem;
+        }
+        const from = endpoint_name(system, a);
+        const to = endpoint_name(system, b);
+        if (wanted == null and degradable(system, from) and degradable(system, to)) {
+            wanted = baseline;
+        }
+        if (std.meta.eql(wanted, network.netem[a][b])) continue;
+        nodes.link_degrade(from, to, wanted) catch continue;
+        network.netem[a][b] = wanted;
+    };
+}
+
+/// Whether a fault takes the link between endpoints a and b down (isolate, partition).
+fn cuts_link(system: *const schema.System, applied: *const Applied, a: usize, b: usize) bool {
+    const node = endpoint_index(system, applied.node) orelse return false;
+    return switch (applied.kind) {
+        .isolate => a == node or b == node,
+        .partition => blk: {
+            const peer = endpoint_index(system, applied.peer) orelse break :blk false;
+            break :blk (a == node and b == peer) or (a == peer and b == node);
+        },
+        else => false,
+    };
+}
+
+/// What an active fault does to the direction from a to b, if anything.
+fn link_netem(system: *const schema.System, entry: *const Active, a: usize, b: usize) ?nodes.Netem {
+    const applied = &entry.applied;
+    switch (applied.kind) {
+        .degrade => {
+            const from = endpoint_index(system, applied.node) orelse return null;
+            const to = endpoint_index(system, applied.peer) orelse return null;
+            return if (a == from and b == to) applied.netem else null;
+        },
+        .partition_groups, .clog => {
+            if (!disrupts(system, applied, a, b)) return null;
+            var netem = disruption_netem(applied);
+            if (entry.releasing) netem.delay_ns = 0;
+            return netem;
+        },
+        else => return null,
+    }
+}
+
+/// Dropped (stopped), delayed (slowed), or held until the fault ends and then delivered
+/// (jammed).
+fn disruption_netem(applied: *const Applied) nodes.Netem {
     const delay_ns = switch (applied.disruption.?) {
         .stopped => 0,
         .slowed => slowed_delay_ns_min +
             applied.duration_ns % (slowed_delay_ns_max - slowed_delay_ns_min),
         .jammed => applied.duration_ns,
     };
-    const netem = nodes.Netem{
+    return .{
         .delay_ns = delay_ns,
         .loss_ppm = if (applied.disruption.? == .stopped) nodes.Netem.ppm else 0,
         .seed = applied.duration_ns,
     };
-    for (links[0..count]) |link| nodes.link_degrade(link.from, link.to, netem) catch {};
-    sdk.event("fault", applied.*);
-    sleep_ns(applied.duration_ns);
-    if (applied.disruption.? == .jammed) {
-        // Release what is held (delay 0 keeps the queue), then remove the qdisc.
-        var release = netem;
-        release.delay_ns = 0;
-        for (links[0..count]) |link| nodes.link_degrade(link.from, link.to, release) catch {};
-        sleep_through_ns(10 * std.time.ns_per_ms);
-    }
-    for (links[0..count]) |link| link_rest(system, link.from, link.to);
 }
 
-fn apply_link(system: *const schema.System, applied: *const Applied) void {
-    switch (applied.kind) {
-        .isolate => {
-            if (!links_set(system, applied.node, .down)) return;
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            _ = links_set(system, applied.node, .up);
-        },
-        .partition => {
-            nodes.link_set(system, applied.node, applied.peer, .down) catch return;
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            nodes.link_set(system, applied.node, applied.peer, .up) catch {};
-        },
-        .degrade => {
-            const netem = applied.netem orelse return;
-            nodes.link_degrade(applied.node, applied.peer, netem) catch return;
-            sdk.event("fault", applied.*);
-            sleep_ns(applied.duration_ns);
-            link_rest(system, applied.node, applied.peer);
-        },
-        else => unreachable,
+/// The more aggressive of two settings: more loss, then more delay.
+fn harsher(a: nodes.Netem, b: nodes.Netem) bool {
+    if (a.loss_ppm != b.loss_ppm) return a.loss_ppm > b.loss_ppm;
+    return a.delay_ns > b.delay_ns;
+}
+
+fn endpoint_name(system: *const schema.System, index: usize) []const u8 {
+    return if (index == 0) schema.runner_name else system.nodes[index - 1].name;
+}
+
+fn endpoint_index(system: *const schema.System, name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, schema.runner_name)) return 0;
+    for (system.nodes, 1..) |node, index| {
+        if (std.mem.eql(u8, node.name, name)) return index;
     }
+    return null;
 }
 
 /// Draws the baseline and puts it on every link whose ends allow degradation (none: no
@@ -552,30 +707,12 @@ fn baseline_start(system: *const schema.System) void {
         .loss_ppm = @intCast(sdk.random_below(baseline_loss_ppm_max + 1)),
         .seed = sdk.random_u64(),
     };
-    for (system.nodes) |node| baseline_links(system, node.name);
+    network_refresh(system);
     sdk.event("network_baseline", .{
         .delay_ns = baseline.?.delay_ns,
         .jitter_ns = baseline.?.jitter_ns,
         .loss_ppm = baseline.?.loss_ppm,
     });
-}
-
-/// The baseline on both directions of every link of the node (to the runner and the others).
-fn baseline_links(system: *const schema.System, name: []const u8) void {
-    if (baseline == null) return;
-    link_rest(system, name, schema.runner_name);
-    link_rest(system, schema.runner_name, name);
-    for (system.nodes) |peer| {
-        if (std.mem.eql(u8, peer.name, name)) continue;
-        link_rest(system, name, peer.name);
-        link_rest(system, peer.name, name);
-    }
-}
-
-/// A link with no fault on it: the baseline where both ends allow degradation, else nothing.
-fn link_rest(system: *const schema.System, from: []const u8, to: []const u8) void {
-    const settings = if (degradable(system, from) and degradable(system, to)) baseline else null;
-    nodes.link_degrade(from, to, settings) catch {};
 }
 
 fn degradable(system: *const schema.System, name: []const u8) bool {
@@ -610,16 +747,6 @@ fn degradation(flavor: Degradation) nodes.Netem {
     return netem;
 }
 
-/// Every link of `name` (to the runner and to each other node) goes up or down.
-fn links_set(system: *const schema.System, name: []const u8, state: nodes.LinkState) bool {
-    nodes.link_set(system, name, schema.runner_name, state) catch return false;
-    for (system.nodes) |peer| {
-        if (std.mem.eql(u8, peer.name, name)) continue;
-        nodes.link_set(system, name, peer.name, state) catch {};
-    }
-    return true;
-}
-
 fn clock_shift(skip_ns: u64, direction: struct { forward: bool }) void {
     var now: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &now);
@@ -643,14 +770,20 @@ fn control_open() void {
 }
 
 /// Sleeps for `duration_ns`, or less: a stop or a quiet-period request ends it (the caller
-/// then undoes its fault).
+/// then undoes its fault; a request also heals the network). Network faults end on time
+/// meanwhile.
 fn sleep_ns(duration_ns: u64) void {
-    if (control < 0) return nodes.sleep_ns(duration_ns);
     const deadline_ns = monotonic_ns() + duration_ns;
     for (0..injections_max) |_| {
         const now_ns = monotonic_ns();
+        if (system_active) |system| network_expire(system, now_ns);
         if (now_ns >= deadline_ns or stopping.load(.acquire)) return;
-        const left_ns = deadline_ns - now_ns;
+        const wake_ns = @min(deadline_ns, network_next_end() orelse deadline_ns);
+        const left_ns = wake_ns -| now_ns;
+        if (control < 0) {
+            nodes.sleep_ns(left_ns);
+            continue;
+        }
         var timeout = linux.timespec{
             .sec = @intCast(left_ns / std.time.ns_per_s),
             .nsec = @intCast(left_ns % std.time.ns_per_s),
@@ -659,7 +792,10 @@ fn sleep_ns(duration_ns: u64) void {
         const result = linux.ppoll(&poll, 1, &timeout, null);
         if (linux.errno(result) == .INTR) return; // A stop.
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
-        if (requests_read() > 0) return;
+        if (requests_read() > 0) {
+            if (system_active) |system| network_heal(system);
+            return;
+        }
     }
 }
 
@@ -715,13 +851,23 @@ test faults_collect {
     // a: pause, restart, throttle, process pause; with the runner and with b: partition and
     // degrade both ways (6). b: pause, isolate, throttle, process pause; with the runner:
     // partition and degrade both ways (3). Thread pauses where process pauses are (2). A clog
-    // of b (it allows isolation), groups across the runner, a and b. Clock skip.
-    try std.testing.expectEqual(@as(u32, 22), faults_collect(&system, &scenario, &faults));
-    const groups = faults[0..22];
+    // of b (it allows isolation), groups across the runner, a and b. Clock skip. A restore.
+    try std.testing.expectEqual(@as(u32, 23), faults_collect(&system, &scenario, &faults));
+    const groups = faults[0..23];
     const has_groups = for (groups) |fault| {
         if (fault.kind == .partition_groups) break true;
     } else false;
     try std.testing.expect(has_groups);
+    try std.testing.expectEqual(Kind.restore, faults[22].kind);
+}
+
+test harsher {
+    const stopped = nodes.Netem{ .delay_ns = 0, .loss_ppm = nodes.Netem.ppm, .seed = 0 };
+    const jammed = nodes.Netem{ .delay_ns = 400 * std.time.ns_per_ms, .seed = 0 };
+    const slowed = nodes.Netem{ .delay_ns = 60 * std.time.ns_per_ms, .seed = 0 };
+    try std.testing.expect(harsher(stopped, jammed));
+    try std.testing.expect(harsher(jammed, slowed));
+    try std.testing.expect(!harsher(slowed, stopped));
 }
 
 test groups_draw {

@@ -33,7 +33,7 @@ change that moves it.
 |---|---|---|
 | Partitions (stopped, slowed, jammed; groups; asymmetric) | `partition_groups`: the runner and nodes split into 2-3 groups, stopped, slowed or jammed (held, then delivered); single links too, either direction | ✅ |
 | Clogs (a node's inbound/outbound) | `clog`: a node's inbound, outbound or both, stopped, slowed or jammed; isolate (links down) | ✅ |
-| Baseline latency, restore | `network_baseline`: delay, jitter and drops (ppm) drawn per timeline, on every link that allows degradation, all run long; a fault's end restores the baseline | 🟡 faults do not overlap, so no separate restore event |
+| Baseline latency, restore | `network_baseline`: delay, jitter and drops (ppm) drawn per timeline, on every link that allows degradation, all run long. Network faults overlap, each link carrying the most aggressive (down, then loss, then delay); `restore` heals them all at once (logged only when some were under way) | ✅ |
 | Node throttling, pause, kill/stop and restart | throttle, pause, restart, process_kill | ✅ |
 | Clock skips | clock_skip, forward or back; a quarter permanent, so they stack | ✅ |
 | Thread pausing | `thread_pause`: one thread stopped (ptrace), the rest of its process running; process_pause too | ✅ |

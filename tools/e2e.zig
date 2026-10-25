@@ -634,6 +634,8 @@ fn check_network_faults(context: *Context) !void {
     const clogs = try query_count(context, &.{ events, "event=fault details.kind=clog" });
     const threads = try query_count(context, &.{ events, "event=fault details.kind=thread_pause" });
     const baselines = try query_count(context, &.{ events, "event=network_baseline" });
+    // A restore is logged only while network faults are under way: they overlap the next fault.
+    const restores = try query_count(context, &.{ events, "event=fault details.kind=restore" });
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{
         context.determinismo, "query",  events, "event=fault details.kind=partition_groups",
@@ -656,11 +658,11 @@ fn check_network_faults(context: *Context) !void {
         }
         same = std.mem.eql(u8, hashes[0].events_hash, hashes[1].events_hash);
     }
-    const all = groups > 0 and clogs > 0 and threads > 0 and baselines == 64 and same;
+    const all = groups > 0 and clogs > 0 and threads > 0 and baselines == 64 and
+        restores > 0 and same;
     expect(context, all, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses, " ++
-        "{d} network baselines; a branch with a partition replays exactly", .{
-        groups, clogs, threads, baselines,
-    });
+        "{d} network baselines, {d} restores of overlapping network faults; a branch with a " ++
+        "partition replays exactly", .{ groups, clogs, threads, baselines, restores });
 }
 
 /// How many events `determinismo query` finds (its --count line).
