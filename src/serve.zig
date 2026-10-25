@@ -55,7 +55,8 @@ pub const Options = struct {
 
 const runs_max = 4096;
 const jobs_max = 256;
-const request_size_max = 4 << 20; // A notebook with its actions' results.
+// A notebook with its actions' results, an uploaded strategy.
+const request_size_max = 64 << 20;
 /// Responses (and the run files they are made of) grow as needed up to this: a query over a
 /// long run's every timeline is large.
 const response_size_max = 256 << 20;
@@ -172,6 +173,7 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     const eql = std.mem.eql;
     var parts = std.mem.tokenizeScalar(u8, request.path, '/');
     const first = parts.next() orelse return error.NotFound;
+    if (eql(u8, first, "strategies")) return strategies_route(server, parts.next(), request, out);
     if (!eql(u8, first, "runs")) return error.NotFound;
     const id_text = parts.next() orelse {
         if (eql(u8, request.method, "POST")) return run_create(server, request.body, out);
@@ -314,7 +316,10 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     });
     if (asked.scenario) |scenario| try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     if (asked.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
-    if (asked.strategy) |strategy| try argv.appendSlice(server.arena, &.{ "--strategy", strategy });
+    if (asked.strategy) |strategy| {
+        const command = try strategy_resolve(server, strategy);
+        try argv.appendSlice(server.arena, &.{ "--strategy", command });
+    }
     if (asked.jobs) |jobs| {
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
     }
@@ -681,6 +686,73 @@ fn notebook(server: *Server, run: *const Run, request: Request, out: *std.Io.Wri
     };
     try out.print("{{\"source\":{f}}}\n", .{std.json.fmt(source, .{})});
     return 200;
+}
+
+/// Strategies uploaded to this server (`PUT /strategies/<name>`, the executable as the body;
+/// `GET /strategies` lists them). A run names one as `@<name> [arguments]`. They run on this
+/// host as any `--strategy` command does, so serve should listen where only trusted users reach.
+fn strategies_route(
+    server: *Server,
+    name: ?[]const u8,
+    request: Request,
+    out: *std.Io.Writer,
+) !u16 {
+    const eql = std.mem.eql;
+    const directory = try std.fs.path.join(server.arena, &.{
+        server.options.data_directory, "strategies",
+    });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(server.io, directory);
+    const given = name orelse {
+        if (!eql(u8, request.method, "GET")) return error.NotFound;
+        var dir = try cwd.openDir(server.io, directory, .{ .iterate = true });
+        defer dir.close(server.io);
+        var iterator = dir.iterate();
+        try out.writeAll("[");
+        var count: u32 = 0;
+        while (try iterator.next(server.io)) |entry| {
+            if (count > 0) try out.writeAll(",");
+            try out.print("{f}", .{std.json.fmt(entry.name, .{})});
+            count += 1;
+        }
+        try out.writeAll("]\n");
+        return 200;
+    };
+    if (!eql(u8, request.method, "PUT")) return error.NotFound;
+    if (!strategy_name_valid(given) or request.body.len == 0) return error.BadRequest;
+    const path = try std.fs.path.join(server.arena, &.{ directory, given });
+    try cwd.writeFile(server.io, .{
+        .sub_path = path,
+        .data = request.body,
+        .flags = .{ .permissions = .executable_file },
+    });
+    try out.print("{{\"strategy\":\"@{s}\",\"bytes\":{d}}}\n", .{ given, request.body.len });
+    return 201;
+}
+
+fn strategy_name_valid(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '.') return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return false;
+    }
+    return true;
+}
+
+/// `@<name> args` names an uploaded strategy: its path, with the arguments.
+fn strategy_resolve(server: *Server, strategy: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, strategy, "@")) return strategy;
+    const end = std.mem.indexOfScalar(u8, strategy, ' ') orelse strategy.len;
+    const name = strategy[1..end];
+    if (!strategy_name_valid(name)) return error.BadRequest;
+    return print(server, "{s}/strategies/{s}{s}", .{
+        server.options.data_directory, name, strategy[end..],
+    });
+}
+
+test strategy_name_valid {
+    try std.testing.expect(strategy_name_valid("llm.py"));
+    try std.testing.expect(!strategy_name_valid("../x"));
+    try std.testing.expect(!strategy_name_valid(".hidden"));
 }
 
 fn system_arguments(

@@ -99,9 +99,9 @@ as hints of where bugs hide. To get there:
    the catalog's open targets and reward timelines that move toward them.
 5. **Strategies anyone can bring.** `--strategy "<command>"` already runs any program (any
    language, any API behind it), over JSON lines, and it need not be deterministic (its
-   overrides are in the tapes). Left: upload a strategy (a binary, a script, or an image) to
-   `serve` and through MCP, and remote strategies over HTTP or a WebSocket, so a strategy can
-   run anywhere (a laptop, a GPU box, a hosted service).
+   overrides are in the tapes); `tcp://` reaches one running anywhere, and `serve` takes uploads
+   (`PUT /strategies/<name>`, `@name` in a run). Left: uploads through MCP, and container
+   images as strategies (dependencies included).
 6. **Measure:** time to find the known bugs (bank, shop, clojure-bank, the maze, Raft) per
    strategy and per branch budget, in `bench/`, so changes to guidance are judged by numbers.
 

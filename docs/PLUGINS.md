@@ -17,6 +17,12 @@ determinismo explore ... --strategy "python3 plugins/python/llm.py"     # Claude
 determinismo explore ... --strategy tcp://127.0.0.1:9000                # a plugin elsewhere
 ```
 
+A plugin can be uploaded to `determinismo serve`: `PUT /strategies/<name>` with the executable
+(or a script with a `#!` line) as the body, or the web UI's New run dialog; runs then name it
+`@<name> [arguments]`, and `GET /strategies` lists them. It runs on the server like any
+`--strategy` command, so serve should listen where only trusted users reach it. Nothing about
+determinismo is rebuilt for a new strategy.
+
 A plugin can run anywhere: `tcp://<address>:<port>` connects to one already listening (one
 connection per exploration worker). `plugins/python/serve_tcp.py <port> <command>` serves any
 plugin command that way, and an SSH tunnel brings it to the host from a laptop:

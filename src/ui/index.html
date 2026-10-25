@@ -188,7 +188,10 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
     </div>
     <label>Branching<select name="branching"><option value="tree">Tree: also from moments of earlier timelines that reached new behaviors</option>
       <option value="flat">Flat: every timeline from the setup snapshot</option></select></label>
-    <label>Strategy (optional; it plans its own branches, so the branching is flat)<input name="strategy" placeholder="det-strategy-mutate --sync-dir /tmp/corpus"></label>
+    <label>Strategy (optional; it plans its own branches, so the branching is flat)<input name="strategy" placeholder="det-strategy-mutate --sync-dir /tmp/corpus   or   @my-strategy --flag"></label>
+    <label>Or upload one (any executable or script with a #! line; it runs on the server)
+      <input type="file" id="strategy-file"></label>
+    <div class="muted" id="strategy-status" style="font-size:12px"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button value="cancel" formnovalidate>Cancel</button>
       <button class="primary" value="start">Start</button>
@@ -1248,6 +1251,18 @@ function describe(event) {
 
 // New runs --------------------------------------------------------------------------------
 $("#new-run").addEventListener("click", () => $("#run-dialog").showModal());
+// An uploaded strategy is kept by the server; runs name it as @name.
+$("#strategy-file").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  const name = file.name.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
+  $("#strategy-status").textContent = `Uploading ${name}…`;
+  const response = await fetch(`/strategies/${encodeURIComponent(name)}`, { method: "PUT", body: file });
+  if (!response.ok) { $("#strategy-status").textContent = await response.text(); return; }
+  const { strategy } = await response.json();
+  $("#run-form").elements.strategy.value = strategy;
+  $("#strategy-status").textContent = `Uploaded: this run uses ${strategy} (add arguments after it).`;
+});
 $("#run-form").addEventListener("submit", async (event) => {
   if (event.submitter && event.submitter.value === "cancel") return;
   const form = new FormData($("#run-form"));

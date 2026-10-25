@@ -1161,7 +1161,8 @@ fn explore_tree(
         }
         // In index order (workers finish in any): what each reached that none before it had.
         const done = summaries.items[0..summaries.count];
-        std.mem.sort(Summary, done, {}, summary_before);
+        // In place: a summary is large, and std.mem.sort keeps a cache of them on the stack.
+        std.sort.insertion(Summary, done, {}, summary_before);
         var candidates: [tree.generation_size]Candidate = undefined;
         var candidate_count: u32 = 0;
         const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
@@ -1191,7 +1192,7 @@ fn explore_tree(
             candidate_count += 1;
         }
         const chosen = candidates[0..candidate_count];
-        std.mem.sort(Candidate, chosen, {}, candidate_before);
+        std.sort.insertion(Candidate, chosen, {}, candidate_before);
         var next: std.ArrayList(Planned) = .empty;
         var made: u32 = 0;
         for (chosen) |candidate| {
