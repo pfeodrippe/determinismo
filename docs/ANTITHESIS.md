@@ -47,7 +47,7 @@ change that moves it.
 |---|---|---|
 | Triage report: environment, utilization, findings, properties | web UI (`determinismo serve`, at `/`): runs, live progress, findings, utilization, properties; text report, JSONL record (and Environment: the resolved system recorded with each run) | ✅ |
 | Properties grouped (setup, efficiency, performance, correctness, SDK kinds, test composer), examples with passing/failing moments | grouped (determinismo's, always, sometimes, reachability), All/Passed/Failed, filter, failing and passing examples at their moments, each opening its logs | ✅ |
-| Findings across runs (new, ongoing, resolved, rare) | `GET /runs/<id>/findings` and the UI's Findings section: against the previous finished run of the same system and scenario; rare when one timeline showed it | ✅ (not yet statistical, as Antithesis's "resolved") |
+| Findings across runs (new, ongoing, resolved, rare) | `GET /runs/<id>/findings` and the UI's Findings section: against the previous finished run of the same system and scenario; rare when one timeline showed it; resolved only when missing it by chance is under 5% ((1 - k/n)^m), else unseen | ✅ |
 | New behavior discovery curve | `GET /runs/<id>/discovery`, in the UI's Utilization: distinct behaviors (assertion outcomes, events, coverage) after each branch | ✅ |
 | Default properties: no unexpected container exits | nodes do not exit unexpectedly | ✅ |
 | Default: commands finish with zero exit code | test commands exit successfully | ✅ |

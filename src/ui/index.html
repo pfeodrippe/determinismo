@@ -391,10 +391,10 @@ async function findingsLoad() {
   const counts = {};
   for (const finding of result.findings) counts[finding.finding] = (counts[finding.finding] || 0) + 1;
   const summary = $("#findings .summary");
-  if (summary) summary.innerHTML = ["new", "ongoing", "resolved"].filter((kind) => counts[kind])
+  if (summary) summary.innerHTML = ["new", "ongoing", "resolved", "unseen"].filter((kind) => counts[kind])
     .map((kind) => `<span class="${kind === "resolved" ? "pass-text" : kind === "new" ? "fail-text" : ""}">${counts[kind]} ${kind}</span>`).join(", ")
     || (result.previous == null ? "first run of this system" : "nothing changed");
-  const badge = { new: "fail", ongoing: "error", resolved: "pass" };
+  const badge = { new: "fail", ongoing: "error", resolved: "pass", unseen: "error" };
   body.innerHTML = result.findings.length ? result.findings.map((finding) =>
     `<div class="property" style="cursor:pointer" data-goto="${escape(finding.message)}"><div class="row">
       <span class="badge ${badge[finding.finding]}">${finding.finding.toUpperCase()}</span>

@@ -22,6 +22,7 @@
 //!   GET  /runs/<id>/discovery  {points: [[branches, behaviors], ...]}: new behavior discovery
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
 //!                             since the previous finished run of the same system and scenario
+//!                             (new, ongoing, resolved, or unseen: maybe missed by chance)
 //!   POST /runs/<id>/query    {condition, preceded_by?, followed_by?, not_preceded_by?,
 //!                             not_followed_by?, within?, branch?, up_to_vtime?, limit?,
 //!                             output?: events|count|branches} -> JSON lines (query.zig)
@@ -492,11 +493,10 @@ const SummaryProperty = struct {
         return property.failing orelse (property.branches_failing > 0);
     }
 };
-const SummaryLine = struct {
-    summary: struct { branches: u32, properties: []const SummaryProperty },
-};
+const Summary = struct { branches: u32, properties: []const SummaryProperty };
+const SummaryLine = struct { summary: Summary };
 
-fn summary_read(server: *Server, id: u32) ?[]const SummaryProperty {
+fn summary_read(server: *Server, id: u32) ?Summary {
     const record = run_file(server, id, "record.jsonl") catch return null;
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
@@ -504,7 +504,7 @@ fn summary_read(server: *Server, id: u32) ?[]const SummaryProperty {
         const parsed = std.json.parseFromSliceLeaky(SummaryLine, server.arena, line, .{
             .ignore_unknown_fields = true,
         }) catch return null;
-        return parsed.summary.properties;
+        return parsed.summary;
     }
     return null;
 }
@@ -536,12 +536,15 @@ fn run_identity(server: *Server, id: u32) ![]const u8 {
 }
 
 /// New (fails now, not in the previous run), ongoing (fails in both), resolved (failed before,
-/// passes now); rare when only one timeline showed it.
+/// passes now, and that is unlikely to be luck) or unseen (passes now, but as rare a failure
+/// could have been missed); rare when only one timeline showed it.
 fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
-    const now = summary_read(server, run.id) orelse return error.NotFinished;
+    const summary_now = summary_read(server, run.id) orelse return error.NotFinished;
+    const now = summary_now.properties;
     const previous_id = try run_previous(server, run);
-    const before: []const SummaryProperty = if (previous_id) |id| summary_read(server, id) orelse
-        &.{} else &.{};
+    const summary_before: Summary = if (previous_id) |id| summary_read(server, id) orelse
+        .{ .branches = 0, .properties = &.{} } else .{ .branches = 0, .properties = &.{} };
+    const before = summary_before.properties;
     try out.writeAll("{\"previous\":");
     if (previous_id) |id| try out.print("{d}", .{id}) else try out.writeAll("null");
     try out.writeAll(",\"findings\":[");
@@ -553,7 +556,10 @@ fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const failed_before = if (earlier) |other| other.failed() else false;
         const finding: ?[]const u8 = if (property.failed())
             (if (failed_before) "ongoing" else "new")
-        else if (failed_before) "resolved" else null;
+        else if (failed_before)
+            resolution(earlier.?, summary_before.branches, summary_now.branches)
+        else
+            null;
         const kind = finding orelse continue;
         if (!first) try out.writeAll(",");
         first = false;
@@ -577,6 +583,32 @@ fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     }
     try out.writeAll("]}\n");
     return 200;
+}
+
+/// Whether a failure that is gone is gone for sure. A failure of a property judged per timeline
+/// (always, unreachable) that showed in k of n timelines is missed by m new timelines with
+/// probability (1 - k/n)^m: below 5% it is resolved, else only unseen. A property judged over
+/// the multiverse (sometimes, reachable) that now holds is resolved.
+fn resolution(before: SummaryProperty, branches_before: u32, branches_now: u32) []const u8 {
+    const per_timeline = std.mem.startsWith(u8, before.kind, "always") or
+        std.mem.eql(u8, before.kind, "unreachable");
+    if (!per_timeline or branches_before == 0 or before.branches_failing == 0) return "resolved";
+    const rate = @as(f64, @floatFromInt(@min(before.branches_failing, branches_before))) /
+        @as(f64, @floatFromInt(branches_before));
+    const missed = std.math.pow(f64, 1 - rate, @floatFromInt(branches_now));
+    return if (missed < 0.05) "resolved" else "unseen";
+}
+
+test resolution {
+    const always = SummaryProperty{ .kind = "always", .message = "m", .branches_failing = 1 };
+    // Seen in 1 of 100: 16 clean timelines could easily have missed it.
+    try std.testing.expectEqualStrings("unseen", resolution(always, 100, 16));
+    // Seen in 50 of 100: 16 clean timelines would almost surely have shown it.
+    var common = always;
+    common.branches_failing = 50;
+    try std.testing.expectEqualStrings("resolved", resolution(common, 100, 16));
+    const sometimes = SummaryProperty{ .kind = "sometimes", .message = "m", .failing = true };
+    try std.testing.expectEqualStrings("resolved", resolution(sometimes, 100, 1));
 }
 
 fn system_arguments(
