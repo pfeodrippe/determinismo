@@ -90,6 +90,23 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(guest_exe);
     }
 
+    // libvoidstar.so, Antithesis's native library for the system's processes (every node has it
+    // at /usr/lib/libvoidstar.so): no libc, so any program can load it. Beside the runtime.
+    const voidstar = b.addLibrary(.{
+        .name = "voidstar",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("guest/runtime/voidstar.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+            .strip = true, // It lands in every initramfs.
+        }),
+    });
+    b.getInstallStep().dependOn(&b.addInstallArtifact(voidstar, .{
+        .dest_dir = .{ .override = .bin },
+    }).step);
+
     // Reference strategy plugins (docs/PLUGINS.md). They run on the host, next to determinismo.
     for ([_][]const u8{ "random", "mutate" }) |plugin| {
         const plugin_exe = b.addExecutable(.{
@@ -210,6 +227,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/composer.zig",
         "guest/runtime/profile.zig",
         "guest/runtime/cores.zig",
+        "guest/runtime/voidstar.zig",
         "examples/nrepl/bencode.zig",
         "examples/shop/pg.zig",
         "tools/e2e.zig",

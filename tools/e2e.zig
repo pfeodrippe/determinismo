@@ -97,7 +97,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
         .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },
+        .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1141,6 +1141,54 @@ fn check_disk(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
     }) catch ""});
+}
+
+/// libvoidstar.so, Antithesis's native library, in a node: Python (musl) loads it with ctypes,
+/// and its SDK message is an event, its random number a decision (the same on a replay), its
+/// coverage an edge event of the module, in the timeline's events.
+fn check_voidstar(context: *Context) !void {
+    const arena = context.arena;
+    const code =
+        \\det-nodes exec client python3 -c '
+        \\import ctypes, json
+        \\lib = ctypes.CDLL("/usr/lib/libvoidstar.so")
+        \\lib.fuzz_get_random.restype = ctypes.c_uint64
+        \\lib.init_coverage_module.restype = ctypes.c_uint64
+        \\lib.notify_coverage.restype = ctypes.c_bool
+        \\number = lib.fuzz_get_random()
+        \\message = json.dumps({"event": "voidstar", "details": {"random": number}}).encode()
+        \\lib.fuzz_json_data(message, len(message))
+        \\lib.fuzz_flush()
+        \\base = lib.init_coverage_module(3, b"none.sym.tsv")
+        \\print("voidstar", number, base, lib.notify_coverage(ctypes.c_size_t(base + 1)))'
+    ;
+    var outputs: [2][]const u8 = undefined;
+    var events_found = true;
+    for (&outputs, 0..) |*output, attempt| {
+        const events = try std.fmt.allocPrint(arena, "{s}/voidstar-{d}", .{
+            context.scratch, attempt,
+        });
+        const report = try explore(context, &.{
+            "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "bank",
+            "--seed", "1", "--branch", "0", "--until", "event=command_start", "--exec", code,
+            "--events-dir", events,
+        });
+        output.* = try lines_with(arena, report, &.{"voidstar"});
+        const path = try std.fs.path.join(arena, &.{ events, "branch-0.jsonl" });
+        const cwd = std.Io.Dir.cwd();
+        const text = cwd.readFileAlloc(context.io, path, arena, .limited(64 << 20)) catch "";
+        const event = std.mem.indexOf(u8, text, "\"event\": \"voidstar\"") != null; // json.dumps'.
+        const edge = std.mem.indexOf(u8, text, "edge none.sym.tsv:1") != null;
+        events_found = events_found and event and edge;
+    }
+    // notify_coverage answers False: the edge is reported once, never asked about again.
+    const answered = std.mem.indexOf(u8, outputs[0], "voidstar ") != null and
+        std.mem.indexOf(u8, outputs[0], "False") != null;
+    const same = std.mem.eql(u8, outputs[0], outputs[1]);
+    const passes = answered and events_found and same;
+    expect(context, passes, "voidstar: a node's Python loads libvoidstar.so; its message, " ++
+        "decision and coverage reach the timeline, the same twice", .{});
+    if (!passes) std.debug.print("{s}\n{s}\n", .{ outputs[0], outputs[1] });
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.

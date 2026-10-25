@@ -1179,6 +1179,14 @@ const Launch = struct {
         try mount("/opt/determinismo", platform, null, linux.MS.BIND | linux.MS.REC, null);
         const remount = linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY;
         try mount(null, platform, null, remount, null);
+        // Antithesis's native library, where its SDKs and instrumented programs look for it.
+        try mkdir_all(try print_z(&buffer, "{s}/usr/lib", .{launch.root}));
+        const voidstar = try print_z(&buffer, "{s}/usr/lib/libvoidstar.so", .{launch.root});
+        const create: linux.O = .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true };
+        const created = linux.open(voidstar, create, 0o644);
+        if (linux.errno(created) == .SUCCESS) _ = linux.close(@intCast(created));
+        try mount(voidstar_path, voidstar, null, linux.MS.BIND, null);
+        try mount(null, voidstar, null, remount, null);
         // What container runtimes add to /dev (bash process substitution needs /dev/fd).
         const links = [_]struct { path: []const u8, target: [:0]const u8 }{
             .{ .path = "dev/fd", .target = "/proc/self/fd" },
@@ -1206,6 +1214,7 @@ const Launch = struct {
     }
 };
 
+const voidstar_path = "/opt/determinismo/lib/libvoidstar.so"; // initramfs.zig's.
 const mounts_max = 4096;
 var mountinfo_buffer: [1 << 20]u8 = undefined;
 

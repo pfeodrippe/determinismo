@@ -25,7 +25,9 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   privileged node, or a three-node K3s cluster with pods spread over it (`examples/k3s`), under
   the same faults (partitions between Kubernetes nodes included), replayed exactly.
 - **Tests as scenarios**: functions listing test commands (Antithesis's rules), assertions and
-  steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK;
+  steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK
+  (every node has a `libvoidstar.so` of determinismo's, so programs built with Antithesis's
+  instrumentors report their coverage, as source lines for Go);
   Antithesis's default properties built in (nodes do not exit unexpectedly, no process crashes,
   no OOM kills, kernel warnings, panics or uncaught exceptions, test commands start, finish and
   exit 0, peak memory under 95%, logging under 200 MB per virtual hour, the fault injector

@@ -3,7 +3,8 @@
 //!
 //!   det-initramfs --bin <dir> --module <det_guest.ko> --busybox <static busybox> --out <file>
 //!
-//! Contents: det-init as /init, the guest runtime in /opt/determinismo/bin, busybox (with a
+//! Contents: det-init as /init, the guest runtime in /opt/determinismo/bin (and libvoidstar.so,
+//! which nodes get as /usr/lib/libvoidstar.so, in /opt/determinismo/lib), busybox (with a
 //! link per applet in /bin) for shells in debugging and the exec agent, det_guest.ko, a minimal
 //! /etc, and (when the host has mkfs.ext4) an empty ext4 filesystem for nodes whose disks can
 //! crash (/opt/determinismo/durable.blocks, see `durable_template`). Nothing about the system
@@ -22,7 +23,7 @@ const runtime = [_][]const u8{
 const directories = [_][]const u8{
     "bin",                  "sbin",                     "etc", "proc", "sys", "dev",
     "run",                  "tmp",                      "det", "root", "opt", "opt/determinismo",
-    "opt/determinismo/bin", "opt/determinismo/modules",
+    "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib",
 };
 const applets_max = 1024;
 
@@ -90,6 +91,13 @@ fn entries_collect(arena: std.mem.Allocator, io: std.Io, inputs: Inputs) ![]Entr
             .data = try cwd.readFileAlloc(io, path, arena, .unlimited),
         });
     }
+    try entries.append(arena, .{
+        .path = "opt/determinismo/lib/libvoidstar.so",
+        .mode = mode_file,
+        .data = try cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{
+            inputs.bin, "libvoidstar.so",
+        }), arena, .unlimited),
+    });
     try entries.append(arena, .{
         .path = "init",
         .mode = mode_symlink,
