@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     try check_example(&context, .{ .program = "shop-test", .scenario = "prices", .branches = 4 });
     try check_tapes(&context);
     try check_builtin_properties(&context);
+    try check_parallel(&context);
     if (context.failures > 0) {
         std.debug.print("e2e: {d} checks failed\n", .{context.failures});
         std.process.exit(1);
@@ -157,6 +158,33 @@ fn check_builtin_properties(context: *Context) !void {
     });
     const caught = std.mem.indexOf(u8, crash, "FAIL \"nodes do not exit unexpectedly\"") != null;
     expect(context, caught, "built-in properties catch a node that exits", .{});
+}
+
+/// Branches give the same timelines whether one worker runs them or one per CPU does.
+fn check_parallel(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const common = [_][]const u8{
+        "--program", program, "--scenario", "bank", "--seed", "21", "--branches", "8",
+    };
+    const one = try explore(context, &(common ++ [_][]const u8{ "--jobs", "1" }));
+    const many = try explore(context, &(common ++ [_][]const u8{ "--jobs", "4" }));
+    var sequential: [branches_max]Branch = undefined;
+    var parallel: [branches_max]Branch = undefined;
+    const count = parse_branches(one, &sequential);
+    const counts_match = count == 8 and parse_branches(many, &parallel) == count;
+    const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
+    expect(context, same, "parallel workers give the timelines of one worker", .{});
+}
+
+/// Whether every branch of `a` has a twin in `b` (same index) with the same event hash.
+fn same_timelines(a: []const Branch, b: []const Branch) bool {
+    for (a) |branch| {
+        const twin = for (b) |other| {
+            if (other.index == branch.index) break other;
+        } else return false;
+        if (!std.mem.eql(u8, twin.events_hash, branch.events_hash)) return false;
+    }
+    return true;
 }
 
 /// Runs `determinismo explore` with the machine options; returns its whole output.

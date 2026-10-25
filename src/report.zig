@@ -104,31 +104,41 @@ pub const Multiverse = struct {
         const state = try vm.det_state();
         multiverse.skid_max = @max(multiverse.skid_max, state.skid_max);
         multiverse.overshoots += state.overshoots;
-        print("[branch {d:>4}] seed={x:0>16} {s:<8} vtime={d:.3}s wall={d:.3}s events={d} " ++
+        // One write per line: parallel workers share the terminal.
+        var line_buffer: [4096]u8 = undefined;
+        var line: std.Io.Writer = .fixed(&line_buffer);
+        line.print("[branch {d:>4}] seed={x:0>16} {s:<8} vtime={d:.3}s wall={d:.3}s events={d} " ++
             "events_hash={x:0>16} failing={d}", .{
             branch.index,                    branch.seed,             @tagName(branch.outcome),
             seconds(state.tsc / tsc_per_ns), seconds(branch.wall_ns), vm.events.count,
             vm.events.hash.final(),          failing,
-        });
+        }) catch {};
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
             try multiverse.merge(property, branch.index);
-            if (!property.passing()) print("  FAIL \"{s}\"", .{property.name()});
+            if (!property.passing()) line.print("  FAIL \"{s}\"", .{property.name()}) catch {};
         }
-        print("\n", .{});
+        line.writeAll("\n") catch {
+            line.end = line_buffer.len - 1;
+            line_buffer[line.end] = '\n';
+            line.end += 1;
+        };
+        _ = std.os.linux.write(2, line.buffered().ptr, line.buffered().len);
         assert(multiverse.failing_branches <= multiverse.branches);
+    }
+
+    fn aggregate_find(multiverse: *Multiverse, property: *const Events.Property) !*Aggregate {
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            if (std.mem.eql(u8, aggregate.property.name(), property.name())) return aggregate;
+        }
+        if (multiverse.aggregate_count == Events.property_count_max) return error.TooManyProperties;
+        multiverse.aggregates[multiverse.aggregate_count] = .{ .property = property.* };
+        multiverse.aggregate_count += 1;
+        return &multiverse.aggregates[multiverse.aggregate_count - 1];
     }
 
     fn merge(multiverse: *Multiverse, property: *const Events.Property, branch: u32) !void {
         assert(property.trues <= property.hits);
-        const aggregate = for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
-            if (std.mem.eql(u8, aggregate.property.name(), property.name())) break aggregate;
-        } else blk: {
-            const full = multiverse.aggregate_count == Events.property_count_max;
-            if (full) return error.TooManyProperties;
-            multiverse.aggregates[multiverse.aggregate_count] = .{ .property = property.* };
-            multiverse.aggregate_count += 1;
-            break :blk &multiverse.aggregates[multiverse.aggregate_count - 1];
-        };
+        const aggregate = try multiverse.aggregate_find(property);
         if (property.hits > 0) aggregate.branches_hit += 1;
         if (!property.passing()) {
             aggregate.branches_failing += 1;
@@ -137,6 +147,27 @@ pub const Multiverse = struct {
                 aggregate.first_failure = property.first_failure;
             }
         }
+    }
+
+    /// Adds another worker's results. The example branch of a failing property is the lowest
+    /// failing index, so the summary does not depend on which worker finished first.
+    pub fn absorb(multiverse: *Multiverse, other: *const Multiverse) !void {
+        multiverse.branches += other.branches;
+        multiverse.failing_branches += other.failing_branches;
+        multiverse.skid_max = @max(multiverse.skid_max, other.skid_max);
+        multiverse.overshoots += other.overshoots;
+        for (other.aggregates[0..other.aggregate_count]) |*incoming| {
+            const aggregate = try multiverse.aggregate_find(&incoming.property);
+            aggregate.branches_hit += incoming.branches_hit;
+            aggregate.branches_failing += incoming.branches_failing;
+            const branch = incoming.first_failing_branch orelse continue;
+            const earlier = if (aggregate.first_failing_branch) |known| branch < known else true;
+            if (earlier) {
+                aggregate.first_failing_branch = branch;
+                aggregate.first_failure = incoming.first_failure;
+            }
+        }
+        assert(multiverse.failing_branches <= multiverse.branches);
     }
 
     pub fn summarize(multiverse: *const Multiverse, wall_ns: u64) void {

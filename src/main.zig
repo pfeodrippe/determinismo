@@ -17,7 +17,7 @@ const prepare = @import("prepare.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
-    \\       determinismo explore <machine options> [--branches <n>] [--branch <index>]
+    \\       determinismo explore <machine options> [--branches <n>] [--branch <index>] [--jobs <n>]
     \\                            [--strategy "<plugin> <args>"] [--tape-dir <dir>]
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms> [--exec "<shell command>"]]
@@ -62,6 +62,8 @@ const Arguments = struct {
     tape_directory: ?[]const u8 = null,
     /// Replay the branch recorded in this tape.
     tape_path: ?[]const u8 = null,
+    /// Parallel workers for branches (default: one per available CPU).
+    jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
     moment_vtime_ms: ?u64 = null,
     moment_command: ?[]const u8 = null,
@@ -261,15 +263,9 @@ fn command_explore(
         exploration.exploration_seed = header.exploration_seed;
         exploration.replay = .{ .header = header, .overrides = overrides };
     }
-    if (arguments.strategy_command) |command| {
-        if (exploration.replay != null) return error.ReplayWithStrategy; // Tapes replace plugins.
-        const strategy = try context.arena.create(Strategy);
-        try strategy.start(context.arena, command);
-        try strategy.hello(exploration.exploration_seed);
-        exploration.strategy = strategy;
+    if (arguments.strategy_command != null and exploration.replay != null) {
+        return error.ReplayWithStrategy; // Tapes replace plugins.
     }
-    defer if (exploration.strategy) |strategy| strategy.stop();
-
     const time_start_ns = monotonic_ns();
     options.seed = exploration.exploration_seed;
     const snapshot = try context.arena.create(Snapshot);
@@ -277,14 +273,170 @@ fn command_explore(
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
     const multiverse = try context.arena.create(report.Multiverse);
     multiverse.* = .{};
-    try explore_branches(context, vm, options, .{
+    const branches = Branches{
         .snapshot = snapshot,
         .multiverse = multiverse,
         .exploration = &exploration,
         .arguments = arguments,
-    });
+    };
+    const jobs = jobs_count(arguments);
+    if (jobs == 1) {
+        try strategy_start(context, arguments, &exploration);
+        defer if (exploration.strategy) |strategy| strategy.stop();
+        try explore_branches(context, vm, options, branches);
+    } else {
+        std.debug.print("[determinismo] {d} branches on {d} workers\n", .{
+            arguments.branches, jobs,
+        });
+        try explore_parallel(context, vm, options, branches, jobs);
+    }
     multiverse.summarize(monotonic_ns() - time_start_ns);
     return multiverse.failing_branches;
+}
+
+fn strategy_start(context: Context, arguments: *const Arguments, exploration: *Exploration) !void {
+    const command = arguments.strategy_command orelse return;
+    const strategy = try context.arena.create(Strategy);
+    try strategy.start(context.arena, command);
+    try strategy.hello(exploration.exploration_seed);
+    exploration.strategy = strategy;
+}
+
+/// Workers for the branches: one per CPU this process may run on, unless one branch is asked
+/// for or events are logged (one log, one timeline at a time).
+fn jobs_count(arguments: *const Arguments) u32 {
+    const single = arguments.branch_only != null or arguments.tape_path != null;
+    if (single or arguments.events_path != null) return 1;
+    const jobs = arguments.jobs orelse cpus_available();
+    return @max(1, @min(jobs, arguments.branches, jobs_max));
+}
+
+fn cpus_available() u32 {
+    var set: linux.cpu_set_t = undefined;
+    const result = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set);
+    if (linux.errno(result) != .SUCCESS) return 1;
+    var count: u32 = 0;
+    for (set) |word| count += @popCount(word);
+    return @max(count, 1);
+}
+
+/// Forks `jobs` workers after the snapshot: each makes its own VMs from it (copy-on-write) and
+/// runs branches `index % jobs == worker`, then sends its results through a pipe. A branch's
+/// timeline does not depend on which worker runs it.
+fn explore_parallel(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    jobs: u32,
+) !void {
+    assert(jobs > 1 and jobs <= jobs_max);
+    var readers: [jobs_max]linux.fd_t = undefined;
+    var pids: [jobs_max]linux.pid_t = undefined;
+    for (0..jobs) |worker| {
+        var pipe: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const pid = linux.fork();
+        if (linux.errno(pid) != .SUCCESS) return error.Fork;
+        if (pid == 0) {
+            _ = linux.close(pipe[0]);
+            worker_run(context, vm, options, branches, .{
+                .worker = @intCast(worker),
+                .jobs = jobs,
+                .results_fd = pipe[1],
+            });
+        }
+        _ = linux.close(pipe[1]);
+        readers[worker] = pipe[0];
+        pids[worker] = @intCast(pid);
+    }
+    const results = try context.arena.create(report.Multiverse);
+    for (readers[0..jobs], pids[0..jobs]) |reader, pid| {
+        const received = read_exact(reader, std.mem.asBytes(results));
+        _ = linux.close(reader);
+        var status: i32 = 0;
+        _ = linux.waitpid(pid, &status, 0);
+        if (!received or status != 0) return error.WorkerFailed;
+        try branches.multiverse.absorb(results);
+    }
+}
+
+const Worker = struct { worker: u32, jobs: u32, results_fd: linux.fd_t };
+
+fn worker_run(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    worker: Worker,
+) noreturn {
+    cpu_pin(worker.worker);
+    var exploration = branches.exploration.*;
+    var mine = branches;
+    mine.exploration = &exploration;
+    mine.worker = worker.worker;
+    mine.jobs = worker.jobs;
+    mine.multiverse.* = .{};
+    const ok = worker_explore(context, vm, options, mine, &exploration);
+    if (ok) write_all(worker.results_fd, std.mem.asBytes(mine.multiverse));
+    linux.exit_group(if (ok) 0 else 1);
+}
+
+fn worker_explore(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    exploration: *Exploration,
+) bool {
+    strategy_start(context, branches.arguments, exploration) catch return false;
+    defer if (exploration.strategy) |strategy| strategy.stop();
+    explore_branches(context, vm, options, branches) catch |err| {
+        std.debug.print("[determinismo] worker {d}: {s}\n", .{ branches.worker, @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
+/// Spreads workers over CPUs (VMs run faster when not migrated); best effort.
+fn cpu_pin(worker: u32) void {
+    var available: linux.cpu_set_t = undefined;
+    const size = @sizeOf(linux.cpu_set_t);
+    if (linux.errno(linux.sched_getaffinity(0, size, &available)) != .SUCCESS) return;
+    const bits_per_word = @bitSizeOf(@TypeOf(available[0]));
+    var seen: u32 = 0;
+    for (0..available.len * bits_per_word) |cpu| {
+        const word = available[cpu / bits_per_word];
+        if (word >> @intCast(cpu % bits_per_word) & 1 == 0) continue;
+        if (seen == worker % cpus_available()) {
+            var set: linux.cpu_set_t = @splat(0);
+            set[cpu / bits_per_word] = @as(@TypeOf(set[0]), 1) << @intCast(cpu % bits_per_word);
+            _ = linux.sched_setaffinity(0, &set) catch {};
+            return;
+        }
+        seen += 1;
+    }
+}
+
+fn read_exact(fd: linux.fd_t, target: []u8) bool {
+    var done: u64 = 0;
+    while (done < target.len) {
+        const result = linux.read(fd, target[done..].ptr, target.len - done);
+        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) != .SUCCESS or result == 0) return false;
+        done += result;
+    }
+    return true;
+}
+
+fn write_all(fd: linux.fd_t, bytes: []const u8) void {
+    var done: u64 = 0;
+    while (done < bytes.len) {
+        const result = linux.write(fd, bytes[done..].ptr, bytes.len - done);
+        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) != .SUCCESS) return;
+        done += result;
+    }
 }
 
 fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
@@ -308,7 +460,12 @@ const Branches = struct {
     multiverse: *report.Multiverse,
     exploration: *const Exploration,
     arguments: *const Arguments,
+    /// This process runs the branches whose index modulo `jobs` is `worker`.
+    worker: u32 = 0,
+    jobs: u32 = 1,
 };
+
+const jobs_max = 256;
 
 fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: Branches) !void {
     const exploration = branches.exploration;
@@ -318,6 +475,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
     const count = if (single) 1 else branches.arguments.branches;
     for (first..first + count) |index_usize| {
         const index: u32 = @intCast(index_usize);
+        if (index % branches.jobs != branches.worker) continue;
         options.seed = if (exploration.replay) |replay|
             replay.header.branch_seed
         else
@@ -483,6 +641,8 @@ fn parse_option(
         arguments.branches = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--branch")) {
         arguments.branch_only = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, flag, "--jobs")) {
+        arguments.jobs = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--strategy")) {
         arguments.strategy_command = value;
     } else if (eql(u8, flag, "--tape-dir")) {
