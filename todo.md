@@ -1,3 +1,4 @@
 - [ ] test TLC ( https://github.com/tlaplus/tlaplus )
 - [ ] test determinismo itself (nested kvm)
 - [ ] can we do load/perf test with it ?
+- [ ] writing tests in clojure (using zig or some abstraction that communicates using something else?)
