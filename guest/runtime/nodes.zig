@@ -490,10 +490,9 @@ pub fn disk_heal(name: []const u8) !bool {
     defer _ = linux.unlink(flag);
     const loop = try loop_read(&paths);
     var parameters_buffer: [64]u8 = undefined;
-    const parameters = try std.fmt.bufPrint(&parameters_buffer, "7:{d} 0", .{loop});
     var name_buffer: [mapper_name_size]u8 = undefined;
     const mapper = try mapper_name(&name_buffer, name);
-    try mapper_table(mapper, .{ .kind = "linear", .parameters = parameters });
+    try mapper_table(mapper, try disk_baseline_target(&parameters_buffer, loop));
     sdk.event("node_disk_heal", .{ .node = name });
     if (pid_read(name) != null and !mounted_read_only(paths.layer)) return false;
     try kill(name);
@@ -593,6 +592,41 @@ const mapper_buffer_size = @sizeOf(DmIoctl) + @sizeOf(DmTargetSpec) + 256;
 
 const MapperTarget = struct { kind: []const u8, parameters: []const u8 };
 
+/// What a sync costs outside disk faults, set when faults start: a disk that answers at once
+/// leaves no time for another thread to run while one waits on it, so races around a sync
+/// (a write that lands after a newer one) would never happen.
+const disk_baseline_path = state_root ++ "/disk_baseline_ms";
+
+/// Every durable disk gets `delay_ms` on each I/O (0: none), from now on and after a disk fault.
+pub fn disk_baseline_set(system: *const schema.System, delay_ms: u32) !void {
+    var text_buffer: [16]u8 = undefined;
+    try file_write(disk_baseline_path, try std.fmt.bufPrint(&text_buffer, "{d}", .{delay_ms}));
+    for (system.nodes) |*node| {
+        if (!node.faults.crash and !node.faults.disk) continue;
+        var paths: Paths = undefined;
+        try paths.init(node.name);
+        const loop = loop_read(&paths) catch continue; // Not started yet: attached with it.
+        if (disk_failing(node.name)) continue; // Healed to it.
+        var parameters_buffer: [64]u8 = undefined;
+        var name_buffer: [mapper_name_size]u8 = undefined;
+        const target = try disk_baseline_target(&parameters_buffer, loop);
+        try mapper_table(try mapper_name(&name_buffer, node.name), target);
+    }
+}
+
+fn disk_baseline_target(buffer: *[64]u8, loop: u32) !MapperTarget {
+    var text_buffer: [16]u8 = undefined;
+    const text = read_small(disk_baseline_path, &text_buffer) orelse "0";
+    const delay_ms = std.fmt.parseInt(u32, text, 10) catch return error.BadDiskBaseline;
+    if (delay_ms == 0) {
+        return .{ .kind = "linear", .parameters = try std.fmt.bufPrint(buffer, "7:{d} 0", .{loop}) };
+    }
+    return .{
+        .kind = "delay",
+        .parameters = try std.fmt.bufPrint(buffer, "7:{d} 0 {d}", .{ loop, delay_ms }),
+    };
+}
+
 fn mapper_name(buffer: *[mapper_name_size]u8, node: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "det-{s}", .{node});
 }
@@ -604,8 +638,7 @@ fn mapper_attach(node: []const u8, loop: u32) !u32 {
     const dev = mapper_call(dm_dev_status, name, 0, null) catch blk: {
         _ = try mapper_call(dm_dev_create, name, 0, null);
         var parameters_buffer: [64]u8 = undefined;
-        const parameters = try std.fmt.bufPrint(&parameters_buffer, "7:{d} 0", .{loop});
-        try mapper_table(name, .{ .kind = "linear", .parameters = parameters });
+        try mapper_table(name, try disk_baseline_target(&parameters_buffer, loop));
         break :blk try mapper_call(dm_dev_status, name, 0, null);
     };
     // The kernel's huge_encode_dev: minor bits 0-7, then 20 and up.

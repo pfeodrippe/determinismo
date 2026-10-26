@@ -105,6 +105,7 @@ const degrade_loss_percent_max = 30;
 const baseline_delay_ns_min = 100 * std.time.ns_per_us;
 const baseline_delay_ns_max = 2 * std.time.ns_per_ms;
 const baseline_loss_ppm_max = 1000;
+const disk_baseline_ms_max = 2;
 /// Drawn once per timeline; links return to it when a fault on them ends.
 var baseline: ?nodes.Netem = null;
 
@@ -159,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
     arena_active = arena;
     sdk.event("faults_start", .{ .faults = count });
     baseline_start(&system);
+    disk_baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
     const names = try fault_names(arena, faults[0..count]);
     var injections: u32 = 0;
@@ -916,6 +918,20 @@ fn baseline_start(system: *const schema.System) void {
         .jitter_ns = baseline.?.jitter_ns,
         .loss_ppm = baseline.?.loss_ppm,
     });
+}
+
+/// Durable disks' latency for the timeline (the network has its baseline, disks theirs): each
+/// I/O 0 to `disk_baseline_ms_max` ms, as a real disk's sync takes time.
+fn disk_baseline_start(system: *const schema.System) void {
+    var any = false;
+    for (system.nodes) |node| any = any or node.faults.crash or node.faults.disk;
+    if (!any) return;
+    const delay_ms: u32 = @intCast(sdk.random_below(disk_baseline_ms_max + 1));
+    nodes.disk_baseline_set(system, delay_ms) catch |err| {
+        sdk.event("disk_baseline_failed", .{ .err = @errorName(err) });
+        return;
+    };
+    sdk.event("disk_baseline", .{ .delay_ms = delay_ms });
 }
 
 fn degradable(system: *const schema.System, name: []const u8) bool {
