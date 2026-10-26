@@ -1377,9 +1377,9 @@ fn explore_tree(
         });
     }
     // In-run snapshots (holders.zig): not with a strategy (its decisions replay from its tape, as
-    // holders do not) or CPU modulation (whose time an extra stop would move).
+    // holders do not).
     var registry: holders.Registry = undefined;
-    const holding = exploration.strategy == null and !options.cpu_modulation;
+    const holding = exploration.strategy == null;
     if (holding) try registry.init();
     defer if (holding) registry.release();
     var generation: u32 = 0;
@@ -1801,8 +1801,8 @@ const HolderMaker = struct {
     ) anyerror!*const Snapshot {
         const maker: *HolderMaker = @ptrCast(@alignCast(context));
         var options = maker.options.*;
-        assert(!options.idle);
-        options.idle = point.idle; // The timeline's idle skip goes on, as it did there.
+        assert(options.from_hold == null);
+        options.from_hold = point; // The timeline goes on as it did there.
         return node_make(maker.arena, vm, &options, from, seed, vtime_ns, null);
     }
 };
@@ -2073,7 +2073,10 @@ fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     hasher.update(options.cmdline);
     hasher.update(std.mem.asBytes(&options.timer_slack_ns)); // Where timer interrupts land.
     hasher.update(std.mem.asBytes(&options.branch_event)); // What time is made of.
-    if (options.cpu_modulation) hasher.update("cpu-modulation"); // And how fast it runs.
+    if (options.cpu_modulation) { // And how fast it runs.
+        hasher.update("cpu-modulation");
+        hasher.update(std.mem.asBytes(&VM.modulation_version));
+    }
     for (arguments.disk_paths[0..arguments.disk_count]) |path| {
         hasher.update(std.fs.path.basename(path));
     }

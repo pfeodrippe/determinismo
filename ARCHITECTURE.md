@@ -146,6 +146,12 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
 - `vtime = f(instruction count, per-event charges, modulation parameters)`. The parameters are
   inputs too, which gives **CPU modulation** as a fault (clock-speed strobing, per-operation cost
   changes) for free.
+- Under CPU modulation a branch's extra time is owed until the guest's next exit adds it. Stops
+  are computed from the effective time (the guest's clock plus what is owed, in thousandths of a
+  tick), which grows by exactly the same amount every branch: a timer's branch target and soft
+  stop come out the same wherever they are computed. The modulation steps (adds what is owed,
+  draws the next speed) at the guest's own exits only, never at a moment's or a hold point's
+  stop, so neither changes the timeline it stops in.
 
 ### 4.5 Host configuration
 
@@ -260,7 +266,8 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   (a timeline's length over 64, plus one every eighth when nothing is new), at most 8 per
   timeline, none under 8 GB of available memory, and the OOM killer's first victims. A holder
   forked inside an idle skip replays to a later moment by going on with the skip (the guest
-  stays halted, as it did in the timeline; resuming it would run its idle loop once more).
+  stays halted, as it did in the timeline; resuming it would run its idle loop once more), and
+  with CPU modulation it goes on at the timeline's speed with its owed time (§4.4).
   `explore --verify-holders` remakes every node a holder made by a replay and compares the two:
   registers, memory, branch count and events are the same, and only what the guest cannot see
   may differ (MSRs KVM derives from host time, a past exception's leftovers, unusable segments'

@@ -1005,7 +1005,7 @@ fn check_tree(context: *Context) !void {
     const count = parse_branches(one, &sequential);
     const same = count == 40 and parse_branches(many, &parallel) == count and
         same_timelines(sequential[0..count], parallel[0..count]);
-    const deep = try deepest_replays(context, program, record, tapes, sequential[0..count]);
+    const deep = try deepest_replays(context, program, record, tapes, sequential[0..count], &.{});
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
     // from their parents' start would make, which the deepest timeline's lone replay checks.
     const held = held_nodes(one) > 0 and held_nodes(many) > 0;
@@ -1041,12 +1041,47 @@ fn check_tree(context: *Context) !void {
         strategy_record,
         strategy_tapes,
         steered_branches[0..steered_count],
+        &.{},
     );
     const steered_ok = steered_count == 40 and steered_deep.depth >= 1 and steered_deep.replays;
     expect(context, steered_ok, "tree with a strategy: {d} timelines, up to {d} deep; #{?d} " ++
         "replays from its tape (its ancestors' decisions from theirs)", .{
         steered_count, steered_deep.depth, steered_deep.index,
     });
+    // With CPU modulation: holders keep the modulated timelines as they were, their nodes are
+    // the ones a replay makes, and a deep timeline replays alone.
+    const modulated_tapes = try std.fmt.allocPrint(arena, "{s}/tree-modulated-tapes", .{
+        context.scratch,
+    });
+    const modulated_record = try std.fmt.allocPrint(arena, "{s}/tree-modulated.jsonl", .{
+        context.scratch,
+    });
+    const modulated = try explore(context, &(common ++ [_][]const u8{
+        "--jobs",     "2",             "--cpu-modulation", "--verify-holders",
+        "--tape-dir", modulated_tapes, "--record",         modulated_record,
+    }));
+    var modulated_branches: [branches_max]Branch = undefined;
+    const modulated_count = parse_branches(modulated, &modulated_branches);
+    const modulated_deep = try deepest_replays(
+        context,
+        program,
+        modulated_record,
+        modulated_tapes,
+        modulated_branches[0..modulated_count],
+        &.{"--cpu-modulation"},
+    );
+    const modulated_verified = std.mem.indexOf(u8, modulated, "ns: the same") != null and
+        std.mem.indexOf(u8, modulated, "DIFFERENT") == null;
+    const modulated_ok = modulated_count == 40 and modulated_deep.depth >= 1 and
+        modulated_deep.replays and held_nodes(modulated) > 0 and modulated_verified;
+    expect(context, modulated_ok, "tree with cpu modulation: {d} timelines, up to {d} deep; " ++
+        "#{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the one a " ++
+        "replay makes", .{
+        modulated_count, modulated_deep.depth, modulated_deep.index, held_nodes(modulated),
+    });
+    if (!modulated_verified) std.debug.print("{s}\n", .{lines_with(arena, modulated, &.{
+        "verify",
+    }) catch ""});
 }
 
 /// The tree's nodes made from in-run snapshots, over its generations ("(n from in-run
@@ -1070,6 +1105,8 @@ fn deepest_replays(
     record: []const u8,
     tapes: []const u8,
     explored: []const Branch,
+    /// The exploration's options a replay needs too (they are in its inputs).
+    options: []const []const u8,
 ) !struct { index: ?u32, depth: usize, replays: bool } {
     const arena = context.arena;
     const cwd = std.Io.Dir.cwd();
@@ -1090,9 +1127,9 @@ fn deepest_replays(
     }
     const index = deepest orelse return .{ .index = null, .depth = 0, .replays = false };
     const tape = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index });
-    const replay = try explore(context, &.{
-        "--program", program, "--scenario", "bank", "--tape", tape,
-    });
+    const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--tape", tape };
+    const argv = try std.mem.concat(arena, []const u8, &.{ &system, options });
+    const replay = try explore(context, argv);
     var replayed: [1]Branch = undefined;
     const original = for (explored) |branch| {
         if (branch.index == index) break branch;

@@ -80,7 +80,7 @@ hold_tsc: ?u64,
 hold: ?*const Hold,
 /// Behaviors the hold's owner was told of (Hold.behaviors).
 hold_behaviors: u32,
-/// Restored from a hold point inside an idle skip (Options.idle): the skip goes on first.
+/// Restored from a hold point inside an idle skip (Options.from_hold): the skip goes on first.
 idle_pending: bool,
 deterministic: bool,
 builtin_properties: bool,
@@ -156,24 +156,45 @@ pub const Options = struct {
     /// A timeline's ceiling of virtual time: a guest that never finishes (processes wedged, a
     /// command waiting forever) ends there as hung.
     vtime_limit_ns: ?u64 = null,
-    /// The snapshot is a hold point inside an idle skip (a holder's, holders.zig) and this run
-    /// replays its timeline: the guest stays halted and the skip goes on, as it did there
-    /// (resuming the guest would run its idle loop once more). Nodes and branches resume it.
-    idle: bool = false,
+    /// The snapshot is a hold point (a holder's, holders.zig) of the timeline this run replays
+    /// on: it goes on as the timeline did there. Inside an idle skip the guest stays halted and
+    /// the skip goes on (resuming the guest would run its idle loop once more), and the CPU
+    /// modulation keeps its speed and owed time. Nodes and branches start over instead.
+    from_hold: ?Hold.Point = null,
 };
 
 /// The machine runs `slowdown_permille` thousandths slower than its base rate (each branch
 /// takes that much more virtual time) until `change_tsc`, when the next speed is drawn. The extra
 /// time is added at exits the guest's execution decides (I/O, stops, halts), never at a host
 /// interrupt, so that the guest reads the same clock on every replay.
-const Modulation = struct {
+pub const Modulation = struct {
     slowdown_permille: u32 = 0,
     /// Branches whose extra time is added.
     branches: u64 = 0,
     /// Extra time not yet added, in thousandths of a tick.
     remainder: u64 = 0,
     change_tsc: u64 = 0,
+
+    /// The extra time owed for the branches since the last exit, in thousandths of a tick.
+    fn owed_milli(modulation: Modulation, branches: u64, tsc_per_branch: u32) u64 {
+        assert(branches >= modulation.branches);
+        return (branches - modulation.branches) * tsc_per_branch *
+            modulation.slowdown_permille + modulation.remainder;
+    }
+
+    /// The same modulation, for a machine whose branch count starts over (a snapshot's).
+    pub fn rebased(modulation: Modulation, branches: u64, tsc_per_branch: u32) Modulation {
+        var moved = modulation;
+        moved.remainder = modulation.owed_milli(branches, tsc_per_branch);
+        moved.branches = 0;
+        return moved;
+    }
 };
+
+/// Bumped whenever virtual time under CPU modulation changes (a modulated timeline's inputs
+/// hash it; determinism_abi covers every timeline). 2: owed time counts in timer targets, and
+/// moments and hold points do not step the modulation.
+pub const modulation_version: u32 = 2;
 const modulation_permille_max = 1000; // Twice as slow at most.
 const modulation_stretch_ns_min = 10 * std.time.ns_per_ms;
 const modulation_stretch_ns_max = 200 * std.time.ns_per_ms;
@@ -250,11 +271,13 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     try vm.init_vcpu();
     try snapshot.restore(vm);
     try vm.det_enable(options, .{ .tsc_base = snapshot.tsc });
-    if (options.cpu_modulation) vm.modulation = .{};
+    if (options.cpu_modulation) {
+        vm.modulation = if (options.from_hold != null) snapshot.modulation.? else .{};
+    }
     vm.events.log_fd = options.events_fd;
     vm.events.retroactive = options.retroactive;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
-    vm.idle_pending = options.idle;
+    vm.idle_pending = if (options.from_hold) |point| point.idle else false;
     assert(vm.branches_offset == snapshot.branches);
 }
 
@@ -496,8 +519,11 @@ fn run_loop(vm: *VM) !Outcome {
             },
             else => return err,
         };
+        // At the guest's own exits: a moment's or a hold point's stop is not one (a timeline
+        // without that stop has no exit there).
         switch (vm.run.exit_reason) {
-            .io, .mmio, .det_target, .hlt => try vm.modulate(),
+            .io, .mmio, .hlt => try vm.modulate(),
+            .det_target => if (vm.target_kind == .timer) try vm.modulate(),
             else => {},
         }
         switch (vm.run.exit_reason) {
@@ -605,7 +631,15 @@ fn timer_arm(vm: *VM) !void {
     if (vm.target_branches != 0) return;
     const deadline = vm.deadline_next() orelse return;
     const state = try vm.det_state();
-    if (deadline.tsc <= state.tsc) switch (deadline.kind) {
+    // Virtual time in thousandths of a tick: the guest's clock and what the CPU modulation owes
+    // it (added at the next exit). It grows by per_branch a branch, so a stop computed from it
+    // is the same wherever it is computed: at a hold point as at the exit before it.
+    const owed_milli = if (vm.modulation) |m|
+        m.owed_milli(state.branches, vm.tsc_per_branch)
+    else
+        0;
+    const now_milli = state.tsc * 1000 + owed_milli;
+    if (deadline.tsc * 1000 <= now_milli) switch (deadline.kind) {
         .moment => {
             vm.moment_tsc = state.tsc; // Already past: the moment is now.
             vm.target_kind = .moment;
@@ -620,16 +654,16 @@ fn timer_arm(vm: *VM) !void {
     const slack_tsc = if (deadline.kind.exact()) 0 else vm.timer_slack_tsc;
     const hard_tsc = deadline.tsc + slack_tsc;
     // With CPU modulation a branch takes more virtual time than the guest's clock shows until
-    // the next exit adds it: count branches at the modulated rate, and place the soft stop
-    // where the clock reads the deadline once the extra time is added.
+    // the next exit adds it: count branches at the modulated rate, and place the soft stop at
+    // the first clock read that, its owed time added, reads the deadline.
     const permille: u64 = 1000 + if (vm.modulation) |m| m.slowdown_permille else 0;
     const per_branch = @as(u64, vm.tsc_per_branch) * permille;
-    const branches_left = @divCeil((hard_tsc - state.tsc) * 1000, per_branch);
+    const branches_left = @divCeil(hard_tsc * 1000 - now_milli, per_branch);
     assert(branches_left > 0);
     vm.target_kind = deadline.kind;
     try vm.target_set(state.branches + branches_left);
     if (!deadline.kind.exact() and slack_tsc > 0) {
-        try vm.soft_set(state.tsc + (deadline.tsc - state.tsc) * 1000 / permille);
+        try vm.soft_set(state.tsc + @divCeil(deadline.tsc * 1000 - now_milli, permille));
     }
 }
 
@@ -638,9 +672,7 @@ fn timer_arm(vm: *VM) !void {
 fn modulate(vm: *VM) !void {
     const modulation = if (vm.modulation) |*m| m else return;
     const state = try vm.det_state();
-    assert(state.branches >= modulation.branches);
-    const owed = (state.branches - modulation.branches) * vm.tsc_per_branch *
-        modulation.slowdown_permille + modulation.remainder;
+    const owed = modulation.owed_milli(state.branches, vm.tsc_per_branch);
     modulation.branches = state.branches;
     modulation.remainder = owed % 1000;
     var extra_tsc = owed / 1000;
@@ -778,7 +810,7 @@ pub const Hold = struct {
 
     pub const Point = struct {
         /// Inside an idle skip: the guest is halted, and a replay from here goes on skipping
-        /// (Options.idle). Else the guest stopped at an exact branch count.
+        /// (Options.from_hold). Else the guest stopped at an exact branch count.
         idle: bool,
     };
 };

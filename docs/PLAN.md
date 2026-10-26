@@ -17,6 +17,9 @@ build e2e` tests it.
      replay of its parent to the moment (minutes with fifteen-minute timelines), each checked
      against a replay's node by `--verify-holders` in the e2e tree check. Next: return to more
      moments per generation now that a node costs little.
+   - Done: holders with CPU modulation (Antithesis turns modulation on with faults, and the Raft
+     double vote is an interleaving): stops computed from the effective time, the modulation
+     stepped at the guest's own exits only, and carried on in a holder's replay.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,

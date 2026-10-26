@@ -32,6 +32,9 @@ blocks: @FieldType(VM, "blocks"),
 block_count: u32,
 decisions: @FieldType(VM, "decisions"),
 events: @FieldType(VM, "events"),
+/// The CPU modulation at the snapshot, its owed time included: a holder's replay goes on with
+/// it (VM.Options.from_hold); nodes and branches start over.
+modulation: ?VM.Modulation,
 
 const Snapshot = @This();
 
@@ -84,6 +87,7 @@ fn state_save(snapshot: *Snapshot, vm: *VM, memory_fd: std.os.linux.fd_t) !void 
         .block_count = vm.block_count,
         .decisions = vm.decisions,
         .events = vm.events,
+        .modulation = if (vm.modulation) |m| m.rebased(state.branches, vm.tsc_per_branch) else null,
     };
     try save_vcpu(snapshot, vm.vcpu_fd);
     try save_msrs(snapshot, vm);
