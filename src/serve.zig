@@ -6,20 +6,25 @@
 //!   <data>/runs/<id>/output.log     its output
 //!   <data>/runs/<id>/record.jsonl   its results (explore --record)
 //!   <data>/runs/<id>/tapes/         the tapes of its branches
-//!   <data>/runs/<id>/events/        every branch's events (explore --events-dir)
+//!   <data>/runs/<id>/events/        every branch's events (explore --events-dir), and their
+//!                                   database (store.zig), where every question about the run
+//!                                   is answered
 //!
 //! Endpoints (JSON in, JSON out):
 //!   GET  /                   the web UI (ui/index.html): runs, properties, logs, search, map
 //!   POST /runs               {program | compose, scenario?, profile?, seed?, branches?, jobs?,
 //!                             strategy?, from_branch?, from_vtime_ms?}  -> {id}
-//!   GET  /runs               every run with its state
-//!   GET  /runs/<id>          its state and record (run, branches, summary)
+//!   GET  /runs               every run: {id, state, scenario, system, from_branch}
+//!   GET  /runs/<id>          its state, its record (run, snapshot, summary, changed) and stats
+//!                             (timelines, failing_timelines, vtime_ns, wall_ns, behaviors, events)
+//!   GET  /runs/<id>/timelines  every finished timeline, with the properties it violates
+//!   GET  /runs/<id>/properties every property with its verdict across the timelines so far
+//!   GET  /runs/<id>/discovery  {points: [[timelines, behaviors], ...]}: new behavior discovery
 //!   GET  /runs/<id>/output   its output, as text
 //!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec?} -> its output
 //!   POST /runs/<id>/causality {branch, property, points?, futures?} -> {id} (in the background)
 //!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
-//!   GET  /runs/<id>/discovery  {points: [[branches, behaviors], ...]}: new behavior discovery
 //!   GET  /runs/<id>/notebook  {source}; PUT {source}: the run's notebook (JavaScript cells)
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
 //!                             since the previous finished run of the same system and scenario
@@ -29,14 +34,21 @@
 //!                             output?: events|count|branches} -> JSON lines (query.zig)
 //!   POST /runs/<id>/events   {pipeline, branch?, limit?, output?} -> JSON lines: an event set
 //!                             (event_sets.zig)
+//!   POST /runs/<id>/sql      {sql}: one SELECT on the run's events database -> its rows
 //!
-//! One request at a time, with fixed buffers; runs proceed in the background meanwhile.
+//! Each request is answered by a thread of its own (a replay takes minutes; a query over a long
+//! run, seconds), with its own allocations and database connection. Runs, jobs and the
+//! databases are shared: a mutex guards runs and jobs, and a run's database is attached once (a
+//! DuckDB instance holds them all) and brought up to date by whoever asks first. A thread
+//! watches runs meanwhile: it reaps them, and ingests the timelines that finished.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
 const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
+const duckdb = @import("duckdb.zig");
+const store = @import("store.zig");
 
 pub const Options = struct {
     /// "address:port", e.g. 127.0.0.1:7878. Bind to loopback unless the network is trusted.
@@ -61,6 +73,15 @@ const request_size_max = 64 << 20;
 /// long run's every timeline is large.
 const response_size_max = 256 << 20;
 const arguments_max = 64;
+/// Requests answered at once (each a thread); past it, 503.
+const requests_max = 64;
+/// Rows a request's own SQL answers with at most.
+const sql_rows_max = 100_000;
+/// DuckDB's share of the host: the runs need the rest.
+const database_threads = 4;
+const database_memory_mib = 4096;
+/// How often the watcher reaps runs and ingests their finished timelines.
+const watch_interval_ns = std.time.ns_per_s;
 
 const Run = struct {
     id: u32,
@@ -74,6 +95,8 @@ const Run = struct {
     /// Started by an earlier server and still running: not its child, so watched with kill(0)
     /// and judged by its record once gone.
     adopted: bool = false,
+    /// Ingested since it finished: its database has every timeline.
+    complete: bool = false,
 };
 
 const nrepl_port_base = 17000;
@@ -86,44 +109,268 @@ const Job = struct {
     done: bool = false,
 };
 
-const Server = struct {
+/// What the threads share: runs and jobs (under `mutex`), and the runs' databases.
+const Shared = struct {
+    options: Options,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    runs: [runs_max]Run = undefined,
+    run_count: u32 = 0,
     jobs: [jobs_max]Job = undefined,
     job_count: u32 = 0,
+    /// One instance with every run's database attached (as run_<id>) once asked for.
+    database: duckdb.Database,
+    /// By run id: attached yet, and the lock its attach, ingest and answers hold.
+    attached: [runs_max]bool = @splat(false),
+    store_locks: [runs_max]std.Io.Mutex = @splat(.init),
+    /// By run id: how many ingests brought timelines in, and the answers that change only
+    /// then (a running run's page asks for them every few seconds).
+    generations: [runs_max]u64 = @splat(0),
+    /// By run id: the size of timelines.jsonl at the last ingest (it only grows: the same size,
+    /// nothing to bring in).
+    ingested: [runs_max]u64 = @splat(0),
+    answers: [runs_max][@typeInfo(Kept).@"enum".field_names.len]Answer = @splat(@splat(.{})),
+    requests: std.atomic.Value(u32) = .init(0),
+
+    fn lock(shared: *Shared) void {
+        shared.mutex.lockUncancelable(shared.io);
+    }
+
+    fn unlock(shared: *Shared) void {
+        shared.mutex.unlock(shared.io);
+    }
+};
+
+/// What a run's database answers that changes only when timelines arrive.
+const Kept = enum { stats, timelines, properties, discovery };
+const Answer = struct { generation: u64 = 0, bytes: ?[]u8 = null };
+
+/// A request being answered: what it shares, and what it allocates (gone with it).
+const Server = struct {
+    shared: *Shared,
     options: Options,
     io: std.Io,
     arena: std.mem.Allocator,
-    runs: [runs_max]Run = undefined,
-    run_count: u32 = 0,
-    request: [request_size_max]u8 = undefined,
+    /// What DuckDB said, when a request failed on the database.
+    detail: ?[]const u8 = null,
 };
 
 pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
-    const server = try arena.create(Server);
-    server.* = .{
+    const shared = try arena.create(Shared);
+    var failure: duckdb.Failure = .{};
+    shared.* = .{
         .options = options,
         .io = io,
-        .arena = arena,
+        .database = duckdb.Database.open(":memory:", .{
+            .threads = database_threads,
+            .memory_limit_mib = database_memory_mib,
+        }, &failure) catch |err| {
+            std.debug.print("[determinismo] the events database: {s}\n", .{failure.text()});
+            return err;
+        },
     };
     const runs_directory = try std.fs.path.join(arena, &.{ options.data_directory, "runs" });
     try std.Io.Dir.cwd().createDirPath(io, runs_directory);
-    try runs_load(server);
+    var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
+    try runs_load(&server);
     const listener = try listen(options.listen);
+    const watcher = try std.Thread.spawn(.{}, watch, .{shared});
+    watcher.detach();
     std.debug.print("[determinismo] serving on http://{s} (data in {s})\n", .{
         options.listen, options.data_directory,
     });
     while (true) {
         const client = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(client) != .SUCCESS) continue;
-        // What a request allocates (a query over a big run reads gigabytes) goes with it: the
-        // server's own state is fixed arrays of plain values.
-        var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-        defer request_arena.deinit();
-        server.arena = request_arena.allocator();
-        defer server.arena = arena;
-        runs_reap(server);
-        handle(server, @intCast(client));
-        _ = linux.close(@intCast(client));
+        const fd: linux.fd_t = @intCast(client);
+        if (shared.requests.fetchAdd(1, .monotonic) >= requests_max) {
+            _ = shared.requests.fetchSub(1, .monotonic);
+            respond(fd, 503, "text/plain", "busy\n");
+            _ = linux.close(fd);
+            continue;
+        }
+        const thread = std.Thread.spawn(.{}, answer, .{ shared, fd }) catch {
+            _ = shared.requests.fetchSub(1, .monotonic);
+            respond(fd, 503, "text/plain", "busy\n");
+            _ = linux.close(fd);
+            continue;
+        };
+        thread.detach();
     }
+}
+
+/// A request's thread: its allocations go with it.
+fn answer(shared: *Shared, client: linux.fd_t) void {
+    defer _ = shared.requests.fetchSub(1, .monotonic);
+    defer _ = linux.close(client);
+    var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer request_arena.deinit();
+    var server: Server = .{
+        .shared = shared,
+        .options = shared.options,
+        .io = shared.io,
+        .arena = request_arena.allocator(),
+    };
+    handle(&server, client);
+}
+
+/// The watcher: reaps runs, and ingests the timelines that finished (a running run's as they
+/// do; a finished run's last ones once).
+fn watch(shared: *Shared) void {
+    var ids: [runs_max]u32 = undefined;
+    while (true) {
+        const interval: linux.timespec = .{
+            .sec = @divFloor(watch_interval_ns, std.time.ns_per_s),
+            .nsec = @mod(watch_interval_ns, std.time.ns_per_s),
+        };
+        assert(linux.errno(linux.nanosleep(&interval, null)) != .INVAL);
+        shared.lock();
+        runs_reap(shared);
+        var count: usize = 0;
+        for (shared.runs[0..shared.run_count]) |*run| {
+            if (run.complete) continue;
+            ids[count] = run.id;
+            count += 1;
+            // Finished: one last ingest brings in every timeline.
+            if (run.status != null) run.complete = true;
+        }
+        shared.unlock();
+        for (ids[0..count]) |id| {
+            var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer request_arena.deinit();
+            var server: Server = .{
+                .shared = shared,
+                .options = shared.options,
+                .io = shared.io,
+                .arena = request_arena.allocator(),
+            };
+            run_update(&server, id) catch |err| {
+                std.debug.print("[determinismo] run {d}'s events: {s} {s}\n", .{
+                    id, @errorName(err), server.detail orelse "",
+                });
+            };
+        }
+    }
+}
+
+/// Brings the run's events database up to date: attached the first time, then the timelines
+/// that finished since the last ingest (none when timelines.jsonl did not grow: no connection).
+fn run_update(server: *Server, id: u32) !void {
+    const shared = server.shared;
+    assert(id < runs_max);
+    const lock = &shared.store_locks[id];
+    lock.lockUncancelable(server.io);
+    defer lock.unlock(server.io);
+    const events = try run_store(server, id);
+    var failure: duckdb.Failure = .{};
+    if (!shared.attached[id]) {
+        try std.Io.Dir.cwd().createDirPath(server.io, events.directory);
+        const database = &shared.database;
+        const arena = server.arena;
+        const name = events.name;
+        _ = store.Store.attach(database, arena, events.directory, name, &failure) catch |err| {
+            server.detail = try server.arena.dupe(u8, failure.text());
+            return err;
+        };
+        shared.attached[id] = true;
+    }
+    const timelines = try std.fs.path.join(server.arena, &.{ events.directory, "timelines.jsonl" });
+    const stat = std.Io.Dir.cwd().statFile(server.io, timelines, .{});
+    const size = if (stat) |known| known.size else |_| 0;
+    if (size == shared.ingested[id]) return;
+    var connection = events.connect(&shared.database, server.arena, &failure) catch |err| {
+        server.detail = try server.arena.dupe(u8, failure.text());
+        return err;
+    };
+    defer connection.close();
+    const directory = events.directory;
+    const arrived = store.ingest(&connection, server.arena, server.io, directory) catch |err| {
+        server.detail = try server.arena.dupe(u8, connection.failure.text());
+        return err;
+    };
+    shared.ingested[id] = size;
+    if (arrived > 0) shared.generations[id] += 1;
+}
+
+fn run_store(server: *Server, id: u32) !store.Store {
+    return .{
+        .directory = try std.fs.path.join(server.arena, &.{
+            try run_directory(server, id), "events",
+        }),
+        .name = try print(server, "run_{d}", .{id}),
+    };
+}
+
+/// A connection to the run's events database, up to date.
+fn run_database(server: *Server, id: u32) !duckdb.Connection {
+    try run_update(server, id);
+    return run_connect(server, id);
+}
+
+fn run_connect(server: *Server, id: u32) !duckdb.Connection {
+    var failure: duckdb.Failure = .{};
+    const events = try run_store(server, id);
+    return events.connect(&server.shared.database, server.arena, &failure) catch |err| {
+        server.detail = try server.arena.dupe(u8, failure.text());
+        return err;
+    };
+}
+
+/// The run's answer of a kind, up to date: as kept, when no timeline arrived since; else
+/// computed by `compute` and kept.
+fn answer_kept(
+    server: *Server,
+    id: u32,
+    kept: Kept,
+    compute: *const fn (*Server, *duckdb.Connection, *std.Io.Writer) anyerror!void,
+) ![]const u8 {
+    try run_update(server, id);
+    const shared = server.shared;
+    const lock = &shared.store_locks[id];
+    lock.lockUncancelable(server.io);
+    const slot = &shared.answers[id][@backingInt(kept)];
+    const generation = shared.generations[id];
+    if (slot.bytes) |bytes| if (slot.generation == generation) {
+        defer lock.unlock(server.io);
+        return server.arena.dupe(u8, bytes);
+    };
+    lock.unlock(server.io);
+    var connection = try run_connect(server, id);
+    defer connection.close();
+    var out: std.Io.Writer.Allocating = .init(server.arena);
+    compute(server, &connection, &out.writer) catch |err| {
+        if (err == error.DuckDB) server.detail = connection.failure.text();
+        return err;
+    };
+    const bytes = try std.heap.page_allocator.dupe(u8, out.written());
+    lock.lockUncancelable(server.io);
+    defer lock.unlock(server.io);
+    if (slot.bytes) |old| std.heap.page_allocator.free(old);
+    slot.* = .{ .generation = generation, .bytes = bytes };
+    return out.written();
+}
+
+fn stats_compute(_: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
+    try connection.json(out, store.stats_sql, .{});
+}
+
+fn timelines_compute(_: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
+    try connection.json(out, store.timelines_sql, .{});
+}
+
+fn properties_compute(_: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
+    try connection.json(out, store.properties_sql, .{});
+}
+
+fn discovery_compute(server: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
+    const Point = struct { timelines: u64, behaviors: u64 };
+    const points = try connection.rows(Point, server.arena, store.discovery_sql, .{});
+    try out.writeAll("{\"points\":[");
+    for (points, 0..) |point, index| {
+        if (index > 0) try out.writeAll(",");
+        try out.print("[{d},{d}]", .{ point.timelines, point.behaviors });
+    }
+    try out.writeAll("]}\n");
 }
 
 fn listen(address_text: []const u8) !linux.fd_t {
@@ -163,12 +410,15 @@ fn handle(server: *Server, client: linux.fd_t) void {
     if (page and std.mem.eql(u8, request.method, "GET")) {
         return respond(client, 200, "text/html; charset=utf-8", ui_html);
     }
-    var response: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer response.deinit();
+    var response: std.Io.Writer.Allocating = .init(server.arena);
     const writer = &response.writer;
     const status = route(server, request, writer) catch |err| blk: {
         response.clearRetainingCapacity();
-        writer.print("{{\"error\":\"{s}\"}}\n", .{@errorName(err)}) catch {};
+        writer.print("{{\"error\":\"{s}\"", .{@errorName(err)}) catch {};
+        if (server.detail) |detail| {
+            writer.print(",\"detail\":{f}", .{std.json.fmt(detail, .{})}) catch {};
+        }
+        writer.writeAll("}\n") catch {};
         break :blk @as(u16, switch (err) {
             error.NotFound => 404,
             error.BadRequest, error.SyntaxError, error.UnexpectedToken => 400,
@@ -192,12 +442,12 @@ fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
         return error.NotFound;
     };
     const id = std.fmt.parseInt(u32, id_text, 10) catch return error.NotFound;
-    const run = run_find(server, id) orelse return error.NotFound;
+    const run = run_get(server, id) orelse return error.NotFound;
     const action = parts.next() orelse {
         if (!eql(u8, request.method, "GET")) return error.NotFound;
-        return run_show(server, run, out);
+        return run_show(server, &run, out);
     };
-    return run_route(server, run, action, &parts, request, out);
+    return run_route(server, &run, action, &parts, request, out);
 }
 
 /// /runs/<id>/<action>[/...]: what one run offers.
@@ -218,29 +468,10 @@ fn run_route(
         return run_replay(server, run, request.body, out);
     }
     if (eql(u8, action, "stop") and eql(u8, request.method, "POST")) {
-        return run_stop(server, @constCast(run), out);
+        return run_stop(server, run.id, out);
     }
     if (eql(u8, action, "extract") and eql(u8, request.method, "POST")) {
         return run_extract(server, run, request.body, out);
-    }
-    if (eql(u8, action, "discovery") and eql(u8, request.method, "GET")) {
-        // A finished run's never changes: computed once (it reads every event), then kept.
-        const finished = run.status != null;
-        if (finished) if (run_file(server, run.id, "discovery.json")) |kept| {
-            try out.writeAll(kept);
-            return 200;
-        } else |_| {};
-        const directory = try run_directory(server, run.id);
-        const events = try std.fs.path.join(server.arena, &.{ directory, "events" });
-        const timelines = try query.timelines_read(server.arena, server.io, events, null);
-        const points = try query.discovery(server.arena, timelines);
-        const text = try print(server, "{{\"points\":{f}}}\n", .{std.json.fmt(points, .{})});
-        if (finished) {
-            const path = try std.fs.path.join(server.arena, &.{ directory, "discovery.json" });
-            std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = text }) catch {};
-        }
-        try out.writeAll(text);
-        return 200;
     }
     if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
         return findings_show(server, run, out);
@@ -251,7 +482,7 @@ fn run_route(
         return notebook_evaluate(server, run, request.body, out);
     }
     if (eql(u8, action, "nrepl") and eql(u8, request.method, "POST")) {
-        return nrepl_start(server, @constCast(run), out);
+        return nrepl_start(server, run.id, out);
     }
     if (eql(u8, action, "causality")) {
         if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
@@ -259,27 +490,61 @@ fn run_route(
         const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
         return causality_show(server, run, index, out);
     }
-    if (eql(u8, action, "query") and eql(u8, request.method, "POST")) {
-        const asked = try std.json.parseFromSliceLeaky(query.Request, server.arena, request.body, .{
-            .ignore_unknown_fields = true,
-        });
-        const events = try std.fs.path.join(server.arena, &.{
-            try run_directory(server, run.id), "events",
-        });
-        try out.writeAll(try query.answer(server.arena, server.io, events, asked));
+    // The rest is the run's events database's.
+    const reads = [_][]const u8{ "timelines", "properties", "discovery" };
+    const writes = [_][]const u8{ "query", "events", "sql" };
+    const database_read = for (reads) |name| {
+        if (eql(u8, action, name)) break eql(u8, request.method, "GET");
+    } else for (writes) |name| {
+        if (eql(u8, action, name)) break eql(u8, request.method, "POST");
+    } else false;
+    if (!database_read) return error.NotFound;
+    const kept: ?Kept = std.meta.stringToEnum(Kept, action);
+    if (kept) |kind| {
+        const compute = switch (kind) {
+            .timelines => &timelines_compute,
+            .properties => &properties_compute,
+            .discovery => &discovery_compute,
+            .stats => unreachable, // Part of GET /runs/<id>.
+        };
+        try out.writeAll(try answer_kept(server, run.id, kind, compute));
         return 200;
     }
-    if (eql(u8, action, "events") and eql(u8, request.method, "POST")) {
-        const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
-        const asked = try std.json.parseFromSliceLeaky(event_sets.Request, server.arena,
-            request.body, options_json);
-        const events = try std.fs.path.join(server.arena, &.{
-            try run_directory(server, run.id), "events",
-        });
-        try out.writeAll(try event_sets.answer(server.arena, server.io, events, asked));
-        return 200;
+    var connection = try run_database(server, run.id);
+    defer connection.close();
+    database_answer(server, &connection, action, request.body, out) catch |err| {
+        if (err == error.DuckDB) server.detail = connection.failure.text();
+        return err;
+    };
+    return 200;
+}
+
+/// What the run's events database answers (store.zig, query.zig, event_sets.zig).
+fn database_answer(
+    server: *Server,
+    connection: *duckdb.Connection,
+    action: []const u8,
+    body: []const u8,
+    out: *std.Io.Writer,
+) !void {
+    const eql = std.mem.eql;
+    const arena = server.arena;
+    const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    if (eql(u8, action, "query")) {
+        const asked = try std.json.parseFromSliceLeaky(query.Request, arena, body, options_json);
+        const search = try query.query_of(arena, asked);
+        _ = try query.answer(connection, arena, &search, out, true);
+        return;
     }
-    return error.NotFound;
+    if (eql(u8, action, "events")) {
+        const Asked = event_sets.Request;
+        const asked = try std.json.parseFromSliceLeaky(Asked, arena, body, options_json);
+        return event_sets.request_answer(connection, arena, server.io, asked, out);
+    }
+    assert(eql(u8, action, "sql"));
+    const Asked = struct { sql: []const u8 };
+    const asked = try std.json.parseFromSliceLeaky(Asked, arena, body, options_json);
+    _ = try connection.select_json(out, try arena.dupeSentinel(u8, asked.sql, 0), sql_rows_max);
 }
 
 /// What a client may ask for; mirrors explore's flags.
@@ -321,18 +586,41 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     const asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     });
-    if (server.run_count == runs_max) return error.TooManyRuns;
-    const id = if (server.run_count == 0) 1 else server.runs[server.run_count - 1].id + 1;
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock(); // Until the run is in the list: ids are given once.
+    if (shared.run_count == runs_max) return error.TooManyRuns;
+    const id = if (shared.run_count == 0) 1 else shared.runs[shared.run_count - 1].id + 1;
+    if (id >= runs_max) return error.TooManyRuns;
     const directory = try run_directory(server, id);
     try std.Io.Dir.cwd().createDirPath(server.io, directory);
     try std.Io.Dir.cwd().writeFile(server.io, .{
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, "request.json" }),
         .data = body,
     });
+    const argv = try explore_arguments(server, &asked, directory);
+    const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
+    const pid = try spawn(server.arena, argv, output, &.{});
+    // For a restarted server to find it still running (runs_load).
+    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
+    const pid_text = try print(server, "{d}\n", .{pid});
+    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = pid_text });
+    shared.runs[shared.run_count] = .{ .id = id, .pid = pid };
+    shared.run_count += 1;
+    try out.print("{{\"id\":{d}}}\n", .{id});
+    return 201;
+}
+
+/// The explore command of a run asked for, writing into its directory.
+fn explore_arguments(
+    server: *Server,
+    asked: *const RunRequest,
+    directory: []const u8,
+) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, server.options.machine);
-    try system_arguments(server.arena, &argv, &asked);
+    try system_arguments(server.arena, &argv, asked);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed}) });
     if (asked.time_budget) |budget| {
         try argv.appendSlice(server.arena, &.{ "--time-budget", budget });
@@ -369,60 +657,57 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     if (asked.from_branch) |branch| {
         try argv.appendSlice(server.arena, &.{
             "--from-branch",   try print(server, "{d}", .{branch}),
-            "--from-vtime-ms", try print(server, "{d}", .{
+            "--from-vtime-ms",
+            try print(server, "{d}", .{
                 asked.from_vtime_ms orelse return error.BadRequest,
             }),
         });
     }
-    const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
-    const pid = try spawn(server.arena, argv.items, output, &.{});
-    // For a restarted server to find it still running (runs_load).
-    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
-    const pid_text = try print(server, "{d}\n", .{pid});
-    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = pid_text });
-    server.runs[server.run_count] = .{ .id = id, .pid = pid };
-    server.run_count += 1;
-    try out.print("{{\"id\":{d}}}\n", .{id});
-    return 201;
+    return argv.items;
 }
 
+/// Every run, with what tells it apart (its system and scenario).
 fn runs_list(server: *Server, out: *std.Io.Writer) !u16 {
+    const runs = runs_copy(server);
     try out.writeAll("[");
-    for (server.runs[0..server.run_count], 0..) |*run, index| {
+    for (runs, 0..) |*run, index| {
         if (index > 0) try out.writeAll(",");
-        try out.print("{{\"id\":{d},\"state\":\"{s}\"}}", .{ run.id, state(run) });
+        try out.print("{{\"id\":{d},\"state\":\"{s}\"", .{ run.id, state(run) });
+        const request_json = run_file(server, run.id, "request.json") catch "";
+        if (std.json.parseFromSliceLeaky(RunRequest, server.arena, request_json, .{
+            .ignore_unknown_fields = true,
+        })) |asked| {
+            const system = std.fs.path.basename(asked.program orelse asked.compose orelse "");
+            try out.print(",\"system\":{f},\"scenario\":{f},\"from_branch\":{f}", .{
+                std.json.fmt(system, .{}),            std.json.fmt(asked.scenario, .{}),
+                std.json.fmt(asked.from_branch, .{}),
+            });
+        } else |_| {}
+        try out.writeAll("}");
     }
     try out.writeAll("]\n");
     return 200;
 }
 
-/// The run's state and its record, gathered as {"run":..,"branches":[..],"summary":..}.
+/// The run's state, its record's lines but the timelines' (run, snapshot, summary, changed),
+/// and its stats from its events database.
 fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     const record = run_file(server, run.id, "record.jsonl") catch "";
     try out.print("{{\"id\":{d},\"state\":\"{s}\"", .{ run.id, state(run) });
     if (run.status) |status| try out.print(",\"status\":{d}", .{status});
-    var branches: u32 = 0;
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "{\"run\":")) {
-            try out.print(",\"run\":{s}", .{line["{\"run\":".len .. line.len - 1]});
-        } else if (std.mem.startsWith(u8, line, "{\"summary\":")) {
-            try out.print(",\"summary\":{s}", .{line["{\"summary\":".len .. line.len - 1]});
-        } else if (std.mem.startsWith(u8, line, "{\"snapshot\":")) {
-            try out.print(",\"snapshot\":{s}", .{line["{\"snapshot\":".len .. line.len - 1]});
-        } else if (std.mem.startsWith(u8, line, "{\"changed\":")) {
-            try out.print(",\"changed\":{s}", .{line["{\"changed\":".len .. line.len - 1]});
+        for ([_][]const u8{ "run", "summary", "snapshot", "changed" }) |key| {
+            const prefix = try print(server, "{{\"{s}\":", .{key});
+            if (!std.mem.startsWith(u8, line, prefix)) continue;
+            try out.print(",\"{s}\":{s}", .{ key, line[prefix.len .. line.len - 1] });
         }
     }
-    try out.writeAll(",\"branches\":[");
-    lines = std.mem.tokenizeScalar(u8, record, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
-        if (branches > 0) try out.writeAll(",");
-        try out.writeAll(line["{\"branch\":".len .. line.len - 1]);
-        branches += 1;
-    }
-    try out.writeAll("]}\n");
+    try out.writeAll(",\"stats\":");
+    // One row: the object.
+    const text = try answer_kept(server, run.id, .stats, &stats_compute);
+    try out.writeAll(text[1 .. text.len - 1]);
+    try out.writeAll("}\n");
     return 200;
 }
 
@@ -524,7 +809,6 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const asked = try std.json.parseFromSliceLeaky(CausalityRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     });
-    if (server.job_count == jobs_max) return error.TooManyJobs;
     const original = try std.json.parseFromSliceLeaky(
         RunRequest,
         server.arena,
@@ -541,30 +825,38 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     }
     if (original.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
     try argv.appendSlice(server.arena, &.{
-        "--branch",  try print(server, "{d}", .{asked.branch}),
+        "--branch",   try print(server, "{d}", .{asked.branch}),
         "--property", asked.property,
-        "--points",  try print(server, "{d}", .{asked.points}),
-        "--futures", try print(server, "{d}", .{asked.futures}),
+        "--points",   try print(server, "{d}", .{asked.points}),
+        "--futures",  try print(server, "{d}", .{asked.futures}),
         "--json",
     });
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    if (shared.job_count == jobs_max) return error.TooManyJobs;
     var index: u32 = 0;
-    for (server.jobs[0..server.job_count]) |job| {
+    for (shared.jobs[0..shared.job_count]) |job| {
         if (job.run == run.id) index = @max(index, job.index + 1);
     }
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const directory = try run_directory(server, run.id);
     const output = try std.fs.path.join(server.arena, &.{ directory, name });
     const pid = try spawn(server.arena, argv.items, output, &.{});
-    server.jobs[server.job_count] = .{ .run = run.id, .index = index, .pid = pid };
-    server.job_count += 1;
+    shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
+    shared.job_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{index});
     return 201;
 }
 
 fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
-    const job = for (server.jobs[0..server.job_count]) |*job| {
+    const shared = server.shared;
+    shared.lock();
+    const found: ?Job = for (shared.jobs[0..shared.job_count]) |job| {
         if (job.run == run.id and job.index == index) break job;
-    } else return error.NotFound;
+    } else null;
+    shared.unlock();
+    const job = found orelse return error.NotFound;
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const output = run_file(server, run.id, name) catch "";
     try out.print("{{\"done\":{},\"points\":[", .{job.done});
@@ -580,42 +872,50 @@ fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Wri
     return 200;
 }
 
-/// A property as a finished run's summary has it.
-const SummaryProperty = struct {
+/// A property as a run's events database judges it (store.properties_sql).
+const Judged = struct {
     kind: []const u8,
     message: []const u8,
-    /// Absent from records written before multiverse verdicts: violated in some branch then.
-    failing: ?bool = null,
-    branches_failing: u32 = 0,
-
-    fn failed(property: SummaryProperty) bool {
-        return property.failing orelse (property.branches_failing > 0);
-    }
+    failing: bool,
+    branches_failing: u32,
 };
-const Summary = struct { branches: u32, properties: []const SummaryProperty };
-const SummaryLine = struct { summary: Summary };
 
-fn summary_read(server: *Server, id: u32) ?Summary {
-    const record = run_file(server, id, "record.jsonl") catch return null;
-    var lines = std.mem.tokenizeScalar(u8, record, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "{\"summary\":")) continue;
-        const parsed = std.json.parseFromSliceLeaky(SummaryLine, server.arena, line, .{
-            .ignore_unknown_fields = true,
-        }) catch return null;
-        return parsed.summary;
-    }
-    return null;
+/// A run's properties and how many timelines it has.
+const Verdicts = struct { timelines: u32, properties: []const Judged };
+
+fn verdicts_read(server: *Server, id: u32) !Verdicts {
+    var connection = try run_database(server, id);
+    defer connection.close();
+    const Row = struct { kind: []const u8, message: []const u8, status: []const u8, failing: u32 };
+    const sql = "SELECT type, message, status, timelines_failing FROM (" ++
+        store.properties_sql ++ ")";
+    const rows = connection.rows(Row, server.arena, sql, .{}) catch |err| {
+        if (err == error.DuckDB) server.detail = connection.failure.text();
+        return err;
+    };
+    const properties = try server.arena.alloc(Judged, rows.len);
+    for (rows, properties) |row, *property| property.* = .{
+        .kind = row.kind,
+        .message = row.message,
+        .failing = std.mem.eql(u8, row.status, "failing"),
+        .branches_failing = row.failing,
+    };
+    const Count = struct { count: u32 };
+    const counting = "SELECT count(*) FROM timelines";
+    const count = (try connection.row(Count, server.arena, counting, .{})).?;
+    return .{ .timelines = count.count, .properties = properties };
 }
 
-/// The previous finished run of the same system and scenario, as Antithesis compares runs.
+/// The previous run of the same system and scenario that ended (finished or stopped), as
+/// Antithesis compares runs.
 fn run_previous(server: *Server, run: *const Run) !?u32 {
     const mine = try run_identity(server, run.id);
-    var index = server.run_count;
+    const runs = runs_copy(server);
+    var index = runs.len;
     while (index > 0) {
         index -= 1;
-        const other = &server.runs[index];
-        if (other.id >= run.id or other.status == null) continue;
+        const other = &runs[index];
+        if (other.id >= run.id or (other.status == null and !other.stopped)) continue;
         const theirs = run_identity(server, other.id) catch continue;
         if (std.mem.eql(u8, mine, theirs)) return other.id;
     }
@@ -636,14 +936,17 @@ fn run_identity(server: *Server, id: u32) ![]const u8 {
 
 /// New (fails now, not in the previous run), ongoing (fails in both), resolved (failed before,
 /// passes now, and that is unlikely to be luck) or unseen (passes now, but as rare a failure
-/// could have been missed); rare when only one timeline showed it.
+/// could have been missed); rare when only one timeline showed it. Once the run ended.
 fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
-    const summary_now = summary_read(server, run.id) orelse return error.NotFinished;
-    const now = summary_now.properties;
+    if (run.status == null and !run.stopped) return error.NotFinished;
+    const verdicts_now = try verdicts_read(server, run.id);
+    const now = verdicts_now.properties;
     const previous_id = try run_previous(server, run);
-    const summary_before: Summary = if (previous_id) |id| summary_read(server, id) orelse
-        .{ .branches = 0, .properties = &.{} } else .{ .branches = 0, .properties = &.{} };
-    const before = summary_before.properties;
+    const verdicts_before: Verdicts = if (previous_id) |id|
+        try verdicts_read(server, id)
+    else
+        .{ .timelines = 0, .properties = &.{} };
+    const before = verdicts_before.properties;
     try out.writeAll("{\"previous\":");
     if (previous_id) |id| try out.print("{d}", .{id}) else try out.writeAll("null");
     try out.writeAll(",\"findings\":[");
@@ -652,24 +955,26 @@ fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const earlier = for (before) |other| {
             if (std.mem.eql(u8, other.message, property.message)) break other;
         } else null;
-        const failed_before = if (earlier) |other| other.failed() else false;
-        const finding: ?[]const u8 = if (property.failed())
+        const failed_before = if (earlier) |other| other.failing else false;
+        const finding: ?[]const u8 = if (property.failing)
             (if (failed_before) "ongoing" else "new")
         else if (failed_before)
-            resolution(earlier.?, summary_before.branches, summary_now.branches)
+            resolution(earlier.?, verdicts_before.timelines, verdicts_now.timelines)
         else
             null;
         const kind = finding orelse continue;
         if (!first) try out.writeAll(",");
         first = false;
         try out.print("{{\"message\":{f},\"kind\":{f},\"finding\":\"{s}\",\"rare\":{}}}", .{
-            std.json.fmt(property.message, .{}), std.json.fmt(property.kind, .{}), kind,
-            property.failed() and property.branches_failing == 1,
+            std.json.fmt(property.message, .{}),
+            std.json.fmt(property.kind, .{}),
+            kind,
+            property.failing and property.branches_failing == 1,
         });
     }
     // Properties that failed before and no longer exist (code removed) are resolved too.
     for (before) |other| {
-        if (!other.failed()) continue;
+        if (!other.failing) continue;
         const still = for (now) |property| {
             if (std.mem.eql(u8, property.message, other.message)) break true;
         } else false;
@@ -688,7 +993,7 @@ fn findings_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
 /// (always, unreachable) that showed in k of n timelines is missed by m new timelines with
 /// probability (1 - k/n)^m: below 5% it is resolved, else only unseen. A property judged over
 /// the multiverse (sometimes, reachable) that now holds is resolved.
-fn resolution(before: SummaryProperty, branches_before: u32, branches_now: u32) []const u8 {
+fn resolution(before: Judged, branches_before: u32, branches_now: u32) []const u8 {
     const per_timeline = std.mem.startsWith(u8, before.kind, "always") or
         std.mem.eql(u8, before.kind, "unreachable");
     if (!per_timeline or branches_before == 0 or before.branches_failing == 0) return "resolved";
@@ -699,14 +1004,24 @@ fn resolution(before: SummaryProperty, branches_before: u32, branches_now: u32) 
 }
 
 test resolution {
-    const always = SummaryProperty{ .kind = "always", .message = "m", .branches_failing = 1 };
+    const always: Judged = .{
+        .kind = "always",
+        .message = "m",
+        .failing = true,
+        .branches_failing = 1,
+    };
     // Seen in 1 of 100: 16 clean timelines could easily have missed it.
     try std.testing.expectEqualStrings("unseen", resolution(always, 100, 16));
     // Seen in 50 of 100: 16 clean timelines would almost surely have shown it.
     var common = always;
     common.branches_failing = 50;
     try std.testing.expectEqualStrings("resolved", resolution(common, 100, 16));
-    const sometimes = SummaryProperty{ .kind = "sometimes", .message = "m", .failing = true };
+    const sometimes: Judged = .{
+        .kind = "sometimes",
+        .message = "m",
+        .failing = true,
+        .branches_failing = 0,
+    };
     try std.testing.expectEqualStrings("resolved", resolution(sometimes, 100, 1));
 }
 
@@ -728,11 +1043,11 @@ fn notebook(server: *Server, run: *const Run, request: Request, out: *std.Io.Wri
     }
     if (!std.mem.eql(u8, request.method, "GET")) return error.NotFound;
     const limit: std.Io.Limit = .limited(request_size_max);
-    const source = std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, limit) catch
-        |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
+    const source = std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, limit) catch |err|
+        switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
     try out.print("{{\"source\":{f}}}\n", .{std.json.fmt(source, .{})});
     return 200;
 }
@@ -820,16 +1135,34 @@ fn system_arguments(
     if (asked.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
 }
 
-fn run_find(server: *Server, id: u32) ?*Run {
-    for (server.runs[0..server.run_count]) |*run| {
+/// The run, as it is now (a copy: the watcher updates the list).
+fn run_get(server: *Server, id: u32) ?Run {
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    for (shared.runs[0..shared.run_count]) |run| {
         if (run.id == id) return run;
     }
     return null;
 }
 
+/// Every run, as they are now.
+fn runs_copy(server: *Server) []const Run {
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    return server.arena.dupe(Run, shared.runs[0..shared.run_count]) catch &.{};
+}
+
 /// Stops a running run: SIGTERM to its process group (the explorer and its workers; each run
 /// leads its own session). Marked stopped, on disk too.
-fn run_stop(server: *Server, run: *Run, out: *std.Io.Writer) !u16 {
+fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    const run = for (shared.runs[0..shared.run_count]) |*run| {
+        if (run.id == id) break run;
+    } else return error.NotFound;
     if (run.status != null) return error.NotRunning;
     if (linux.errno(linux.kill(-run.pid, .TERM)) != .SUCCESS) return error.NotRunning;
     run.stopped = true;
@@ -859,8 +1192,8 @@ fn runs_load(server: *Server) !void {
                 run.adopted = true;
             }
         }
-        server.runs[server.run_count] = run;
-        server.run_count += 1;
+        server.shared.runs[server.shared.run_count] = run;
+        server.shared.run_count += 1;
     }
 }
 
@@ -902,18 +1235,27 @@ fn recorded_status(record: []const u8) u32 {
     return if (record[digit] == '0') 0 else 3; // As explore exits.
 }
 
-fn runs_reap(server: *Server) void {
-    for (server.jobs[0..server.job_count]) |*job| {
+/// Marks the runs and jobs that ended (the watcher's, under the lock).
+fn runs_reap(shared: *Shared) void {
+    var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer request_arena.deinit();
+    var server: Server = .{
+        .shared = shared,
+        .options = shared.options,
+        .io = shared.io,
+        .arena = request_arena.allocator(),
+    };
+    for (shared.jobs[0..shared.job_count]) |*job| {
         if (job.done) continue;
         var status: i32 = 0;
         const result = linux.wait4(job.pid, &status, linux.W.NOHANG, null);
         if (linux.errno(result) == .SUCCESS and result != 0) job.done = true;
     }
-    for (server.runs[0..server.run_count]) |*run| {
+    for (shared.runs[0..shared.run_count]) |*run| {
         if (run.status != null) continue;
         if (run.adopted) {
             if (linux.errno(linux.kill(run.pid, @fromBackingInt(0))) != .SRCH) continue;
-            const record = run_file(server, run.id, "record.jsonl") catch "";
+            const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
             continue;
         }
@@ -922,7 +1264,7 @@ fn runs_reap(server: *Server) void {
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         const bits: u32 = @bitCast(status);
         run.status = if (bits & 0x7f == 0) (bits >> 8) & 0xff else 128 + (bits & 0x7f);
-        archive(server, run) catch |err| {
+        archive(&server, run) catch |err| {
             std.debug.print("[determinismo] archiving run {d} failed: {s}\n", .{
                 run.id, @errorName(err),
             });
@@ -968,7 +1310,13 @@ fn notebook_script(server: *Server) ![]const u8 {
 /// A babashka nREPL server for the run (started once, on loopback): the notebook's names in
 /// `user`, over the run's events and record, with actions that run at once through this API.
 /// Editors connect through a tunnel to its port.
-fn nrepl_start(server: *Server, run: *Run, out: *std.Io.Writer) !u16 {
+fn nrepl_start(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock(); // Started once.
+    const run = for (shared.runs[0..shared.run_count]) |*run| {
+        if (run.id == id) break run;
+    } else return error.NotFound;
     if (run.nrepl_port == null) {
         const arena = server.arena;
         const port: u16 = nrepl_port_base + @as(u16, @intCast(run.id % 1000));
@@ -979,8 +1327,8 @@ fn nrepl_start(server: *Server, run: *Run, out: *std.Io.Writer) !u16 {
         };
         const environment = [_][]const u8{
             try print(server, "DETERMINISMO={s}", .{server.options.self}),
-            try print(server, "DETERMINISMO_EVENTS={s}/events", .{directory}),
             try print(server, "DETERMINISMO_RECORD={s}/record.jsonl", .{directory}),
+            try print(server, "DETERMINISMO_SERVE=http://{s}", .{server.options.listen}),
             try print(server, "DETERMINISMO_API=http://{s}", .{server.options.listen}),
             try print(server, "DETERMINISMO_RUN={d}", .{run.id}),
         };
@@ -1008,10 +1356,11 @@ fn notebook_evaluate(
     try cwd.writeFile(server.io, .{ .sub_path = input, .data = body });
     var environment = std.process.Environ.Map.init(server.arena);
     try environment.put("DETERMINISMO", server.options.self);
-    const events = try std.fs.path.join(arena, &.{ directory, "events" });
     const record = try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
-    try environment.put("DETERMINISMO_EVENTS", events);
     try environment.put("DETERMINISMO_RECORD", record);
+    const serve_url = try print(server, "http://{s}", .{server.options.listen});
+    try environment.put("DETERMINISMO_SERVE", serve_url);
+    try environment.put("DETERMINISMO_RUN", try print(server, "{d}", .{run.id}));
     try environment.put("PATH", "/usr/local/bin:/usr/bin:/bin");
     const result = try std.process.run(server.arena, server.io, .{
         .argv = &.{ server.options.bb, script, input },
@@ -1068,20 +1417,25 @@ fn spawn(
 }
 
 fn request_read(server: *Server, client: linux.fd_t) !Request {
-    var size: u32 = 0;
+    var buffer = try server.arena.alloc(u8, 64 * 1024);
+    var size: usize = 0;
     while (true) {
-        const result = linux.read(client, server.request[size..].ptr, server.request.len - size);
+        if (size == buffer.len) {
+            if (buffer.len == request_size_max) return error.BadRequest;
+            buffer = try server.arena.realloc(buffer, @min(buffer.len * 4, request_size_max));
+        }
+        const result = linux.read(client, buffer[size..].ptr, buffer.len - size);
         if (linux.errno(result) != .SUCCESS or result == 0) return error.BadRequest;
-        size += @intCast(result);
-        const text = server.request[0..size];
-        const header_end = std.mem.indexOf(u8, text, "\r\n\r\n") orelse {
-            if (size == server.request.len) return error.BadRequest;
-            continue;
-        };
+        size += result;
+        const text = buffer[0..size];
+        const header_end = std.mem.indexOf(u8, text, "\r\n\r\n") orelse continue;
         const length = content_length(text[0..header_end]);
         const total = header_end + 4 + length;
-        if (total > server.request.len) return error.BadRequest;
-        if (size < total) continue;
+        if (total > request_size_max) return error.BadRequest;
+        if (size < total) {
+            if (total > buffer.len) buffer = try server.arena.realloc(buffer, total);
+            continue;
+        }
         var line = std.mem.tokenizeScalar(u8, text[0..header_end], ' ');
         return .{
             .method = line.next() orelse return error.BadRequest,
@@ -1108,6 +1462,7 @@ fn respond(client: linux.fd_t, status: u16, content_type: []const u8, body: []co
         201 => "Created",
         400 => "Bad Request",
         404 => "Not Found",
+        503 => "Service Unavailable",
         else => "Internal Server Error",
     };
     const head = std.fmt.bufPrint(&header, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n" ++

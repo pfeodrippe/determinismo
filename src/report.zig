@@ -14,10 +14,17 @@ const print = std.debug.print;
 /// branch as it ends, and a `summary` line. Opened with O_APPEND before workers fork, so each
 /// line (one write) stays whole.
 pub var record_fd: ?std.os.linux.fd_t = null;
+/// The events directory's timelines.jsonl (`explore --events-dir`): a line per timeline as it
+/// ends, after its events, as its `branch` line has it; the events database ingests what it
+/// lists (store.zig). Opened as record_fd is.
+pub var timelines_fd: ?std.os.linux.fd_t = null;
 const record_line_size_max = 64 * 1024;
 
 pub fn record(value: anytype) void {
-    const fd = record_fd orelse return;
+    line_write(record_fd orelse return, value);
+}
+
+fn line_write(fd: std.os.linux.fd_t, value: anytype) void {
     var buffer: [record_line_size_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     std.json.Stringify.value(value, .{}, &writer) catch return; // Too large: dropped.
@@ -301,7 +308,7 @@ pub const Multiverse = struct {
                 failing_count += 1;
             }
         }
-        record(.{ .branch = .{
+        const timeline = .{
             .index = branch.index,
             .seed = &hex(branch.seed),
             .outcome = @tagName(branch.outcome),
@@ -313,7 +320,9 @@ pub const Multiverse = struct {
             .path = branch.path,
             .generation = branch.generation,
             .why = branch.why,
-        } });
+        };
+        record(.{ .branch = timeline });
+        if (timelines_fd) |fd| line_write(fd, timeline);
         line.writeAll("\n") catch {
             line.end = line_buffer.len - 1;
             line_buffer[line.end] = '\n';

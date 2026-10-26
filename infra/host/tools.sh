@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Installs the pinned toolchain into ~/opt, checked against its published checksums: Zig, babashka
-# (notebooks) and the TLA+ tools (`determinismo tla`). Idempotent. Runs on the host as the user.
+# (notebooks), DuckDB (the events database) and the TLA+ tools (`determinismo tla`). Idempotent.
+# Runs on the host as the user.
 # Usage: infra/host/tools.sh
 set -euo pipefail
 opt=$HOME/opt
@@ -33,8 +34,28 @@ if ! "$opt/bb/bb" --version 2>/dev/null | grep -q 'v1.13.225'; then
   rm "$opt/$bb"
 fi
 
+# DuckDB (the events database, linked into determinismo by build.zig): its static libraries for
+# musl, and the libstdc++ they were built against (Alpine 3.22's, GCC 14.2.0).
+duckdb=$opt/duckdb-2.0.0
+if [ ! -f "$duckdb/libstdc++.a" ]; then
+  mkdir -p "$duckdb"
+  fetch https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-static-libs-linux-amd64-musl.tar.gz \
+    2f783d69fc8713cf8482577fcde7e000f487997908feb9ef20ad35a3a642f59c "$opt/duckdb-static-libs.tar.gz"
+  tar -xzf "$opt/duckdb-static-libs.tar.gz" -C "$duckdb"
+  rm "$opt/duckdb-static-libs.tar.gz"
+  # An apk is gzip members of tar archives one after another (--ignore-zeros reads past each).
+  fetch https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/libstdc++-dev-14.2.0-r6.apk \
+    13e2169b46a24f03c87caf91387312724b01951c222bd061d6d87c48903836a9 "$opt/libstdc++-dev.apk"
+  tar -xzf "$opt/libstdc++-dev.apk" --ignore-zeros -C "$duckdb" --strip-components 2 \
+    usr/lib/libstdc++.a 2>/dev/null
+  rm "$opt/libstdc++-dev.apk"
+  echo "150c8c511468a90780f804058d984c07c1c69519f3bd8fe0689c49c9a1f7da70  $duckdb/libstdc++.a" |
+    sha256sum -c --status || { echo "error: libstdc++.a from the apk" >&2; exit 1; }
+fi
+ln -sfn "$duckdb" "$opt/duckdb"
+
 mkdir -p "$opt/tla"
 fetch https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
   d15655eeaff4b3f7b3d65c46b838bc0f35d131b2ef4b1e473689b62c98d4726f "$opt/tla/tla2tools.jar"
 
-echo "zig $("$opt/zig/zig" version), $("$opt/bb/bb" --version), tla2tools v1.8.0"
+echo "zig $("$opt/zig/zig" version), $("$opt/bb/bb" --version), duckdb v2.0.0, tla2tools v1.8.0"

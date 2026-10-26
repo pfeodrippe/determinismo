@@ -8,6 +8,8 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
 const event_sets = @import("event_sets.zig");
+const store = @import("store.zig");
+const duckdb = @import("duckdb.zig");
 
 pub const Options = struct {
     machine: []const []const u8,
@@ -95,8 +97,10 @@ fn handle(arena: std.mem.Allocator, io: std.Io, options: Options, message: []con
         const params = (request.object.get("params") orelse return error.BadRequest).object;
         const name = (params.get("name") orelse return error.BadRequest).string;
         const call_arguments = params.get("arguments") orelse return error.BadRequest;
-        const text = tool_call(arena, io, options, name, call_arguments) catch |err| {
-            const failure = try std.fmt.allocPrint(arena, "error: {s}", .{@errorName(err)});
+        var detail: ?[]const u8 = null;
+        const text = tool_call(arena, io, options, name, call_arguments, &detail) catch |err| {
+            const said = detail orelse @errorName(err);
+            const failure = try std.fmt.allocPrint(arena, "error: {s}", .{said});
             return respond_text(arena, id, failure, true);
         };
         return respond_text(arena, id, text, false);
@@ -107,29 +111,59 @@ fn handle(arena: std.mem.Allocator, io: std.Io, options: Options, message: []con
     }));
 }
 
+fn events_answer(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    value: std.json.Value,
+    connection: *duckdb.Connection,
+    out: *std.Io.Writer,
+) !void {
+    const eql = std.mem.eql;
+    const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    if (eql(u8, name, "query")) {
+        const asked = try std.json.parseFromValueLeaky(query.Request, arena, value, options_json);
+        const search = try query.query_of(arena, asked);
+        _ = try query.answer(connection, arena, &search, out, true);
+    } else if (eql(u8, name, "events")) {
+        const Asked = event_sets.Request;
+        const asked = try std.json.parseFromValueLeaky(Asked, arena, value, options_json);
+        try event_sets.request_answer(connection, arena, io, asked, out);
+    } else {
+        const Asked = struct { sql: []const u8 };
+        const asked = try std.json.parseFromValueLeaky(Asked, arena, value, options_json);
+        const sql = try arena.dupeSentinel(u8, asked.sql, 0);
+        const more = try connection.select_json(out, sql, sql_rows_max);
+        const cut = "\n(only the first {d} rows: add a LIMIT, or aggregate)";
+        if (more) try out.print(cut, .{sql_rows_max});
+    }
+}
+
+/// Rows the sql tool answers with at most.
+const sql_rows_max = 10_000;
+
 fn tool_call(
     arena: std.mem.Allocator,
     io: std.Io,
     options: Options,
     name: []const u8,
     value: std.json.Value,
+    failure: *?[]const u8,
 ) ![]const u8 {
     const eql = std.mem.eql;
-    if (eql(u8, name, "query")) {
-        // An exploration's events directory, and the query (query.Request's fields).
+    // On an exploration's events database (its events_dir): a search, an event set, or SQL.
+    if (eql(u8, name, "query") or eql(u8, name, "events") or eql(u8, name, "sql")) {
         const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
         const Where = struct { events_dir: []const u8 };
         const where = try std.json.parseFromValueLeaky(Where, arena, value, options_json);
-        const asked = try std.json.parseFromValueLeaky(query.Request, arena, value, options_json);
-        return query.answer(arena, io, where.events_dir, asked);
-    }
-    if (eql(u8, name, "events")) {
-        const options_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
-        const Where = struct { events_dir: []const u8 };
-        const where = try std.json.parseFromValueLeaky(Where, arena, value, options_json);
-        const asked = try std.json.parseFromValueLeaky(event_sets.Request, arena, value,
-            options_json);
-        return event_sets.answer(arena, io, where.events_dir, asked);
+        const opened = try store.open_for_command(arena, io, where.events_dir);
+        defer opened.close();
+        var out: std.Io.Writer.Allocating = .init(arena);
+        events_answer(arena, io, name, value, &opened.connection, &out.writer) catch |err| {
+            if (err == error.DuckDB) failure.* = opened.connection.failure.text();
+            return err;
+        };
+        return out.written();
     }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
@@ -180,12 +214,11 @@ fn tool_call(
     if (eql(u8, name, "causality")) {
         const branch = arguments.branch orelse return error.MissingBranch;
         const property = arguments.property orelse return error.MissingProperty;
-        try argv.appendSlice(arena, &.{
-            "--branch",  try number(arena, branch), "--property", property,
-            "--points",  try number(arena, arguments.points),
-            "--futures", try number(arena, arguments.futures),
-            "--json",
-        });
+        const branch_text = try number(arena, branch);
+        const points = try number(arena, arguments.points);
+        const futures = try number(arena, arguments.futures);
+        try argv.appendSlice(arena, &.{ "--branch", branch_text, "--property", property });
+        try argv.appendSlice(arena, &.{ "--points", points, "--futures", futures, "--json" });
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return result.stdout;
     }

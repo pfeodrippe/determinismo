@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "tcp", .module = tcp }},
     });
+    // The events database (src/duckdb.zig): DuckDB 2.0's static libraries for musl and the
+    // libstdc++ they were built against, as infra/host/tools.sh installs them.
+    const duckdb = b.option([]const u8, "duckdb", "DuckDB's libraries ($HOME/opt/duckdb)") orelse
+        b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse "/", "opt", "duckdb" });
     const exe = b.addExecutable(.{
         .name = "determinismo",
         .root_module = b.createModule(.{
@@ -30,6 +34,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "determinismo", .module = sdk }},
         }),
     });
+    duckdb_link(b, exe.root_module, duckdb);
     b.installArtifact(exe);
 
     // A small Redis client, shared by the examples and the plain workload.
@@ -246,6 +251,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tcp", .module = tcp },
             },
         }) });
+        if (std.mem.eql(u8, root, "src/main.zig")) duckdb_link(b, unit_tests.root_module, duckdb);
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
     const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -254,4 +260,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     test_step.dependOn(&b.addRunArtifact(tidy_tests).step);
+}
+
+fn duckdb_link(b: *std.Build, module: *std.Build.Module, directory: []const u8) void {
+    const archives = [_][]const u8{
+        "libduckdb_static.a", "libcore_functions_extension.a", "libjson_extension.a", "libstdc++.a",
+    };
+    for (archives) |archive| module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ directory, archive }) });
+    module.link_libc = true;
+    // libstdc++ unwinds with LLVM's libunwind, Zig's own (the same _Unwind ABI as libgcc's).
+    module.linkSystemLibrary("unwind", .{ .use_pkg_config = .no });
 }

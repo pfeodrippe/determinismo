@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Updates a set-up host's build in place, from your machine: the repository synced, determinismo
-# and the guest's initramfs rebuilt, serve and its runs left running (a run keeps the binary it
-# started with; new runs and replays use the new one). For the VMM, the guest runtime and the
-# examples; a change to the KVM patch or the tools needs setup.sh, which stops serve and its runs.
+# Updates a set-up host's build in place, from your machine: the repository synced, the pinned
+# tools installed (tools.sh), determinismo and the guest's initramfs rebuilt, and serve restarted
+# on the new build with its runs left running (a run keeps the binary it started with; new runs,
+# replays and serve itself use the new one). A change to the KVM patch needs setup.sh, which stops
+# serve and its runs.
 # Usage: infra/host/update.sh <ip> [--user <user>]
 set -euo pipefail
 
@@ -39,10 +40,16 @@ if ! diff -q <(cd "$kvm_tree" && git diff -- arch/x86/kvm arch/x86/include virt/
   echo "error: kernel/patches is not the KVM built here: run setup.sh" >&2
   exit 1
 fi
+echo "== the tools"
+infra/host/tools.sh
 echo "== the build"
 ~/opt/zig/zig build -Drelease
 zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko \
   --busybox /usr/bin/busybox --out ~/guest/base.cpio
+if systemctl is-active --quiet determinismo-serve.service; then
+  # The unit as serve.sh writes it now (its runs outlive a restart), then the new build.
+  sudo infra/host/serve.sh "$USER" start
+fi
 echo "== serve: $(systemctl is-active determinismo-serve.service || true)"
 EOF
 echo "== $ip updated"

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Runs `determinismo serve` as a systemd unit for the user's build: started at boot after our
-# KVM, restarted if it fails, and stopped with every run it started (they live in its cgroup).
-# Idempotent. Run as root.
+# KVM, restarted if it fails. A restart (a new build) leaves its runs running: the new serve adopts
+# them (their pid files). `stop` takes the runs too (they live in its cgroup): before KVM is
+# reloaded. Idempotent. Run as root.
 # Usage: serve.sh <user> start|stop
 #   Then, as the user on the host: determinismo explore --serve 127.0.0.1:7878 ...
 set -euo pipefail
@@ -13,6 +14,7 @@ uid=$(id -u "$user")
 unit=determinismo-serve.service
 case $action in
   stop)
+    systemctl kill "$unit" 2>/dev/null || true # Every process of the unit: its runs too.
     systemctl stop "$unit" 2>/dev/null || true
     exit 0
     ;;
@@ -36,7 +38,8 @@ WorkingDirectory=$home/determinismo
 ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen 127.0.0.1:7878 \\
   --data $home/det-runs --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
   --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096
-KillMode=control-group
+# Restarts stop serve alone: its runs go on, adopted by the next.
+KillMode=process
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

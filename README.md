@@ -195,7 +195,7 @@ infra/host/bootstrap.sh <ip>              # packages, user `det`, SSH hardening,
 # On the host, in the repository:
 sudo infra/host/m0-check.sh               # hardware qualification
 infra/host/build-kvm.sh                   # KVM with kernel/patches/*.patch
-infra/host/tools.sh                       # Zig, babashka, TLA+ tools (pinned, checksummed)
+infra/host/tools.sh                       # Zig, babashka, DuckDB, TLA+ tools (pinned, checksummed)
 sudo infra/host/load-kvm.sh               # swap in our KVM modules
 sudo infra/host/kvm-at-boot.sh det        # and at every boot
 guest/kernel/build.sh ~/guest             # the guest kernel and det_guest.ko
@@ -234,9 +234,11 @@ replays branches; an MCP server gives agents the same powers:
 ```
 determinismo serve --listen 127.0.0.1:7878 --data ~/runs --kernel ... --initrd ... --cache ~/cache
 curl -X POST localhost:7878/runs -d '{"program":"zig-out/bin/bank-test","scenario":"bank","branches":40}'
-curl localhost:7878/runs/1                       # state, branches, properties
+curl localhost:7878/runs/1                       # state, record, stats
+curl localhost:7878/runs/1/properties            # every property's verdict so far (also /timelines, /discovery)
+curl -X POST localhost:7878/runs/1/sql -d '{"sql":"SELECT kind, count(*) FROM events GROUP BY kind"}'
 curl -X POST localhost:7878/runs/1/replay -d '{"branch":3}'
-determinismo mcp --kernel ... --initrd ... --cache ~/cache   # tools: describe, explore, replay, fork, query, events, causality, mutate
+determinismo mcp --kernel ... --initrd ... --cache ~/cache   # tools: describe, explore, replay, fork, query, events, sql, causality, mutate
 ```
 
 Multiverse debugging: stop a branch at a moment and run a command there (output streams back,

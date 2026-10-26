@@ -441,6 +441,20 @@ determinism makes state recomputable.
 
 - Durable data per run is small: tapes are KBs–MBs; logs dominate (budget per vtime hour, with
   retroactive/suppressed verbose logging recoverable by replay).
+- **The events database** (implemented: `src/store.zig`, `src/duckdb.zig`): every run's events
+  live in DuckDB 2.0 (linked in statically, its C API v2 behind one Zig module), the one place
+  questions about a run are answered: the UI's panels (stats, properties with their verdicts,
+  timelines, discovery), searches (the query language compiles to SQL, temporal conditions to
+  window functions), event sets (each operation a temporary table) and agents' read-only SQL.
+  The VMM writes JSON lines per timeline (events directory); the explorer lists each finished
+  timeline in `timelines.jsonl` after its events; ingest brings in what finished since, as one
+  batch in one transaction (one scan of all the new files), so readers see whole timelines
+  only. Each event keeps its JSON plus typed columns for what is filtered on (kind, name, type,
+  condition, node, text, behavior) and for the hottest JSON paths (their text and JSON type, so
+  conditions on them skip parsing). A timeline is a view: the setup's events, its ancestors'
+  parts, its own. Serve attaches every run's database to one instance; a watcher ingests as
+  timelines finish (a `stat` when nothing did), and answers that change only with new
+  timelines are kept until they arrive.
 - Long-term replayability requires pinning: determinism-ABI version, hypervisor build, host CPU
   model, guest kernel + images, CPUID baseline. Implemented: the inputs hash (recorded in tapes,
   checked on replay) covers the kernel and initramfs bytes, the command line, the disks (named by

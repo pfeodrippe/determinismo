@@ -2,8 +2,8 @@
 ;; A run's notebook, evaluated by babashka (serve.zig runs it: bb notebook.clj <input.json>).
 ;; Cells are Clojure, evaluated in order in one namespace (as Antithesis's notebook): what a cell
 ;; defines, later cells use. Each cell shows what it printed and its value: events as a log, data
-;; as EDN, markdown with `md`. Queries run the determinismo CLI on the run's events (what the HTTP
-;; API answers); actions (replay, stacks, profile, extract) run when clicked in the UI, and their
+;; as EDN, markdown with `md`. Queries, event sets and SQL ask the run's events database through
+;; serve; actions (replay, stacks, profile, extract) run when clicked in the UI, and their
 ;; results come back here for later cells.
 ;;
 ;; Over nREPL (serve.zig starts `bb --init notebook.clj nrepl-server` for a run), the same
@@ -20,8 +20,9 @@
 
 (def ^:private environment
   {:determinismo (or (System/getenv "DETERMINISMO") "determinismo")
-   :events (System/getenv "DETERMINISMO_EVENTS")
    :record (System/getenv "DETERMINISMO_RECORD")
+   ;; Serve, which holds the run's events database: queries, event sets and SQL go through it.
+   :serve (System/getenv "DETERMINISMO_SERVE")
    ;; Set over nREPL: actions run at once, through serve's API for this run.
    :api (System/getenv "DETERMINISMO_API")
    :run (System/getenv "DETERMINISMO_RUN")})
@@ -34,12 +35,15 @@
 (defn- json-lines [text]
   (->> (str/split-lines text) (remove str/blank?) (mapv #(json/parse-string % true))))
 
-(defn- cli [command request]
-  (let [{:keys [exit out err]} (process/shell {:out :string :err :string :continue true}
-                                              (:determinismo environment) command
-                                              (:events environment) (json/generate-string request))]
-    (when-not (zero? exit) (throw (ex-info (str command ": " (str/trim (str err out))) {:request request})))
-    (json-lines out)))
+(defn- database
+  "Asks the run's events database (through serve): the answer's text."
+  [path request]
+  (let [url (str (:serve environment) "/runs/" (:run environment) "/" path)
+        response (http/post url {:body (json/generate-string request) :throw false
+                                 :headers {"Content-Type" "application/json"} :timeout 600000})]
+    (when-not (= 200 (:status response))
+      (throw (ex-info (str path ": " (:body response)) {:request request})))
+    (:body response)))
 
 ;; Built-ins -------------------------------------------------------------------------------
 
@@ -55,13 +59,19 @@
   "Events of every timeline matching a condition (query.zig's language):
   (query \"assert.condition=false\" {:limit 20 :preceded_by \"event=fault\" :within 1})."
   ([condition] (query condition {}))
-  ([condition options] (cli "query" (merge {:condition condition :limit 100} options))))
+  ([condition options] (json-lines (database "query" (merge {:condition condition :limit 100} options)))))
 
 (defn events
   "An event set pipeline (event_sets.zig): (events [{:filter \"assert.condition=false\"}
   {:with_last {:fault \"event=fault\"}}] {:limit 50})."
   ([pipeline] (events pipeline {}))
-  ([pipeline options] (cli "events" (merge {:pipeline pipeline :limit 100} options))))
+  ([pipeline options] (json-lines (database "events" (merge {:pipeline pipeline :limit 100} options)))))
+
+(defn sql
+  "One SELECT on the run's events database (tables events, timelines, steps; the view
+  timeline_events): its rows. (sql \"SELECT kind, count(*) AS n FROM events GROUP BY kind\")."
+  [text]
+  (json/parse-string (database "sql" {:sql text}) true))
 
 (defn md
   "Shows markdown."
@@ -155,7 +165,7 @@
         {:outputs (conj @*outputs* {:type "error" :text (or (ex-message error) (str error))})
          :failed true}))))
 
-(def ^:private names '[run query events md replay stacks profile extract result])
+(def ^:private names '[run query events sql md replay stacks profile extract result])
 
 (defn -main [input-path]
   (let [input (json/parse-string (slurp input-path))]

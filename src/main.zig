@@ -365,8 +365,8 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     }
     // Catalogs span scenarios (a test program's, a service serving several): an assertion
     // must be reached in some scenario, judged once all ran.
-    const every_scenario = if (prepared) |known| scenarios.len == known.system.scenarios.len else
-        true;
+    const all_scenarios = if (prepared) |known| known.system.scenarios.len else scenarios.len;
+    const every_scenario = scenarios.len == all_scenarios;
     if (catalog.judge(every_scenario) > 0) failing_scenarios += 1;
     return failing_scenarios;
 }
@@ -696,6 +696,8 @@ fn command_explore(
     if (arguments.events_directory) |directory| {
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
         options.events_fd = try events_file(context.arena, directory, "setup.jsonl");
+        const timelines = try std.fs.path.join(context.arena, &.{ directory, "timelines.jsonl" });
+        report.timelines_fd = try open_for_appending(context.arena, timelines);
     }
     try explore_snapshot(vm, options, snapshot);
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
@@ -799,10 +801,13 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     const snapshot = try context.arena.create(Snapshot);
     try snapshot.take_copy(vm);
     vm.deinit();
+    const wall_s = @as(f64, @floatFromInt(monotonic_ns() - time_start_ns)) / std.time.ns_per_s;
     std.debug.print("[determinismo] forked branch {d} at vtime={d}ns branches={d} " ++
         "({d:.3}s wall); its branches follow\n", .{
-        fork.fork.branch, fork.fork.vtime_ns, snapshot.branches,
-        @as(f64, @floatFromInt(monotonic_ns() - time_start_ns)) / std.time.ns_per_s,
+        fork.fork.branch,
+        fork.fork.vtime_ns,
+        snapshot.branches,
+        wall_s,
     });
     return snapshot;
 }
@@ -2414,6 +2419,8 @@ test {
     _ = @import("tla.zig");
     _ = @import("guest_memory.zig");
     _ = @import("query.zig");
+    _ = @import("duckdb.zig");
+    _ = @import("store.zig");
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
     _ = @import("changed.zig");

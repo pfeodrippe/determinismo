@@ -207,6 +207,10 @@ const state = {
   runs: [], runId: null, run: null, poll: null, tab: "all", filter: "", logs: null,
   view: "report", notebook: null, // The run's notebook: cells, their outputs, action results.
   open: new Set(["findings", "properties", "map"]), // Sections shown expanded.
+  discovery: null, // The last discovery chart drawn ({runId, html}): kept until the next one.
+  refreshing: false, // A refresh in flight: polls do not pile up behind a slow one.
+  examples: new Map(), // A property's examples once loaded (by message), and those shown open.
+  examplesOpen: new Set(),
 };
 const $ = (selector, root = document) => root.querySelector(selector);
 const escape = (text) => String(text).replace(/[&<>"']/g, (c) =>
@@ -227,27 +231,30 @@ const lines = (text) => text.split("\n").filter((line) => line.trim()).map((line
 const query = async (request) => lines(await api(`/runs/${state.runId}/query`, request));
 
 // Runs ------------------------------------------------------------------------------------
-// Each run's record, kept once it finished: its label here, its subtrees in the tree.
+// A run, from its events database: its record and stats, its timelines, its properties.
+async function runFetch(id) {
+  const [info, branches, properties] = await Promise.all([
+    apiJson(`/runs/${id}`), apiJson(`/runs/${id}/timelines`), apiJson(`/runs/${id}/properties`)]);
+  return { ...info, branches, properties };
+}
+// Runs forked from moments of others, kept once they ended: subtrees in the tree.
 const details = new Map();
 async function runDetails(run) {
   const known = details.get(run.id);
   if (known && known.state !== "running") return known;
-  try { details.set(run.id, await apiJson(`/runs/${run.id}`)); } catch { /* Not yet. */ }
+  try { details.set(run.id, await runFetch(run.id)); } catch { /* Not yet. */ }
   return details.get(run.id);
 }
-function runLabel(record) {
-  const info = (record && record.run) || {};
-  const system = (info.program || info.compose || "").split("/").pop();
-  const fork = info.from_branch != null ? ` · fork of #${info.from_branch}` : "";
-  return escape([system, info.scenario].filter(Boolean).join(" · ") + fork);
+function runLabel(run) {
+  const fork = run.from_branch != null ? ` · fork of #${run.from_branch}` : "";
+  return escape([run.system, run.scenario].filter(Boolean).join(" · ") + fork);
 }
 async function runsRefresh() {
   try { state.runs = await apiJson("/runs"); } catch { return; }
-  await Promise.all(state.runs.map(runDetails));
   const list = $("#runs");
   list.innerHTML = state.runs.slice().reverse().map((run) =>
     `<li data-id="${run.id}" class="${run.id === state.runId ? "selected" : ""}">
-       <span class="label">Run ${run.id}<small>${runLabel(details.get(run.id))}</small></span>${stateBadge(run.state)}</li>`).join("");
+       <span class="label">Run ${run.id}<small>${runLabel(run)}</small></span>${stateBadge(run.state)}</li>`).join("");
   list.querySelectorAll("li").forEach((item) =>
     item.addEventListener("click", () => runOpen(Number(item.dataset.id))));
 }
@@ -258,6 +265,8 @@ function stateBadge(name) {
 
 async function runOpen(id) {
   state.runId = id;
+  state.examples = new Map();
+  state.examplesOpen = new Set();
   state.logs = null;
   state.notebook = null;
   clearInterval(state.poll);
@@ -269,8 +278,14 @@ async function runOpen(id) {
 }
 
 async function runRefresh() {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  const id = state.runId;
+  let fresh;
+  try { fresh = await runFetch(id); } finally { state.refreshing = false; }
+  if (id !== state.runId) return; // Another run was opened meanwhile.
   const before = state.run;
-  state.run = await apiJson(`/runs/${state.runId}`);
+  state.run = fresh;
   if (state.view === "notebook" && $("#notebook")) return; // Never under the writer's cursor.
   // While the run goes on, what changes is updated in place (no flicker, no re-query of every
   // section); the tree, which queries every timeline's events, every 10 seconds.
@@ -286,7 +301,9 @@ function liveUpdate() {
   const bar = $(".progress div");
   if (bar) bar.style.width = `${100 * progress()}%`;
   const properties = $("#properties");
-  if (properties && document.activeElement !== $("#property-filter")) {
+  // Not under the reader: examples open (and a causality analysis in them) stay as they are.
+  if (properties && state.examplesOpen.size) $(".summary", properties).innerHTML = propertiesSummary();
+  else if (properties && document.activeElement !== $("#property-filter")) {
     $(".summary", properties).innerHTML = propertiesSummary();
     $(".body", properties).innerHTML = propertiesBody();
     propertiesWire();
@@ -310,13 +327,13 @@ function progress() {
 }
 const duration = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${(s / 60).toFixed(1)} min` : `${s.toFixed(1)} s`;
 function statsHtml() {
-  const run = state.run, info = run.run || {};
-  const done = run.branches.length;
-  const failing = run.branches.filter((branch) => branch.failing.length > 0).length;
+  const run = state.run, info = run.run || {}, stats = run.stats || {};
+  const done = stats.timelines ?? run.branches.length;
+  const failing = stats.failing_timelines ?? 0;
   const list = properties();
   const failed = list.filter(isFailing).length;
-  const vtime = run.branches.reduce((sum, b) => sum + b.vtime_ns, 0) / 1e9;
-  const wall = (run.summary ? run.summary.wall_ns : run.branches.reduce((sum, b) => sum + b.wall_ns, 0)) / 1e9;
+  const vtime = (stats.vtime_ns || 0) / 1e9;
+  const wall = (run.summary ? run.summary.wall_ns : stats.wall_ns || 0) / 1e9;
   const speed = run.summary && run.summary.vtime_per_wall ? `${run.summary.vtime_per_wall.toFixed(2)}× wall, one core` : "virtual seconds";
   const stat = (title, value, note, color = "") =>
     `<div class="stat"><div class="title">${title}</div><div class="value" style="color:${color}">${value}</div><div class="note">${note}</div></div>`;
@@ -324,9 +341,9 @@ function statsHtml() {
   return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), `${planned} · ${duration(wall)} wall`)}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
-    ${stat("Properties", `${failed} / ${list.length}`, run.summary ? "failing" : "failing so far", failed ? "var(--fail)" : "var(--pass)")}
+    ${stat("Properties", `${failed} / ${list.length}`, run.state === "running" ? "failing so far" : "failing", failed ? "var(--fail)" : "var(--pass)")}
     ${stat("Virtual time", duration(vtime), speed)}
-    ${stat("Behaviors", `<span id="behaviors">–</span>`, `<span id="behaviors-note">distinct, by timelines</span>`, "var(--accent)")}
+    ${stat("Behaviors", `<span id="behaviors">${(stats.behaviors ?? 0).toLocaleString()}</span>`, `<span id="behaviors-note">distinct, by timelines</span>`, "var(--accent)")}
   </div>`;
 }
 function chartsHtml() {
@@ -338,9 +355,9 @@ function chartsHtml() {
       <span class="count fail-text">${p.branches_failing || "never"}</span></div>`).join("");
   return `<div class="charts" id="charts-live">
     <div class="chart"><div class="head"><h3>New behavior discovery</h3><span>distinct behaviors by timelines</span></div>
-      <div id="discovery" class="muted">Loading…</div></div>
+      ${discoveryKept() ? `<div id="discovery">${discoveryKept()}</div>` : `<div id="discovery" class="muted">Loading…</div>`}</div>
     <div class="chart"><div class="head"><h3>Failing properties</h3><span>timelines failing each one</span></div>
-      <div class="bars">${bars || `<div class="pass-text" style="padding:20px 0">Every property passes${state.run.summary ? "" : " so far"}.</div>`}
+      <div class="bars">${bars || `<div class="pass-text" style="padding:20px 0">Every property passes${state.run.state === "running" ? " so far" : ""}.</div>`}
       ${passing ? `<div class="muted" style="margin-top:6px">${passing} passing</div>` : ""}</div></div>
   </div>`;
 }
@@ -476,12 +493,19 @@ function utilizationBody() {
     <div class="muted" style="max-width:720px;margin-top:10px">New behavior discovery (above): a curve still climbing says run longer;
       one flat for long says these tests found what they can: strengthen them (more drivers, assertions, faults) to find more.</div>`;
 }
+// The chart drawn last for this run: shown again while the next one loads (no flicker).
+const discoveryKept = () => state.discovery && state.discovery.runId === state.runId ? state.discovery.html : null;
 async function discoveryDraw() {
-  const box = $("#discovery");
-  if (!box) return;
+  const id = state.runId;
   let points;
-  try { points = (await apiJson(`/runs/${state.runId}/discovery`)).points; } catch { box.textContent = "No events recorded."; return; }
-  if (!points.length) { box.textContent = "No timelines yet."; return; }
+  try { points = (await apiJson(`/runs/${id}/discovery`)).points; } catch (error) {
+    const box = $("#discovery");
+    if (box && !discoveryKept()) box.textContent = `No events recorded (${error.message}).`;
+    return;
+  }
+  const box = $("#discovery");
+  if (!box || id !== state.runId) return;
+  if (!points.length) { if (!discoveryKept()) box.textContent = "No timelines yet."; return; }
   const width = Math.max(320, box.clientWidth), height = 170, left = 44, bottom = 22;
   const maxX = Math.max(1, points[points.length - 1][0]), maxY = Math.max(1, ...points.map((p) => p[1]));
   const x = (v) => left + (width - left - 12) * v / maxX, y = (v) => height - bottom - (height - bottom - 10) * v / maxY;
@@ -494,6 +518,8 @@ async function discoveryDraw() {
      <line x1="${left}" x2="${width - 12}" y1="${y(v)}" y2="${y(v)}" stroke="#30333d" stroke-dasharray="${v ? "2 4" : ""}"/>`).join("");
   box.innerHTML = `<svg width="${width}" height="${height}">${ticksY}<path d="${area}" fill="#8f7cf7" opacity=".14"/>
     <path d="${line}" fill="none" stroke="#8f7cf7" stroke-width="2.2"/>${ticksX}</svg>`;
+  box.classList.remove("muted");
+  state.discovery = { runId: id, html: box.innerHTML };
   // Still rising: the last fifth of the timelines found new behaviors.
   const recent = points.filter(([b]) => b >= maxX * 0.8);
   const rising = recent.length > 1 && recent[recent.length - 1][1] > recent[0][1];
@@ -501,28 +527,26 @@ async function discoveryDraw() {
   if ($("#behaviors-note")) $("#behaviors-note").textContent = rising ? "still rising: run longer" : "flat lately";
 }
 
-// Properties: from the summary, or (while running) from the failing branches so far.
+// Properties: each assertion with its verdict across the timelines so far (the run's events
+// database judges them as Antithesis does).
 const builtin = new Set(["test commands exit successfully", "nodes do not exit unexpectedly",
   "no process crashes (segfault, illegal instruction, ...)",
   "the kernel kills no process for lack of memory", "the kernel reports no warnings, BUGs or hung tasks",
   "the guest finishes its scenario (no panic, hang or crash)"]);
 function properties() {
-  if (state.run.summary) return state.run.summary.properties;
-  const failing = new Map();
-  for (const branch of state.run.branches) for (const name of branch.failing) {
-    const property = failing.get(name) || { kind: "?", message: name, branches_hit: 0, branches_failing: 0, example_branch: branch.index };
-    property.branches_failing += 1;
-    failing.set(name, property);
-  }
-  return [...failing.values()];
+  return (state.run.properties || []).map((p) => ({
+    kind: p.type, message: p.message, location: p.location, status: p.status,
+    failing: p.status === "failing", branches_hit: p.timelines_hit, branches_true: p.timelines_true,
+    branches_failing: p.timelines_failing, example_branch: p.first_failing_timeline,
+  }));
 }
-// The summary's verdict across the multiverse (a sometimes never true, a reachable never
-// reached fail too); while a run goes, the violations seen so far.
-const isFailing = (property) => property.failing ?? property.branches_failing > 0;
+// Failing across the multiverse (a sometimes never true too); an assertion that must be reached
+// and was not is "unreached": judged across scenarios.
+const isFailing = (property) => property.failing;
 function propertiesSummary() {
   const list = properties();
   const failed = list.filter(isFailing).length;
-  return `<span class="${failed ? "fail-text" : "pass-text"}">${failed} failing</span> of ${list.length}${state.run.summary ? "" : " (so far)"}`;
+  return `<span class="${failed ? "fail-text" : "pass-text"}">${failed} failing</span> of ${list.length}${state.run.state === "running" ? " (so far)" : ""}`;
 }
 function propertiesBody() {
   const list = properties();
@@ -548,8 +572,11 @@ function propertiesBody() {
 }
 function propertyHtml(property) {
   const failed = isFailing(property);
+  const badge = failed ? `<span class="badge fail">failed</span>`
+    : property.status === "unreached" ? `<span class="badge error" title="Never reached in this run's scenario: judged across scenarios">unreached</span>`
+    : `<span class="badge pass">passed</span>`;
   return `<div class="property" data-message="${escape(property.message)}">
-    <div class="row"><span class="badge ${failed ? "fail" : "pass"}">${failed ? "failed" : "passed"}</span>
+    <div class="row">${badge}
       <span class="name">${escape(property.message)}${property.location ? ` <span class="muted mono" style="font-size:11px">${escape(property.location)}</span>` : ""}</span>
       <span class="counts">${escape(property.kind)} · hit in ${property.branches_hit}${property.kind === "sometimes" ? ` · true in ${property.branches_true ?? "?"}` : ""} · failing in ${property.branches_failing}</span></div>
     <div class="examples" hidden></div></div>`;
@@ -567,40 +594,59 @@ function propertiesWire() {
   });
   document.querySelectorAll(".property > .row").forEach((row) => row.addEventListener("click", () =>
     examplesToggle(row.parentElement)));
+  // Those open before a render, again (from what they loaded).
+  document.querySelectorAll(".property").forEach((element) => {
+    if (!state.examplesOpen.has(element.dataset.message)) return;
+    $(".examples", element).hidden = false;
+    examplesDraw(element);
+  });
 }
 
 // Examples: the moments a property failed (and passed), by timeline.
 async function examplesToggle(element) {
+  const message = element.dataset.message;
   const box = $(".examples", element);
   box.hidden = !box.hidden;
-  if (box.hidden || box.dataset.loaded) return;
+  if (box.hidden) { state.examplesOpen.delete(message); return; }
+  state.examplesOpen.add(message);
+  if (state.examples.has(message)) return examplesDraw(element);
   box.innerHTML = `<div class="muted">Loading examples…</div>`;
-  const message = element.dataset.message;
   const field = `assert.message=${quote(message)}`;
   try {
     const failing = await query({ condition: `${field} assert.condition=false or antithesis_assert.message=${quote(message)} antithesis_assert.condition=false`, output: "branches", limit: 1000000 });
     const passing = await query({ condition: `${field} assert.condition=true or antithesis_assert.message=${quote(message)} antithesis_assert.condition=true`, output: "branches", limit: 1000000 });
-    const failingBranches = new Set(failing.map((example) => example.branch));
-    const rows = [
-      ...failing.slice(0, 10).map((example) => ({ ...example, failing: true })),
-      ...passing.filter((example) => !failingBranches.has(example.branch)).slice(0, 5).map((example) => ({ ...example, failing: false })),
-    ];
-    box.dataset.loaded = "1";
-    box.innerHTML = rows.length ? `<table><tr><th>Example</th><th>Branch</th><th>Time</th><th>Hits</th><th></th></tr>
-      ${rows.map((row) => `<tr class="clickable" data-branch="${row.branch}" data-vtime="${row.first_vtime_ns}">
-        <td class="${row.failing ? "fail-text" : "pass-text"}">${row.failing ? "Failing" : "Passing"}</td>
-        <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
-        <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
-      </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.length} passing. Click an example for its logs.</div>
-      <div class="causality-result"></div>`
-      : `<div class="muted">No assertion events for this property (determinismo checks it when a timeline ends).</div>`;
-    box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
-      logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
-    box.querySelectorAll("button.causality").forEach((button) => button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      causalityRun($(".causality-result", box), Number(button.dataset.branch), message);
-    }));
-  } catch (error) { box.innerHTML = `<div class="fail-text">${escape(error.message)}</div>`; }
+    state.examples.set(message, { failing, passing });
+  } catch (error) { state.examples.set(message, { error: error.message }); }
+  // Drawn where the property is now (the list may have been drawn again meanwhile).
+  const now = [...document.querySelectorAll(".property")].find((other) => other.dataset.message === message);
+  if (now && state.examplesOpen.has(message)) examplesDraw(now);
+}
+function examplesDraw(element) {
+  const message = element.dataset.message;
+  const box = $(".examples", element);
+  const loaded = state.examples.get(message);
+  if (!loaded) { box.innerHTML = `<div class="muted">Loading examples…</div>`; return; }
+  if (loaded.error) { box.innerHTML = `<div class="fail-text">${escape(loaded.error)}</div>`; return; }
+  const { failing, passing } = loaded;
+  const failingBranches = new Set(failing.map((example) => example.branch));
+  const rows = [
+    ...failing.slice(0, 10).map((example) => ({ ...example, failing: true })),
+    ...passing.filter((example) => !failingBranches.has(example.branch)).slice(0, 5).map((example) => ({ ...example, failing: false })),
+  ];
+  box.innerHTML = rows.length ? `<table><tr><th>Example</th><th>Branch</th><th>Time</th><th>Hits</th><th></th></tr>
+    ${rows.map((row) => `<tr class="clickable" data-branch="${row.branch}" data-vtime="${row.first_vtime_ns}">
+      <td class="${row.failing ? "fail-text" : "pass-text"}">${row.failing ? "Failing" : "Passing"}</td>
+      <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
+      <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
+    </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.filter((example) => !failingBranches.has(example.branch)).length} passing. Click an example for its logs.</div>
+    <div class="causality-result"></div>`
+    : `<div class="muted">No assertion events for this property (determinismo checks it when a timeline ends).</div>`;
+  box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
+    logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
+  box.querySelectorAll("button.causality").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    causalityRun($(".causality-result", box), Number(button.dataset.branch), message);
+  }));
 }
 
 // Findings: what changed since the previous run of the same system and scenario.
@@ -779,6 +825,7 @@ async function mapDraw() {
     return found;
   };
   const forkedHere = info.from_branch != null;
+  if (!forkedHere) await Promise.all(state.runs.filter((other) => other.from_branch != null && other.id !== run.id).map(runDetails));
   const children = [...details.values()].filter((other) => other.id !== run.id && other.run && !forkedHere
     && other.run.from_branch != null && other.run.inputs === info.inputs && other.run.seed === info.seed
     && other.run.scenario === info.scenario && other.branches.length);

@@ -5,7 +5,6 @@
 //! No allocation: properties live in a fixed table, and JSON parsing uses a buffer the caller
 //! reserves once at startup (`parse_buffer_size`) and that is reset for every event.
 const std = @import("std");
-const query = @import("query.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
@@ -71,7 +70,7 @@ last_event_name_size: u8 = 0,
 /// rate the "logging output" property checks.
 output_bytes: u64 = 0,
 first_vtime_ns: ?u64 = null,
-/// The behaviors this timeline reached (query.behavior_hash: an assertion with its outcome, an
+/// The behaviors this timeline reached (behavior_hash: an assertion with its outcome, an
 /// event with its categorical details; and how close a guidance assertion came, by powers of
 /// two), each with when it first did: where the tree explorer branches from (main.zig).
 behaviors: [behavior_count_max]Behavior = undefined,
@@ -112,31 +111,38 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     if (events.first_vtime_ns == null) events.first_vtime_ns = moment.vtime_ns;
     events.hash.update(std.mem.asBytes(&moment));
     events.hash.update(data);
-    if (events.log_fd) |fd| if (!events.retroactive_hidden(data)) {
-        write_log_line(fd, .{ .sequence = events.count, .moment = moment, .data = data });
-    };
 
     events.last_event_name_size = 0;
+    // 64 times the largest event: a failure to parse is never for lack of room.
     var fba = std.heap.FixedBufferAllocator.init(events.parse_buffer);
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), data, .{}) catch {
-        return; // Not JSON: kept in the log, but carries no properties.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), data, .{}) catch
+        null;
+    if (events.log_fd) |fd| if (!events.retroactive_hidden(data)) {
+        write_log_line(fd, .{
+            .sequence = events.count,
+            .moment = moment,
+            .data = data,
+            .json = parsed != null,
+        });
     };
-    if (parsed != .object) return;
-    if (parsed.object.get("event")) |name| {
+    // Not JSON: logged as text (`{"raw": ...}`), but carries no properties.
+    const value = parsed orelse return;
+    if (value != .object) return;
+    if (value.object.get("event")) |name| {
         if (name == .string) {
             const size: u8 = @intCast(@min(name.string.len, events.last_event_name.len));
             @memcpy(events.last_event_name[0..size], name.string[0..size]);
             events.last_event_name_size = size;
         }
     }
-    events.behavior_note(moment, parsed);
-    if (parsed.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
-    if (parsed.object.get("output")) |output| try events.on_output(moment, output);
-    if (parsed.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
-    if (parsed.object.get("antithesis_assert")) |assertion| {
+    events.behavior_note(moment, value);
+    if (value.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
+    if (value.object.get("output")) |output| try events.on_output(moment, output);
+    if (value.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
+    if (value.object.get("antithesis_assert")) |assertion| {
         try events.on_antithesis_assert(moment, assertion);
     }
-    if (parsed.object.get("antithesis_setup")) |setup| {
+    if (value.object.get("antithesis_setup")) |setup| {
         const status = if (setup == .object) string_field(setup.object, "status") else null;
         if (status != null and std.mem.eql(u8, status.?, "complete")) {
             events.on_lifecycle(moment, .{ .string = "setup_complete" });
@@ -155,7 +161,7 @@ fn retroactive_hidden(events: *const Events, data: []const u8) bool {
 }
 
 fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
-    const hash = query.behavior_hash(value) orelse guidance_hash(value) orelse
+    const hash = behavior_hash(value) orelse guidance_hash(value) orelse
         output_hash(value) orelse return;
     if (events.behavior_count == behavior_count_max) return;
     const key = hash | 1; // 0 marks an empty slot.
@@ -261,6 +267,47 @@ test output_template {
 
 /// A guidance assertion's distance by power of two (0 or less: there): a timeline that came
 /// closer than any before reached a new behavior.
+/// What the explorer counts as a behavior: an assertion with its outcome, an event with its
+/// categorical details (a code coverage edge or line included); not numbers, not what
+/// determinismo itself reports (commands, faults, lifecycle). The events database counts the
+/// same (store.zig's `behavior`).
+const runtime_events = [_][]const u8{
+    "composer_start", "composer_done", "command_start", "command_exit", "faults_phase",
+    "faults_start",   "faults_stop",   "fault",         "nodes_up",     "node_start",
+    "node_ready",     "node_kill",     "exec_start",    "exec_output",  "exec_done",
+};
+const behavior_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
+
+fn behavior_hash(value: std.json.Value) ?u64 {
+    if (value != .object) return null;
+    var hasher = std.hash.Wyhash.init(0x6265686176696f72);
+    if (value.object.get("assert")) |assertion| {
+        if (assertion != .object) return null;
+        for ([_][]const u8{ "type", "message", "condition" }) |key| {
+            hash_field(&hasher, assertion.object, key);
+        }
+        return hasher.final();
+    }
+    const name = value.object.get("event") orelse return null;
+    if (name != .string) return null;
+    for (runtime_events) |runtime| if (std.mem.eql(u8, name.string, runtime)) return null;
+    hasher.update(name.string);
+    if (value.object.get("details")) |details| {
+        if (details == .object) for (behavior_keys) |key| hash_field(&hasher, details.object, key);
+    }
+    return hasher.final();
+}
+
+fn hash_field(hasher: *std.hash.Wyhash, object: std.json.ObjectMap, key: []const u8) void {
+    const value = object.get(key) orelse return;
+    hasher.update(key);
+    switch (value) {
+        .string => |text| hasher.update(text),
+        .bool => |flag| hasher.update(if (flag) "true" else "false"),
+        else => {}, // Numbers and structures: not behaviors.
+    }
+}
+
 fn guidance_hash(value: std.json.Value) ?u64 {
     const guidance = value.object.get("guidance") orelse return null;
     if (guidance != .object) return null;
@@ -490,8 +537,10 @@ fn string_field(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
-const LogLine = struct { sequence: u64, moment: Moment, data: []const u8 };
+const LogLine = struct { sequence: u64, moment: Moment, data: []const u8, json: bool };
 
+/// One JSON line (the events database ingests them, store.zig): data that is not JSON is
+/// written as text, `{"raw": "..."}`.
 fn write_log_line(fd: linux.fd_t, line: LogLine) void {
     assert(fd >= 0);
     assert(line.sequence > 0);
@@ -501,7 +550,15 @@ fn write_log_line(fd: linux.fd_t, line: LogLine) void {
         line.sequence, line.moment.vtime_ns, line.moment.branches,
     }) catch unreachable; // 128 bytes fit three u64s and the keys.
     write_all(fd, head);
-    write_all(fd, line.data);
+    if (line.json) {
+        write_all(fd, line.data);
+    } else {
+        // At most 4096 bytes, each at most 6 escaped (or 4 as a byte array, for invalid UTF-8).
+        var raw_buffer: [4096 * 6 + 16]u8 = undefined;
+        var raw: std.Io.Writer = .fixed(&raw_buffer);
+        raw.print("{{\"raw\":{f}}}", .{std.json.fmt(line.data, .{})}) catch unreachable;
+        write_all(fd, raw.buffered());
+    }
     write_all(fd, "}\n");
 }
 

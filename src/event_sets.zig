@@ -21,7 +21,7 @@
 //!                                   first set's version wins, as distinct_by_moment)
 //!   {"intersect": [<pipeline>, ...]}  events in the set and in every other
 //!   {"difference": <pipeline>}      events in the set but not the other
-//!   {"narrow": ["<path>", ...]}     events with only those fields
+//!   {"narrow": ["<path>", ...]}     events with only those fields (a null field is left out)
 //!   {"through": "<command>"}        any program, in any language, as map, flatmap and fold:
 //!                                   it reads the set as JSON lines ({"branch", "index",
 //!                                   "vtime_ns", "event"}, timeline by timeline, in order) and
@@ -30,30 +30,17 @@
 //!
 //! Each pipeline starts from every event of every timeline. Synthetic fields go into the event's
 //! JSON, so later conditions see them (`last_fault.event.details.kind=partition`).
+//!
+//! Pipelines run on the run's events database (store.zig): the universe is a temporary table of
+//! every timeline's events, numbered in each timeline (`idx`), and each operation makes the next
+//! set as a temporary table of the request's connection.
 const std = @import("std");
 const assert = std.debug.assert;
 const query = @import("query.zig");
+const duckdb = @import("duckdb.zig");
+const store = @import("store.zig");
 
 const pipeline_depth_max = 8;
-
-/// One event of a set: the timeline event it stands for, and its JSON (maybe synthetic).
-pub const Item = struct {
-    timeline: u32,
-    index: u32,
-    vtime_ns: u64,
-    value: std.json.Value,
-
-    fn order(_: void, a: Item, b: Item) bool {
-        if (a.timeline != b.timeline) return a.timeline < b.timeline;
-        if (a.index != b.index) return a.index < b.index;
-        return a.vtime_ns < b.vtime_ns;
-    }
-
-    fn key(item: Item) Key {
-        return .{ item.timeline, item.index, item.vtime_ns };
-    }
-};
-const Key = struct { u32, u32, u64 };
 
 const Named = struct { name: []const u8, condition: query.Condition };
 
@@ -176,311 +163,297 @@ fn seconds_ns(value: std.json.Value) !u64 {
     return @trunc(seconds * std.time.ns_per_s);
 }
 
-/// Where the sets come from, and what `through` needs to run programs.
-pub const Universe = struct {
+/// The event as its set's operations see it: the object itself, or another value under `value`.
+const object_sql = "(CASE WHEN json_type(event) = 'OBJECT' THEN event " ++
+    "ELSE json_object('value', event) END)";
+
+/// Pipelines evaluated on a run's events database, set by set (temporary tables of
+/// `connection`: timeline, idx, vtime_ns, seq, event).
+const Evaluator = struct {
+    connection: *duckdb.Connection,
     arena: std.mem.Allocator,
     io: std.Io,
-    timelines: []const query.Timeline,
+    sets: u32 = 0,
 
-    /// The item as an event to match, its JSON in `cell` (the caller's).
-    fn event(universe: *const Universe, item: *const Item, cell: *query.Event.Cell) query.Event {
-        const original = &universe.timelines[item.timeline].events[item.index];
-        cell.* = .{ .value = item.value, .arena = universe.arena };
-        return .{
-            .branch = original.branch,
-            .seq = original.seq,
-            .vtime_ns = item.vtime_ns,
-            .line = "",
-            .cell = cell,
+    /// The universe: every event of every timeline (or of one), numbered in it.
+    fn universe(evaluator: *Evaluator, only_branch: ?u32) !void {
+        const scope = if (only_branch) |branch|
+            try std.fmt.allocPrint(evaluator.arena, " WHERE timeline = {d}", .{branch})
+        else
+            "";
+        try evaluator.exec(
+            \\CREATE TEMP TABLE universe AS SELECT timeline,
+            \\    (row_number() OVER (PARTITION BY timeline ORDER BY vtime_ns, seq) - 1)::UBIGINT
+            \\        AS idx,
+            \\    vtime_ns, seq, event FROM timeline_events{s}
+        , .{scope});
+    }
+
+    fn exec(evaluator: *Evaluator, comptime format: []const u8, arguments: anytype) !void {
+        const sql = try std.fmt.allocPrintSentinel(evaluator.arena, format, arguments, 0);
+        try evaluator.connection.exec(sql);
+    }
+
+    /// A new set from a SELECT of its five columns: its table.
+    fn set(evaluator: *Evaluator, select: []const u8) ![]const u8 {
+        evaluator.sets += 1;
+        const name = try std.fmt.allocPrint(evaluator.arena, "set_{d}", .{evaluator.sets});
+        const create = "CREATE TEMP TABLE {s} AS " ++
+            "SELECT timeline, idx, vtime_ns, seq, event FROM ({s})";
+        try evaluator.exec(create, .{
+            name, select,
+        });
+        return name;
+    }
+
+    fn condition(evaluator: *Evaluator, value: *const query.Condition) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(evaluator.arena);
+        try value.sql(&out.writer, false); // Sets carry synthetic fields: the JSON says.
+        return out.written();
+    }
+
+    fn literal(evaluator: *Evaluator, text: []const u8) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(evaluator.arena);
+        try query.string_literal(&out.writer, text);
+        return out.written();
+    }
+
+    fn pipeline(evaluator: *Evaluator, operations: Pipeline) anyerror![]const u8 {
+        var current: []const u8 = "universe";
+        for (operations) |*operation| current = try evaluator.apply(operation, current);
+        return current;
+    }
+
+    fn apply(evaluator: *Evaluator, operation: *const Operation, input: []const u8) ![]const u8 {
+        const arena = evaluator.arena;
+        const print = std.fmt.allocPrint;
+        return switch (operation.*) {
+            .filter => |*value| evaluator.set(try print(arena, "SELECT * FROM {s} WHERE ({s})", .{
+                input, try evaluator.condition(value),
+            })),
+            // Conditions are never NULL: NOT keeps exactly what does not match.
+            .exclude => |*value| evaluator.set(try print(arena, "SELECT * FROM {s} WHERE NOT ({s})", .{
+                input, try evaluator.condition(value),
+            })),
+            .with_last => |named| {
+                var current = input;
+                for (named) |*entry| current = try evaluator.with_last(current, entry);
+                return current;
+            },
+            .with_next => |next| evaluator.with_next(input, next.sets, next.timeout_ns),
+            .@"union" => |others| evaluator.set_union(input, others),
+            .intersect => |others| {
+                var current = input;
+                for (others) |other| {
+                    const table = try evaluator.pipeline(other);
+                    current = try evaluator.set(try print(arena,
+                        \\SELECT s.* FROM {s} s SEMI JOIN {s} o USING (timeline, idx, vtime_ns)
+                    , .{ current, table }));
+                }
+                return current;
+            },
+            .difference => |other| {
+                const table = try evaluator.pipeline(other);
+                return evaluator.set(try print(arena,
+                    \\SELECT s.* FROM {s} s ANTI JOIN {s} o USING (timeline, idx, vtime_ns)
+                , .{ input, table }));
+            },
+            .narrow => |paths| evaluator.narrow(input, paths),
+            .through => |command| evaluator.through(input, command),
         };
     }
 
-    fn all(universe: *const Universe) ![]Item {
-        var count: usize = 0;
-        for (universe.timelines) |timeline| count += timeline.events.len;
-        const items = try universe.arena.alloc(Item, count);
-        var at: usize = 0;
-        for (universe.timelines, 0..) |timeline, timeline_index| {
-            for (timeline.events, 0..) |original, index| {
-                items[at] = .{
-                    .timeline = @intCast(timeline_index),
-                    .index = @intCast(index),
-                    .vtime_ns = original.vtime_ns,
-                    .value = original.value(),
-                };
-                at += 1;
-            }
+    /// `last_<name>`: the nearest earlier event of the timeline (the universe's) matching.
+    fn with_last(evaluator: *Evaluator, input: []const u8, named: *const Named) ![]const u8 {
+        const field = try std.fmt.allocPrint(evaluator.arena, "last_{s}", .{named.name});
+        return evaluator.set(try std.fmt.allocPrint(evaluator.arena,
+            \\WITH found AS (
+            \\    SELECT timeline, idx, last_value(CASE WHEN {s} THEN
+            \\        json_object('vtime_ns', vtime_ns, 'seq', seq, 'event', event) END
+            \\        IGNORE NULLS) OVER (PARTITION BY timeline ORDER BY idx
+            \\            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS found
+            \\    FROM universe
+            \\)
+            \\SELECT s.timeline, s.idx, s.vtime_ns, s.seq,
+            \\    CASE WHEN f.found IS NULL THEN s.event
+            \\        ELSE json_merge_patch({s}, json_object({s}, f.found)) END AS event
+            \\FROM {s} s LEFT JOIN found f USING (timeline, idx)
+        , .{
+            try evaluator.condition(&named.condition), object_sql,
+            try evaluator.literal(field),              input,
+        }));
+    }
+
+    /// For each event, the next of its timeline matching one of the sets (the first set
+    /// matching names it), or a timeout where the timeline went on past it.
+    fn with_next(
+        evaluator: *Evaluator,
+        input: []const u8,
+        named: []const Named,
+        timeout_ns: ?u64,
+    ) ![]const u8 {
+        const arena = evaluator.arena;
+        var types: std.Io.Writer.Allocating = .init(arena);
+        try types.writer.writeAll("CASE");
+        for (named) |*entry| {
+            try types.writer.print(" WHEN {s} THEN {s}", .{
+                try evaluator.condition(&entry.condition), try evaluator.literal(entry.name),
+            });
         }
-        return items;
+        try types.writer.writeAll(" END");
+        const within = if (timeout_ns) |timeout|
+            try std.fmt.allocPrint(arena, " AND next_vtime_ns <= vtime_ns + {d}", .{timeout})
+        else
+            "";
+        const timeouts = if (timeout_ns) |timeout| try std.fmt.allocPrint(arena,
+            \\UNION ALL
+            \\SELECT p.timeline, p.idx, p.vtime_ns + {d}, p.seq,
+            \\    json_object('with_next_type', 'timeout', 'last_event', p.event)
+            \\FROM paired p
+            \\JOIN (SELECT timeline, max(vtime_ns) AS end_ns FROM universe GROUP BY timeline) e
+            \\    USING (timeline)
+            \\WHERE (p.next_idx IS NULL OR p.next_vtime_ns > p.vtime_ns + {d})
+            \\    AND e.end_ns >= p.vtime_ns + {d}
+        , .{ timeout, timeout, timeout }) else "";
+        return evaluator.set(try std.fmt.allocPrint(arena,
+            \\WITH matching AS (
+            \\    SELECT * FROM (
+            \\        SELECT timeline, idx, vtime_ns, seq, event, {s} AS type FROM universe
+            \\    )
+            \\    WHERE type IS NOT NULL
+            \\), paired AS (
+            \\    SELECT s.*, m.idx AS next_idx, m.vtime_ns AS next_vtime_ns, m.seq AS next_seq,
+            \\        m.event AS next_event, m.type AS next_type
+            \\    FROM {s} s ASOF LEFT JOIN matching m ON s.timeline = m.timeline AND s.idx < m.idx
+            \\)
+            \\SELECT timeline, next_idx AS idx, next_vtime_ns AS vtime_ns, next_seq AS seq,
+            \\    json_merge_patch(CASE WHEN json_type(next_event) = 'OBJECT' THEN next_event
+            \\        ELSE json_object('value', next_event) END,
+            \\        json_object('last_event', event, 'with_next_type', next_type)) AS event
+            \\FROM paired WHERE next_idx IS NOT NULL{s}
+            \\{s}
+        , .{ types.written(), input, within, timeouts }));
+    }
+
+    /// The set and the others' events at moments not yet in it (the first one's version).
+    fn set_union(evaluator: *Evaluator, input: []const u8, others: []const Pipeline) ![]const u8 {
+        const arena = evaluator.arena;
+        var sources: std.Io.Writer.Allocating = .init(arena);
+        for (others, 1..) |other, source| {
+            const table = try evaluator.pipeline(other);
+            if (source > 1) try sources.writer.writeAll(" UNION ALL ");
+            const select = "SELECT *, {d} AS source, row_number() OVER () AS position FROM {s}";
+            try sources.writer.print(select, .{
+                source, table,
+            });
+        }
+        return evaluator.set(try std.fmt.allocPrint(arena,
+            \\SELECT * FROM {s}
+            \\UNION ALL
+            \\SELECT timeline, idx, vtime_ns, seq, event FROM ({s}) o
+            \\WHERE NOT EXISTS (SELECT 1 FROM {s} s
+            \\    WHERE s.timeline = o.timeline AND s.idx = o.idx AND s.vtime_ns = o.vtime_ns)
+            \\QUALIFY row_number()
+            \\    OVER (PARTITION BY timeline, idx, vtime_ns ORDER BY source, position) = 1
+        , .{ input, sources.written(), input }));
+    }
+
+    /// Only the paths given, each where it was (a missing or null one left out).
+    fn narrow(
+        evaluator: *Evaluator,
+        input: []const u8,
+        paths: []const []const []const u8,
+    ) ![]const u8 {
+        const arena = evaluator.arena;
+        var expression: std.Io.Writer.Allocating = .init(arena);
+        try expression.writer.writeAll("'{}'::JSON");
+        for (paths) |path| {
+            var json_path: std.Io.Writer.Allocating = .init(arena);
+            try json_path.writer.writeAll("$");
+            for (path) |key| try json_path.writer.print(".\"{s}\"", .{key});
+            const found = try std.fmt.allocPrint(arena, "json_extract(event, {s})", .{
+                try evaluator.literal(json_path.written()),
+            });
+            var nested: []const u8 = found;
+            var at = path.len;
+            while (at > 0) {
+                at -= 1;
+                nested = try std.fmt.allocPrint(arena, "json_object({s}, {s})", .{
+                    try evaluator.literal(path[at]), nested,
+                });
+            }
+            const previous = try arena.dupe(u8, expression.written());
+            expression.clearRetainingCapacity();
+            const merged = "CASE WHEN {s} IS NULL THEN {s} ELSE json_merge_patch({s}, {s}) END";
+            try expression.writer.print(merged, .{
+                found, previous, previous, nested,
+            });
+        }
+        return evaluator.set(try std.fmt.allocPrint(arena,
+            \\SELECT timeline, idx, vtime_ns, seq, {s} AS event FROM {s}
+        , .{ expression.written(), input }));
+    }
+
+    /// The set through a program: JSON lines in (from a file, so that the program may read at
+    /// its pace), JSON lines out, each naming the timeline event it stands for.
+    fn through(evaluator: *Evaluator, input: []const u8, command: []const u8) ![]const u8 {
+        const arena = evaluator.arena;
+        const Row = struct { branch: u32, index: u64, vtime_ns: u64, event: []const u8 };
+        const rows = try evaluator.connection.rows(Row, arena, try std.fmt.allocPrintSentinel(arena,
+            \\SELECT timeline, idx, vtime_ns, event FROM {s} ORDER BY timeline, idx, vtime_ns
+        , .{input}, 0), .{});
+        var lines: std.Io.Writer.Allocating = .init(arena);
+        for (rows) |row| {
+            try lines.writer.print(item_format, .{
+                row.branch, row.index, row.vtime_ns, row.event,
+            });
+        }
+        const pid = std.os.linux.getpid();
+        const at = evaluator.sets;
+        const in_path = try std.fmt.allocPrint(arena, "/tmp/determinismo-events-{d}-{d}.in", .{
+            pid, at,
+        });
+        const out_path = try std.fmt.allocPrint(arena, "/tmp/determinismo-events-{d}-{d}.out", .{
+            pid, at,
+        });
+        const cwd = std.Io.Dir.cwd();
+        try cwd.writeFile(evaluator.io, .{ .sub_path = in_path, .data = lines.written() });
+        defer cwd.deleteFile(evaluator.io, in_path) catch {};
+        const result = try std.process.run(arena, evaluator.io, .{
+            .argv = &.{ "/bin/sh", "-c", "exec <\"$0\"; eval \"$1\"", in_path, command },
+        });
+        if (result.term != .exited or result.term.exited != 0) {
+            const failed = "[determinismo] events: `{s}` failed:\n{s}";
+            std.debug.print(failed, .{ command, result.stderr });
+            return error.ThroughFailed;
+        }
+        if (std.mem.trim(u8, result.stdout, " \n").len == 0) {
+            return evaluator.set("SELECT * FROM universe WHERE false");
+        }
+        try cwd.writeFile(evaluator.io, .{ .sub_path = out_path, .data = result.stdout });
+        defer cwd.deleteFile(evaluator.io, out_path) catch {};
+        const table = try evaluator.set(try std.fmt.allocPrint(arena,
+            \\SELECT o.branch AS timeline, o."index" AS idx,
+            \\    coalesce(o.vtime_ns, u.vtime_ns) AS vtime_ns,
+            \\    u.seq AS seq, o.event AS event
+            \\FROM read_json({s}, format = 'newline_delimited',
+            \\    columns = {{
+            \\        branch: 'UINTEGER', "index": 'UBIGINT', vtime_ns: 'UBIGINT', event: 'JSON'
+            \\    }}) o
+            \\LEFT JOIN universe u ON u.timeline = o.branch AND u.idx = o."index"
+        , .{try evaluator.literal(out_path)}));
+        const Unknown = struct { count: u64 };
+        const unknown_sql = try std.fmt.allocPrintSentinel(arena, "SELECT count(*) FROM {s} " ++
+            "WHERE seq IS NULL", .{table}, 0);
+        const unknown = (try evaluator.connection.row(Unknown, arena, unknown_sql, .{})).?;
+        // A branch or index not in the set's universe.
+        if (unknown.count > 0) return error.ThroughUnknownEvent;
+        return table;
     }
 };
 
-pub fn evaluate(universe: *const Universe, pipeline: Pipeline) anyerror![]Item {
-    var items = try universe.all();
-    for (pipeline) |*operation| items = try apply(universe, operation, items);
-    return items;
-}
-
-fn apply(universe: *const Universe, operation: *const Operation, items: []Item) ![]Item {
-    return switch (operation.*) {
-        .filter => |*condition| keep(universe, items, condition, true),
-        .exclude => |*condition| keep(universe, items, condition, false),
-        .with_last => |sets| with_last(universe, items, sets),
-        .with_next => |next| with_next(universe, items, next.sets, next.timeout_ns),
-        .@"union" => |others| set_union(universe, items, others),
-        .intersect => |others| set_intersect(universe, items, others),
-        .difference => |other| set_difference(universe, items, other),
-        .narrow => |paths| narrow(universe.arena, items, paths),
-        .through => |command| through(universe, items, command),
-    };
-}
-
-fn keep(
-    universe: *const Universe,
-    items: []Item,
-    condition: *const query.Condition,
-    wanted: bool,
-) []Item {
-    var kept: usize = 0;
-    for (items) |item| {
-        var cell: query.Event.Cell = undefined;
-        const event = universe.event(&item, &cell);
-        if (condition.matches(&event) != wanted) continue;
-        items[kept] = item;
-        kept += 1;
-    }
-    return items[0..kept];
-}
-
-/// The timeline event at `index`, as a JSON object: where it is, and the event.
-fn moment_value(
-    arena: std.mem.Allocator,
-    original: *const query.Event,
-    value: std.json.Value,
-) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    try object.put(arena, "vtime_ns", .{ .integer = @intCast(original.vtime_ns) });
-    try object.put(arena, "seq", .{ .integer = @intCast(original.seq) });
-    try object.put(arena, "event", value);
-    return .{ .object = object };
-}
-
-fn with_fields(
-    arena: std.mem.Allocator,
-    value: std.json.Value,
-    fields: []const struct { []const u8, std.json.Value },
-) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    if (value == .object) object = try value.object.clone(arena);
-    if (value != .object) try object.put(arena, "value", value);
-    for (fields) |field| try object.put(arena, field[0], field[1]);
-    return .{ .object = object };
-}
-
-fn with_last(universe: *const Universe, items: []Item, sets: []const Named) ![]Item {
-    const arena = universe.arena;
-    for (items) |*item| {
-        const events = universe.timelines[item.timeline].events;
-        for (sets) |*set| {
-            var at: usize = item.index;
-            const found = while (at > 0) {
-                at -= 1;
-                if (set.condition.matches(&events[at])) break &events[at];
-            } else null;
-            const original = found orelse continue;
-            const name = try std.fmt.allocPrint(arena, "last_{s}", .{set.name});
-            const last = try moment_value(arena, original, original.value());
-            item.value = try with_fields(arena, item.value, &.{.{ name, last }});
-        }
-    }
-    return items;
-}
-
-fn with_next(
-    universe: *const Universe,
-    items: []Item,
-    sets: []const Named,
-    timeout_ns: ?u64,
-) ![]Item {
-    const arena = universe.arena;
-    var next: std.ArrayList(Item) = .empty;
-    for (items) |*item| {
-        const events = universe.timelines[item.timeline].events;
-        const deadline_ns: ?u64 = if (timeout_ns) |timeout| item.vtime_ns + timeout else null;
-        var at: usize = item.index + 1;
-        const found: ?struct { usize, []const u8 } = search: while (at < events.len) : (at += 1) {
-            if (deadline_ns) |deadline| if (events[at].vtime_ns > deadline) break :search null;
-            for (sets) |*set| {
-                if (set.condition.matches(&events[at])) break :search .{ at, set.name };
-            }
-        } else null;
-        if (found) |match| {
-            const original = &events[match[0]];
-            try next.append(arena, .{
-                .timeline = item.timeline,
-                .index = @intCast(match[0]),
-                .vtime_ns = original.vtime_ns,
-                .value = try with_fields(arena, original.value(), &.{
-                    .{ "last_event", item.value },
-                    .{ "with_next_type", .{ .string = match[1] } },
-                }),
-            });
-            continue;
-        }
-        // A timeout is known only where the timeline went on past it.
-        const deadline = deadline_ns orelse continue;
-        if (events.len == 0 or events[events.len - 1].vtime_ns < deadline) continue;
-        var synthetic: std.json.ObjectMap = .empty;
-        try synthetic.put(arena, "with_next_type", .{ .string = "timeout" });
-        try synthetic.put(arena, "last_event", item.value);
-        try next.append(arena, .{
-            .timeline = item.timeline,
-            .index = item.index,
-            .vtime_ns = deadline,
-            .value = .{ .object = synthetic },
-        });
-    }
-    std.mem.sort(Item, next.items, {}, Item.order);
-    return next.items;
-}
-
-fn keys_of(arena: std.mem.Allocator, items: []const Item) !std.AutoHashMapUnmanaged(Key, void) {
-    var keys: std.AutoHashMapUnmanaged(Key, void) = .empty;
-    try keys.ensureTotalCapacity(arena, @intCast(items.len));
-    for (items) |item| keys.putAssumeCapacity(item.key(), {});
-    return keys;
-}
-
-fn set_union(universe: *const Universe, items: []Item, others: []const Pipeline) ![]Item {
-    const arena = universe.arena;
-    var seen = try keys_of(arena, items);
-    var all: std.ArrayList(Item) = .fromOwnedSlice(items);
-    for (others) |other| {
-        for (try evaluate(universe, other)) |item| {
-            const entry = try seen.getOrPut(arena, item.key());
-            if (entry.found_existing) continue;
-            try all.append(arena, item);
-        }
-    }
-    std.mem.sort(Item, all.items, {}, Item.order);
-    return all.items;
-}
-
-fn set_intersect(universe: *const Universe, items: []Item, others: []const Pipeline) ![]Item {
-    var kept = items;
-    for (others) |other| {
-        const keys = try keys_of(universe.arena, try evaluate(universe, other));
-        var count: usize = 0;
-        for (kept) |item| {
-            if (!keys.contains(item.key())) continue;
-            kept[count] = item;
-            count += 1;
-        }
-        kept = kept[0..count];
-    }
-    return kept;
-}
-
-fn set_difference(universe: *const Universe, items: []Item, other: Pipeline) ![]Item {
-    const keys = try keys_of(universe.arena, try evaluate(universe, other));
-    var count: usize = 0;
-    for (items) |item| {
-        if (keys.contains(item.key())) continue;
-        items[count] = item;
-        count += 1;
-    }
-    return items[0..count];
-}
-
-fn narrow(arena: std.mem.Allocator, items: []Item, paths: []const []const []const u8) ![]Item {
-    for (items) |*item| {
-        var narrowed: std.json.ObjectMap = .empty;
-        for (paths) |path| {
-            const found = path_get(item.value, path) orelse continue;
-            try path_put(arena, &narrowed, path, found);
-        }
-        item.value = .{ .object = narrowed };
-    }
-    return items;
-}
-
-fn path_get(value: std.json.Value, path: []const []const u8) ?std.json.Value {
-    var at = value;
-    for (path) |part| {
-        if (at != .object) return null;
-        at = at.object.get(part) orelse return null;
-    }
-    return at;
-}
-
-fn path_put(
-    arena: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    path: []const []const u8,
-    value: std.json.Value,
-) !void {
-    assert(path.len > 0);
-    if (path.len == 1) return object.put(arena, path[0], value);
-    const entry = try object.getOrPut(arena, path[0]);
-    if (!entry.found_existing or entry.value_ptr.* != .object) {
-        entry.value_ptr.* = .{ .object = .empty };
-    }
-    try path_put(arena, &entry.value_ptr.object, path[1..], value);
-}
-
-/// The set through a program: JSON lines in (from a file, so that the program may read at
-/// its pace), JSON lines out.
-fn through(universe: *const Universe, items: []Item, command: []const u8) ![]Item {
-    const arena = universe.arena;
-    var input: std.Io.Writer.Allocating = .init(arena);
-    for (items) |*item| try item_write(&input.writer, universe, item);
-    var path_buffer: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/determinismo-events-{d}-{d}", .{
-        std.os.linux.getpid(), @intFromPtr(items.ptr),
-    });
-    const cwd = std.Io.Dir.cwd();
-    try cwd.writeFile(universe.io, .{ .sub_path = path, .data = input.written() });
-    defer cwd.deleteFile(universe.io, path) catch {};
-    const result = try std.process.run(arena, universe.io, .{
-        .argv = &.{ "/bin/sh", "-c", "exec <\"$0\"; eval \"$1\"", path, command },
-    });
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("[determinismo] events: `{s}` failed:\n{s}", .{ command, result.stderr });
-        return error.ThroughFailed;
-    }
-    const Line = struct { branch: u32, index: u32, vtime_ns: ?u64 = null, event: std.json.Value };
-    var out: std.ArrayList(Item) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
-    while (lines.next()) |text| {
-        const line = try std.json.parseFromSliceLeaky(Line, arena, text, .{
-            .ignore_unknown_fields = true,
-        });
-        const timeline = timeline_of(universe.timelines, line.branch) orelse
-            return error.ThroughUnknownBranch;
-        const events = universe.timelines[timeline].events;
-        if (line.index >= events.len) return error.ThroughBadIndex;
-        try out.append(arena, .{
-            .timeline = timeline,
-            .index = line.index,
-            .vtime_ns = line.vtime_ns orelse events[line.index].vtime_ns,
-            .value = line.event,
-        });
-    }
-    std.mem.sort(Item, out.items, {}, Item.order);
-    return out.items;
-}
-
-fn timeline_of(timelines: []const query.Timeline, branch: u32) ?u32 {
-    for (timelines, 0..) |timeline, index| if (timeline.branch == branch) return @intCast(index);
-    return null;
-}
-
-fn item_write(out: *std.Io.Writer, universe: *const Universe, item: *const Item) !void {
-    const branch = universe.timelines[item.timeline].branch;
-    try out.print("{{\"branch\":{d},\"index\":{d},\"vtime_ns\":{d},\"event\":{f}}}\n", .{
-        branch, item.index, item.vtime_ns, std.json.fmt(item.value, .{}),
-    });
-}
+/// An item of a set as JSON lines carry it (answers, and `through`'s programs).
+const item_format = "{{\"branch\":{d},\"index\":{d},\"vtime_ns\":{d},\"event\":{s}}}\n";
 
 /// A pipeline as JSON, for the HTTP API and agents (MCP).
 pub const Request = struct {
@@ -490,179 +463,243 @@ pub const Request = struct {
     output: query.Output = .events,
 };
 
-pub fn answer(
-    arena: std.mem.Allocator,
-    io: std.Io,
-    directory: []const u8,
-    request: Request,
-) ![]const u8 {
-    const pipeline = try pipeline_parse(arena, request.pipeline);
-    const universe = Universe{
-        .arena = arena,
-        .io = io,
-        .timelines = try query.timelines_read(arena, io, directory, request.branch),
-    };
-    const items = try evaluate(&universe, pipeline);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    try write(&out.writer, &universe, items, .{
-        .limit = request.limit,
-        .output = request.output,
-        .json = true,
-    });
-    return out.written();
-}
-
 const Show = struct { limit: u64, output: query.Output, json: bool };
 
-fn write(out: *std.Io.Writer, universe: *const Universe, items: []const Item, show: Show) !void {
+/// Evaluates a pipeline on a run's events database (`connection`'s); writes the set, and
+/// returns how many events it has.
+pub fn answer(
+    connection: *duckdb.Connection,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    pipeline: Pipeline,
+    only_branch: ?u32,
+    show: Show,
+    out: *std.Io.Writer,
+) !u64 {
+    var evaluator: Evaluator = .{ .connection = connection, .arena = arena, .io = io };
+    try evaluator.universe(only_branch);
+    const table = try evaluator.pipeline(pipeline);
+    const Count = struct { count: u64 };
+    const counting = "SELECT count(*) FROM {s}";
+    const total_sql = try std.fmt.allocPrintSentinel(arena, counting, .{table}, 0);
+    const total = (try connection.row(Count, arena, total_sql, .{})).?.count;
     switch (show.output) {
-        .events => for (items[0..@min(items.len, show.limit)]) |*item| {
-            if (show.json) {
-                try item_write(out, universe, item);
-                continue;
-            }
-            const branch = universe.timelines[item.timeline].branch;
-            const ms = item.vtime_ns / std.time.ns_per_ms;
-            try out.print("branch {d} vtime {d}.{d:0>6}s  {f}  (--from-branch {d} " ++
-                "--from-vtime-ms {d})\n", .{
-                branch,                         item.vtime_ns / std.time.ns_per_s,
-                item.vtime_ns % std.time.ns_per_s / 1000, std.json.fmt(item.value, .{}),
-                branch,                         ms,
-            });
-        },
-        .count, .branches => {
-            var branches: u64 = 0;
-            var at: usize = 0;
-            while (at < items.len) {
-                const first = at;
-                while (at < items.len and items[at].timeline == items[first].timeline) at += 1;
-                branches += 1;
-                if (show.output != .branches) continue;
-                const branch = universe.timelines[items[first].timeline].branch;
-                const shown = .{ branch, at - first, items[first].vtime_ns };
+        .events => {
+            const Row = struct { branch: u32, index: u64, vtime_ns: u64, event: []const u8 };
+            const rows = try connection.rows(Row, arena, try std.fmt.allocPrintSentinel(arena,
+                \\SELECT timeline, idx, vtime_ns, event FROM {s}
+                \\ORDER BY timeline, idx, vtime_ns LIMIT {d}
+            , .{ table, @min(show.limit, std.math.maxInt(i64)) }, 0), .{});
+            for (rows) |row| {
                 if (show.json) {
-                    try out.print("{{\"branch\":{d},\"matches\":{d},\"first_vtime_ns\":{d}}}\n",
-                        shown);
+                    try out.print(item_format, .{ row.branch, row.index, row.vtime_ns, row.event });
+                    continue;
+                }
+                try out.print("branch {d} vtime {d}.{d:0>6}s  {s}  (--from-branch {d} " ++
+                    "--from-vtime-ms {d})\n", .{
+                    row.branch,                              row.vtime_ns / std.time.ns_per_s,
+                    row.vtime_ns % std.time.ns_per_s / 1000, row.event,
+                    row.branch,                              row.vtime_ns / std.time.ns_per_ms,
+                });
+            }
+        },
+        .branches => {
+            const Row = struct { branch: u32, matches: u64, first_vtime_ns: u64 };
+            const rows = try connection.rows(Row, arena, try std.fmt.allocPrintSentinel(arena,
+                \\SELECT timeline, count(*), first(vtime_ns ORDER BY idx, vtime_ns) FROM {s}
+                \\GROUP BY timeline ORDER BY timeline
+            , .{table}, 0), .{});
+            for (rows) |row| {
+                if (show.json) {
+                    try out.print("{{\"branch\":{d},\"matches\":{d},\"first_vtime_ns\":{d}}}\n", .{
+                        row.branch, row.matches, row.first_vtime_ns,
+                    });
                 } else {
-                    try out.print("branch {d}: {d} events, first at vtime {d}ns\n", shown);
+                    try out.print("branch {d}: {d} events, first at vtime {d}ns\n", .{
+                        row.branch, row.matches, row.first_vtime_ns,
+                    });
                 }
             }
-            if (show.output != .count) return;
-            const counts = .{ items.len, branches, universe.timelines.len };
+        },
+        .count => {
+            const Row = struct { branches: u64, timelines: u64 };
+            const row = (try connection.row(Row, arena, try std.fmt.allocPrintSentinel(arena,
+                \\SELECT (SELECT count(DISTINCT timeline) FROM {s}),
+                \\    (SELECT count(DISTINCT timeline) FROM universe)
+            , .{table}, 0), .{})).?;
             if (show.json) {
-                try out.print("{{\"events\":{d},\"branches\":{d},\"timelines\":{d}}}\n", counts);
+                try out.print("{{\"events\":{d},\"branches\":{d},\"timelines\":{d}}}\n", .{
+                    total, row.branches, row.timelines,
+                });
             } else {
-                try out.print("{d} events in {d} of {d} timelines\n", counts);
+                try out.print("{d} events in {d} of {d} timelines\n", .{
+                    total, row.branches, row.timelines,
+                });
             }
         },
     }
+    return total;
+}
+
+/// A request (the HTTP API's, an agent's) on a run's events database: its answer as JSON lines.
+pub fn request_answer(
+    connection: *duckdb.Connection,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    request: Request,
+    out: *std.Io.Writer,
+) !void {
+    const pipeline = try pipeline_parse(arena, request.pipeline);
+    _ = try answer(connection, arena, io, pipeline, request.branch, .{
+        .limit = request.limit,
+        .output = request.output,
+        .json = true,
+    }, out);
 }
 
 /// The command: arguments after `events`. Exit status 0 when the set is not empty, 1 when it
 /// is (as grep), 2 on usage errors.
 pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8) !u8 {
     if (arguments.len < 2) return error.Usage;
+    var show = Show{ .limit = std.math.maxInt(u64), .output = .events, .json = false };
+    var branch: ?u32 = null;
+    var pipeline_value: std.json.Value = undefined;
     // `events <dir> '{"pipeline": [...], ...}'`: the HTTP API's request, and its answer.
     if (arguments.len == 2 and std.mem.startsWith(u8, arguments[1], "{\"pipeline\"")) {
         const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
         const asked = try std.json.parseFromSliceLeaky(Request, arena, arguments[1], options);
-        try std.Io.File.stdout().writeStreamingAll(io, try answer(arena, io, arguments[0], asked));
-        return 0;
+        pipeline_value = asked.pipeline;
+        branch = asked.branch;
+        show = .{ .limit = asked.limit, .output = asked.output, .json = true };
+    } else {
+        var index: usize = 2;
+        while (index < arguments.len) : (index += 1) {
+            const flag = arguments[index];
+            const eql = std.mem.eql;
+            if (eql(u8, flag, "--count")) {
+                show.output = .count;
+            } else if (eql(u8, flag, "--branches")) {
+                show.output = .branches;
+            } else if (eql(u8, flag, "--json")) {
+                show.json = true;
+            } else if (index + 1 < arguments.len and eql(u8, flag, "--limit")) {
+                index += 1;
+                show.limit = try std.fmt.parseInt(u64, arguments[index], 10);
+            } else if (index + 1 < arguments.len and eql(u8, flag, "--branch")) {
+                index += 1;
+                branch = try std.fmt.parseInt(u32, arguments[index], 10);
+            } else return error.Usage;
+        }
+        pipeline_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, arguments[1], .{});
     }
-    var show = Show{ .limit = std.math.maxInt(u64), .output = .events, .json = false };
-    var branch: ?u32 = null;
-    var index: usize = 2;
-    while (index < arguments.len) : (index += 1) {
-        const flag = arguments[index];
-        const eql = std.mem.eql;
-        if (eql(u8, flag, "--count")) {
-            show.output = .count;
-        } else if (eql(u8, flag, "--branches")) {
-            show.output = .branches;
-        } else if (eql(u8, flag, "--json")) {
-            show.json = true;
-        } else if (index + 1 < arguments.len and eql(u8, flag, "--limit")) {
-            index += 1;
-            show.limit = try std.fmt.parseInt(u64, arguments[index], 10);
-        } else if (index + 1 < arguments.len and eql(u8, flag, "--branch")) {
-            index += 1;
-            branch = try std.fmt.parseInt(u32, arguments[index], 10);
-        } else return error.Usage;
-    }
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, arguments[1], .{});
-    const pipeline = try pipeline_parse(arena, value);
-    const universe = Universe{
-        .arena = arena,
-        .io = io,
-        .timelines = try query.timelines_read(arena, io, arguments[0], branch),
-    };
-    const items = try evaluate(&universe, pipeline);
+    const pipeline = try pipeline_parse(arena, pipeline_value);
+    const opened = try store.open_for_command(arena, io, arguments[0]);
+    defer opened.close();
     var buffer: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try write(&stdout.interface, &universe, items, show);
+    const out = &stdout.interface;
+    const total = answer(&opened.connection, arena, io, pipeline, branch, show, out) catch |err| {
+        std.debug.print("error: {s}\n", .{opened.connection.failure.text()});
+        return err;
+    };
     try stdout.interface.flush();
-    return if (items.len > 0) 0 else 1;
+    return if (total > 0) 0 else 1;
 }
 
-fn timeline_test(arena: std.mem.Allocator, lines: []const []const u8) !query.Timeline {
-    const events = try arena.alloc(query.Event, lines.len);
-    for (lines, events, 0..) |line, *event, index| {
-        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
-        event.* = try query.Event.of(arena, .{
-            .branch = 0,
-            .seq = index,
-            .vtime_ns = index * std.time.ns_per_s,
-        }, value);
-    }
-    return .{ .branch = 0, .events = events };
-}
+const testing = std.testing;
 
-fn evaluate_test(universe: *const Universe, pipeline: []const u8) ![]Item {
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, universe.arena, pipeline, .{});
-    return evaluate(universe, try pipeline_parse(universe.arena, value));
-}
-
-test evaluate {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "pipelines: with_last, with_next and timeouts, set operations, narrow, through" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const timelines = [_]query.Timeline{try timeline_test(arena, &.{
-        \\{"event":"fault","details":{"kind":"partition"}}
-        ,
-        \\{"event":"request","details":{"ok":false}}
-        ,
-        \\{"event":"fault","details":{"kind":"pause"}}
-        ,
-        \\{"event":"request","details":{"ok":true}}
-        ,
-        \\{"event":"request","details":{"ok":true}}
-    })};
-    const universe = Universe{ .arena = arena, .io = undefined, .timelines = &timelines };
-    // Failed requests whose last fault was a partition.
-    const failed = try evaluate_test(&universe,
-        \\[{"filter": "event=request details.ok=false"},
-        \\ {"with_last": {"fault": "event=fault"}},
-        \\ {"filter": "last_fault.event.details.kind=partition"}]
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try connection.exec(
+        \\CREATE TABLE timeline_events AS SELECT 0::UINTEGER AS timeline, seq::UBIGINT AS seq,
+        \\    seq::UBIGINT * 1000000000 AS vtime_ns, event::JSON AS event FROM (VALUES
+        \\    (0, '{"event":"fault","details":{"kind":"partition"}}'),
+        \\    (1, '{"event":"request","details":{"ok":false}}'),
+        \\    (2, '{"event":"fault","details":{"kind":"pause"}}'),
+        \\    (3, '{"event":"request","details":{"ok":true}}'),
+        \\    (4, '{"event":"request","details":{"ok":true}}')
+        \\) t(seq, event);
     );
-    try std.testing.expectEqual(@as(usize, 1), failed.len);
-    try std.testing.expectEqual(@as(u32, 1), failed[0].index);
-    // After each fault, the next successful request (or a timeout).
-    const recovered = try evaluate_test(&universe,
-        \\[{"filter": "event=fault"},
-        \\ {"with_next": {"ok": "event=request details.ok=true"}, "timeout": 1.5}]
-    );
-    try std.testing.expectEqual(@as(usize, 2), recovered.len);
-    const first_type = recovered[0].value.object.get("with_next_type").?.string;
-    try std.testing.expectEqualStrings("timeout", first_type); // 2s later: past 1.5s.
-    try std.testing.expectEqual(@as(u32, 3), recovered[1].index);
-    // Set operations: requests minus the failed ones, plus faults.
-    const sets = try evaluate_test(&universe,
-        \\[{"filter": "event=request"},
-        \\ {"difference": [{"filter": "details.ok=false"}]},
-        \\ {"union": [[{"filter": "event=fault"}]]},
-        \\ {"intersect": [[{"exclude": "details.kind=pause"}]]},
-        \\ {"narrow": ["event"]}]
-    );
-    try std.testing.expectEqual(@as(usize, 3), sets.len); // Partition, two good requests.
-    try std.testing.expectEqual(@as(usize, 1), sets[0].value.object.count());
+    const Check = struct { []const u8, []const u8 };
+    const checks = [_]Check{
+        // Failed requests whose last fault was a partition.
+        .{
+            \\[{"filter": "event=request details.ok=false"},
+            \\ {"with_last": {"fault": "event=fault"}},
+            \\ {"filter": "last_fault.event.details.kind=partition"}]
+            ,
+            \\{"branch":0,"index":1,"vtime_ns":1000000000,"event":{"event":"request",
+            ++
+                \\"details":{"ok":false},"last_fault":{"vtime_ns":0,"seq":0,
+            ++
+                \\"event":{"event":"fault",
+            ++
+                \\"details":{"kind":"partition"}}}}}
+                \\
+        },
+        // After each fault, the next successful request (or a timeout: 2 s later is past 1.5 s).
+        .{
+            \\[{"filter": "event=fault"},
+            \\ {"with_next": {"ok": "event=request details.ok=true"}, "timeout": 1.5},
+            \\ {"narrow": ["with_next_type", "last_event.details.kind"]}]
+            ,
+            \\{"branch":0,"index":0,"vtime_ns":1500000000,"event":{"with_next_type":"timeout",
+            ++
+                \\"last_event":{"details":{"kind":"partition"}}}}
+                \\{"branch":0,"index":3,"vtime_ns":3000000000,"event":{"with_next_type":"ok",
+            ++
+                \\"last_event":{"details":{"kind":"pause"}}}}
+                \\
+        },
+        // Set operations: requests minus the failed ones, plus faults, without the pause.
+        .{
+            \\[{"filter": "event=request"},
+            \\ {"difference": [{"filter": "details.ok=false"}]},
+            \\ {"union": [[{"filter": "event=fault"}]]},
+            \\ {"intersect": [[{"exclude": "details.kind=pause"}]]},
+            \\ {"narrow": ["event"]}]
+            ,
+            \\{"branch":0,"index":0,"vtime_ns":0,"event":{"event":"fault"}}
+            \\{"branch":0,"index":3,"vtime_ns":3000000000,"event":{"event":"request"}}
+            \\{"branch":0,"index":4,"vtime_ns":4000000000,"event":{"event":"request"}}
+            \\
+        },
+        // Any program as map: every other event, renamed.
+        .{
+            \\[{"filter": "event=request"},
+            \\ {"through": "sed -n '1p;3p' | sed 's/\"request\"/\"call\"/'"},
+            \\ {"narrow": ["event"]}]
+            ,
+            \\{"branch":0,"index":1,"vtime_ns":1000000000,"event":{"event":"call"}}
+            \\{"branch":0,"index":4,"vtime_ns":4000000000,"event":{"event":"call"}}
+            \\
+        },
+    };
+    for (checks) |check| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, check[0], .{});
+        const pipeline = try pipeline_parse(arena, value);
+        // A connection per request, as serve's: the sets are its temporary tables.
+        var request = try database.connect(&failure);
+        defer request.close();
+        var out: std.Io.Writer.Allocating = .init(arena);
+        _ = answer(&request, arena, testing.io, pipeline, null, .{
+            .limit = 100,
+            .output = .events,
+            .json = true,
+        }, &out.writer) catch |err| {
+            std.debug.print("{s}\n{s}\n", .{ check[0], request.failure.text() });
+            return err;
+        };
+        testing.expectEqualStrings(check[1], out.written()) catch |err| {
+            std.debug.print("{s}\n", .{check[0]});
+            return err;
+        };
+    }
 }

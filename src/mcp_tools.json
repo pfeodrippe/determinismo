@@ -184,7 +184,7 @@
   },
   {
     "name": "query",
-    "description": "Search the events of an exploration (its events_dir), as Antithesis's Logs Explorer: a condition of terms 'path op value' joined by and/or over the event JSON (event=fault, details.kind=partition, output.text~refused, assert.condition=false, output.source=redis) or vtime/branch/seq; operators = != ~ !~ < <= > >= ? !?. Temporal conditions look in the same timeline before (preceded_by) or after (followed_by) the event, within some virtual seconds. Each match comes with its moment (branch, vtime_ns) to replay or fork from.",
+    "description": "Search the events of an exploration (its events_dir), as Antithesis's Logs Explorer: a condition of terms 'path op value' joined by and/or over the event JSON (event=fault, details.kind=partition, output.text~refused, assert.condition=false, output.source=redis) or vtime/branch/seq; operators = != ~ !~ =~ !=~ < <= > >= ? !?. Temporal conditions look in the same timeline before (preceded_by) or after (followed_by) the event, within some virtual seconds. Each match comes with its moment (branch, vtime_ns) to replay or fork from.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -272,6 +272,26 @@
       "required": [
         "events_dir",
         "pipeline"
+      ]
+    }
+  },
+  {
+    "name": "sql",
+    "description": "Read-only SQL (DuckDB) on an exploration's events database (its events_dir), for what query and events do not say: one SELECT, answered as a JSON array (at most 10000 rows). Tables: events (every event once: branch = the timeline whose file it is in, NULL for the setup's shared by all; seq, vtime_ns, branches; kind = assert | event | output | decision | lifecycle | guidance | antithesis_assert | antithesis_sdk | raw; name = an assertion's or guidance's message, an event's/lifecycle's/decision's name, an output's stream; type = an assertion's type (always, always_or_unreachable, sometimes, reachable, unreachable); condition = its outcome (NULL: declared only); node = an event's details.node or an output's source; text = an output's text; behavior = a hash of what counts as one behavior; event = the event's JSON, e.g. event->>'$.details.kind'), timelines (branch, seed, outcome, vtime_ns, wall_ns, events, events_hash, generation, why, parent, start_ns, path), steps (a tree timeline's ancestors' parts), and the view timeline_events (each timeline's events from the setup through its ancestors to its own: timeline, origin, then the event columns). Example: SELECT name, count(DISTINCT timeline) FROM timeline_events WHERE kind = 'assert' AND NOT condition GROUP BY name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "events_dir": {
+          "type": "string",
+          "description": "From explore or fork"
+        },
+        "sql": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "events_dir",
+        "sql"
       ]
     }
   },
