@@ -94,6 +94,11 @@ pub fn start(
     if (linux.errno(result) != .SUCCESS) return error.Clone;
     if (result == 0) {
         _ = linux.close(sync[1]);
+        // Other nodes' mounts go first, before it is in the node's cgroup within reach of its
+        // faults: a copy held here keeps another node's disk alive after its crash (its remount
+        // gets the old, shut down filesystem back, or the disk is busy), and a fault may stop
+        // or freeze it for seconds before it runs the node's program.
+        launch.mounts_detach_other_nodes() catch |err| die("detach", err);
         var byte: [1]u8 = undefined;
         _ = linux.read(sync[0], &byte, 1); // The parent has set up cgroup and network.
         // Its own cgroup namespace, rooted at its cgroup (as containers have): what it creates
@@ -297,8 +302,11 @@ fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
     var device_buffer: [32]u8 = undefined;
     const device = try print_z(&device_buffer, "/dev/dm-{d}", .{minor});
     try device_wait(device);
+    try device_free_wait(device);
     // noinit_itable: no background zeroing of inode tables (it would fill guest memory).
     try mount(device, paths.layer, "ext4", 0, "data=ordered,noinit_itable");
+    // Not left mounted on a failure: the next start would mount the disk over it.
+    errdefer _ = linux.umount2(paths.layer, 0);
     // The template is small; grown in place to the disk's size (nothing to do the next time).
     const fd = linux.open(paths.layer, directory_flags, 0);
     if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
@@ -526,6 +534,25 @@ fn device_wait(device: [:0]const u8) !void {
         sleep_ns(poll_interval_ns);
     }
     return error.NoDevice;
+}
+
+/// Until no filesystem holds the device. After a crash its old filesystem outlives the unmount
+/// for as long as a mount namespace still has it; mounted then, the disk is busy, or comes back
+/// as that shut down filesystem.
+fn device_free_wait(device: [:0]const u8) !void {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .EXCL = true, .CLOEXEC = true };
+    for (0..stop_attempts_max) |_| {
+        const fd = linux.open(device, flags, 0);
+        switch (linux.errno(fd)) {
+            .SUCCESS => {
+                _ = linux.close(@intCast(fd));
+                return;
+            },
+            .BUSY => sleep_ns(poll_interval_ns),
+            else => return error.OpenFailed,
+        }
+    }
+    return error.DeviceBusy;
 }
 
 // device-mapper's ioctls (linux/dm-ioctl.h), on /dev/mapper/control.
@@ -1194,8 +1221,14 @@ const Launch = struct {
         die("exec", error.ExecutableNotFound);
     }
 
-    fn mounts(launch: *const Launch) !void {
+    fn mounts_detach_other_nodes(launch: *const Launch) !void {
+        // Private first: a detach would otherwise reach the guest's mounts too.
         try mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, null);
+        const directory = std.fs.path.dirname(launch.root) orelse return error.BadRoot;
+        try mounts_detach_others(directory, state_root);
+    }
+
+    fn mounts(launch: *const Launch) !void {
         var buffer: [path_size_max]u8 = undefined;
         const Target = struct {
             path: []const u8,
@@ -1248,10 +1281,9 @@ const Launch = struct {
                 else => return error.Symlink,
             }
         }
-        // The namespace began as a copy of the guest's mounts, other nodes' disks and roots
-        // among them: a copy held here would keep another node's disk alive after its crash
-        // (its remount would get the old, shut down filesystem back).
-        try mounts_detach_others(launch.root);
+        // The namespace began as a copy of the guest's mounts (other nodes' went first, see
+        // `start`): only the node's root stays.
+        try mounts_detach_others(launch.root, "/");
         // The guest's root is the initramfs, where pivot_root is not allowed: move the node's
         // root over it and chroot, as switch_root does. The mount namespace is the node's own.
         if (linux.errno(linux.chdir(launch.root)) != .SUCCESS) return error.Chdir;
@@ -1265,9 +1297,9 @@ const voidstar_path = "/opt/determinismo/lib/libvoidstar.so"; // initramfs.zig's
 const mounts_max = 4096;
 var mountinfo_buffer: [1 << 20]u8 = undefined;
 
-/// Detaches every mount of this (new, private) namespace other than `root`, what is under it
-/// and its ancestors (which hold it until it moves over `/`).
-fn mounts_detach_others(root: []const u8) !void {
+/// Detaches every mount of this (new, private) namespace under `within` other than `root`, what
+/// is under it and its ancestors (which hold it until it moves over `/`).
+fn mounts_detach_others(root: []const u8, within: []const u8) !void {
     const fd = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return error.NoMountinfo;
     defer _ = linux.close(@intCast(fd));
@@ -1298,6 +1330,7 @@ fn mounts_detach_others(root: []const u8) !void {
         if (std.mem.eql(u8, point, root) or path_under(point, root) or path_under(root, point)) {
             continue;
         }
+        if (!path_under(point, within)) continue;
         var buffer: [path_size_max]u8 = undefined;
         const path = print_z(&buffer, "{s}", .{point}) catch continue;
         _ = linux.umount2(path, linux.MNT.DETACH); // Gone already with a detached parent.
