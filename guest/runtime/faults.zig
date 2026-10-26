@@ -27,8 +27,16 @@
 //! "cpu_percent": 10}, {"kind": "clock_skip", "skip_ms": 500, "forward": true} (permanent),
 //! {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
 //! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); restart, crash,
-//! wipe, stop, process_pause, thread_pause, process_kill, isolate and partition (with "peer")
-//! too.
+//! durable_crash, wipe, stop, process_pause, thread_pause, process_kill, isolate and partition
+//! (with "peer") too.
+//!
+//! Durability points (sync_stall, durable_crash): while the fault lasts, the guest module makes
+//! each of the node's fsyncs and sync writes a decision, and one in a few is picked. A stall
+//! holds the syncing thread there while the node's other threads run (the interleavings around
+//! persisting). A crash parks it there, before its data reaches the disk or just after, and
+//! asks for the node's crash: a power loss exactly where a system persists what it acts on (a
+//! vote granted, a write acknowledged). A thread here waits for those asks and crashes the node;
+//! it starts again at the fault's end.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -57,6 +65,11 @@ const Kind = enum {
     restart,
     /// A power loss: the node's disk keeps what was synced, then it starts again.
     crash,
+    /// A power loss at a durability point: its fsyncs and sync writes are decisions, and the
+    /// one picked crashes the node there (before its data is on disk, or just after).
+    durable_crash,
+    /// Its fsyncs and sync writes are decisions, and the ones picked are held for a while.
+    sync_stall,
     /// It starts again fresh from its image, everything it wrote gone.
     wipe,
     /// A graceful stop (SIGTERM, then a kill after a grace period), then it starts again.
@@ -91,6 +104,8 @@ const endpoints_max = schema.nodes_max + 1;
 /// A group outside every partition: the endpoint does not allow partitions.
 const group_none = 255;
 const throttle_percent_min = 5;
+/// The longest a sync_stall may hold one sync (each stall draws up to its fault's maximum).
+const stall_ms_max = 1000;
 const throttle_percent_max = 50;
 const disk_delay_ms_max = 200;
 const disk_sector_size = 512;
@@ -230,6 +245,12 @@ const Applied = struct {
     /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
     injected: bool = false,
     disk: ?nodes.DiskFault = null,
+    /// For durable_crash and sync_stall: one durability point in this many is picked; a crash
+    /// there is just after the sync or before it; a stall lasts up to stall_ms_max.
+    one_in: u32 = 0,
+    after_sync: bool = false,
+    stall_ms_min: u32 = 1,
+    stall_ms_max: u32 = 0,
 };
 
 /// A fault's parameters, drawn from platform randomness.
@@ -277,6 +298,14 @@ fn draw(fault: *const Fault) Applied {
         .clog => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
             applied.direction = sdk.random_choice(Direction, std.enums.values(Direction));
+        },
+        .durable_crash => {
+            applied.one_in = 1 + @as(u32, @intCast(sdk.random_below_named("fault.durable_one_in", 8)));
+            applied.after_sync = sdk.random_below_named("fault.durable_after", 2) == 1;
+        },
+        .sync_stall => {
+            applied.one_in = 1 + @as(u32, @intCast(sdk.random_below_named("fault.stall_one_in", 4)));
+            applied.stall_ms_max = 1 + @as(u32, @intCast(sdk.random_below_named("fault.stall_ms", stall_ms_max)));
         },
         .disk => {
             const failures = std.enums.values(nodes.DiskFailure);
@@ -367,11 +396,15 @@ fn faults_collect(
         if (allowed.pause) faults_add(faults, &count, .{ .kind = .pause, .node = node.name });
         if (allowed.isolate) faults_add(faults, &count, .{ .kind = .isolate, .node = node.name });
         if (allowed.restart) faults_add(faults, &count, .{ .kind = .restart, .node = node.name });
-        if (allowed.crash) faults_add(faults, &count, .{ .kind = .crash, .node = node.name });
+        if (allowed.crash) {
+            faults_add(faults, &count, .{ .kind = .crash, .node = node.name });
+            faults_add(faults, &count, .{ .kind = .durable_crash, .node = node.name });
+        }
         if (allowed.wipe) faults_add(faults, &count, .{ .kind = .wipe, .node = node.name });
         if (allowed.stop) faults_add(faults, &count, .{ .kind = .stop, .node = node.name });
         if (allowed.disk) faults_add(faults, &count, .{ .kind = .disk, .node = node.name });
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
+        if (allowed.sync_stall) faults_add(faults, &count, .{ .kind = .sync_stall, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
             faults_add(faults, &count, .{ .kind = .thread_pause, .node = node.name });
@@ -447,6 +480,8 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .pause,
         .restart,
         .crash,
+        .durable_crash,
+        .sync_stall,
         .wipe,
         .stop,
         .disk,
@@ -504,6 +539,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .pause => nodes.freeze(applied.node, .frozen),
         .restart => nodes.kill(applied.node),
         .crash => nodes.crash(applied.node),
+        .durable_crash, .sync_stall => durable_arm(applied),
         .wipe => nodes.wipe(applied.node),
         .stop => stop_begin(applied.node, &fault),
         .disk => nodes.disk_fail(applied.node, applied.disk.?),
@@ -526,6 +562,21 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
     const name = fault.applied.node;
     switch (fault.applied.kind) {
         .pause => nodes.freeze(name, .thawed) catch {},
+        .sync_stall => durable_disarm(name),
+        .durable_crash => {
+            const index = node_index_of(system, name) orelse return;
+            durable_lock_take();
+            durable_active[index] = false;
+            durable_disarm(name);
+            const crashed = durable_crashed[index];
+            durable_crashed[index] = false;
+            durable_lock.unlock();
+            // Crashed at a durability point meanwhile: it starts again, as after a crash.
+            if (crashed) {
+                if (system.node(name)) |node| readdress_maybe(system, node);
+                node_start_again(system, name);
+            }
+        },
         .restart, .crash, .wipe, .stop => {
             if (fault.grace_end_ns != null) nodes.kill_remaining(name) catch {}; // Healed early.
             // Antithesis's restarted nodes may rejoin with a new address: a decision.
@@ -596,6 +647,144 @@ fn node_next_end() ?u64 {
 
 fn node_heal(system: *const schema.System) void {
     for (&nodes_faulted) |*slot| node_end(system, slot);
+}
+
+// Durability points ---------------------------------------------------------------------------
+// The guest module's (det_guest.c): armed per node cgroup, asked through /dev/determinismo.
+
+const ioctl_durability_arm = 0xde02;
+const ioctl_durability_wait = 0xde03;
+const DurabilityMode = enum(u32) { stall = 0, crash_before = 1, crash_after = 2 };
+
+const DurabilityArm = extern struct {
+    cgroup: u64 align(1),
+    one_in: u32 align(1),
+    mode: DurabilityMode align(1),
+    stall_ms_min: u32 align(1),
+    stall_ms_max: u32 align(1),
+    node: [32]u8 align(1),
+};
+const DurabilityRequest = extern struct {
+    cgroup: u64 align(1),
+    pid: i32 align(1),
+    mode: DurabilityMode align(1),
+    comm: [16]u8 align(1),
+};
+
+comptime {
+    assert(@sizeOf(DurabilityArm) == 56); // The module's struct det_durability_arm (packed).
+    assert(@sizeOf(DurabilityRequest) == 32);
+}
+
+/// The listener crashes nodes while the main loop ends their faults: under this lock, a crash
+/// comes only while the node's fault lasts, and its end sees whether one came.
+var durable_lock: std.atomic.Mutex = .unlocked;
+/// The node's durable_crash fault lasts.
+var durable_active: [schema.nodes_max]bool = @splat(false);
+/// The node crashed at a durability point during its fault (it starts again at the end).
+var durable_crashed: [schema.nodes_max]bool = @splat(false);
+var durable_device: linux.fd_t = -1;
+var durable_listening: bool = false;
+
+fn node_index_of(system: *const schema.System, name: []const u8) ?usize {
+    for (system.nodes, 0..) |node, index| {
+        if (std.mem.eql(u8, node.name, name)) return index;
+    }
+    return null;
+}
+
+/// The node's cgroup, as the module names it: its directory's inode number.
+fn node_cgroup(name: []const u8) !u64 {
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/{s}", .{ nodes.cgroup_root, name }, 0);
+    var stat: linux.Statx = undefined;
+    const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .INO = true }, &stat);
+    if (linux.errno(result) != .SUCCESS) return error.NoCgroup;
+    return stat.ino;
+}
+
+fn durable_lock_take() void {
+    while (!durable_lock.tryLock()) {
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+}
+
+fn durable_arm(applied: *const Applied) !void {
+    if (durable_device < 0) {
+        const fd = linux.open(sdk.device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) return error.NoDevice;
+        durable_device = @intCast(fd);
+    }
+    if (!durable_listening) {
+        const listener = try std.Thread.spawn(.{}, durable_listen, .{});
+        listener.detach();
+        durable_listening = true;
+    }
+    var arm: DurabilityArm = .{
+        .cgroup = try node_cgroup(applied.node),
+        .one_in = applied.one_in,
+        .mode = if (applied.kind == .sync_stall)
+            .stall
+        else if (applied.after_sync) .crash_after else .crash_before,
+        .stall_ms_min = applied.stall_ms_min,
+        .stall_ms_max = @max(applied.stall_ms_max, applied.stall_ms_min),
+        .node = @splat(0),
+    };
+    const length = @min(applied.node.len, arm.node.len - 1);
+    @memcpy(arm.node[0..length], applied.node[0..length]);
+    if (applied.kind == .durable_crash) {
+        const system = system_active orelse return error.NoSystem;
+        const index = node_index_of(system, applied.node) orelse return error.UnknownNode;
+        durable_lock_take();
+        defer durable_lock.unlock();
+        durable_active[index] = true;
+    }
+    const armed = linux.ioctl(durable_device, ioctl_durability_arm, @intFromPtr(&arm));
+    if (linux.errno(armed) != .SUCCESS) return error.ArmFailed;
+}
+
+fn durable_disarm(name: []const u8) void {
+    if (durable_device < 0) return;
+    var arm: DurabilityArm = .{
+        .cgroup = node_cgroup(name) catch return,
+        .one_in = 0,
+        .mode = .stall,
+        .stall_ms_min = 0,
+        .stall_ms_max = 0,
+        .node = @splat(0),
+    };
+    _ = linux.ioctl(durable_device, ioctl_durability_arm, @intFromPtr(&arm));
+}
+
+/// The listener: each ask of a durability point, its node crashed there.
+fn durable_listen() void {
+    const system = system_active orelse return;
+    while (true) {
+        var request: DurabilityRequest = undefined;
+        const asked = linux.ioctl(durable_device, ioctl_durability_wait, @intFromPtr(&request));
+        if (linux.errno(asked) == .INTR) continue;
+        if (linux.errno(asked) != .SUCCESS) return;
+        const node = for (system.nodes, 0..) |node, index| {
+            const cgroup = node_cgroup(node.name) catch continue;
+            if (cgroup == request.cgroup) break .{ node.name, index };
+        } else continue;
+        durable_lock_take();
+        defer durable_lock.unlock();
+        if (!durable_active[node[1]]) continue; // Its fault ended: disarmed, nothing parked.
+        sdk.event("durable_crash", .{
+            .node = node[0],
+            .process = std.mem.sliceTo(&request.comm, 0),
+            .pid = request.pid,
+            .when = if (request.mode == .crash_after) "after_sync" else "before_sync",
+        });
+        // Disarmed once the freeze is asked for: the parked process goes on into it.
+        nodes.crash_with(node[0], durable_disarm) catch |err| {
+            sdk.event("fault_failed", .{ .node = node[0], .err = @errorName(err) });
+            continue;
+        };
+        durable_crashed[node[1]] = true;
+    }
 }
 
 /// One of the node's processes stopped (SIGSTOP).
@@ -1097,6 +1286,11 @@ const Request = struct {
     /// disk.
     failure: nodes.DiskFailure = .errors,
     delay_ms: u32 = 50,
+    /// durable_crash and sync_stall: one durability point in `one_in` is picked.
+    one_in: u32 = 1,
+    after_sync: bool = false,
+    stall_ms_min: u32 = 1,
+    stall_ms_max: u32 = 100,
 };
 
 fn inject(json: []const u8) void {
@@ -1168,6 +1362,12 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
             applied.permanent = true;
         },
         .custom => applied.program = request.program,
+        .durable_crash, .sync_stall => {
+            applied.one_in = @max(request.one_in, 1);
+            applied.after_sync = request.after_sync;
+            applied.stall_ms_min = request.stall_ms_min;
+            applied.stall_ms_max = request.stall_ms_max;
+        },
         .disk => applied.disk = .{
             .failure = request.failure,
             .delay_ms = request.delay_ms,

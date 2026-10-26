@@ -137,6 +137,14 @@ as hints of where bugs hide. To get there:
 Each gets a test program in `examples/` (or a separate repository when it grows), explored
 blind, with its findings documented in its README.
 
+- **Faults at durability points** (done: `sync_stall`, `durable_crash`; ARCHITECTURE.md §9): the
+  Raft POC's remaining bug (two leaders in a term) is an interleaving that opens only while a
+  goroutine waits on a store write (tests/antithesis-compat/README.md); random pauses hit it by
+  luck (no failure in 938 timelines, the assertion evaluated in each). The guest module makes a
+  node's fsyncs and sync writes seeded decisions: stalls there widen exactly those windows, and
+  crashes there hit act-then-persist bugs. Any system's, not Raft's alone. Next: measure how
+  often the Raft hunts reach the double vote with them.
+
 1. **Raft**: HashiCorp Raft (examples/raft, at the article's upstream commit 4c8f61ac), then
    OpenRaft, MicroRaft, Aeron Cluster.
 2. **Clojure's most used libraries** (Clojars downloads, from ecosyste.ms, plus the core libraries

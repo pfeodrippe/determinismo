@@ -5,15 +5,20 @@
 # on the new build with its runs left running (a run keeps the binary it started with; new runs,
 # replays and serve itself use the new one). A change to the KVM patch needs setup.sh, which stops
 # serve and its runs.
-# Usage: infra/host/update.sh <ip> [--user <user>]
+# The guest module (det_guest.ko) is rebuilt on a host with the guest kernel's tree
+# (~/guest-kernel, from guest/kernel/build.sh); a host without one takes vmlinuz and the module
+# from another, updated first: --guest-from <user@host>.
+# Usage: infra/host/update.sh <ip> [--user <user>] [--guest-from <user@host>]
 set -euo pipefail
 
-ip=${1:?usage: $0 <ip> [--user <user>]}
+ip=${1:?usage: $0 <ip> [--user <user>] [--guest-from <user@host>]}
 shift
 user=det
+guest_from=
 while [ $# -gt 0 ]; do
   case $1 in
     --user) user=$2 ;;
+    --guest-from) guest_from=$2 ;;
     *) echo "error: unknown option $1" >&2; exit 2 ;;
   esac
   shift 2
@@ -29,6 +34,12 @@ rsync -az -e "ssh ${ssh_opts[*]}" \
   --exclude guest/module/Module.symvers --exclude guest/module/modules.order \
   "$repo/" "$user@$ip:determinismo/"
 
+if [ -n "$guest_from" ]; then
+  echo "== the guest, from $guest_from"
+  ssh "${ssh_opts[@]}" "$guest_from" 'tar -C ~/guest -c vmlinuz det_guest.ko' \
+    | ssh "${ssh_opts[@]}" "$user@$ip" 'mkdir -p ~/guest && tar -C ~/guest -x'
+fi
+
 ssh "${ssh_opts[@]}" "$user@$ip" bash -s <<'EOF'
 set -euo pipefail
 cd ~/determinismo
@@ -43,6 +54,11 @@ fi
 echo "== the tools"
 infra/host/tools.sh
 echo "== the build"
+kernel_tree=~/guest-kernel/linux-source-6.12
+if [ -d "$kernel_tree" ]; then
+  make -s -C guest/module KDIR="$kernel_tree" clean all
+  cp guest/module/det_guest.ko ~/guest/det_guest.ko
+fi
 ~/opt/zig/zig build -Drelease
 zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko \
   --busybox /usr/bin/busybox --out ~/guest/base.cpio

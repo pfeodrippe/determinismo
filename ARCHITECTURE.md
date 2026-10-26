@@ -288,6 +288,18 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
 - **Fault set** (target): network latency/partition/clog/restore, node pause/kill/stop/throttle,
   clock skips, CPU modulation, thread pausing (needs instrumentation), custom faults (user
   scripts, e.g. nREPL calls), disk I/O errors in virtio-blk.
+- **Durability points** (beyond Antithesis's documented set): a node's fsyncs, fdatasyncs,
+  msyncs and sync writes all reach `vfs_fsync_range`, where the guest module's kprobe sends an
+  armed node's calls to a wrapper (an ip redirect, as error injection does; the probe has a
+  post-handler so it stays an int3 one, never optimized into a jump that would ignore the
+  redirect). While a `sync_stall` or `durable_crash` fault lasts, each of its syncs is a decision
+  (one randomness pull), and one in a few is picked: a stall holds the syncing thread for a drawn
+  time while the node's other threads run (the interleavings around persisting: a goroutine
+  waiting on a store write while another acts on what the store says, as the Raft POC's double
+  vote needs); a crash parks it before its data reaches the disk, or just after, and det-faults
+  crashes the node there (it freezes the node, then disarms it, which releases the parked task
+  into the freeze, then cuts the disk and kills it). Generic: any system's act-then-persist
+  windows, whatever its language or store.
 - **Concurrency strategy** (later): trace memory accesses in instrumented code, find
   *communication points* (overlapping accesses from different threads, at least one a write;
   SKI / Project Zero's MAccConc), and preempt exactly there. Because the VM is deterministic, every

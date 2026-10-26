@@ -99,8 +99,14 @@ pub const Faults = struct {
     restart: bool = false,
     /// Kill it as a power loss would and start it again: its disk keeps what was synced
     /// (fsync, sync, O_SYNC) and loses the rest (Antithesis's restarts that keep "durably synced
-    /// filesystem changes"). The node's writable layer is then an ext4 disk of its own.
+    /// filesystem changes"). The node's writable layer is then an ext4 disk of its own. With
+    /// it, crashes at durability points too: at one of its fsyncs (or sync writes), before its
+    /// data reaches the disk or just after.
     crash: bool = false,
+    /// Hold its fsyncs (and sync writes) for a while, one in a few, while its other threads
+    /// run: the interleavings around persisting (a goroutine waiting on a store write while
+    /// another acts on what the store says).
+    sync_stall: bool = true,
     /// Kill it and start it fresh from its image: everything it wrote is gone (Antithesis's
     /// restarts that "lose all of their modified data").
     wipe: bool = false,

@@ -153,4 +153,11 @@ stable store first), so the term can go back:
 
 The race opens only while a goroutine waits on a store write (fsync), and then needs a cut link
 and a node that has not voted. Each step is common in our runs, but all four together, in that
-order, have not happened yet.
+order, have not happened yet: 938 timelines of runs 8 to 12, 45 and 46 evaluated election
+safety, none failing.
+
+So the window itself is now a fault: `sync_stall` (on by default, ARCHITECTURE.md §9) holds a
+node's fsyncs for a drawn time while its other goroutines run, and `durable_crash` (with
+`+crash`) crashes the node at one. bbolt syncs every transaction (each `SetUint64` of the term
+or the vote), so a stall there stretches the moment a goroutine waits on a raft store write from
+microseconds to up to a second. Whether that is enough is what the next hunts measure.

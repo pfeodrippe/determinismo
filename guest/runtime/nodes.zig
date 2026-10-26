@@ -22,7 +22,7 @@ pub const LinkState = netlink.LinkState;
 
 pub const system_path = "/det/system.json";
 const state_root = "/run/det/nodes";
-const cgroup_root = "/sys/fs/cgroup/nodes";
+pub const cgroup_root = "/sys/fs/cgroup/nodes";
 const system_size_max = 1 << 20;
 pub const path_size_max = 256;
 const arguments_max = 64;
@@ -251,6 +251,13 @@ pub fn kill_remaining(name: []const u8) !void {
 /// loses the rest; its processes are gone. The next start mounts the disk again (ext4 replays
 /// its journal: consistent, as after a real crash).
 pub fn crash(name: []const u8) !void {
+    return crash_with(name, null);
+}
+
+/// A crash, with `frozen_begun` called once the node's freeze is asked for, before it is
+/// waited for: a crash at a durability point releases the process parked there (a sleep in the
+/// kernel the freeze does not reach), which then freezes on its way out.
+pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) !void {
     var paths: Paths = undefined;
     try paths.init(name);
     // Frozen first, all at once as the power goes: running on between the shutdown and the
@@ -258,6 +265,7 @@ pub fn crash(name: []const u8) !void {
     // reports it), and exiting after it they would close files ext4 then writes back.
     try file_write(paths.cgroup_freeze, "1");
     defer file_write(paths.cgroup_freeze, "0") catch {}; // Its next start runs.
+    if (frozen_begun) |call| call(name);
     try cgroup_frozen_wait(&paths);
     const fd = linux.open(paths.layer, directory_flags, 0);
     if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;

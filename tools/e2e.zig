@@ -97,15 +97,16 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "until", check_until_and_causality },     .{ "coverage", check_coverage },
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
         .{ "tree", check_tree },                     .{ "disk", check_disk },
-        .{ "mutate", check_mutate },                 .{ "inject", check_inject },
-        .{ "compose", check_compose },               .{ "shards", check_shards },
-        .{ "stress", check_stress },                 .{ "controller", check_controller },
-        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
-        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },               .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },               .{ "readdress", check_readdress },
-        .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
+        .{ "durability", check_durability },         .{ "mutate", check_mutate },
+        .{ "inject", check_inject },                 .{ "compose", check_compose },
+        .{ "shards", check_shards },                 .{ "stress", check_stress },
+        .{ "controller", check_controller },         .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                       .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
+        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },             .{ "changed", check_changed },
+        .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
+        .{ "hang", check_hang },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1221,6 +1222,42 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// Faults at durability points (the guest module's): a stall holds a node's syncs; a crash at
+/// a sync loses the write before it and keeps it just after; a timeline replays exactly.
+fn check_durability(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{
+        "--program", program, "--profile", "durable", "--scenario", "durability", "--seed", "1",
+    };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
+    const properties = [_][]const u8{
+        "a sync stall holds a node's syncs, and they complete",
+        "a crash just before a sync loses the write",
+        "a crash just after a sync keeps the write",
+        "a write crashed at its sync never returns",
+    };
+    var passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
+    for (properties) |property| {
+        const line = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
+        passes = passes and std.mem.indexOf(u8, report, line) != null;
+    }
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var same = false;
+    if (count > 0) {
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            same_timelines(&replayed, branches[0..count]);
+    }
+    expect(context, passes and same, "durability points: a stall holds a node's syncs; a " ++
+        "crash just before a sync loses the write, just after keeps it; a timeline replays " ++
+        "exactly", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});
 }
 

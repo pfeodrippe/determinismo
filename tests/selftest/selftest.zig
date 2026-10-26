@@ -23,6 +23,9 @@
 //!              survives a crash, what it did not is lost, a wipe loses both (with a second
 //!              durable node beside it); then disk faults asked for: lost writes, failing
 //!              writes, a slow disk, and the disk afterwards
+//!   durability (profile "durable") faults at the echo node's durability points: a stall holds
+//!              its syncs; a crash at a sync loses the write when it comes before it, and keeps
+//!              it when it comes just after
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -52,6 +55,7 @@ const quiet = sdk.schema.Faults{
     .degrade = false,
     .throttle = false,
     .process_pause = false,
+    .sync_stall = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -63,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
             .oom = oom,
             .crash = crash,
             .disk = disk,
+            .durability = durability,
             .inject = inject,
             .readdress = readdress,
             .hang = hang,
@@ -227,6 +232,63 @@ fn segfault(context: *System.Context) !void {
 
 fn disk(s: *System.Scenario) void {
     s.singleton_driver("disk_faults", disk_faults);
+}
+
+fn durability(s: *System.Scenario) void {
+    s.singleton_driver("durability_faults", durability_faults);
+}
+
+/// Faults at durability points, asked for in a quiet period: only these.
+fn durability_faults(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    // Every sync held 200 ms: a file and its directory synced take 400 ms or more.
+    const stall_ms = 200;
+    sdk.fault(.{
+        .kind = "sync_stall",
+        .node = echo.name,
+        .one_in = 1,
+        .stall_ms_min = stall_ms,
+        .stall_ms_max = stall_ms,
+        .duration_ms = 5000,
+    });
+    sdk.sleep_ms(100); // The injector applies it.
+    const start_ns = monotonic_ns();
+    const stalled_written = synced_write(&echo, "/data/stalled");
+    const took_ns = monotonic_ns() - start_ns;
+    const held = stalled_written and took_ns >= 2 * stall_ms * std.time.ns_per_ms;
+    sdk.always(held, "a sync stall holds a node's syncs, and they complete", .{
+        .took_ns = took_ns,
+        .written = stalled_written,
+    });
+    sdk.sleep_ms(5000);
+    // A crash at the write's first sync, before it: the write is gone after the restart.
+    try durable_crash_at(&echo, "/data/before", false);
+    const before = file_present(&echo, "/data/before");
+    sdk.always(!before, "a crash just before a sync loses the write", .{ .present = before });
+    // Just after it: the file synced (its directory entry with it) survives.
+    try durable_crash_at(&echo, "/data/after", true);
+    const after = file_present(&echo, "/data/after");
+    sdk.always(after, "a crash just after a sync keeps the write", .{ .present = after });
+    sdk.stop_faults(0);
+}
+
+/// The node crashes at the first sync of a write of `path` (before it or just after), and is
+/// back at the fault's end.
+fn durable_crash_at(echo: *const sdk.Node, path: []const u8, after_sync: bool) !void {
+    const fault_ms = 2000;
+    sdk.fault(.{
+        .kind = "durable_crash",
+        .node = echo.name,
+        .one_in = 1,
+        .after_sync = after_sync,
+        .duration_ms = fault_ms,
+    });
+    sdk.sleep_ms(100);
+    const written = synced_write(echo, path); // Killed in its sync.
+    sdk.always(!written, "a write crashed at its sync never returns", .{});
+    sdk.sleep_ms(fault_ms);
+    try sdk.retry(100, 100, answers, .{echo.address});
 }
 
 fn disk_faults(context: *System.Context) !void {
