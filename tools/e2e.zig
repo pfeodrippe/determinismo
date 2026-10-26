@@ -107,6 +107,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
         .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
+        .{ "pinned", check_pinned },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1371,6 +1372,46 @@ fn check_retroactive(context: *Context) !void {
     if (!passes) std.debug.print("hidden {} shown {} replayed {} same {}\n", .{
         hidden, shown, replayed, same,
     });
+}
+
+/// A pinned system replays on another host: a kit (the run's pin, with its node disks beside it
+/// by name) replays a timeline from an empty cache, with nothing pulled or built, to the same
+/// events.
+fn check_pinned(context: *Context) !void {
+    const arena = context.arena;
+    const io = context.io;
+    const cwd = std.Io.Dir.cwd();
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "5", "--branch", "0" };
+    const events = try std.fs.path.join(arena, &.{ context.scratch, "pinned-events" });
+    const report = try explore(context, &(system ++ [_][]const u8{ "--events-dir", events }));
+    const Pin = struct { system_json: []const u8, disks: []const []const u8 };
+    const pin_path = try std.fs.path.join(arena, &.{ events, "system.pin.json" });
+    const pin_json = try cwd.readFileAlloc(io, pin_path, arena, .limited(1 << 20));
+    const pin = try std.json.parseFromSliceLeaky(Pin, arena, pin_json, .{});
+    const kit = try std.fs.path.join(arena, &.{ context.scratch, "pinned-kit" });
+    try cwd.createDirPath(io, kit);
+    const names = try arena.alloc([]const u8, pin.disks.len);
+    for (pin.disks, names) |disk, *name| {
+        name.* = std.fs.path.basename(disk);
+        const copy = try std.fs.path.join(arena, &.{ kit, name.* });
+        cwd.access(io, copy, .{}) catch try cwd.copyFile(disk, cwd, copy, io, .{});
+    }
+    const kit_pin = try std.fs.path.join(arena, &.{ kit, "system.pin.json" });
+    try cwd.writeFile(io, .{ .sub_path = kit_pin, .data = try std.fmt.allocPrint(arena, "{f}", .{
+        std.json.fmt(Pin{ .system_json = pin.system_json, .disks = names }, .{}),
+    }) });
+    const fresh = try std.fs.path.join(arena, &.{ context.scratch, "pinned-cache" });
+    const replayed = try explore(context, &(system ++ [_][]const u8{ "--system", kit_pin, "--cache", fresh }));
+    var original: [1]Branch = undefined;
+    var again: [1]Branch = undefined;
+    const same = parse_branches(report, &original) == 1 and parse_branches(replayed, &again) == 1 and
+        std.mem.eql(u8, original[0].events_hash, again[0].events_hash);
+    const built = std.mem.indexOf(u8, replayed, "] building ") != null or
+        std.mem.indexOf(u8, replayed, "] pulling ") != null or
+        std.mem.indexOf(u8, replayed, "] flattening ") != null;
+    expect(context, same and !built, "pinned: a kit replays a timeline from an empty cache, " ++
+        "nothing pulled or built ({s})", .{if (same) original[0].events_hash else "differs"});
 }
 
 /// Whether some events file of an events directory has `text`.
