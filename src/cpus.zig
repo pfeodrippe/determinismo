@@ -14,19 +14,33 @@
 //! A process with `DETERMINISMO_CPU_PRIORITY` set (checks, e.g. `zig build e2e`) goes first: while
 //! one waits it holds a shared lock on the pool's `priority` file, and the others leave the next
 //! free CPU to it. Exploration runs never have to stop for a check.
+//!
+//! Runs share the host: one process of a run waits for a CPU at a time (the others queue on the
+//! run's `run-<key>.turn` lock), and the waiting runs are served at random (each tries again after
+//! a random 10 to 30 ms, its first try included). Every run that wants CPUs then gets them
+//! equally often, however many processes it has; a lone run takes them all. (With exponential
+//! backoff, a run's next timeline, forked as its last one gave a CPU back, took that CPU every
+//! time while other runs' waiters slept 100 ms; and served at random, runs got CPUs in
+//! proportion to their waiting processes: one run with 300 held most of the host.)
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
 const cpus_max = 1024;
-const wait_ns_min = std.time.ns_per_ms;
-const wait_ns_max = 100 * std.time.ns_per_ms;
+const wait_ns_min = 10 * std.time.ns_per_ms;
+const wait_ns_max = 30 * std.time.ns_per_ms;
+
+/// The run this process belongs to: set by a run's first process before it forks the others
+/// (they inherit it); a process outside any run is a run of its own.
+pub var run_key: ?linux.pid_t = null;
 
 pub const Pool = struct {
     /// The CPUs this process may run on, and their lock files.
     cpus: [cpus_max]u16 = undefined,
     fds: [cpus_max]linux.fd_t = undefined,
     count: u32 = 0,
+    /// The run's turn to wait: one of its processes at a time holds it.
+    turn_fd: linux.fd_t = -1,
     /// The pool's `priority` file: shared-locked by priority processes while they wait.
     priority_fd: linux.fd_t = -1,
     priority: bool = false,
@@ -69,6 +83,13 @@ pub const Pool = struct {
         if (linux.errno(priority_fd) != .SUCCESS) return error.PoolFile;
         pool.priority_fd = @intCast(priority_fd);
         pool.priority = std.c.getenv("DETERMINISMO_CPU_PRIORITY") != null;
+        var turn_buffer: [96]u8 = undefined;
+        const turn_path = try std.fmt.bufPrintSentinel(&turn_buffer, "{s}/run-{d}.turn", .{
+            directory, run_key orelse linux.getpid(),
+        }, 0);
+        const turn_fd = linux.open(turn_path, flags, 0o600);
+        if (linux.errno(turn_fd) != .SUCCESS) return error.PoolFile;
+        pool.turn_fd = @intCast(turn_fd);
         // Each core's first thread, then the siblings (stable: by number within each).
         var order: [cpus_max]u32 = undefined;
         for (order[0..pool.count], 0..) |*slot, index| slot.* = @intCast(index);
@@ -91,6 +112,7 @@ pub const Pool = struct {
     pub fn close(pool: *Pool) void {
         for (pool.fds[0..pool.count]) |fd| _ = linux.close(fd);
         if (pool.priority_fd >= 0) _ = linux.close(pool.priority_fd);
+        if (pool.turn_fd >= 0) _ = linux.close(pool.turn_fd);
         pool.count = 0;
     }
 
@@ -103,20 +125,34 @@ pub const Pool = struct {
         defer if (pool.priority) {
             _ = linux.flock(pool.priority_fd, std.posix.LOCK.UN);
         };
-        var wait_ns: u64 = wait_ns_min;
-        while (true) : ({
+        // The run's turn: its other processes queue behind this one (in the kernel, asleep).
+        if (!pool.priority) {
+            while (linux.errno(linux.flock(pool.turn_fd, std.posix.LOCK.EX)) == .INTR) {}
+        }
+        defer if (!pool.priority) {
+            _ = linux.flock(pool.turn_fd, std.posix.LOCK.UN);
+        };
+        // Host-side only (which CPU a timeline runs on never changes it): any seed will do.
+        var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
+        while (true) {
             // Every CPU runs a VM, or one waits with priority: back-pressure, until one is free.
-            const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
-            _ = linux.nanosleep(&pause, null);
-            wait_ns = @min(wait_ns * 2, wait_ns_max);
-        }) {
-            if (!pool.priority and pool.priority_waiting()) continue;
+            // A priority process tries at once; the others wait their turn first, at random.
+            if (!pool.priority) {
+                const wait_ns = random.random().intRangeAtMost(u64, wait_ns_min, wait_ns_max);
+                const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
+                _ = linux.nanosleep(&pause, null);
+                if (pool.priority_waiting()) continue;
+            }
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
                 if (linux.errno(locked) != .SUCCESS) continue;
                 pin(pool.cpus[slot]);
                 return .{ .slot = slot };
+            }
+            if (pool.priority) {
+                const pause: linux.timespec = .{ .sec = 0, .nsec = wait_ns_min };
+                _ = linux.nanosleep(&pause, null);
             }
         }
     }
@@ -152,6 +188,12 @@ fn sibling(cpu: u16) bool {
     const end = std.mem.indexOfAny(u8, text[0..size], ",-\n") orelse size;
     const first = std.fmt.parseInt(u16, text[0..end], 10) catch return false;
     return cpu != first;
+}
+
+fn monotonic_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
 
 fn pin(cpu: u16) void {

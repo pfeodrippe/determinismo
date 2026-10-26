@@ -235,6 +235,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
     if (arguments.serve_address) |address| return submit(arena, arguments, address);
+    // This process and everything it forks are one run sharing the host's CPUs (cpus.zig).
+    cpus.run_key = linux.getpid();
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     const profile = arguments.profile orelse "";
     const all = std.mem.eql(u8, profile, "all");

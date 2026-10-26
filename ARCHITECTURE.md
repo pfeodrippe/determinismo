@@ -288,7 +288,12 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   a lock on a file per CPU (flock: the kernel releases a dead holder's). Physical cores first,
   then their hyperthread siblings: a VM alone on a core is fastest, and once every core is busy
   the siblings add throughput. Never more VMs running than hardware threads, whatever the number
-  of runs; a lone run takes them all.
+  of runs; a lone run takes them all. Runs share the host: one process of a run waits for a CPU
+  at a time (the others queue on the run's turn lock), and the waiting runs are served at random
+  (each tries again after a random 10 to 30 ms), so every run that wants CPUs gets them equally
+  often, whatever its number of processes. (With backoff, a run's next timeline took the CPU its
+  last one gave back every time; served per process, a run with 300 processes held most of the
+  host.)
 - **The tree's generations** are judged in order, each once complete (a seed gives the same
   tree), but they no longer stop the workers: when generation g is judged, g + 3 is planned,
   and the generations between run meanwhile. Each timeline runs in a process of its own, forked
