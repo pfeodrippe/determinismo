@@ -49,7 +49,7 @@ index 3f83e36..f6185fc 100644
  
  struct kvm_x86_init_ops vt_init_ops __initdata = {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 84420bf..ea35e5a 100644
+index 84420bf..58d7a75 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -73,6 +73,7 @@
@@ -60,7 +60,7 @@ index 84420bf..ea35e5a 100644
  
  MODULE_AUTHOR("Qumranet");
  MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
-@@ -5924,9 +5925,264 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+@@ -5924,9 +5925,271 @@ static int handle_pause(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -164,6 +164,9 @@ index 84420bf..ea35e5a 100644
 +	struct vcpu_vmx *vmx = to_vmx(vcpu);
 +	u64 now;
 +
++	/* Perf could not schedule the pinned counter (the PMU's counters all taken): no clock. */
++	if (unlikely(READ_ONCE(vmx->det.counter->state) == PERF_EVENT_STATE_ERROR))
++		return -EBUSY;
 +	if (!vmx->det.target || vmx->det.stepping || !READ_ONCE(vmx->det.overflowed))
 +		return ret;
 +	WRITE_ONCE(vmx->det.overflowed, false);
@@ -251,6 +254,10 @@ index 84420bf..ea35e5a 100644
 +	counter = perf_event_create_kernel_counter(&attr, -1, current, vmx_det_overflow, vmx);
 +	if (IS_ERR(counter))
 +		return PTR_ERR(counter);
++	if (READ_ONCE(counter->state) == PERF_EVENT_STATE_ERROR) { /* No PMU counter left for it. */
++		perf_event_release_kernel(counter);
++		return -EBUSY;
++	}
 +	vmx->det.counter = counter;
 +	vmx->det.tsc_base = cfg->tsc_base;
 +	vmx->det.tsc_per_branch = cfg->tsc_per_branch;
@@ -326,7 +333,7 @@ index 84420bf..ea35e5a 100644
  }
  
  static int handle_invpcid(struct kvm_vcpu *vcpu)
-@@ -6109,6 +6365,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6109,6 +6372,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
@@ -334,7 +341,7 @@ index 84420bf..ea35e5a 100644
  	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
-@@ -6620,6 +6877,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+@@ -6620,6 +6884,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
  
@@ -344,7 +351,7 @@ index 84420bf..ea35e5a 100644
  	/*
  	 * Exit to user space when bus lock detected to inform that there is
  	 * a bus lock in guest.
-@@ -7273,6 +7533,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+@@ -7273,6 +7540,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
  		return handle_fastpath_preemption_timer(vcpu, force_immediate_exit);
  	case EXIT_REASON_HLT:
  		return handle_fastpath_hlt(vcpu);
@@ -353,7 +360,7 @@ index 84420bf..ea35e5a 100644
  	default:
  		return EXIT_FASTPATH_NONE;
  	}
-@@ -7503,6 +7765,8 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -7503,6 +7772,8 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
  	nested_vmx_free_vcpu(vcpu);
  	free_loaded_vmcs(vmx->loaded_vmcs);
  	free_page((unsigned long)vmx->ve_info);
