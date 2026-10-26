@@ -253,13 +253,19 @@ pub fn kill_remaining(name: []const u8) !void {
 pub fn crash(name: []const u8) !void {
     var paths: Paths = undefined;
     try paths.init(name);
+    // Frozen first, all at once as the power goes: running on between the shutdown and the
+    // kill, its processes would see their writes fail (a program that stops on a failed write
+    // reports it), and exiting after it they would close files ext4 then writes back.
+    try file_write(paths.cgroup_freeze, "1");
+    defer file_write(paths.cgroup_freeze, "0") catch {}; // Its next start runs.
+    try cgroup_frozen_wait(&paths);
     const fd = linux.open(paths.layer, directory_flags, 0);
     if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
     var flags: u32 = ext4_going_flags_nologflush;
     const shutdown = linux.ioctl(@intCast(fd), ext4_ioc_shutdown, @intFromPtr(&flags));
     _ = linux.close(@intCast(fd));
     if (linux.errno(shutdown) != .SUCCESS) return error.NotADurableDisk; // Not ext4: no crash.
-    try kill(name);
+    try kill(name); // A frozen process dies of SIGKILL too.
     try layer_unmount(&paths);
     sdk.event("node_crash", .{ .node = name });
 }
@@ -1061,6 +1067,17 @@ fn memory_limit(paths: *const Paths, memory_max_mib: ?u32) !void {
     else
         "max\n";
     try file_write(path, value);
+}
+
+/// Until every process of the node is frozen (one inside a system call stops when it returns).
+fn cgroup_frozen_wait(paths: *const Paths) !void {
+    for (0..stop_attempts_max) |_| {
+        var buffer: [256]u8 = undefined;
+        const events = read_small(paths.cgroup_events, &buffer) orelse return error.NoCgroup;
+        if (std.mem.indexOf(u8, events, "frozen 1") != null) return;
+        sleep_ns(poll_interval_ns);
+    }
+    return error.NodeDidNotFreeze;
 }
 
 fn cgroup_populated(paths: *const Paths) !bool {
