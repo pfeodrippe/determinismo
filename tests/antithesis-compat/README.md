@@ -127,6 +127,10 @@ others at 1470). Reaching it took a cut-off leader with 16 or more uncommitted w
 than the 16 trailing logs), which four drivers never gave (one write each at a time): runs 15
 and 16 never left more than 7.
 
+It replays: `POST /runs/3/replay {"branch":38}` on that host re-ran #15 and #27 to their moments
+and #38 from there (its own 353.7 s of virtual time in 176 s), to the same 282,521 events
+(events hash `b0cca81b8b4110f0`) and the same convergence failure.
+
 ### Not found yet
 
 Antithesis's post reports one more: double votes from the same off-loop heartbeats (election
