@@ -107,11 +107,30 @@ main.go); ours were three minutes. And a node's durable disk lived in guest memo
 took no virtual time and no other goroutine ran during it: durable disks now take 0 to 2 ms per
 I/O, drawn per timeline.
 
+**A follower installs the same snapshot forever: the snapshot installation livelock**
+(Antithesis's hashicorp/raft#697), found blind on 2026-10-26 in the first hour of a run with
+fifteen-minute timelines and up to 32 parallel drivers (determinismo-2's run 3, timeline 38,
+third generation: #15, from 446.2 s #27, from 689.2 s #38). node-0, a cut-off leader that had
+taken writes nobody committed, kept entries up to index 1375; the new leader, its log compacted
+past them, sent it snapshot 438-1358:
+
+    node-0: Installed remote snapshot: last-index=1358 last-term=438
+    node-1: failed to get previous log: previous-index=1358 last-index=1375 ...
+    (previous-index 1357, 1356, ... down to 1346)
+    node-1: installing snapshot on: peer=node-0 id=438-1358-...    (again)
+
+node-0 keeps its stale entries 1359 to 1375 after installing the snapshot (the Raft paper's
+"discard the entire log" is missing), rejects the next AppendEntries, and gets the same snapshot
+again: 2,050 times between 696.6 s and 1,042.8 s, through the quiet period after faults stopped
+at 912.7 s, until `eventually_fsm_convergence` gave up (node-0 at applied index 1358, the
+others at 1470). Reaching it took a cut-off leader with 16 or more uncommitted writes (more
+than the 16 trailing logs), which four drivers never gave (one write each at a time): runs 15
+and 16 never left more than 7.
+
 ### Not found yet
 
-Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
-safety), and a snapshot installation livelock (convergence; it needs snapshots and a follower
-far behind, which long timelines now give).
+Antithesis's post reports one more: double votes from the same off-loop heartbeats (election
+safety).
 
 What the double vote needs, read from raft.go. A heartbeat runs `appendEntries` on the
 transport's goroutine, beside the main loop. It checks the term (`a.Term > getCurrentTerm() ||
