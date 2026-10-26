@@ -99,6 +99,10 @@ target_branches: u64,
 /// The armed soft stop (a clock reading, timer_arm), 0 for none.
 soft_tsc: u64,
 decisions: Decisions,
+/// A moment at or before the timeline's last randomness pull (the latest event's then: no clock
+/// read on the pull's path). Past the last pull its future is fixed: every timeline branched
+/// there would be the same one, so the tree explorer branches before it.
+last_pull_ns: u64,
 events: Events,
 stats: Stats,
 /// Optional text trace of every point where the VMM changes the guest's course: timer stops,
@@ -279,6 +283,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     vm.events.log_fd = options.events_fd;
     vm.events.retroactive = options.retroactive;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
+    vm.last_pull_ns = 0;
     vm.idle_pending = if (options.from_hold) |point| point.idle else false;
     assert(vm.branches_offset == snapshot.branches);
 }
@@ -344,6 +349,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .target_branches = 0,
         .soft_tsc = 0,
         .decisions = .{ .seed = options.seed },
+        .last_pull_ns = 0,
         .events = undefined,
         .stats = .{},
         .trace_fd = options.trace_fd,
@@ -1115,6 +1121,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
     const pull = vm.decisions.pulls;
     vm.decisions.random(value);
     assert(vm.decisions.pulls == pull + 1);
+    vm.last_pull_ns = vm.events.last_vtime_ns;
     if (vm.overrides) |overrides| {
         assert(vm.strategy == null); // A replay never consults the strategy.
         if (try overrides.apply(pull, value)) {

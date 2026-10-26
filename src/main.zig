@@ -1301,6 +1301,10 @@ const Summary = struct {
     /// The in-run snapshots it kept (holders.zig), for the explorer to return to.
     holder_count: u32,
     holders: [holders.per_timeline_max]holders.Held,
+    /// Its whole trace's hash (from the setup snapshot): equal, the same timeline.
+    trace_hash: u64,
+    /// At or before its last randomness pull (VM.last_pull_ns): branches return before it.
+    last_pull_ns: u64,
 };
 
 const Summaries = struct {
@@ -1315,6 +1319,8 @@ const Summaries = struct {
         summary.start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
+        summary.trace_hash = vm.events.hash.final();
+        summary.last_pull_ns = vm.last_pull_ns;
         summary.holder_count = @intCast(kept.len);
         @memcpy(summary.holders[0..kept.len], kept);
         @memcpy(
@@ -1364,6 +1370,8 @@ fn explore_tree(
     const total = branches.arguments.branches;
     const base = seed_base(exploration);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    // The traces explored: a timeline that repeats one is never returned to (its first was).
+    var traces: std.AutoHashMapUnmanaged(u64, void) = .empty;
     // How many timelines reached each behavior (what a strategy's `returns` is told).
     var visits: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     var plan: std.ArrayList(Planned) = .empty;
@@ -1436,6 +1444,7 @@ fn explore_tree(
         const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
         var random: std.Random.DefaultPrng = .init(generation_seed);
         for (done) |summary| {
+            if ((try traces.getOrPut(arena, summary.trace_hash)).found_existing) continue;
             var novel: u32 = 0;
             var moment: ?u64 = null;
             var label: []const u8 = "";
@@ -1457,7 +1466,8 @@ fn explore_tree(
                     if (!hunks_reached[hunk]) target.timelines[hunk] += 1;
                     hunks_reached[hunk] = true;
                     const own = behavior.vtime_ns > summary.start_ns;
-                    const room = behavior.vtime_ns + changed_room_ns < summary.end_ns;
+                    const room = behavior.vtime_ns + changed_room_ns < summary.end_ns and
+                        behavior.vtime_ns < summary.last_pull_ns;
                     if (own and room and changed_moment == null) {
                         changed_moment = behavior.vtime_ns;
                         changed_label = behavior.name();
@@ -1466,7 +1476,9 @@ fn explore_tree(
                 const timelines = reached.get(behavior.hash) orelse continue; // Known before.
                 novel += 1;
                 score += 1.0 / @as(f64, @floatFromInt(timelines));
-                if (behavior.vtime_ns <= room_end and timelines <= moment_reached) {
+                // A moment past its last randomness pull returns to the same timeline.
+                const open = behavior.vtime_ns < summary.last_pull_ns;
+                if (behavior.vtime_ns <= room_end and open and timelines <= moment_reached) {
                     moment = behavior.vtime_ns;
                     moment_reached = timelines;
                     label = behavior.name();
@@ -1679,7 +1691,9 @@ fn tree_returns(
     for (chosen) |candidate| {
         if (list.items.len == nodes) break;
         const summary = candidate.summary;
-        const span = summary.end_ns -| summary.start_ns;
+        // Only moments before its last randomness pull lead elsewhere.
+        const end_ns = @min(summary.end_ns, summary.last_pull_ns);
+        const span = end_ns -| summary.start_ns;
         if (span < 2 * std.time.ns_per_ms) continue;
         const after = if (candidate.changed_moment) |moment|
             moment + std.time.ns_per_us
@@ -1690,7 +1704,7 @@ fn tree_returns(
         const at = std.math.clamp(
             after,
             summary.start_ns + std.time.ns_per_ms,
-            summary.end_ns - std.time.ns_per_ms,
+            end_ns - std.time.ns_per_ms,
         );
         const why = if (candidate.changed_moment != null)
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first ran changed " ++

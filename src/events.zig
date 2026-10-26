@@ -70,6 +70,8 @@ last_event_name_size: u8 = 0,
 /// rate the "logging output" property checks.
 output_bytes: u64 = 0,
 first_vtime_ns: ?u64 = null,
+/// The latest event's moment.
+last_vtime_ns: u64 = 0,
 /// The behaviors this timeline reached (behavior_hash: an assertion with its outcome, an
 /// event with its categorical details; and how close a guidance assertion came, by powers of
 /// two), each with when it first did: where the tree explorer branches from (main.zig).
@@ -109,6 +111,7 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     assert(data.len <= 4096);
     events.count += 1;
     if (events.first_vtime_ns == null) events.first_vtime_ns = moment.vtime_ns;
+    events.last_vtime_ns = moment.vtime_ns;
     events.hash.update(std.mem.asBytes(&moment));
     events.hash.update(data);
 
