@@ -894,7 +894,10 @@ pub fn readdress(system: *const schema.System, node: *const schema.Resolved) !ne
         try other_paths.init(other.name);
         var hosts_buffer: [path_size_max]u8 = undefined;
         const hosts = try print_z(&hosts_buffer, "{s}/etc/hosts", .{other_paths.root});
-        if (exists(hosts)) try hosts_write(hosts, system);
+        // A node going down meanwhile (its disk cut by a crash) refuses the write: it gets the
+        // hosts as they are when it starts again (root_prepare). The others must still learn the
+        // new address, or they would lose the node for good.
+        if (exists(hosts)) hosts_write(hosts, system) catch {};
     }
     sdk.event("node_address", .{ .node = node.name, .address = std.mem.trimEnd(u8, text, "\n") });
     return new;
