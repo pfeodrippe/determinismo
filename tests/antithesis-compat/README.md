@@ -68,6 +68,14 @@ index 1866, term 400, node-1's entry and node-2's differ. Its log shows how:
 Fix: the leader must stamp entries with the term it was elected in (kept in its leader state),
 and heartbeats that change the term must go through the main loop.
 
+That two-hour run (352 timelines of three minutes) shows where it leads: 3 timelines fail
+log-matching, and in one (`--branch 351`) the wrong entry stays. node-2 is elected for term 257
+holding, at index 1186, a term-256 entry with data where the committed one was the new leader's
+empty no-op (the monitor's `[leader-completeness]`), and at the end the replicas sit at the same
+applied index, 1984, with different state machines (1597 blocks on node-2, 1596 on the
+others: `[fsm-convergence] cluster failed to converge`). Log matching, leader completeness and
+state machine safety: the properties Antithesis's post lists for this bug.
+
 ### Not found yet
 
 Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
