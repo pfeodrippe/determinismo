@@ -154,8 +154,8 @@ pub fn request_line(address: [4]u8, port: u16, request: []const u8, reply: []u8)
 
 pub const Response = struct { status: u16, body: []const u8 };
 
-/// One HTTP/1.0 request on a new connection (the server closes it after answering): its status
-/// and body, copied into `buffer`. For the HTTP APIs systems under test expose.
+/// One HTTP/1.0 request on a new connection: its status and body, copied into `buffer`. For the
+/// HTTP APIs systems under test expose.
 pub fn http(
     address: [4]u8,
     port: u16,
@@ -164,8 +164,22 @@ pub fn http(
     body: []const u8,
     buffer: []u8,
 ) !Response {
+    return http_with(address, port, method, path, body, buffer, .{});
+}
+
+/// `http` with connection options: a longer timeout for servers that answer slowly but surely
+/// (a consensus write waits out an election).
+pub fn http_with(
+    address: [4]u8,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    buffer: []u8,
+    options: Options,
+) !Response {
     var connection: Connection = undefined;
-    try connection.open(address, port, .{});
+    try connection.open(address, port, options);
     defer connection.close();
     var head_buffer: [512]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buffer, "{s} {s} HTTP/1.0\r\nHost: node\r\n" ++
@@ -174,27 +188,77 @@ pub fn http(
     });
     try connection.write_all(head);
     try connection.write_all(body);
-    return response_parse(try connection.read_all(), buffer);
+    return response_read(&connection, buffer);
 }
 
-fn response_parse(raw: []const u8, buffer: []u8) !Response {
-    // "HTTP/1.x NNN reason\r\n" headers "\r\n\r\n" body.
-    if (raw.len < 12 or !std.mem.startsWith(u8, raw, "HTTP/1.")) return error.BadReply;
-    const status = std.fmt.parseInt(u16, raw[9..12], 10) catch return error.BadReply;
-    const end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
-    const body = raw[end + 4 ..];
+/// "HTTP/1.x NNN reason", headers, an empty line, then the body: Content-Length bytes when the
+/// server says how many (it may keep the connection open after them, as Java's HttpServer
+/// does), else everything until it closes. A reply cut short (nothing, or part of its head)
+/// means the server went away (a stop, a crash): ConnectionClosed, not another protocol.
+fn response_read(connection: *Connection, buffer: []u8) !Response {
+    const status_line = try connection.read_line();
+    if (status_line.len < 12 or !std.mem.startsWith(u8, status_line, "HTTP/1.")) {
+        return error.BadReply;
+    }
+    const status = std.fmt.parseInt(u16, status_line[9..12], 10) catch return error.BadReply;
+    var length: ?u32 = null;
+    while (true) {
+        const line = try connection.read_line();
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        length = std.fmt.parseInt(u32, value, 10) catch return error.BadReply;
+    }
+    const body = if (length) |size| try connection.read_exact(size) else try connection.read_all();
     if (body.len > buffer.len) return error.ReplyTooLarge;
     @memcpy(buffer[0..body.len], body);
     return .{ .status = status, .body = buffer[0..body.len] };
 }
 
-test response_parse {
-    var buffer: [64]u8 = undefined;
-    const raw = "HTTP/1.1 409 Conflict\r\nA: b\r\n\r\nleader raft-2\n";
-    const response = try response_parse(raw, &buffer);
-    try std.testing.expectEqual(@as(u16, 409), response.status);
-    try std.testing.expectEqualStrings("leader raft-2\n", response.body);
-    try std.testing.expectError(error.BadReply, response_parse("garbage", &buffer));
+test response_read {
+    const Case = struct { sent: []const u8, close: bool };
+    const cases = [_]Case{
+        // A length, the connection left open (keep-alive): the read stops at the length.
+        .{ .sent = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", .close = false },
+        // No length: the body runs until the server closes.
+        .{ .sent = "HTTP/1.0 409 Conflict\r\nA: b\r\n\r\nleader raft-2\n", .close = true },
+    };
+    const expected = [_]Response{
+        .{ .status = 200, .body = "hello" },
+        .{ .status = 409, .body = "leader raft-2\n" },
+    };
+    for (cases, expected) |case, want| {
+        var fds: [2]i32 = undefined;
+        _ = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        defer _ = linux.close(fds[1]);
+        var connection = Connection{ .fd = fds[0] };
+        defer connection.close();
+        _ = linux.write(fds[1], case.sent.ptr, case.sent.len);
+        if (case.close) _ = linux.shutdown(fds[1], linux.SHUT.WR);
+        var buffer: [64]u8 = undefined;
+        const response = try response_read(&connection, &buffer);
+        try std.testing.expectEqual(want.status, response.status);
+        try std.testing.expectEqualStrings(want.body, response.body);
+    }
+    // Cut short by the server going away (nothing, or part of the head), or not HTTP at all.
+    const failures = [_]struct { []const u8, anyerror }{
+        .{ "", error.ConnectionClosed },
+        .{ "HTTP/1.1 200 OK\r\nA:", error.ConnectionClosed },
+        .{ "garbage, and more garbage\n", error.BadReply },
+    };
+    for (failures) |failure| {
+        var fds: [2]i32 = undefined;
+        _ = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        defer _ = linux.close(fds[1]);
+        var connection = Connection{ .fd = fds[0] };
+        defer connection.close();
+        _ = linux.write(fds[1], failure[0].ptr, failure[0].len);
+        _ = linux.shutdown(fds[1], linux.SHUT.WR);
+        var buffer: [64]u8 = undefined;
+        try std.testing.expectError(failure[1], response_read(&connection, &buffer));
+    }
 }
 
 test "lines and exact reads over a socket pair" {
