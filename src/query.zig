@@ -57,6 +57,8 @@ pub const Condition = struct {
     alternatives: []const []const Term,
 
     pub fn matches(condition: *const Condition, event: *const Event) bool {
+        // Most lines cannot match on their text alone: no JSON parsed for them.
+        if (event.line.len > 0 and !condition.may_match(event.line)) return false;
         for (condition.alternatives) |terms| {
             const all = for (terms) |*term| {
                 if (!term_matches(term, event)) break false;
@@ -65,15 +67,73 @@ pub const Condition = struct {
         }
         return false;
     }
+
+    /// Whether the line has the text some alternative needs: a term `path=value` or
+    /// `path~value` needs `value` in it (as JSON writes strings, numbers and booleans, when it
+    /// has no characters JSON escapes); other terms need nothing.
+    pub fn may_match(condition: *const Condition, line: []const u8) bool {
+        for (condition.alternatives) |terms| {
+            const possible = for (terms) |*term| {
+                if (term_needs(term)) |needed| {
+                    if (std.mem.indexOf(u8, line, needed) == null) break false;
+                }
+            } else true;
+            if (possible) return true;
+        }
+        return false;
+    }
 };
 
-/// One event of a timeline: its JSON, where it happened.
+fn term_needs(term: *const Term) ?[]const u8 {
+    if (term.operator != .equal and term.operator != .contains) return null;
+    if (term.path.len == 1) {
+        for ([_][]const u8{ "vtime", "branch", "seq" }) |pseudo| {
+            if (std.mem.eql(u8, term.path[0], pseudo)) return null; // Not in the event's JSON.
+        }
+    }
+    if (term.value.len == 0) return null;
+    for (term.value) |byte| if (byte == '"' or byte == '\\' or byte < 0x20 or byte >= 0x80) {
+        return null; // Written escaped.
+    };
+    return term.value;
+}
+
+/// One event of a timeline: where it happened, its line, and its JSON (parsed when first
+/// needed: a search over many timelines skips most lines on their text).
 pub const Event = struct {
     branch: u32,
     seq: u64,
     vtime_ns: u64,
-    value: std.json.Value,
     line: []const u8,
+    /// Shared by the copies of the event in the timelines that inherit it.
+    cell: *Cell,
+
+    pub const Cell = struct { value: ?std.json.Value = null, arena: std.mem.Allocator };
+
+    pub fn value(event: *const Event) std.json.Value {
+        if (event.cell.value) |known| return known;
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const parsed = std.json.parseFromSliceLeaky(Line, event.cell.arena, event.line, options);
+        event.cell.value = if (parsed) |line| line.event else |_| .null;
+        return event.cell.value.?;
+    }
+
+    /// An event whose JSON is known already.
+    pub fn of(
+        arena: std.mem.Allocator,
+        place: struct { branch: u32, seq: u64, vtime_ns: u64, line: []const u8 = "" },
+        json: std.json.Value,
+    ) !Event {
+        const cell = try arena.create(Cell);
+        cell.* = .{ .value = json, .arena = arena };
+        return .{
+            .branch = place.branch,
+            .seq = place.seq,
+            .vtime_ns = place.vtime_ns,
+            .line = place.line,
+            .cell = cell,
+        };
+    }
 };
 
 pub fn parse(arena: std.mem.Allocator, text: []const u8) !Condition {
@@ -244,7 +304,7 @@ fn field_get(event: *const Event, path: []const []const u8) ?Field {
         if (eql(u8, path[0], "branch")) return .{ .number = @floatFromInt(event.branch) };
         if (eql(u8, path[0], "seq")) return .{ .number = @floatFromInt(event.seq) };
     }
-    var value = event.value;
+    var value = event.value();
     for (path) |key| {
         if (value != .object) return null;
         value = value.object.get(key) orelse return null;
@@ -413,6 +473,8 @@ const Own = struct {
 
 const Line = struct { seq: u64, vtime_ns: u64, event: std.json.Value };
 
+/// An events file's lines: their place read off their start (`{"seq":n,"vtime_ns":n,`, as the
+/// VMM writes them), their JSON left for when it is needed.
 fn events_parse(
     arena: std.mem.Allocator,
     source: []const u8,
@@ -421,17 +483,31 @@ fn events_parse(
 ) !void {
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (lines.next()) |text| {
-        const line = std.json.parseFromSliceLeaky(Line, arena, text, .{
-            .ignore_unknown_fields = true,
-        }) catch continue; // Lines that are not JSON events (plain logs) carry nothing to query.
+        // Lines that are not JSON events (plain logs, a path header) carry nothing to query.
+        const place = line_place(text) orelse continue;
+        const cell = try arena.create(Event.Cell);
+        cell.* = .{ .arena = arena };
         try events.append(arena, .{
             .branch = branch,
-            .seq = line.seq,
-            .vtime_ns = line.vtime_ns,
-            .value = line.event,
+            .seq = place.seq,
+            .vtime_ns = place.vtime_ns,
             .line = text,
+            .cell = cell,
         });
     }
+}
+
+fn line_place(text: []const u8) ?struct { seq: u64, vtime_ns: u64 } {
+    const seq_key = "{\"seq\":";
+    const vtime_key = ",\"vtime_ns\":";
+    if (!std.mem.startsWith(u8, text, seq_key)) return null;
+    const seq_end = std.mem.indexOfScalarPos(u8, text, seq_key.len, ',') orelse return null;
+    const seq = std.fmt.parseInt(u64, text[seq_key.len..seq_end], 10) catch return null;
+    if (!std.mem.startsWith(u8, text[seq_end..], vtime_key)) return null;
+    const vtime_start = seq_end + vtime_key.len;
+    const vtime_end = std.mem.indexOfScalarPos(u8, text, vtime_start, ',') orelse return null;
+    const vtime_ns = std.fmt.parseInt(u64, text[vtime_start..vtime_end], 10) catch return null;
+    return .{ .seq = seq, .vtime_ns = vtime_ns };
 }
 
 /// New behavior discovery (Antithesis's utilization chart): after each branch, in index order,
@@ -443,7 +519,7 @@ pub fn discovery(arena: std.mem.Allocator, timelines: []const Timeline) ![]const
     const points = try arena.alloc([2]u64, timelines.len);
     for (timelines, points, 1..) |timeline, *point, count| {
         for (timeline.events) |*event| {
-            const behavior = behavior_hash(event.value) orelse continue;
+            const behavior = behavior_hash(event.value()) orelse continue;
             try seen.put(arena, behavior, {});
         }
         point.* = .{ count, seen.count() };
@@ -716,7 +792,7 @@ fn event_print(out: *std.Io.Writer, event: *const Event, json: bool) !void {
     const ms = event.vtime_ns / std.time.ns_per_ms;
     if (json) {
         try out.print("{{\"branch\":{d},\"seq\":{d},\"vtime_ns\":{d},\"event\":{f}}}\n", .{
-            event.branch, event.seq, event.vtime_ns, std.json.fmt(event.value, .{}),
+            event.branch, event.seq, event.vtime_ns, std.json.fmt(event.value(), .{}),
         });
         return;
     }
@@ -725,7 +801,7 @@ fn event_print(out: *std.Io.Writer, event: *const Event, json: bool) !void {
         event.branch,
         event.vtime_ns / std.time.ns_per_s,
         event.vtime_ns % std.time.ns_per_s / 1000,
-        std.json.fmt(event.value, .{}),
+        std.json.fmt(event.value(), .{}),
         event.branch,
         ms,
     });
@@ -744,13 +820,28 @@ fn branch_print(out: *std.Io.Writer, first: *const Event, count: u64, json: bool
 }
 
 fn event_test(arena: std.mem.Allocator, vtime_ns: u64, json: []const u8) !Event {
-    return .{
-        .branch = 0,
-        .seq = 1,
-        .vtime_ns = vtime_ns,
-        .value = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}),
-        .line = json,
-    };
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    return Event.of(arena, .{ .branch = 0, .seq = 1, .vtime_ns = vtime_ns, .line = json }, value);
+}
+
+test line_place {
+    const line = "{\"seq\":12,\"vtime_ns\":345,\"event\":{\"event\":\"fault\"}}";
+    const place = line_place(line).?;
+    try std.testing.expectEqual(@as(u64, 12), place.seq);
+    try std.testing.expectEqual(@as(u64, 345), place.vtime_ns);
+    try std.testing.expectEqual(null, line_place("{\"path\":[]}"));
+}
+
+test "a condition skips lines without the text it needs" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const condition = try parse(arena, "event=fault or output.text~refused");
+    try std.testing.expect(condition.may_match("{\"event\":\"fault\"}"));
+    try std.testing.expect(condition.may_match("{\"output\":{\"text\":\"refused\"}}"));
+    try std.testing.expect(!condition.may_match("{\"output\":{\"text\":\"fine\"}}"));
+    const numeric = try parse(arena, "vtime>2 and branch=3");
+    try std.testing.expect(numeric.may_match("{}"));
 }
 
 test "conditions: paths, operators, and/or, quoted values" {

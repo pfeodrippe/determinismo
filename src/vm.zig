@@ -805,15 +805,17 @@ pub fn moment(vm: *VM) !Events.Moment {
 /// Whether an event matches `--until` (the events' parse buffer is free again after emit).
 fn until_matches(vm: *VM, moment_now: Events.Moment, line: []const u8) bool {
     const condition = vm.until orelse return false;
+    if (!condition.may_match(line)) return false;
     var fba = std.heap.FixedBufferAllocator.init(vm.events.parse_buffer);
     const value = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), line, .{}) catch
         return false;
+    var cell = query.Event.Cell{ .value = value, .arena = fba.allocator() };
     const event = query.Event{
         .branch = 0,
         .seq = vm.events.count,
         .vtime_ns = moment_now.vtime_ns,
-        .value = value,
         .line = line,
+        .cell = &cell,
     };
     if (!condition.matches(&event)) return false;
     std.debug.print("[determinismo] until: {s}\n", .{line});

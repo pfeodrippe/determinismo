@@ -841,12 +841,14 @@ async function mapDraw() {
       <span><i style="background:#3fbf7f"></i>passing timeline</span><span><i style="background:#f0506e"></i>failing timeline</span>
       <span><i style="background:#f0a650"></i>fault</span><span><i style="background:#f0506e;border-radius:50%"></i>failed assertion</span>
       <span><i style="background:#e6e7eb;border-radius:50%"></i>branch point</span><span><i style="background:#8f7cf7"></i>fork (a subtree: another run)</span></div>
-    <div class="map tree" style="cursor:grab;touch-action:none"></div>
+    <div class="map tree" style="cursor:grab;touch-action:none;position:relative"></div>
     <div class="muted">Hover for details and why; click a timeline (or a mark) for its logs at that moment. Scroll to zoom (time and timelines), drag to pan, double-click to see it all.</div>`;
   const container = body.querySelector(".tree");
   let view = { ...full };
   const draw = () => {
-    container.innerHTML = treeSvg(model, view, Math.max(720, body.clientWidth - 4));
+    const zoomed = view.r0 > 0 || view.r1 < full.r1 || view.t0 > full.t0 || view.t1 < full.t1;
+    container.innerHTML = treeSvg(model, view, Math.max(720, body.clientWidth - 4)) +
+      (zoomed ? treeMinimap(model, view, full) : "");
     container.querySelectorAll(".timeline, .mark, .fork").forEach((element) => element.addEventListener("click", (event) => {
       event.stopPropagation();
       if (element.dataset.run) { runOpen(Number(element.dataset.run)); return; }
@@ -877,8 +879,34 @@ async function mapDraw() {
     redraw();
   }, { passive: false });
   let drag = null;
-  container.addEventListener("pointerdown", (event) => { drag = { x: event.clientX, y: event.clientY, view: { ...view }, moved: false }; });
+  // The minimap: a click or a drag there centers the view on that place of the whole tree.
+  let minimapDrag = false;
+  const minimapGo = (event) => {
+    const minimap = container.querySelector(".minimap");
+    if (!minimap) return;
+    const box = minimap.getBoundingClientRect(), pad = 4;
+    const fx = Math.min(1, Math.max(0, (event.clientX - box.left - pad) / (box.width - 2 * pad)));
+    const fy = Math.min(1, Math.max(0, (event.clientY - box.top - pad) / (box.height - 2 * pad)));
+    const spanT = view.t1 - view.t0, spanR = view.r1 - view.r0;
+    const at = full.t0 + (full.t1 - full.t0) * fx, rowAt = full.r1 * fy;
+    view.t0 = Math.min(Math.max(full.t0, at - spanT / 2), full.t1 - spanT);
+    view.t1 = view.t0 + spanT;
+    view.r0 = Math.min(Math.max(0, rowAt - spanR / 2), full.r1 - spanR);
+    view.r1 = view.r0 + spanR;
+    redraw();
+  };
+  container.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".minimap")) {
+      event.stopPropagation();
+      minimapDrag = true;
+      container.setPointerCapture(event.pointerId);
+      minimapGo(event);
+      return;
+    }
+    drag = { x: event.clientX, y: event.clientY, view: { ...view }, moved: false };
+  });
   container.addEventListener("pointermove", (event) => {
+    if (minimapDrag) { minimapGo(event); return; }
     if (!drag) return;
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     if (!drag.moved && Math.hypot(dx, dy) < 4) return;
@@ -889,13 +917,34 @@ async function mapDraw() {
     view = { t0: drag.view.t0 + dt, t1: drag.view.t1 + dt, r0: drag.view.r0 + dr, r1: drag.view.r1 + dr };
     redraw();
   });
-  const release = () => { if (drag && drag.moved) container.dataset.dragged = "1"; drag = null; container.style.cursor = "grab"; };
+  const release = () => {
+    if (minimapDrag) { minimapDrag = false; container.dataset.dragged = "1"; return; }
+    if (drag && drag.moved) container.dataset.dragged = "1";
+    drag = null;
+    container.style.cursor = "grab";
+  };
   container.addEventListener("pointerup", release);
   container.addEventListener("pointercancel", release);
   container.addEventListener("click", (event) => {
     if (container.dataset.dragged) { delete container.dataset.dragged; event.stopPropagation(); event.preventDefault(); }
   }, true);
   container.addEventListener("dblclick", () => { view = { ...full }; redraw(); });
+}
+
+// The whole tree in small, with the part shown boxed: for finding one's way in big runs.
+function treeMinimap(model, view, full) {
+  const w = 220, h = 110, pad = 4;
+  const x = (ns) => pad + (w - 2 * pad) * (ns - full.t0) / Math.max(1, full.t1 - full.t0);
+  const y = (i) => pad + (h - 2 * pad) * (i + 0.5) / Math.max(1, full.r1);
+  const lines = model.rows.map((row, i) => {
+    const b = row.branch, start = row.parent ? row.parent.vtime_ns : model.rootNs;
+    const color = b.failing && b.failing.length ? "var(--fail)" : "var(--pass)";
+    return `<line x1="${x(start)}" x2="${Math.max(x(start) + 1, x(b.vtime_ns))}" y1="${y(i)}" y2="${y(i)}" stroke="${color}" stroke-opacity=".7" stroke-width="1"/>`;
+  }).join("");
+  const vx0 = x(Math.max(full.t0, view.t0)), vx1 = x(Math.min(full.t1, view.t1));
+  const vy0 = pad + (h - 2 * pad) * view.r0 / full.r1, vy1 = pad + (h - 2 * pad) * view.r1 / full.r1;
+  return `<svg class="minimap" width="${w}" height="${h}" style="position:absolute;right:8px;top:8px;background:var(--panel);border:1px solid var(--line);border-radius:6px;cursor:crosshair" ${tipAttr("<div class=\"t-title\">The whole tree</div>The box is what is shown. Click or drag here to move it; double-click the tree to see it all.")}>
+    ${lines}<rect x="${vx0}" y="${vy0}" width="${Math.max(3, vx1 - vx0)}" height="${Math.max(3, vy1 - vy0)}" fill="rgba(143,124,247,.18)" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
 }
 
 // Where things go for a window of the tree: time t0..t1 across, timelines r0..r1 down.

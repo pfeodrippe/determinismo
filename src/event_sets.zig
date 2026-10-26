@@ -182,14 +182,16 @@ pub const Universe = struct {
     io: std.Io,
     timelines: []const query.Timeline,
 
-    fn event(universe: *const Universe, item: *const Item) query.Event {
+    /// The item as an event to match, its JSON in `cell` (the caller's).
+    fn event(universe: *const Universe, item: *const Item, cell: *query.Event.Cell) query.Event {
         const original = &universe.timelines[item.timeline].events[item.index];
+        cell.* = .{ .value = item.value, .arena = universe.arena };
         return .{
             .branch = original.branch,
             .seq = original.seq,
             .vtime_ns = item.vtime_ns,
-            .value = item.value,
             .line = "",
+            .cell = cell,
         };
     }
 
@@ -204,7 +206,7 @@ pub const Universe = struct {
                     .timeline = @intCast(timeline_index),
                     .index = @intCast(index),
                     .vtime_ns = original.vtime_ns,
-                    .value = original.value,
+                    .value = original.value(),
                 };
                 at += 1;
             }
@@ -241,7 +243,8 @@ fn keep(
 ) []Item {
     var kept: usize = 0;
     for (items) |item| {
-        const event = universe.event(&item);
+        var cell: query.Event.Cell = undefined;
+        const event = universe.event(&item, &cell);
         if (condition.matches(&event) != wanted) continue;
         items[kept] = item;
         kept += 1;
@@ -286,7 +289,7 @@ fn with_last(universe: *const Universe, items: []Item, sets: []const Named) ![]I
             } else null;
             const original = found orelse continue;
             const name = try std.fmt.allocPrint(arena, "last_{s}", .{set.name});
-            const last = try moment_value(arena, original, original.value);
+            const last = try moment_value(arena, original, original.value());
             item.value = try with_fields(arena, item.value, &.{.{ name, last }});
         }
     }
@@ -317,7 +320,7 @@ fn with_next(
                 .timeline = item.timeline,
                 .index = @intCast(match[0]),
                 .vtime_ns = original.vtime_ns,
-                .value = try with_fields(arena, original.value, &.{
+                .value = try with_fields(arena, original.value(), &.{
                     .{ "last_event", item.value },
                     .{ "with_next_type", .{ .string = match[1] } },
                 }),
@@ -604,13 +607,9 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8
 fn timeline_test(arena: std.mem.Allocator, lines: []const []const u8) !query.Timeline {
     const events = try arena.alloc(query.Event, lines.len);
     for (lines, events, 0..) |line, *event, index| {
-        event.* = .{
-            .branch = 0,
-            .seq = index,
-            .vtime_ns = index * std.time.ns_per_s,
-            .value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}),
-            .line = line,
-        };
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+        const place = .{ .branch = 0, .seq = index, .vtime_ns = index * std.time.ns_per_s };
+        event.* = try query.Event.of(arena, place, value);
     }
     return .{ .branch = 0, .events = events };
 }
