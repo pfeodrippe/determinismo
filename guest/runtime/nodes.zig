@@ -776,7 +776,45 @@ fn link_change(
 fn endpoint_address(system: *const schema.System, name: []const u8) !netlink.Address {
     if (std.mem.eql(u8, name, schema.runner_name)) return schema.runner_address;
     const node = system.node(name) orelse return error.UnknownNode;
+    return address_now(node);
+}
+
+/// A node's address now: the system's, or the one a restart gave it (readdress).
+pub fn address_now(node: *const schema.Resolved) !netlink.Address {
+    var paths: Paths = undefined;
+    try paths.init(node.name);
+    var path_buffer: [path_size_max]u8 = undefined;
+    const path = try print_z(&path_buffer, "{s}/address", .{paths.directory});
+    var buffer: [32]u8 = undefined;
+    if (read_small(path, &buffer)) |text| return address_parse(std.mem.trim(u8, text, " \n"));
     return address_parse(node.address);
+}
+
+/// The node, stopped, rejoins with a new address when it starts again (Faults.new_address):
+/// 10.<n>.0.<x> for its n-th one (x as in its first, so no two nodes share one), and every
+/// hosts file (the runner's, each node's) names it there.
+pub fn readdress(system: *const schema.System, node: *const schema.Resolved) !netlink.Address {
+    const old = try address_now(node);
+    const new = netlink.Address{ 10, if (old[1] >= 254) 1 else old[1] + 1, 0, old[3] };
+    var paths: Paths = undefined;
+    try paths.init(node.name);
+    var path_buffer: [path_size_max]u8 = undefined;
+    const path = try print_z(&path_buffer, "{s}/address", .{paths.directory});
+    var text_buffer: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buffer, "{d}.{d}.{d}.{d}\n", .{
+        new[0], new[1], new[2], new[3],
+    });
+    try file_write(path, text);
+    try hosts_write("/etc/hosts", system);
+    for (system.nodes) |*other| {
+        var other_paths: Paths = undefined;
+        try other_paths.init(other.name);
+        var hosts_buffer: [path_size_max]u8 = undefined;
+        const hosts = try print_z(&hosts_buffer, "{s}/etc/hosts", .{other_paths.root});
+        if (exists(hosts)) try hosts_write(hosts, system);
+    }
+    sdk.event("node_address", .{ .node = node.name, .address = std.mem.trimEnd(u8, text, "\n") });
+    return new;
 }
 
 /// Degrades the direction `from` → `to` of a link (delay, jitter, loss), or with null restores it.
@@ -911,7 +949,12 @@ fn hosts_write(path: [:0]const u8, system: *const schema.System) !void {
     try writer.print("{d}.{d}.{d}.{d} {s}\n", .{
         runner[0], runner[1], runner[2], runner[3], schema.runner_name,
     });
-    for (system.nodes) |node| try writer.print("{s} {s}\n", .{ node.address, node.name });
+    for (system.nodes) |*node| {
+        const address = try address_now(node);
+        try writer.print("{d}.{d}.{d}.{d} {s}\n", .{
+            address[0], address[1], address[2], address[3], node.name,
+        });
+    }
     _ = linux.unlink(path);
     try file_write(path, writer.buffered());
 }
@@ -964,7 +1007,7 @@ fn network_connect(
     pid: linux.pid_t,
 ) !void {
     try netlink.in_namespace_of(pid, netlink.Socket.link_set, .{ "lo", .up });
-    const address = try address_parse(node.address);
+    const address = try address_now(node);
     const self = Endpoint{ .name = node.name, .address = address, .pid = pid };
     try link_create(self, .{
         .name = schema.runner_name,
@@ -982,7 +1025,7 @@ fn network_connect(
         const peer_pid = pid_read(peer.name) orelse continue;
         try link_create(self, .{
             .name = peer.name,
-            .address = try address_parse(peer.address),
+            .address = try address_now(peer),
             .pid = peer_pid,
         });
     }
@@ -1053,7 +1096,7 @@ pub fn address_parse(text: []const u8) !netlink.Address {
 
 fn ready_wait(node: *const schema.Resolved) !void {
     const ready = node.ready orelse return;
-    const address = try address_parse(node.address);
+    const address = try address_now(node);
     for (0..ready_attempts_max) |_| {
         if (tcp_accepts(address, ready.tcp)) {
             sdk.event("node_ready", .{ .node = node.name });

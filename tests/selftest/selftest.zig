@@ -16,6 +16,8 @@
 //!   inject     (profile "injectable") faults the scenario asks for (sdk.fault): a pause, a
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back
+//!   readdress  (profile "movable") restarts the scenario asks for: the node answers at its
+//!              name each time, and sometimes came back at a new address
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
 //!              survives a crash, what it did not is lost, a wipe loses both (with a second
 //!              durable node beside it); then disk faults asked for: lost writes, failing
@@ -61,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
             .crash = crash,
             .disk = disk,
             .inject = inject,
+            .readdress = readdress,
             .stress = stress,
             .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
@@ -149,6 +152,16 @@ fn describe_faulted(d: *System.Describe) !void {
         .binary = "zig-out/bin/det-selftest-node",
         .ready = .{ .tcp = port },
         .faults = asked,
+    });
+    // Restarts that may give it a new address, for the "readdress" scenario.
+    const movable = try d.profile("movable");
+    var moves = quiet;
+    moves.restart = true;
+    moves.new_address = true;
+    movable.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = moves,
     });
 }
 
@@ -341,6 +354,55 @@ fn faults_on_request(context: *System.Context) !void {
     try sdk.retry(100, 100, answers, .{echo.address});
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
+}
+
+fn readdress(s: *System.Scenario) void {
+    s.singleton_driver("restarts", restarts);
+}
+
+/// Restarts asked for, in a quiet period: each time the node answers at its name (where the
+/// hosts file says it is); across timelines, sometimes at a new address.
+fn restarts(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    var moved = false;
+    for (0..4) |_| {
+        sdk.fault(.{ .kind = "restart", .node = echo.name, .duration_ms = 200 });
+        sdk.sleep_ms(300); // The fault is over: it started again, maybe elsewhere.
+        const found = host_address(echo.name);
+        const back = if (found) |address|
+            if (sdk.retry(100, 100, answers, .{address})) |_| true else |_| false
+        else
+            false;
+        sdk.always(back, "a restarted node answers at its name", .{});
+        if (found) |address| moved = moved or !std.mem.eql(u8, &address, &echo.address);
+    }
+    sdk.sometimes(moved, "a restarted node comes back at a new address", .{});
+    sdk.stop_faults(0);
+}
+
+/// Where /etc/hosts says `name` is.
+fn host_address(name: []const u8) ?[4]u8 {
+    var buffer: [4096]u8 = undefined;
+    const fd = linux.open("/etc/hosts", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    var lines = std.mem.tokenizeScalar(u8, buffer[0..size], '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const text = fields.next() orelse continue;
+        const host = fields.next() orelse continue;
+        if (!std.mem.eql(u8, host, name)) continue;
+        var address: [4]u8 = undefined;
+        var parts = std.mem.splitScalar(u8, text, '.');
+        for (&address) |*byte| {
+            byte.* = std.fmt.parseInt(u8, parts.next() orelse return null, 10) catch return null;
+        }
+        return address;
+    }
+    return null;
 }
 
 fn gone(address: [4]u8) !void {

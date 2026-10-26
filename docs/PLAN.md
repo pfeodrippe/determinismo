@@ -62,9 +62,9 @@ in ANTITHESIS.md yet.
    Fault types audited against antithesis.com/docs/.../fault_types (all present: partitions
    both ways or one way, clogs, restore, throttle, pause, kill and graceful stop, crash and wipe,
    thread pause, clock skips, CPU modulation, custom; network faults overlap, node faults one at
-   a time per node; any fault on request from a scenario). Left: restarted nodes taking a new
-   address (their peers' /etc/hosts and routes follow), and CPU modulation changing the relative
-   speed of instructions, not only the clock.
+   a time per node; any fault on request from a scenario). Restarted nodes may take a new address
+   (`new_address`). Left: CPU modulation changing the relative speed of instructions, not only
+   the clock.
 5. **Retroactive logging**: verbose output (lines matching a regex, or whole nodes) goes to a
    black hole during exploration, not stored; replaying a branch regenerates it for the Logs
    view, a query, or a file. Antithesis measured virtual time per wall time going from 0.16 to

@@ -64,7 +64,12 @@ fn node_from_service(
             std.debug.print(note, .{ service.key, field });
         }
     }
-    var node = schema.Node{ .name = service.key, .source = .{} };
+    // As on Antithesis, a restarted service may come back with a new address.
+    var node = schema.Node{
+        .name = service.key,
+        .source = .{},
+        .faults = .{ .new_address = true },
+    };
     // As Antithesis does, an image is used by name (built beforehand, as the project's own
     // scripts build it, or pulled); `build` only when no image is named.
     if (fields.get("image")) |image| {

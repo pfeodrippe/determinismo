@@ -512,6 +512,8 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .pause => nodes.freeze(name, .thawed) catch {},
         .restart, .crash, .wipe, .stop => {
             if (fault.grace_end_ns != null) nodes.kill_remaining(name) catch {}; // Healed early.
+            // Antithesis's restarted nodes may rejoin with a new address: a decision.
+            if (system.node(name)) |node| readdress_maybe(system, node);
             node_start_again(system, name);
         },
         .disk => {
@@ -526,6 +528,14 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
         else => {},
     }
+}
+
+fn readdress_maybe(system: *const schema.System, node: *const schema.Resolved) void {
+    if (!node.faults.new_address) return;
+    if (sdk.random_below_named("fault.new_address", 2) != 0) return;
+    _ = nodes.readdress(system, node) catch |err| {
+        sdk.event("fault_readdress_failed", .{ .node = node.name, .err = @errorName(err) });
+    };
 }
 
 fn node_start_again(system: *const schema.System, name: []const u8) void {

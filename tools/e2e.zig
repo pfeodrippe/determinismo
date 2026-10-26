@@ -98,7 +98,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },
+        .{ "changed", check_changed },               .{ "readdress", check_readdress },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1141,6 +1141,26 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// Antithesis's "restarted nodes may change IP addresses": restarts asked for by the scenario;
+/// the node answers at its name every time (hosts files follow it) and in some timeline came
+/// back at a new address.
+fn check_readdress(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const report = try explore(context, &.{
+        "--program",  program, "--profile", "movable", "--scenario", "readdress", "--seed", "1",
+        "--branches", "4",
+    });
+    const answers = std.mem.indexOf(u8, report, "PASS always                hit in    4/4 " ++
+        "branches, failing in    0  a restarted node answers at its name") != null;
+    const moved = std.mem.indexOf(u8, report, "PASS sometimes") != null and
+        std.mem.indexOf(u8, report, "a restarted node comes back at a new address") != null;
+    expect(context, answers and moved, "readdress: restarted nodes answer at their names, " ++
+        "some at a new address", .{});
+    if (!(answers and moved)) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "PASS", "readdress",
     }) catch ""});
 }
 

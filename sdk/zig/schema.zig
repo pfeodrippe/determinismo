@@ -108,6 +108,11 @@ pub const Faults = struct {
     /// fault's end a node that exited, or whose filesystem gave up (read-only), starts again
     /// with its disk mounted afresh, as an operator would reboot it.
     disk: bool = false,
+    /// A restart (restart, crash, wipe, stop) may give it a new address (Antithesis's
+    /// "Restarted nodes may change IP addresses upon rejoining the network"): every hosts file
+    /// then names it there; a peer that kept its old address loses it. Imported Compose
+    /// projects have it; test programs whose drivers hold `Node.address` leave it off.
+    new_address: bool = false,
     /// Degrade single links, in one direction, for a while: delay and loss, duplication,
     /// corruption, reordering or congestion.
     degrade: bool = true,
