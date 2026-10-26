@@ -80,6 +80,8 @@ hold_tsc: ?u64,
 hold: ?*const Hold,
 /// Behaviors the hold's owner was told of (Hold.behaviors).
 hold_behaviors: u32,
+/// Restored from a hold point inside an idle skip (Options.idle): the skip goes on first.
+idle_pending: bool,
 deterministic: bool,
 builtin_properties: bool,
 tsc_per_branch: u32,
@@ -154,6 +156,10 @@ pub const Options = struct {
     /// A timeline's ceiling of virtual time: a guest that never finishes (processes wedged, a
     /// command waiting forever) ends there as hung.
     vtime_limit_ns: ?u64 = null,
+    /// The snapshot is a hold point inside an idle skip (a holder's, holders.zig) and this run
+    /// replays its timeline: the guest stays halted and the skip goes on, as it did there
+    /// (resuming the guest would run its idle loop once more). Nodes and branches resume it.
+    idle: bool = false,
 };
 
 /// The machine runs `slowdown_permille` thousandths slower than its base rate (each branch
@@ -248,6 +254,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     vm.events.log_fd = options.events_fd;
     vm.events.retroactive = options.retroactive;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
+    vm.idle_pending = options.idle;
     assert(vm.branches_offset == snapshot.branches);
 }
 
@@ -298,6 +305,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .hold_tsc = null,
         .hold = null,
         .hold_behaviors = 0,
+        .idle_pending = false,
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
         .tsc_per_branch = options.tsc_per_branch,
@@ -338,6 +346,11 @@ fn init_vcpu(vm: *VM) !void {
         .TYPE = .SHARED,
     }, vm.vcpu_fd, 0));
     vm.run = @ptrFromInt(run_address);
+    // Not in forked children (holders.zig): the mapping keeps the vCPU, so its VM and its pinned
+    // branch counter, alive after this process ends the machine. The counter is bound to this
+    // process: once the hardware's counters are all taken by machines gone, a new machine's does
+    // not count, and its timeline is no longer deterministic.
+    _ = try syscall(linux.madvise(@ptrCast(vm.run), vm.run_size, linux.MADV.DONTFORK));
     try vm.init_cpuid();
 }
 
@@ -470,6 +483,11 @@ fn run_loop(vm: *VM) !Outcome {
     defer vm.serial.flush();
     while (true) {
         if (vm.over_limit) return .hung;
+        if (vm.idle_pending) {
+            vm.idle_pending = false;
+            if (try vm.idle()) |outcome| return outcome;
+            continue;
+        }
         if (vm.deterministic) try vm.timer_arm();
         _ = kvm.ioctl(vm.vcpu_fd, kvm.RUN, 0) catch |err| switch (err) {
             error.Interrupted => {
@@ -502,7 +520,7 @@ fn run_loop(vm: *VM) !Outcome {
                     },
                     .hold => {
                         vm.target_branches = 0;
-                        try vm.hold_reach();
+                        try vm.hold_reach(.{ .idle = false });
                     },
                     .timer => {
                         try vm.target_set(0); // A soft stop leaves the hard one armed.
@@ -513,11 +531,7 @@ fn run_loop(vm: *VM) !Outcome {
             .hlt => {
                 vm.stats.exits.getPtr(.hlt).* += 1;
                 if (!vm.deterministic) return .hlt;
-                switch (try vm.idle_skip()) {
-                    .timer => {},
-                    .moment => if (try vm.moment_arrive()) |outcome| return outcome,
-                    .none => return .hlt, // Halted with no timer: never wakes.
-                }
+                if (try vm.idle()) |outcome| return outcome;
             },
             .shutdown => return .shutdown,
             .intr => vm.stats.exits.getPtr(.intr).* += 1,
@@ -610,8 +624,7 @@ fn timer_arm(vm: *VM) !void {
     // where the clock reads the deadline once the extra time is added.
     const permille: u64 = 1000 + if (vm.modulation) |m| m.slowdown_permille else 0;
     const per_branch = @as(u64, vm.tsc_per_branch) * permille;
-    const branches_left = std.math.divCeil(u64, (hard_tsc - state.tsc) * 1000, per_branch) catch
-        unreachable;
+    const branches_left = @divCeil((hard_tsc - state.tsc) * 1000, per_branch);
     assert(branches_left > 0);
     vm.target_kind = deadline.kind;
     try vm.target_set(state.branches + branches_left);
@@ -718,6 +731,16 @@ fn timer_fire(vm: *VM) !void {
 
 const Idle = enum { timer, moment, none };
 
+/// The guest halted with nothing to do: skip to what wakes it, or to the moment.
+fn idle(vm: *VM) !?Outcome {
+    assert(vm.deterministic);
+    return switch (try vm.idle_skip()) {
+        .timer => null,
+        .moment => try vm.moment_arrive(),
+        .none => .hlt, // Halted with no timer: never wakes.
+    };
+}
+
 /// The guest halted with nothing to do: jump virtual time to the next deadline. A hold point on
 /// the way pauses there and the skip goes on: the guest does not wake (resuming it would run its
 /// idle loop once more, which a timeline without the hold point does not).
@@ -737,7 +760,7 @@ fn idle_skip(vm: *VM) !Idle {
         vm.stats.idle_skips += 1;
         switch (deadline.kind) {
             .moment => return .moment,
-            .hold => try vm.hold_reach(),
+            .hold => try vm.hold_reach(.{ .idle = true }),
             .timer => {
                 try vm.timer_fire();
                 return .timer;
@@ -751,7 +774,13 @@ fn idle_skip(vm: *VM) !Idle {
 pub const Hold = struct {
     context: *anyopaque,
     behaviors: *const fn (context: *anyopaque, vm: *VM, first_new: u32) anyerror!void,
-    reached: *const fn (context: *anyopaque, vm: *VM) anyerror!void,
+    reached: *const fn (context: *anyopaque, vm: *VM, point: Point) anyerror!void,
+
+    pub const Point = struct {
+        /// Inside an idle skip: the guest is halted, and a replay from here goes on skipping
+        /// (Options.idle). Else the guest stopped at an exact branch count.
+        idle: bool,
+    };
 };
 
 /// Pauses the run at `vtime_ns` (later than now) for the hold's owner, in place of a hold point
@@ -775,11 +804,11 @@ fn hold_notice(vm: *VM) !void {
     try hold.behaviors(hold.context, vm, first_new);
 }
 
-fn hold_reach(vm: *VM) !void {
+fn hold_reach(vm: *VM, point: Hold.Point) !void {
     vm.hold_tsc = null;
     vm.target_kind = .timer;
     const hold = vm.hold orelse return;
-    try hold.reached(hold.context, vm);
+    try hold.reached(hold.context, vm, point);
 }
 
 fn now_tsc(vm: *VM) !u64 {

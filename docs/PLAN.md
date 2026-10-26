@@ -14,8 +14,9 @@ build e2e` tests it.
    outcomes, categorical events (coverage lines and edges included), guidance distances, and
    new kinds of output lines. Next steps for it:
    - Done: in-run snapshots (holders, ARCHITECTURE.md §8): a node is a memory copy instead of a
-     replay of its parent to the moment (minutes with fifteen-minute timelines). Next: return
-     to more moments per generation now that a node costs little.
+     replay of its parent to the moment (minutes with fifteen-minute timelines), each checked
+     against a replay's node by `--verify-holders` in the e2e tree check. Next: return to more
+     moments per generation now that a node costs little.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,

@@ -26,107 +26,84 @@ const spacing_ns_min = 10 * std.time.ns_per_ms;
 /// No holder is made with less memory than this available (MemAvailable).
 const memory_reserve_bytes = 8 << 30;
 
-/// What a holder tells the explorer once made, and what the explorer asks it.
-const Registration = extern struct { pid: linux.pid_t, branch: u32, vtime_ns: u64 };
+/// What the explorer asks a holder: the moment of the node to make.
 const Request = extern struct { vtime_ns: u64 };
 
-/// The explorer's end: an abstract Unix socket holders connect to as they are made. The explorer
-/// becomes their subreaper, so holders whose worker exited are still its to wait for.
-pub const Listener = struct {
-    fd: linux.fd_t,
-    address: linux.sockaddr.un,
-    held: [held_max]Held = undefined,
+/// A holder as its timeline's summary carries it to the explorer: its process, and where it
+/// listens (an abstract Unix socket named after the explorer, its worker and its number there).
+pub const Held = extern struct { pid: linux.pid_t, worker: linux.pid_t, id: u32, vtime_ns: u64 };
+
+/// The explorer's holders of a generation, from its timelines' summaries. The explorer is their
+/// subreaper: holders whose worker exited are still its to wait for.
+pub const Registry = struct {
+    explorer: linux.pid_t,
+    entries: [entries_max]Entry = undefined,
     count: u32 = 0,
 
-    /// A generation's holders: 16 timelines of per_timeline_max, with room.
-    const held_max = 512;
-    const Held = struct { pid: linux.pid_t, branch: u32, vtime_ns: u64, socket: linux.fd_t };
+    /// A generation's (the largest, of per_timeline_max each).
+    const entries_max = 256 * per_timeline_max;
+    const Entry = struct { held: Held, branch: u32, taken: bool };
 
-    pub fn init(listener: *Listener) !void {
-        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
-        const created = linux.socket(linux.AF.UNIX, flags, 0);
-        if (linux.errno(created) != .SUCCESS) return error.Socket;
-        listener.* = .{ .fd = @intCast(created), .address = .{ .path = @splat(0) } };
-        errdefer _ = linux.close(listener.fd);
-        // Abstract (a leading NUL): no file to clean up, gone with the explorer.
-        _ = try std.fmt.bufPrint(listener.address.path[1..], "determinismo-holders-{d}", .{
-            linux.getpid(),
-        });
-        const bound = linux.bind(listener.fd, @ptrCast(&listener.address), @sizeOf(linux.sockaddr.un));
-        if (linux.errno(bound) != .SUCCESS) return error.Bind;
-        if (linux.errno(linux.listen(listener.fd, held_max)) != .SUCCESS) return error.Listen;
-        const subreaper = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
+    pub fn init(registry: *Registry) !void {
+        const subreaper = linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
         if (linux.errno(subreaper) != .SUCCESS) return error.Subreaper;
+        registry.* = .{ .explorer = linux.getpid() };
     }
 
-    pub fn deinit(listener: *Listener) void {
-        listener.release();
-        _ = linux.close(listener.fd);
-    }
-
-    /// After a generation's timelines ran: the holders they made (each registered before its
-    /// worker went on, so all are queued by now).
-    pub fn collect(listener: *Listener) void {
-        while (listener.count < held_max) {
-            const accepted = linux.accept4(listener.fd, null, null, linux.SOCK.CLOEXEC);
-            if (linux.errno(accepted) != .SUCCESS) return; // None left (EAGAIN).
-            const socket: linux.fd_t = @intCast(accepted);
-            var registration: Registration = undefined;
-            if (!read_exact(socket, std.mem.asBytes(&registration))) {
-                _ = linux.close(socket);
+    /// A timeline's holders (its summary's), after it ran.
+    pub fn add(registry: *Registry, branch: u32, kept: []const Held) void {
+        for (kept) |held| {
+            if (registry.count == entries_max) {
+                kill(held.pid); // Never with generations of at most 256 timelines.
                 continue;
             }
-            listener.held[listener.count] = .{
-                .pid = registration.pid,
-                .branch = registration.branch,
-                .vtime_ns = registration.vtime_ns,
-                .socket = socket,
-            };
-            listener.count += 1;
+            registry.entries[registry.count] = .{ .held = held, .branch = branch, .taken = false };
+            registry.count += 1;
         }
     }
 
-    pub const Taken = struct { socket: linux.fd_t, pid: linux.pid_t, replay_ns: u64 };
+    pub const Taken = struct { socket: linux.fd_t, pid: linux.pid_t };
 
-    /// The latest holder of `branch` at or before `vtime_ns` that takes the request (one that
-    /// was dropped does not): its socket, where the snapshot comes back as from a node-making
+    /// The latest holder of `branch` at or before `vtime_ns` that takes the request (one killed
+    /// for memory does not): its socket, where the snapshot comes back as from a node-making
     /// child, and its pid. Null when none does.
-    pub fn take(listener: *Listener, branch: u32, vtime_ns: u64) ?Taken {
+    pub fn take(registry: *Registry, branch: u32, vtime_ns: u64) ?Taken {
         while (true) {
-            var best: ?*Held = null;
-            for (listener.held[0..listener.count]) |*held| {
-                if (held.socket < 0 or held.branch != branch or held.vtime_ns > vtime_ns) continue;
-                if (best == null or held.vtime_ns > best.?.vtime_ns) best = held;
+            var best: ?*Entry = null;
+            for (registry.entries[0..registry.count]) |*entry| {
+                if (entry.taken or entry.branch != branch) continue;
+                if (entry.held.vtime_ns > vtime_ns) continue; // At the moment, or replays to it.
+                if (best == null or entry.held.vtime_ns > best.?.held.vtime_ns) best = entry;
             }
-            const held = best orelse return null;
-            const socket = held.socket;
-            held.socket = -1;
-            const request = Request{ .vtime_ns = vtime_ns };
-            const bytes = std.mem.asBytes(&request);
-            const sent = linux.sendto(socket, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
-            if (linux.errno(sent) == .SUCCESS and sent == bytes.len) {
-                return .{ .socket = socket, .pid = held.pid, .replay_ns = vtime_ns - held.vtime_ns };
+            const entry = best orelse return null;
+            entry.taken = true;
+            const held = entry.held;
+            const at = address(registry.explorer, held.worker, held.id);
+            if (connect(&at)) |socket| {
+                const request = Request{ .vtime_ns = vtime_ns };
+                if (write_all(socket, std.mem.asBytes(&request))) {
+                    return .{ .socket = socket, .pid = held.pid };
+                }
+                _ = linux.close(socket);
             }
-            _ = linux.close(socket); // Gone: dropped by its timeline, or killed for memory.
-            reap(held.pid);
+            kill(held.pid); // Gone, or not answering: the next one, or a replay.
         }
     }
 
-    /// The holders nobody took: told to go (their socket closes) and waited for.
-    pub fn release(listener: *Listener) void {
-        for (listener.held[0..listener.count]) |*held| {
-            if (held.socket < 0) continue;
-            _ = linux.close(held.socket);
-            held.socket = -1;
-            reap(held.pid);
+    /// The holders nobody took go (their memory, before the next generation runs).
+    pub fn release(registry: *Registry) void {
+        for (registry.entries[0..registry.count]) |*entry| {
+            if (!entry.taken) kill(entry.held.pid);
         }
-        listener.count = 0;
+        registry.count = 0;
     }
 };
 
 /// A timeline's end, in the worker that runs it: VM.Hold's owner.
 pub const Owner = struct {
-    address: *const linux.sockaddr.un,
+    /// The explorer and this worker: they name the holders' sockets.
+    explorer: linux.pid_t,
+    worker: linux.pid_t,
     /// Behaviors the tree knew before this generation: a holder follows one it did not.
     seen: *const std.AutoHashMapUnmanaged(u64, void),
     branch: u32,
@@ -143,10 +120,12 @@ pub const Owner = struct {
     armed_ns: ?u64 = null,
     armed_new: bool = false,
     last_ns: ?u64 = null,
-    kept: [per_timeline_max + 1]Kept = undefined,
+    /// Holders made so far (each one's socket number).
+    made: u32 = 0,
+    /// The last hold point (the holder forked there keeps it): inside an idle skip or not.
+    point: VM.Hold.Point = .{ .idle = false },
+    kept: [per_timeline_max + 1]Held = undefined,
     kept_count: u32 = 0,
-
-    const Kept = struct { pid: linux.pid_t, vtime_ns: u64 };
 
     /// Replays a holder's snapshot of the timeline to a later moment of it (main.zig's
     /// node_make), in the holder.
@@ -158,6 +137,7 @@ pub const Owner = struct {
             from: *const Snapshot,
             seed: u64,
             vtime_ns: u64,
+            point: VM.Hold.Point,
         ) anyerror!*const Snapshot,
     };
 
@@ -169,6 +149,11 @@ pub const Owner = struct {
     /// Without new behaviors, a holder this often: the timeline's spread over the most it keeps.
     fn period(owner: *const Owner) u64 {
         return owner.spacing_ns * (spacing_divisor / per_timeline_max);
+    }
+
+    /// The holders kept, for the timeline's summary (the explorer's registry).
+    pub fn holders(owner: *const Owner) []const Held {
+        return owner.kept[0..owner.kept_count];
     }
 
     pub fn attach(owner: *Owner, vm: *VM) !void {
@@ -201,7 +186,7 @@ pub const Owner = struct {
         }
     }
 
-    fn reached(context: *anyopaque, vm: *VM) !void {
+    fn reached(context: *anyopaque, vm: *VM, point: VM.Hold.Point) !void {
         const owner: *Owner = @ptrCast(@alignCast(context));
         const moment = owner.armed_ns.?;
         owner.armed_ns = null;
@@ -210,22 +195,22 @@ pub const Owner = struct {
         try owner.arm(vm, moment + owner.period(), false); // The next, unless one is new first.
         if (memory_available() < memory_reserve_bytes) return;
         try owner.snapshot.capture(vm);
-        const socket = connect(owner.address) orelse return; // No explorer listening.
+        owner.point = point;
+        const id = owner.made;
+        owner.made += 1;
+        // Listening before the fork: the explorer may connect whenever it needs the holder.
+        const at = address(owner.explorer, owner.worker, id);
+        const listener = listen(&at) orelse return;
         const pid = linux.fork();
-        if (linux.errno(pid) != .SUCCESS) {
-            _ = linux.close(socket);
-            return;
-        }
-        if (pid == 0) owner.serve(vm, socket, moment);
-        const registration = Registration{
+        if (pid == 0) owner.serve(vm, listener, moment);
+        _ = linux.close(listener);
+        if (linux.errno(pid) != .SUCCESS) return;
+        owner.kept[owner.kept_count] = .{
             .pid = @intCast(pid),
-            .branch = owner.branch,
+            .worker = owner.worker,
+            .id = id,
             .vtime_ns = moment,
         };
-        const written = write_all(socket, std.mem.asBytes(&registration));
-        _ = linux.close(socket);
-        if (!written) return;
-        owner.kept[owner.kept_count] = .{ .pid = @intCast(pid), .vtime_ns = moment };
         owner.kept_count += 1;
         if (owner.kept_count > per_timeline_max) owner.drop();
     }
@@ -242,25 +227,28 @@ pub const Owner = struct {
                 victim = @intCast(index);
             }
         }
-        const pid = owner.kept[victim].pid;
-        _ = linux.kill(pid, .KILL);
-        reap(pid);
+        kill(owner.kept[victim].pid);
         std.mem.copyForwards(
-            Kept,
+            Held,
             owner.kept[victim .. owner.kept_count - 1],
             owner.kept[victim + 1 .. owner.kept_count],
         );
         owner.kept_count -= 1;
     }
 
-    /// The holder: waits for the explorer, then makes the node it asks for and exits.
-    fn serve(owner: *Owner, vm: *VM, socket: linux.fd_t, moment_ns: u64) noreturn {
+    /// The holder: waits for the explorer, then makes the node it asks for and exits (or is
+    /// killed: dropped by its timeline, released by the explorer).
+    fn serve(owner: *Owner, vm: *VM, listener: linux.fd_t, moment_ns: u64) noreturn {
         // The worker's machine is not this process's: only its memory and captured state are.
         _ = linux.close(vm.vcpu_fd);
         _ = linux.close(vm.vm_fd);
         _ = linux.close(vm.kvm_fd);
         if (vm.events.log_fd) |fd| _ = linux.close(fd);
         oom_first();
+        const accepted = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(accepted) != .SUCCESS) linux.exit_group(1);
+        _ = linux.close(listener);
+        const socket: linux.fd_t = @intCast(accepted);
         var request: Request = undefined;
         if (!read_exact(socket, std.mem.asBytes(&request))) linux.exit_group(0); // Released.
         if (request.vtime_ns < moment_ns) linux.exit_group(1);
@@ -274,6 +262,7 @@ pub const Owner = struct {
                 owner.snapshot,
                 owner.seed,
                 request.vtime_ns,
+                owner.point,
             ) catch linux.exit_group(1);
         fd_pass.send(socket, node.memory_fd) catch linux.exit_group(1);
         if (!write_all(socket, std.mem.asBytes(node))) linux.exit_group(1);
@@ -281,17 +270,40 @@ pub const Owner = struct {
     }
 };
 
-/// Waits for a holder to exit (it may have been waited for already, by its worker).
-fn reap(pid: linux.pid_t) void {
+/// Ends a holder and waits for it (it may have been waited for already, by its worker).
+fn kill(pid: linux.pid_t) void {
+    _ = linux.kill(pid, .KILL);
     var status: i32 = 0;
     _ = linux.wait4(pid, &status, 0, null);
 }
 
-fn connect(address: *const linux.sockaddr.un) ?linux.fd_t {
+/// A holder's socket: abstract (no file to clean up), named after its explorer, its worker and
+/// its number there.
+fn address(explorer: linux.pid_t, worker: linux.pid_t, id: u32) linux.sockaddr.un {
+    var at: linux.sockaddr.un = .{ .path = @splat(0) };
+    _ = std.fmt.bufPrint(at.path[1..], "determinismo-holder-{d}-{d}-{d}", .{
+        explorer, worker, id,
+    }) catch unreachable; // Three numbers fit.
+    return at;
+}
+
+fn listen(at: *const linux.sockaddr.un) ?linux.fd_t {
     const created = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(created) != .SUCCESS) return null;
     const socket: linux.fd_t = @intCast(created);
-    const connected = linux.connect(socket, @ptrCast(address), @sizeOf(linux.sockaddr.un));
+    const bound = linux.bind(socket, @ptrCast(at), @sizeOf(linux.sockaddr.un));
+    if (linux.errno(bound) != .SUCCESS or linux.errno(linux.listen(socket, 1)) != .SUCCESS) {
+        _ = linux.close(socket);
+        return null;
+    }
+    return socket;
+}
+
+fn connect(at: *const linux.sockaddr.un) ?linux.fd_t {
+    const created = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(created) != .SUCCESS) return null;
+    const socket: linux.fd_t = @intCast(created);
+    const connected = linux.connect(socket, @ptrCast(at), @sizeOf(linux.sockaddr.un));
     if (linux.errno(connected) != .SUCCESS) {
         _ = linux.close(socket);
         return null;

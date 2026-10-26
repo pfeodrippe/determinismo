@@ -997,7 +997,7 @@ fn check_tree(context: *Context) !void {
         "--branching", "tree",
     };
     const one = try explore(context, &(common ++ [_][]const u8{
-        "--jobs", "1", "--tape-dir", tapes, "--record", record,
+        "--jobs", "1", "--tape-dir", tapes, "--record", record, "--verify-holders",
     }));
     const many = try explore(context, &(common ++ [_][]const u8{ "--jobs", "4" }));
     var sequential: [branches_max]Branch = undefined;
@@ -1009,11 +1009,18 @@ fn check_tree(context: *Context) !void {
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
     // from their parents' start would make, which the deepest timeline's lone replay checks.
     const held = held_nodes(one) > 0 and held_nodes(many) > 0;
-    expect(context, same and deep.depth >= 1 and deep.replays and held, "tree: {d} timelines, " ++
-        "up to {d} deep, the same with one worker or four; #{?d} replays alone from its tape; " ++
-        "{d} nodes from in-run snapshots", .{
+    // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
+    const verified = std.mem.indexOf(u8, one, "ns: the same") != null and
+        std.mem.indexOf(u8, one, "DIFFERENT") == null;
+    const passes = same and deep.depth >= 1 and deep.replays and held and verified;
+    expect(context, passes, "tree: {d} timelines, up to {d} deep, the same with one worker or " ++
+        "four; #{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the " ++
+        "one a replay makes", .{
         count, deep.depth, deep.index, held_nodes(one),
     });
+    if (!verified) std.debug.print("{s}\n", .{lines_with(context.arena, one, &.{
+        "verify",
+    }) catch ""});
     // With a strategy (overriding decisions): nodes replay their parents with their tapes, and
     // a deep timeline still replays alone, without the strategy.
     const strategy_tapes = try std.fmt.allocPrint(arena, "{s}/tree-strategy-tapes", .{

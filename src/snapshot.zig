@@ -51,7 +51,11 @@ pub fn take(snapshot: *Snapshot, vm: *VM) !void {
 pub fn capture(snapshot: *Snapshot, vm: *VM) !void {
     assert(vm.deterministic);
     assert(!vm.frozen);
-    assert(vm.target_branches == 0); // Paused at a hold point: no stop armed, no I/O pending.
+    assert(vm.target_branches == 0); // Paused at a hold point: no stop armed.
+    // As `take` does: an entry that runs nothing settles what KVM keeps lazily (its segment
+    // cache, a pending event's fields, some MSRs), which its GETs report otherwise unsettled.
+    // The run goes on as it would have: its next entry settles them the same way.
+    try complete_pending_io(vm);
     try snapshot.state_save(vm, -1);
     snapshot.serial.output_count = 0;
 }

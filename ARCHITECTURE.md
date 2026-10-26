@@ -131,6 +131,13 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
   branches and full boots of Redis and Postgres. The margin defaults to 128 branches; every run
   reports its largest skid, and any overshoot (a stop past its target) is reported as a run that
   may not replay. Margins of 256, 128 and 64 gave identical timelines; 32 did not.
+- **The counter is a pinned perf event of the VMM process**, and a thread has few of them (4
+  general-purpose counters with hyper-threading on). A vCPU whose counter perf could not schedule
+  is refused (`KVM_RUN` fails with `EBUSY`) rather than run without a clock. A machine a process
+  ended must be gone, counter included: forked children (holders, §8) do not inherit the vCPU's
+  `kvm_run` mapping (`MADV_DONTFORK`), which would keep the VM alive. Found the hard way: four
+  holders kept four ended machines, and from the fifth timeline of a worker on, branch counts
+  stood still and timelines no longer replayed.
 - **Two kinds of stops.** Moments (multiverse debugging) stop at their exact branch count. Timer
   interrupts are **soft**: KVM exits at the first RDTSC at or past the deadline (a free, exact
   point), with a hard stop at the deadline plus `--timer-slack-us` (100 µs) as a backstop for
@@ -251,8 +258,13 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   keeps the machine copy-on-write, and goes on. A node is then a memory copy, not a replay from
   the parent's start; a moment between holders replays from the nearest one. Holders are spaced
   (a timeline's length over 64, plus one every eighth when nothing is new), at most 8 per
-  timeline, none under 8 GB of available memory, and the OOM killer's first victims. The tree is
-  the same as with replays (the e2e tree check, and bench/tree.py's identical numbers).
+  timeline, none under 8 GB of available memory, and the OOM killer's first victims. A holder
+  forked inside an idle skip replays to a later moment by going on with the skip (the guest
+  stays halted, as it did in the timeline; resuming it would run its idle loop once more).
+  `explore --verify-holders` remakes every node a holder made by a replay and compares the two:
+  registers, memory, branch count and events are the same, and only what the guest cannot see
+  may differ (MSRs KVM derives from host time, a past exception's leftovers, unusable segments'
+  attributes). The e2e tree check runs it.
 - Expected cost: milliseconds per branch. If it becomes the bottleneck → in-kernel VM fork
   (ownership level 2) behind the same "branch" interface.
 

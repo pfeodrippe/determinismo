@@ -8,6 +8,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const VM = @import("vm.zig");
+const kvm = @import("kvm.zig");
 const Snapshot = @import("snapshot.zig");
 const Events = @import("events.zig");
 const report = @import("report.zig");
@@ -63,6 +64,8 @@ const usage =
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\                            [--cpu-modulation]   (branches run at varying speeds)
+    \\                            [--verify-holders]   (remake every node an in-run snapshot made
+    \\                            by a replay and compare them, to check holders; slower)
     \\                            [--serve <host:port>]   (a run of that serve, in its web UI)
     \\                            [--events-dir <dir>]   (every branch's events, for query)
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
@@ -175,6 +178,9 @@ const Arguments = struct {
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
     cpu_modulation: bool = false,
+    /// Remake every tree node an in-run snapshot made (holders.zig) by a replay, and print how
+    /// the two differ in what the guest can see ("verify ... DIFFERENT"): a check of holders.
+    verify_holders: bool = false,
     /// Run the exploration in a `determinismo serve` at this address (host:port) instead of
     /// here: it then shows in the web UI, with its record, events, tapes and notebook.
     serve_address: ?[]const u8 = null,
@@ -826,8 +832,7 @@ fn jobs_count(arguments: *const Arguments) u32 {
     const single = arguments.branch_only != null or arguments.tape_path != null;
     if (single or arguments.events_path != null) return 1;
     const jobs = arguments.jobs orelse cpus_available();
-    const shard_branches = std.math.divCeil(u32, arguments.branches, arguments.shard_count) catch
-        unreachable;
+    const shard_branches = @divCeil(arguments.branches, arguments.shard_count);
     return @max(1, @min(jobs, shard_branches, jobs_max));
 }
 
@@ -1110,9 +1115,10 @@ const Branches = struct {
     /// whichever comes next.
     worker: u32 = 0,
     jobs: u32 = 1,
-    /// The tree's in-run snapshots (holders.zig): where holders register, and the behaviors the
-    /// tree knew before this generation. Null: none (no tree, or a strategy, or CPU modulation).
-    holders: ?*const linux.sockaddr.un = null,
+    /// The tree's in-run snapshots (holders.zig): the explorer that names them, and the
+    /// behaviors the tree knew before this generation. Null: none (no tree, or a strategy, or
+    /// CPU modulation).
+    holders: ?linux.pid_t = null,
     seen: ?*const std.AutoHashMapUnmanaged(u64, void) = null,
     /// Shared by parallel workers (memory mapped before they fork): the next position to run.
     /// A timeline is the same whichever worker runs it, so a worker that finished takes the
@@ -1172,9 +1178,10 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         }
         defer if (branches.arguments.events_directory != null) close(vm.events.log_fd.?);
         var owner: holders.Owner = undefined;
-        if (branches.holders) |address| {
+        if (branches.holders) |explorer| {
             owner = .{
-                .address = address,
+                .explorer = explorer,
+                .worker = linux.getpid(),
                 .seen = branches.seen.?,
                 .branch = index,
                 .seed = place.seed,
@@ -1204,7 +1211,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .generation = place.generation,
             .why = place.why,
         });
-        if (branches.summaries) |summaries| summaries.note(vm, place);
+        if (branches.summaries) |summaries| {
+            summaries.note(vm, place, if (branches.holders != null) owner.holders() else &.{});
+        }
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };
             if (try strategy_branch_end(strategy, vm, end)) break;
@@ -1284,13 +1293,16 @@ const Summary = struct {
     end_ns: u64,
     behavior_count: u32,
     behaviors: [Events.behavior_count_max]Events.Behavior,
+    /// The in-run snapshots it kept (holders.zig), for the explorer to return to.
+    holder_count: u32,
+    holders: [holders.per_timeline_max]holders.Held,
 };
 
 const Summaries = struct {
     items: []Summary,
     count: u32 = 0,
 
-    fn note(summaries: *Summaries, vm: *VM, place: Planned) void {
+    fn note(summaries: *Summaries, vm: *VM, place: Planned, kept: []const holders.Held) void {
         assert(summaries.count < summaries.items.len);
         const summary = &summaries.items[summaries.count];
         summaries.count += 1;
@@ -1298,6 +1310,8 @@ const Summaries = struct {
         summary.start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
+        summary.holder_count = @intCast(kept.len);
+        @memcpy(summary.holders[0..kept.len], kept);
         @memcpy(
             summary.behaviors[0..summary.behavior_count],
             vm.events.behaviors[0..vm.events.behavior_count],
@@ -1364,10 +1378,10 @@ fn explore_tree(
     }
     // In-run snapshots (holders.zig): not with a strategy (its decisions replay from its tape, as
     // holders do not) or CPU modulation (whose time an extra stop would move).
-    var listener: holders.Listener = undefined;
+    var registry: holders.Registry = undefined;
     const holding = exploration.strategy == null and !options.cpu_modulation;
-    if (holding) try listener.init();
-    defer if (holding) listener.deinit();
+    if (holding) try registry.init();
+    defer if (holding) registry.release();
     var generation: u32 = 0;
     const items = try arena.alloc(Summary, size);
     const candidates = try arena.alloc(Candidate, size);
@@ -1385,7 +1399,7 @@ fn explore_tree(
         mine.plan = plan.items;
         mine.summaries = &summaries;
         if (holding) {
-            mine.holders = &listener.address;
+            mine.holders = registry.explorer;
             mine.seen = &seen;
         }
         const workers: u32 = @intCast(@min(jobs, plan.items.len));
@@ -1394,12 +1408,14 @@ fn explore_tree(
         } else {
             try explore_parallel(context, vm, options, mine, workers);
         }
-        if (holding) listener.collect();
         // In index order (workers finish in any): what each reached that none before it had.
         // Summaries are large: their order is sorted, not them.
         const done = try arena.alloc(*const Summary, summaries.count);
         for (done, summaries.items[0..summaries.count]) |*slot, *summary| slot.* = summary;
         std.sort.insertion(*const Summary, done, {}, summary_before);
+        if (holding) for (done) |summary| {
+            registry.add(summary.index, summary.holders[0..summary.holder_count]);
+        };
         // What each behavior new this generation was reached by: how many of its timelines.
         // Every timeline is judged against what earlier generations knew, and what it found
         // weighs more the fewer of its generation found it too (measured on the self-test maze:
@@ -1489,10 +1505,11 @@ fn explore_tree(
             }
             // A holder of the parent at the moment, or a little before it: no replay from the
             // parent's start.
-            if (holding) if (listener.take(back.branch, back.vtime_ns)) |taken| {
+            if (holding) if (registry.take(back.branch, back.vtime_ns)) |taken| {
                 makings[making_count] = .{
                     .back = back,
                     .parent = parent,
+                    .held = true,
                     .pid = taken.pid,
                     .socket = taken.socket,
                 };
@@ -1514,7 +1531,17 @@ fn explore_tree(
         while (finished < making_count) : (finished += 1) {
             node_make_finish(arena, &makings[finished]);
         }
-        if (holding) listener.release(); // Their memory, before the next generation runs.
+        if (holding) registry.release(); // Their memory, before the next generation runs.
+        if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
+            const held_node = making.snapshot orelse continue;
+            if (!making.held) continue;
+            var replayed: NodeMaking = .{ .back = making.back, .parent = making.parent };
+            try node_make_start(arena, vm, options, &replayed, null);
+            node_make_finish(arena, &replayed);
+            const replay_node = replayed.snapshot orelse continue;
+            snapshots_compare(making.back, held_node, replay_node);
+            node_free(replay_node, branches.snapshot);
+        };
         var next: std.ArrayList(Planned) = .empty;
         var made: u32 = 0;
         for (makings[0..making_count]) |*making| {
@@ -1770,9 +1797,13 @@ const HolderMaker = struct {
         from: *const Snapshot,
         seed: u64,
         vtime_ns: u64,
+        point: VM.Hold.Point,
     ) anyerror!*const Snapshot {
         const maker: *HolderMaker = @ptrCast(@alignCast(context));
-        return node_make(maker.arena, vm, maker.options, from, seed, vtime_ns, null);
+        var options = maker.options.*;
+        assert(!options.idle);
+        options.idle = point.idle; // The timeline's idle skip goes on, as it did there.
+        return node_make(maker.arena, vm, &options, from, seed, vtime_ns, null);
     }
 };
 
@@ -1782,6 +1813,8 @@ const HolderMaker = struct {
 const NodeMaking = struct {
     back: TreeReturn,
     parent: Planned,
+    /// Made by a holder (else by a replay).
+    held: bool = false,
     pid: linux.pid_t = 0,
     socket: linux.fd_t = -1,
     /// Null when the moment could not be reached (the child said why).
@@ -1842,6 +1875,116 @@ fn node_make_finish(arena: std.mem.Allocator, making: *NodeMaking) void {
     }
     snapshot.memory_fd = fd;
     making.snapshot = snapshot;
+}
+
+/// DETERMINISMO_VERIFY_HOLDERS=1: every node a holder made is made again by a replay and the
+/// two compared (they must be the same: holders.zig).
+/// Prints how a holder's node and a replay's node of the same moment differ (memory included),
+/// but for what the guest cannot see (field_same).
+fn snapshots_compare(back: TreeReturn, held: *const Snapshot, replayed: *const Snapshot) void {
+    var differ: u32 = 0;
+    inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "memory_fd")) continue;
+        if (!field_same(name, held, replayed)) {
+            differ += 1;
+            const a = std.mem.asBytes(&@field(held, name));
+            const b = std.mem.asBytes(&@field(replayed, name));
+            const at = std.mem.indexOfDiff(u8, a, b) orelse 0;
+            std.debug.print("[determinismo] verify #{d} at {d}ns: {s} differs (byte {d} of {d}: " ++
+                "{x} against {x})\n", .{
+                back.branch,
+                back.vtime_ns,
+                name,
+                at,
+                a.len,
+                a[at..@min(a.len, at + 8)],
+                b[at..@min(b.len, at + 8)],
+            });
+        }
+    }
+    const memory_same = memory_equal(held.memory_fd, replayed.memory_fd, held.memory_size);
+    if (!memory_same) differ += 1;
+    std.debug.print("[determinismo] verify #{d} at {d}ns: {s}{s}\n", .{
+        back.branch,
+        back.vtime_ns,
+        if (differ == 0) "the same" else "DIFFERENT",
+        if (memory_same) "" else " (memory too)",
+    });
+}
+
+/// MSRs KVM derives from host time, which the guest's clock (the branch count) is not: the TSC
+/// (its reads are the branch clock) and Hyper-V's runtime and reference counters (not offered).
+const host_time_msrs = [_]u32{ 0x10, 0x40000010, 0x40000020 };
+
+/// A snapshot field the same in both, but for what the guest cannot see: host-time MSRs, the
+/// last exception's or interrupt's leftovers while none is pending or injected (struct
+/// kvm_vcpu_events), and the attributes of unusable segments.
+fn field_same(comptime name: []const u8, held: *const Snapshot, replayed: *const Snapshot) bool {
+    if (comptime std.mem.eql(u8, name, "msrs")) {
+        if (held.msrs.count != replayed.msrs.count) return false;
+        const count = held.msrs.count;
+        for (held.msrs.entries[0..count], replayed.msrs.entries[0..count]) |x, y| {
+            if (x.index != y.index) return false;
+            if (std.mem.indexOfScalar(u32, &host_time_msrs, x.index) != null) continue;
+            if (x.data != y.data) return false;
+        }
+        return true;
+    }
+    if (comptime std.mem.eql(u8, name, "vcpu_events")) {
+        var a = held.vcpu_events.bytes;
+        var b = replayed.vcpu_events.bytes;
+        for ([_]*[64]u8{ &a, &b }) |events| {
+            if (events[0] == 0 and events[3] == 0) { // Exception neither injected nor pending.
+                events[1] = 0;
+                events[2] = 0;
+                @memset(events[4..8], 0);
+            }
+            if (events[8] == 0) { // Interrupt not injected.
+                events[9] = 0;
+                events[10] = 0;
+            }
+        }
+        return std.mem.eql(u8, &a, &b);
+    }
+    if (comptime std.mem.eql(u8, name, "sregs")) {
+        var a = held.sregs;
+        var b = replayed.sregs;
+        inline for (.{ "ds", "es", "fs", "gs", "ss", "ldt" }) |segment| {
+            const x = &@field(a, segment);
+            const y = &@field(b, segment);
+            if (x.unusable != 0 and y.unusable != 0) { // Only the base counts (FS and GS).
+                x.* = segment_unusable(x.base);
+                y.* = segment_unusable(y.base);
+            }
+        }
+        return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    }
+    const a = std.mem.asBytes(&@field(held, name));
+    const b = std.mem.asBytes(&@field(replayed, name));
+    return std.mem.eql(u8, a, b);
+}
+
+fn segment_unusable(base: u64) kvm.Segment {
+    var segment = std.mem.zeroes(kvm.Segment);
+    segment.base = base;
+    segment.unusable = 1;
+    return segment;
+}
+
+fn memory_equal(a: linux.fd_t, b: linux.fd_t, size: u64) bool {
+    var buffers: [2][1 << 20]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) : (offset += buffers[0].len) {
+        const length = @min(buffers[0].len, size - offset);
+        const read_a = linux.pread(a, &buffers[0], length, @intCast(offset));
+        const read_b = linux.pread(b, &buffers[1], length, @intCast(offset));
+        if (read_a != length or read_b != length) return false;
+        if (!std.mem.eql(u8, buffers[0][0..length], buffers[1][0..length])) {
+            std.debug.print("[determinismo] verify: memory differs from {d}\n", .{offset});
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Releases a tree node's memory (never the setup snapshot's), once its branches ran.
@@ -2000,6 +2143,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         }
         if (std.mem.eql(u8, argv[index], "--cpu-modulation")) {
             arguments.cpu_modulation = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--verify-holders")) {
+            arguments.verify_holders = true;
             continue;
         }
         if (index + 1 == argv.len) return error.Usage;
