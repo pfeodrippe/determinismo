@@ -12,6 +12,14 @@ Databases, cloud services and other dependencies inside the machine: [docs/DEPEN
 
 ## What works today
 
+Antithesis's own Raft project ([antithesishq/hashicorp-raft-poc](https://github.com/antithesishq/hashicorp-raft-poc)),
+run unchanged through the Compose importer, gives determinismo two of the three HashiCorp Raft
+bugs Antithesis published, found blind: a leader that rejects every write forever after a cut
+short leadership transfer (hashicorp/raft#696), and logs that diverge when heartbeats handled
+off the main loop change a new leader's term (#695), carried to replicas with different state
+machines; a replay to a moment and a goroutine dump there explain each
+([tests/antithesis-compat](tests/antithesis-compat/README.md)).
+
 Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 
 - **A deterministic machine**: a Zig VMM on a patched KVM where guest time is a function of
