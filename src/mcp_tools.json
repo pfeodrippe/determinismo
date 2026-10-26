@@ -53,6 +53,10 @@
           "type": "string",
           "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
         },
+        "generation": {
+          "type": "integer",
+          "description": "A tree's timelines per generation: 16 (the default), or a multiple of it for a machine with more CPUs (they run at once), with more moments returned to"
+        },
         "changed": {
           "type": "string",
           "description": "A targeted run: a diff file or git range (on the machine running determinismo) whose changed lines the tree explores first; the result says which hunks ran in how many timelines, and which never ran"

@@ -302,6 +302,8 @@ const RunRequest = struct {
     no_faults: ?[]const u8 = null,
     /// How long each timeline's drivers run, in virtual time (explore's --timeline).
     timeline: ?[]const u8 = null,
+    /// Timelines per tree generation (explore's --generation).
+    generation: ?u32 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
     /// A targeted run: a diff file or git range on the server (explore's --changed).
@@ -337,6 +339,9 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     }
     if (asked.branching) |branching| {
         try argv.appendSlice(server.arena, &.{ "--branching", branching });
+    }
+    if (asked.generation) |size| {
+        try argv.appendSlice(server.arena, &.{ "--generation", try print(server, "{d}", .{size}) });
     }
 
     if (asked.branches != null or asked.time_budget == null) {

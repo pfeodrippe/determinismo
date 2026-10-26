@@ -34,6 +34,8 @@ const Arguments = struct {
     time_budget: ?[]const u8 = null,
     /// How long each timeline's drivers run (virtual time); replays need the same.
     timeline: ?[]const u8 = null,
+    /// A tree's timelines per generation (explore's --generation).
+    generation: ?u32 = null,
     branch: ?u32 = null,
     /// Replays a timeline from its tape (an exploration's tape_dir/branch-<n>.jsonl): the way
     /// to replay a tree exploration's timeline past its first generation.
@@ -190,6 +192,9 @@ fn tool_call(
     const known = eql(u8, name, "explore") or eql(u8, name, "fork") or eql(u8, name, "mutate");
     if (!known) return error.UnknownTool;
     if (arguments.time_budget) |budget| try argv.appendSlice(arena, &.{ "--time-budget", budget });
+    if (arguments.generation) |size| {
+        try argv.appendSlice(arena, &.{ "--generation", try number(arena, size) });
+    }
     if (arguments.changed) |source| try argv.appendSlice(arena, &.{ "--changed", source });
     for (arguments.retroactive) |text| try argv.appendSlice(arena, &.{ "--retroactive", text });
     if (arguments.branches != null or arguments.time_budget == null) {

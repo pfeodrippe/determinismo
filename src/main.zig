@@ -42,6 +42,8 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--generation <n>]   (a tree's timelines per generation: 16,
+    \\                            or a multiple of it for machines with more CPUs)
     \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
     \\                            then, in virtual time, ends as hung)
     \\                            [--retroactive '<text>']...   (output lines with it are left out
@@ -146,6 +148,9 @@ const Arguments = struct {
     /// How long (virtual time) each timeline's drivers run: commands keep starting until then
     /// (Antithesis's long timelines). Without it, a drawn number of starts (4 to 64).
     timeline_ms: ?u64 = null,
+    /// Timelines per tree generation (`--generation`, a multiple of 16): more for machines with
+    /// more CPUs (a generation's timelines run at once), with more moments returned to.
+    generation_size: u32 = tree.generation_base,
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
@@ -389,6 +394,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         from_vtime_ms: ?u64,
         cpu_modulation: bool,
         timeline: ?[]const u8,
+        generation: u32,
         changed: ?[]const u8,
         retroactive: []const []const u8,
     };
@@ -409,6 +415,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         .from_vtime_ms = arguments.from_vtime_ms,
         .cpu_modulation = arguments.cpu_modulation,
         .timeline = arguments.timeline_text,
+        .generation = arguments.generation_size,
         .changed = arguments.changed,
         .retroactive = arguments.retroactive[0..arguments.retroactive_count],
     }, .{})});
@@ -643,6 +650,7 @@ fn command_explore(
             .shard = &.{ arguments.shard_index, arguments.shard_count },
             .time_budget_s = if (arguments.time_budget_ns) |ns| ns / std.time.ns_per_s else null,
             .timeline_ms = arguments.timeline_ms,
+            .generation = arguments.generation_size,
             .jobs = jobs_count(arguments),
             .strategy = arguments.strategy_command,
             .branching = @tagName(arguments.branching),
@@ -844,7 +852,7 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     // A tree's first generation starts from the snapshot, as flat branches do; later ones start
     // inside others and replay from their tapes only.
     if (arguments.branch_only) |only| {
-        if (!arguments.branching_given and only >= tree.generation_size) {
+        if (!arguments.branching_given and only >= arguments.generation_size) {
             std.debug.print("[determinismo] branch {d} of a tree exploration (the default) " ++
                 "starts from a moment of another: replay it from its tape (--tape " ++
                 "<tape dir>/branch-{d}.jsonl), or explore with --branching flat\n", .{
@@ -1304,14 +1312,24 @@ const Summaries = struct {
 /// seeds. Some branches of every generation start from the setup snapshot again. A generation
 /// is planned only from the ones before it, so the tree is the same whatever the workers.
 const tree = struct {
-    const generation_size = 16;
-    /// From the setup snapshot, in every generation after the first.
-    const roots = 4;
-    /// Moments returned to per generation, and branches from each.
-    const nodes = 3;
-    const children = (generation_size - roots) / nodes;
+    /// Timelines per generation by default, and the unit of `--generation`.
+    const generation_base = 16;
+    const generation_max = 256;
+    /// Branches from each moment returned to.
+    const children = 4;
+
+    /// From the setup snapshot, in every generation after the first: a quarter.
+    fn roots(size: u32) u32 {
+        return size / 4;
+    }
+
+    /// Moments returned to per generation.
+    fn nodes(size: u32) u32 {
+        return (size - roots(size)) / children;
+    }
+
     comptime {
-        assert(roots + nodes * children == generation_size);
+        assert(roots(generation_base) + nodes(generation_base) * children == generation_base);
     }
 };
 
@@ -1335,8 +1353,9 @@ fn explore_tree(
     else
         null;
     const hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0);
+    const size = branches.arguments.generation_size;
     var next_index: u32 = 0;
-    while (next_index < total and plan.items.len < tree.generation_size) : (next_index += 1) {
+    while (next_index < total and plan.items.len < size) : (next_index += 1) {
         try plan.append(arena, .{
             .index = next_index,
             .seed = branch_seed(base, next_index),
@@ -1350,7 +1369,8 @@ fn explore_tree(
     if (holding) try listener.init();
     defer if (holding) listener.deinit();
     var generation: u32 = 0;
-    const items = try arena.alloc(Summary, tree.generation_size);
+    const items = try arena.alloc(Summary, size);
+    const candidates = try arena.alloc(Candidate, size);
     // Parents' tapes are read into this (a strategy's overrides), one at a time.
     const tape_buffer = if (exploration.strategy != null)
         try arena.create(tape.Overrides)
@@ -1391,7 +1411,6 @@ fn explore_tree(
             const entry = try reached.getOrPut(arena, behavior.hash);
             entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
         };
-        var candidates: [tree.generation_size]Candidate = undefined;
         var candidate_count: u32 = 0;
         const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
         var random: std.Random.DefaultPrng = .init(generation_seed);
@@ -1449,7 +1468,7 @@ fn explore_tree(
         std.sort.insertion(Candidate, chosen, {}, candidate_before);
         const counts = Counts{ .reached = &reached, .visits = &visits };
         const plugin = exploration.strategy;
-        const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random);
+        const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, size);
         for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
             const entry = try visits.getOrPut(arena, behavior.hash);
             entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
@@ -1531,7 +1550,7 @@ fn explore_tree(
         // This generation's snapshots served their branches, and their children's snapshots.
         for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
         // The rest of the generation starts over from the setup snapshot.
-        while (next_index < total and next.items.len < tree.generation_size) : (next_index += 1) {
+        while (next_index < total and next.items.len < size) : (next_index += 1) {
             try next.append(arena, .{
                 .index = next_index,
                 .seed = branch_seed(base, next_index),
@@ -1589,11 +1608,13 @@ fn tree_returns(
     chosen: []const Candidate,
     counts: Counts,
     random: *std.Random.DefaultPrng,
+    size: u32,
 ) ![]const TreeReturn {
     var list: std.ArrayList(TreeReturn) = .empty;
+    const nodes = tree.nodes(size);
     if (strategy) |plugin| {
-        var offered: [tree.generation_size]Strategy.Candidate = undefined;
-        for (chosen, offered[0..chosen.len]) |candidate, *offer| offer.* = .{
+        const offered = try arena.alloc(Strategy.Candidate, chosen.len);
+        for (chosen, offered) |candidate, *offer| offer.* = .{
             .branch = candidate.summary.index,
             .start_ns = candidate.summary.start_ns,
             .end_ns = candidate.summary.end_ns,
@@ -1605,7 +1626,7 @@ fn tree_returns(
             else
                 &.{},
         };
-        const answer = try plugin.returns(arena, generation, offered[0..chosen.len], tree.nodes);
+        const answer = try plugin.returns(arena, generation, offered, nodes);
         for (answer) |back| {
             const candidate = for (chosen) |candidate| {
                 if (candidate.summary.index == back.branch) break candidate;
@@ -1624,7 +1645,7 @@ fn tree_returns(
         if (list.items.len > 0) return list.items;
     }
     for (chosen) |candidate| {
-        if (list.items.len == tree.nodes) break;
+        if (list.items.len == nodes) break;
         const summary = candidate.summary;
         const span = summary.end_ns -| summary.start_ns;
         if (span < 2 * std.time.ns_per_ms) continue;
@@ -2086,6 +2107,11 @@ fn parse_option(
         arguments.retroactive_count += 1;
     } else if (eql(u8, flag, "--changed")) {
         arguments.changed = value;
+    } else if (eql(u8, flag, "--generation")) {
+        const size = try std.fmt.parseInt(u32, value, 10);
+        const multiple = size % tree.generation_base == 0;
+        if (!multiple or size == 0 or size > tree.generation_max) return error.Usage;
+        arguments.generation_size = size;
     } else if (eql(u8, flag, "--timeline")) {
         arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
         arguments.timeline_text = value;
