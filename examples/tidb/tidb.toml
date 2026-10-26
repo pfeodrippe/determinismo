@@ -1,0 +1,10 @@
+# Jepsen's (jepsen-io/tidb, resources/tidb.conf).
+# Schema lease duration (default: 45s)
+lease = "5s"
+# One table per region
+split-table = true
+
+[tikv-client]
+# Max time for a commit command (Jepsen's: 10 ms).
+commit-timeout = "10ms"
+max-txn-time-use = 590

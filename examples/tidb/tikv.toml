@@ -1,0 +1,19 @@
+# Jepsen's (jepsen-io/tidb, resources/tikv.conf): short Raft ticks and leases, and regions of at
+# most 5 keys, so that they split and merge all the time.
+[server]
+status-addr = "0.0.0.0:20180"
+
+[raftstore]
+pd-heartbeat-tick-interval = "5s"
+raft-store-max-leader-lease = "50ms"
+raft-base-tick-interval = "100ms"
+raft-heartbeat-ticks = 3
+raft-election-timeout-ticks = 10
+
+[coprocessor]
+region-max-keys = 5
+region-split-keys = 3
+
+# Three TiKVs share the machine: small caches (by default each takes 45% of its memory).
+[storage.block-cache]
+capacity = "128MB"
