@@ -225,6 +225,10 @@ places, and assertions carry no location.
 
 ## Speed
 
+- One host, many runs: a run's workers default to every CPU, so seven runs put up to 252 VMs on
+  srv2's 36 threads (load 85; run 8 got 1.67x virtual per wall per core). Workers should take a
+  CPU from one pool shared by every run on the host before running a timeline (back-pressure:
+  any number of runs, never more VMs running than cores); until then runs get explicit `jobs`.
 - Virtual time per wall time on busy timelines (0.3 to 0.45 now): profile the VMM's exits and
   single-stepping for timers; cheaper timer delivery.
 - Setup is one core before branches fan out: start branch workers as soon as the snapshot exists,
