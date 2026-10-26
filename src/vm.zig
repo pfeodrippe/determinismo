@@ -1070,6 +1070,9 @@ fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
         .events_hash = vm.events.hash.final(),
     };
     if (vm.tape_fd) |fd| tape.write_checkpoint(fd, now);
+    // A command run at the moment makes a new timeline from there: the tape describes the one
+    // without it (a replay to look inside a timeline, --exec, must not stop at its own change).
+    if (vm.moment_reached and vm.moment_command != null) return;
     if (vm.overrides) |overrides| overrides.check(now) catch |err| {
         const message = "[determinismo] replay diverged from its tape at event {d}\n";
         std.debug.print(message, .{now.events});

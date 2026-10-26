@@ -201,6 +201,17 @@ fn check_tapes(context: *Context) !void {
     });
     const refused = std.mem.indexOf(u8, elsewhere, "the tape was recorded with inputs") != null;
     expect(context, refused, "tapes: a replay on different inputs is refused", .{});
+    // A command at a moment of a replay (looking inside a timeline) makes a new timeline from
+    // there: the replay goes on to the end, not stopping at the tape it no longer follows.
+    const inside = try explore(context, &.{
+        "--program",     program, "--scenario", "bank",               "--tape",     tape,
+        "--at-vtime-ms", "1500",  "--exec",     "echo looked inside", "--continue",
+    });
+    var looked: [1]Branch = undefined;
+    const goes_on = std.mem.indexOf(u8, inside, "looked inside") != null and
+        std.mem.indexOf(u8, inside, "diverged") == null and parse_branches(inside, &looked) == 1;
+    expect(context, goes_on, "tapes: a command at a moment of a replay runs, and the replay " ++
+        "goes on to the end", .{});
 }
 
 /// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance): with coverage
