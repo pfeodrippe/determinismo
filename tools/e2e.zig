@@ -62,7 +62,10 @@ pub fn main(init: std.process.Init) !void {
             "--cache",      cache,
         },
         .bin = bin,
-        .scratch = "/tmp/determinismo-e2e",
+        // Its own: suites run at once (a full one and a single check) do not share files.
+        .scratch = try std.fmt.allocPrint(arena, "/tmp/determinismo-e2e-{d}", .{
+            std.os.linux.getpid(),
+        }),
     };
     std.Io.Dir.cwd().deleteTree(init.io, context.scratch) catch {};
     try std.Io.Dir.cwd().createDirPath(init.io, context.scratch);
@@ -74,9 +77,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     if (context.failures > 0) {
-        std.debug.print("e2e: {d} checks failed\n", .{context.failures});
+        std.debug.print("e2e: {d} checks failed (their files: {s})\n", .{
+            context.failures, context.scratch,
+        });
         std.process.exit(1);
     }
+    std.Io.Dir.cwd().deleteTree(init.io, context.scratch) catch {};
     std.debug.print("e2e: all checks passed\n", .{});
 }
 
@@ -593,18 +599,19 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     var extra: std.ArrayList([]const u8) = .empty;
     try extra.appendSlice(context.arena, system);
     try extra.appendSlice(context.arena, &.{
-        "--branch", "4", "--until", violation, "--rewind-ms", "5", "--exec", "echo rewound",
+        "--branch", "4", "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
     });
     const report = try explore(context, extra.items);
     const holds: u64 = @intFromFloat(number_after(report, "the condition holds at ") orelse 0);
     const target: u64 = @intFromFloat(number_after(report, "; the moment is ") orelse 0);
     const last = std.mem.lastIndexOf(u8, report, "at moment vtime=") orelse 0;
     const reached: u64 = @intFromFloat(number_after(report[last..], "at moment vtime=") orelse 0);
-    const exact = holds > target and holds - target == 5 * std.time.ns_per_ms and
+    // The guest runs on while the command does: the rewind leaves it room to end first.
+    const exact = holds > target and holds - target == 50 * std.time.ns_per_ms and
         reached >= target and reached - target < std.time.ns_per_ms;
     const ran = std.mem.indexOf(u8, report, "\"text\":\"rewound\\n\"") != null;
     const before = std.mem.indexOf(u8, report, "failing=0") != null;
-    expect(context, exact and ran and before, "rewind: 5 ms before the violation " ++
+    expect(context, exact and ran and before, "rewind: 50 ms before the violation " ++
         "({d}ns, then {d}ns), not failing yet", .{ holds, reached });
     // wait_until's timeout: the condition, or this time at the latest (here, before it holds:
     // just after the setup snapshot, wherever the guest's setup put it).
