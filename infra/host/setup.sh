@@ -65,7 +65,11 @@ echo "== hardware qualification"
 sudo infra/host/m0-check.sh
 echo "== our KVM"
 infra/host/build-kvm.sh
-grep -q O /sys/module/kvm/taint 2>/dev/null || sudo infra/host/load-kvm.sh # O: ours, loaded.
+# Loaded unless this very build is (load-kvm.sh records its hashes): a patch changed, it is
+# reloaded, which needs every VM stopped (load-kvm.sh says so otherwise).
+kvm_build=~/kvm-build/linux-$(uname -r | cut -d+ -f1)/arch/x86/kvm
+built=$(sha256sum "$kvm_build/kvm.ko" "$kvm_build/kvm-intel.ko" | cut -d' ' -f1)
+[ "$built" = "$(cat /run/determinismo-kvm 2>/dev/null)" ] || sudo infra/host/load-kvm.sh
 sudo infra/host/kvm-at-boot.sh "$USER"
 echo "== the guest and the build"
 [ -f ~/guest/vmlinuz ] && [ -f ~/guest/det_guest.ko ] || guest/kernel/build.sh ~/guest
