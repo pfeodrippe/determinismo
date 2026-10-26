@@ -22,6 +22,11 @@
 const std = @import("std");
 const linux = std.os.linux;
 
+/// No thread-local state may exist here: in a library others load, the compiler's local-exec
+/// model would put it in the host program's own thread data (glibc's malloc, Go's runtime).
+/// The default panic handler has some; this one has none (a panic traps).
+pub const panic = std.debug.no_panic;
+
 const device_path = "/dev/determinismo";
 const message_size_max = 4096 - 16; // det_guest's page, less its header.
 const symbols_directory = "/symbols/";
