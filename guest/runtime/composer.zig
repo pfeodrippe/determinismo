@@ -15,11 +15,14 @@ const linux = std.os.linux;
 const sdk = @import("determinismo");
 
 const commands_max = 64;
-const running_max = 8;
+const running_max = 1 << parallelism_log2_max;
 const starts_max = 64;
 /// Command starts in one timeline, a long one (det.timeline_ms=) included: a sanity bound.
 const started_max = 1 << 24;
-const parallelism_max = 4;
+/// Parallel drivers running at once: 1, 2, 4, ... up to 32, drawn per timeline. Antithesis sets
+/// no bound ("multiple copies of the same command" at once): a system under the load of many
+/// clients reaches states one client never does (a cut-off leader that took many writes).
+const parallelism_log2_max = 5;
 const pause_ns_max = 20 * std.time.ns_per_ms;
 const faults_path = "/opt/determinismo/bin/det-faults";
 /// detfs (det_guest): "1" once an SDK declared the system's setup complete.
@@ -356,7 +359,7 @@ fn run_singleton(composer: *Composer) void {
 fn run_drivers(composer: *Composer) void {
     const timeline_ns = timeline_length_ns();
     const starts = if (timeline_ns == null) 4 + sdk.random_below(starts_max - 4) else 0;
-    const parallelism = 1 + sdk.random_below(parallelism_max);
+    const parallelism = @as(u64, 1) << @intCast(sdk.random_below(parallelism_log2_max + 1));
     assert(starts <= starts_max);
     var kinds_buffer: [3]Kind = undefined;
     var kinds: []Kind = kinds_buffer[0..0];
