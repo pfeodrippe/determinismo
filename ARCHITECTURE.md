@@ -396,12 +396,20 @@ A profile describes *what* the system is; determinismo decides *how* to material
   guest finishes its scenario (no panic, hang or crash), the kernel kills no process for lack of
   memory (nodes may have memory limits) and reports no warnings, BUGs or hung tasks (det-init
   reads the whole kernel log at the end of each timeline).
-- **History checkers** judge what no single assertion can: drivers record each operation as it
-  happens (invocation, then ok, fail or unknown) into a history file in the runner, and a
-  `finally` command posts it to a checker node. `checkers/elle` is Elle (Jepsen's checker): every
-  anomaly of a list-append or rw-register history (G0, G1, G-single, G2, real-time order for
-  strict serializability). The history is recorded inside the timeline, so an anomaly replays to
-  the moment of every operation in its cycle (examples/etcd).
+- **Host checks** judge what no single assertion can, on the host. A test program declares its
+  checks next to its scenarios (`System.main(init, .{ ..., .checks = .{ .totals = totals } })`,
+  each a function of the records its commands made: `fn (*sdk.Check, []const Record) !void`);
+  commands record as they go (`sdk.record("totals", value)`: JSON lines in the runner). When a
+  timeline ends, the composer streams the records out (base64 chunk events: hashed, not logged),
+  and the worker runs the program itself on the host as `check <name> <scenario>` with them on
+  its input, decoded as the function's Record type: the assertions it makes there (the SDK prints
+  them outside a guest) become properties of the timeline at its end moment, as the built-in
+  ones are (src/checks.zig). The guest pays nothing, every timeline is judged, at native speed
+  on the host's cores, and a replay sends the same records, so it gets the same verdict. A check
+  must be a pure function of its records, and judges without steering: what must react
+  mid-timeline stays an assertion in the guest. `sdk.elle.check` is one: Jepsen's Elle on a
+  transaction history (every anomaly of a list-append or rw-register history, G0, G1, G-single,
+  G2, real-time order), through a warm service on the host it starts once (checkers/elle).
 - The SDK works outside determinismo too (OS randomness, events to stderr), so a test can be run
   locally against local services.
 

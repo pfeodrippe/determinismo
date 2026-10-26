@@ -26,6 +26,9 @@
 //!   durability (profile "durable") faults at the echo node's durability points: a stall holds
 //!              its syncs; a crash at a sync loses the write when it comes before it, and keeps
 //!              it when it comes just after
+//!   records    a driver records numbers and their squares (sdk.record), and the host check
+//!              `squares` (run on the host when the timeline ends) asserts every square and the
+//!              count, from the records alone
 //!   controller (profile "controller", ARCHITECTURE.md §14 level 1) determinismo's own HTTP API
 //!              as the system under test, with a fake explorer, under pauses, partitions and
 //!              restarts: every run it accepted must survive with a sensible state
@@ -75,7 +78,9 @@ pub fn main(init: std.process.Init) !void {
             .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
             .maze = maze,
+            .records = records_scenario,
         },
+        .checks = .{ .squares = squares_check },
     });
 }
 
@@ -228,6 +233,32 @@ fn crash(s: *System.Scenario) void {
 fn segfault(context: *System.Context) !void {
     const node = context.nodes.echo orelse return error.NoEchoNode;
     _ = try node.exec(&.{ "/bin/det-selftest-node", "crash" });
+}
+
+fn records_scenario(s: *System.Scenario) void {
+    s.singleton_driver("record", records_make);
+}
+
+const Square = struct { n: u64, square: u64 };
+const records_count = 50;
+
+/// Numbers and their squares, then a last record that says how many came before.
+fn records_make(context: *System.Context) !void {
+    _ = context;
+    for (0..records_count) |n| sdk.record("squares", Square{ .n = n, .square = n * n });
+    sdk.record("squares", Square{ .n = records_count, .square = 0 }); // The count: no square.
+}
+
+/// On the host, when the timeline ended: every record decoded, in order.
+fn squares_check(check: *sdk.Check, records: []const Square) !void {
+    sdk.always(std.mem.eql(u8, check.scenario, "records"), "a host check knows its scenario", .{});
+    sdk.always(records.len == records_count + 1, "a host check gets every record", .{
+        .records = records.len,
+    });
+    for (records[0..@min(records.len, records_count)], 0..) |record, index| {
+        sdk.always(record.n == index and record.square == index * index, "a host check " ++
+            "gets the records in order, as made", .{ .index = index, .n = record.n });
+    }
 }
 
 fn disk(s: *System.Scenario) void {

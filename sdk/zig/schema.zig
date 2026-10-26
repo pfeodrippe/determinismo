@@ -23,7 +23,27 @@ pub const Description = struct {
     schema: u32 = version,
     profiles: []const Profile,
     scenarios: []const Scenario,
+    checks: []const Check = &.{},
 };
+
+/// A check the host runs on what a timeline recorded: the test program's own (System.main's
+/// `.checks`), run on the host as `<program> check <name> <scenario>` with the records its
+/// commands made (`sdk.record`), which the composer streams out when the timeline ends. The
+/// assertions the check makes are properties of the timeline, at its end: the host runs it on
+/// all its cores, the guest pays nothing, and a replay sends the same records, so it gets the
+/// same verdict. (sdk.elle.check is one: Jepsen's Elle on a transaction history.)
+pub const Check = struct {
+    /// Its name in the program's `.checks`.
+    name: []const u8,
+    /// The records, in the runner (record_path(name)).
+    file: []const u8,
+};
+pub const checks_max = 8;
+
+/// Where `sdk.record(name, ...)` appends, in the runner.
+pub fn record_path(comptime name: []const u8) [:0]const u8 {
+    return std.fmt.comptimePrint("/tmp/det-check-{s}.jsonl", .{name});
+}
 
 /// One way to build the system under test.
 pub const Profile = struct {
@@ -178,6 +198,7 @@ pub const System = struct {
     /// The system declares its own setup through an Antithesis SDK (Compose projects): the
     /// composer waits for it before the drivers, as Antithesis does.
     sdk_setup: bool = false,
+    checks: []const Check = &.{},
 
     pub fn scenario(system: *const System, name: []const u8) ?*const Scenario {
         for (system.scenarios) |*entry| {

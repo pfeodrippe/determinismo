@@ -87,6 +87,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         .nodes = resolved,
         .scenarios = scenarios.items,
         .sdk_setup = options.compose != null,
+        .checks = description.checks,
     };
     var writer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(system, .{ .emit_null_optional_fields = false }, &writer.writer);
@@ -310,7 +311,12 @@ fn profile_remember(
     const cwd = std.Io.Dir.cwd();
     if (cwd.readFileAlloc(context.io, path, context.arena, .limited(1 << 20))) |previous_json| {
         if (!std.mem.eql(u8, previous_json, system_json)) {
-            const previous = try schema.parse(schema.System, context.arena, previous_json);
+            // Remembered by an older determinismo, in a format of its own: nothing to compare.
+            const previous = schema.parse(schema.System, context.arena, previous_json) catch {
+                std.debug.print("[determinismo] profile {s}: the last run's, from another " ++
+                    "version, is replaced\n", .{system.profile});
+                return cwd.writeFile(context.io, .{ .sub_path = path, .data = system_json });
+            };
             std.debug.print("[determinismo] profile {s} changed since the last run:\n", .{
                 system.profile,
             });

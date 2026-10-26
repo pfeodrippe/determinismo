@@ -23,6 +23,8 @@ const query = @import("query.zig");
 const Snapshot = @import("snapshot.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
+const host_checks = @import("checks.zig");
+const schema = @import("determinismo").schema;
 
 kvm_fd: linux.fd_t,
 vm_fd: linux.fd_t,
@@ -84,6 +86,9 @@ hold_behaviors: u32,
 idle_pending: bool,
 deterministic: bool,
 builtin_properties: bool,
+checks: []const schema.Check,
+check_program: ?[]const u8,
+check_scenario: []const u8,
 tsc_per_branch: u32,
 /// CPU modulation, in branches only (Options.cpu_modulation).
 modulation: ?Modulation,
@@ -153,6 +158,12 @@ pub const Options = struct {
     disks: []const Disk = &.{},
     /// The guest runs determinismo's runtime: check the built-in properties when a timeline ends.
     builtin_properties: bool = false,
+    /// The test program's host checks (checks.zig), run on what each timeline recorded, by the
+    /// program itself in the scenario's name; and room for their inputs, reserved once.
+    checks: []const schema.Check = &.{},
+    check_program: ?[]const u8 = null,
+    check_scenario: []const u8 = "",
+    check_buffer: []u8 = &.{},
     /// Antithesis's CPU modulation: branches run slower for stretches of virtual time, each
     /// stretch's speed a decision, so preemption lands at other points of the code.
     cpu_modulation: bool = false,
@@ -338,6 +349,9 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .idle_pending = false,
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
+        .checks = options.checks,
+        .check_program = options.check_program,
+        .check_scenario = options.check_scenario,
         .tsc_per_branch = options.tsc_per_branch,
         .modulation = null,
         .timer_slack_tsc = options.timer_slack_ns * tsc_per_ns,
@@ -357,7 +371,10 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .tape_fd = null,
         .overrides = null,
     };
-    vm.events.init(options.events_parse_buffer, .{ .log_fd = options.events_fd });
+    vm.events.init(options.events_parse_buffer, .{
+        .log_fd = options.events_fd,
+        .check_buffer = options.check_buffer,
+    });
     vm.events.retroactive = options.retroactive;
     if (options.disks.len > disks_max) return error.TooManyDisks;
     for (options.disks, vm.blocks[0..options.disks.len]) |disk, *block| {
@@ -504,7 +521,14 @@ pub fn run_until_exit(vm: *VM) !Outcome {
     const outcome = try vm.run_loop();
     if (vm.builtin_properties and outcome != .setup_complete) {
         const cut_short = outcome == .moment_reached or outcome == .command_done;
-        try vm.events.finish(try vm.moment(), if (cut_short) .cut_short else .ended);
+        const end = try vm.moment();
+        if (!cut_short) if (vm.check_program) |program| {
+            try host_checks.run(&vm.events, end, vm.checks, .{
+                .program = program,
+                .scenario = vm.check_scenario,
+            });
+        };
+        try vm.events.finish(end, if (cut_short) .cut_short else .ended);
     }
     return outcome;
 }

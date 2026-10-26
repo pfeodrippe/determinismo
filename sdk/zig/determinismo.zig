@@ -37,6 +37,7 @@ const system = @import("system.zig");
 pub const System = system.System;
 pub const Node = system.Node;
 pub const Output = system.Output;
+pub const Check = system.Check;
 /// TCP connections with timeouts, for protocol clients (see tcp.zig).
 pub const tcp = @import("tcp");
 /// Transaction histories checked by Elle (see elle.zig and checkers/elle).
@@ -566,6 +567,22 @@ pub fn event(name: []const u8, details: anytype) void {
     json_write(&writer, details);
     writer.writeAll("}") catch unreachable;
     emit_raw(writer.buffered());
+}
+
+/// A record for the program's host check `name` (System.main's `.checks`): one JSON line in the
+/// runner, which the composer sends out when the timeline ends; the host runs the check on all
+/// of them, decoded as its Record type. Records are appended with one write each, so commands in
+/// parallel never interleave inside one.
+pub fn record(comptime name: []const u8, value: anytype) void {
+    var buffer: [message_size_max * 16]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    std.json.Stringify.value(value, .{}, &writer) catch return; // Too large: not recorded.
+    writer.writeByte('\n') catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = linux.open(schema.record_path(name), flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), writer.buffered().ptr, writer.buffered().len);
 }
 
 /// Sleeps for `duration_ms` of (virtual) time.

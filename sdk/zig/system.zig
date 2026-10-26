@@ -17,6 +17,14 @@ const nodes_binary = "/opt/determinismo/bin/det-nodes";
 /// A command's exit status and what it printed.
 pub const Output = struct { status: u8, output: []const u8 };
 
+/// What a host check gets besides its records (System.main's `.checks`): it runs on the host,
+/// once the timeline of `scenario` ended.
+pub const Check = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    scenario: []const u8,
+};
+
 /// A node as tests see it in the guest.
 pub const Node = struct {
     name: []const u8,
@@ -186,6 +194,7 @@ pub fn System(comptime Nodes: type) type {
             profiles: [profiles_max]Profile = undefined,
             count: u32 = 0,
 
+
             pub fn profile(d: *Describe, name: []const u8) !*Profile {
                 if (d.count == profiles_max) return error.TooManyProfiles;
                 d.profiles[d.count] = .{ .name = name };
@@ -206,8 +215,13 @@ pub fn System(comptime Nodes: type) type {
 
         const Self = @This();
 
-        /// `--describe` on the host, `run <scenario> <command>` in the guest. `definition` is
-        /// `.{ .describe = fn (*Describe) !void, .scenarios = .{ .name = fn (*Scenario) void } }`.
+        /// `--describe` and `check <name> <scenario>` on the host, `run <scenario> <command>` in
+        /// the guest. `definition` is `.{ .describe = fn (*Describe) !void, .scenarios = .{ .name
+        /// = fn (*Scenario) void } }`, and optionally `.checks = .{ .name = fn (*Check, []const
+        /// Record) !void }`: host checks, run when each timeline ends on the records its commands
+        /// made (`sdk.record("name", record)`), decoded as the function's Record type (or, for
+        /// `[]const u8`, the raw JSON lines). A check asserts as anything else does
+        /// (`sdk.always`, ...): its assertions are properties of the timeline, at its end.
         pub fn main(init: std.process.Init, comptime definition: anytype) !void {
             const arena = init.arena.allocator();
             const arguments = try init.minimal.args.toSlice(arena);
@@ -217,8 +231,46 @@ pub fn System(comptime Nodes: type) type {
             if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "run")) {
                 return Self.run(init, definition, arguments[2], arguments[3]);
             }
-            std.debug.print("usage: {s} --describe | run <scenario> <command>\n", .{arguments[0]});
+            if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "check")) {
+                var check: Check = .{ .arena = arena, .io = init.io, .scenario = arguments[3] };
+                return Self.check_run(&check, definition, arguments[2]);
+            }
+            std.debug.print("usage: {s} --describe | run <scenario> <command> | " ++
+                "check <name> <scenario>\n", .{arguments[0]});
             std.process.exit(2);
+        }
+
+        /// A host check: its records from standard input (one JSON line each), decoded as the
+        /// function's Record type (raw for `[]const u8`), then the function.
+        fn check_run(check: *Check, comptime definition: anytype, name: []const u8) !void {
+            if (!@hasField(@TypeOf(definition), "checks")) return error.UnknownCheck;
+            const arena = check.arena;
+            var input: std.ArrayList(u8) = .empty;
+            while (true) {
+                try input.ensureUnusedCapacity(arena, 1 << 16);
+                const free = input.unusedCapacitySlice();
+                const result = linux.read(0, free.ptr, free.len);
+                if (linux.errno(result) != .SUCCESS) return error.ReadFailed;
+                if (result == 0) break;
+                input.items.len += result;
+            }
+            inline for (comptime std.meta.fieldNames(@TypeOf(definition.checks))) |field| {
+                if (std.mem.eql(u8, field, name)) {
+                    const function = @field(definition.checks, field);
+                    const Records = @typeInfo(@TypeOf(function)).@"fn".param_types[1].?;
+                    if (Records == []const u8) return function(check, input.items);
+                    const Record = std.meta.Child(Records);
+                    var records: std.ArrayList(Record) = .empty;
+                    var lines = std.mem.tokenizeScalar(u8, input.items, '\n');
+                    while (lines.next()) |line| {
+                        try records.append(arena, try std.json.parseFromSliceLeaky(Record, arena, line, .{
+                            .ignore_unknown_fields = true,
+                        }));
+                    }
+                    return function(check, records.items);
+                }
+            }
+            return error.UnknownCheck;
         }
 
         fn run(
@@ -301,7 +353,21 @@ pub fn System(comptime Nodes: type) type {
                     .clock_skip = scenario.clock_skip,
                 };
             }
-            const description = schema.Description{ .profiles = profiles, .scenarios = &scenarios };
+            // The program's host checks, each with where its records are.
+            const check_names = if (@hasField(@TypeOf(definition), "checks"))
+                comptime std.meta.fieldNames(@TypeOf(definition.checks))
+            else
+                &[_][]const u8{};
+            comptime assert(check_names.len <= schema.checks_max);
+            var checks: [check_names.len]schema.Check = undefined;
+            inline for (check_names, &checks) |name, *check| {
+                check.* = .{ .name = name, .file = schema.record_path(name) };
+            }
+            const description = schema.Description{
+                .profiles = profiles,
+                .scenarios = &scenarios,
+                .checks = &checks,
+            };
             var buffer: [4096]u8 = undefined;
             var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
             const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };

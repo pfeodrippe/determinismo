@@ -222,7 +222,11 @@ pub fn main(init: std.process.Init) !void {
     if (drivers + singletons + composer.kind_count(.anytime) == 0) return error.NoDriverCommands;
 
     sdk.event("composer_start", .{ .commands = composer.command_count });
-    if (script_read(arena)) |script| return run_script(&composer, &script);
+    if (script_read(arena)) |script| {
+        run_script(&composer, &script);
+        checks_stream(&system);
+        return;
+    }
     if (composer.kind_count(.first) > 0) composer.run_to_completion(composer.pick(.first));
     const singleton_timeline = singletons > 0 and (drivers == 0 or sdk.random_below(2) == 0);
     sdk.event("faults_phase", .{ .state = "start" });
@@ -236,7 +240,44 @@ pub fn main(init: std.process.Init) !void {
     composer.faults_stop();
     sdk.event("faults_phase", .{ .state = "stop" });
     run_ending(&composer);
+    checks_stream(&system);
     sdk.event("composer_done", .{ .commands_started = composer.started_count });
+}
+
+/// The bytes of a chunk: 2,400 are 3,200 in base64, an event well under the guest module's page.
+const check_chunk_size = 2400;
+
+/// Each check's file (schema.Check: a history), streamed out for the host once the timeline's
+/// commands are done: base64 chunks (`check_chunk`), then `check_input` with its size (or
+/// `missing`: nothing was recorded). The host runs the check on it and adds its verdict.
+fn checks_stream(system: *const @import("determinismo").schema.System) void {
+    for (system.checks, 0..) |check, index| {
+        var path_buffer: [256]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{check.file}, 0) catch continue;
+        const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) {
+            sdk.event("check_input", .{ .check = index, .missing = true });
+            continue;
+        }
+        defer _ = linux.close(@intCast(fd));
+        var total: u64 = 0;
+        while (true) {
+            var raw: [check_chunk_size]u8 = undefined;
+            var size: usize = 0;
+            while (size < raw.len) { // Whole chunks, but the last.
+                const result = linux.read(@intCast(fd), raw[size..].ptr, raw.len - size);
+                if (linux.errno(result) != .SUCCESS or result == 0) break;
+                size += result;
+            }
+            if (size == 0) break;
+            var encoded: [std.base64.standard.Encoder.calcSize(check_chunk_size)]u8 = undefined;
+            const data = std.base64.standard.Encoder.encode(&encoded, raw[0..size]);
+            sdk.event("check_chunk", .{ .check = index, .data = data });
+            total += size;
+            if (size < raw.len) break;
+        }
+        sdk.event("check_input", .{ .check = index, .bytes = total });
+    }
 }
 
 /// A timeline's shape, extracted from a branch's events (`determinismo script`): commands by

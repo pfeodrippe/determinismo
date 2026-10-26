@@ -1,21 +1,24 @@
-# Elle as a node
+# Elle, on the host
 
 [Elle](https://github.com/jepsen-io/elle) (Jepsen's checker, EPL-2.0) infers the dependency graph
 of a transactional history and reports every anomaly it finds: G0, G1a/b/c, G-single, G2, and
-with real-time order, violations of strict serializability. Here it runs as a node any test
-program can add, without faults (it judges, it is not under test):
+with real-time order, violations of strict serializability. To a test program it is a library:
+a host check (ARCHITECTURE.md §10.4) from `sdk.elle`, run on every timeline's history.
 
 ```zig
-default.node(.elle, .{
-    .build = .{ .context = ".", .dockerfile = "checkers/elle/Dockerfile" },
-    .ready = .{ .tcp = 7700 },
-    .faults = .{ .pause = false, .isolate = false, .partition = false, .degrade = false,
-        .throttle = false, .process_pause = false, .sync_stall = false },
-});
+// The program's checks: Elle on every timeline's history (a model per scenario if need be).
+return System.main(init, .{ .describe = describe, .scenarios = .{ ... },
+    .checks = .{ .elle = sdk.elle.check(.{ .consistency = "strict-serializable" }) } });
+
+// A driver: each operation as it happens (sdk.elle.History records them for the check).
+try history.invoke(arena, process, &asked);
+try history.ok(arena, process, &done); // Or fail, or info.
 ```
 
-Drivers append each operation to a history file in the runner as it happens (one line, one
-write, so lines of parallel drivers never interleave), and a `finally` command posts the file:
+Under it, Elle (Clojure, on the JVM) runs as one warm service per host, on 127.0.0.1:7700, built
+from this directory and started by the first check that needs it: a JVM per check would cost
+more than the check. The check posts the timeline's history to it and asserts the verdict. The
+history is JSON lines, in the order operations happened:
 
 ```
 POST /check?model=list-append&consistency=strict-serializable
@@ -34,11 +37,12 @@ POST /check?model=list-append&consistency=strict-serializable
   "anomalies": "..."}` (the anomalies as Elle prints them, cut short).
 
 Since the history is recorded inside the timeline, an anomaly replays exactly, to the moment of
-every operation in its cycle. Used by `examples/etcd`.
+every operation in its cycle. Used by `examples/etcd` and `examples/postgres`.
 
-Three things the image works around: the guest has one CPU, and a JVM that sees one sizes its
-pools at one thread, with which Elle deadlocks (its history folds wait on tasks queued to the
-same pool), even on an empty history, so the JVM runs with `-XX:ActiveProcessorCount=4`;
+Three things the image works around: a JVM that sees one CPU (as in a guest, or a host pinned to
+one) sizes its pools at one thread, with which Elle deadlocks (its history folds wait on tasks
+queued to the same pool), even on an empty history, so the JVM runs with
+`-XX:ActiveProcessorCount=4`;
 rhizome (Elle's Graphviz renderer) sets Swing up as it loads, which fails on a headless JVM, so
 `src/rhizome/viz.clj` stands in for it (Elle draws only into a `:directory`, never given here);
 and Elle 0.2.8's `elle.txn` loads unilog while declaring it for its dev profile only, so

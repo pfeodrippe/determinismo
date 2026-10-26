@@ -98,15 +98,15 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
         .{ "tree", check_tree },                     .{ "disk", check_disk },
         .{ "durability", check_durability },         .{ "mutate", check_mutate },
-        .{ "inject", check_inject },                 .{ "compose", check_compose },
-        .{ "shards", check_shards },                 .{ "stress", check_stress },
-        .{ "controller", check_controller },         .{ "clojure", check_clojure },
-        .{ "k3s", check_k3s },                       .{ "script", check_script },
-        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
-        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
-        .{ "voidstar", check_voidstar },             .{ "changed", check_changed },
-        .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
-        .{ "hang", check_hang },
+        .{ "checks", check_host_checks },            .{ "inject", check_inject },
+        .{ "compose", check_compose },               .{ "shards", check_shards },
+        .{ "stress", check_stress },                 .{ "controller", check_controller },
+        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
+        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },               .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },               .{ "readdress", check_readdress },
+        .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1223,6 +1223,39 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// Host checks (System.main's `.checks`): records a timeline's command made reach the program's
+/// check on the host, in order and typed, as properties of the timeline; a replay agrees.
+fn check_host_checks(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{ "--program", program, "--scenario", "records", "--seed", "1" };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
+    const properties = [_][]const u8{
+        "a host check knows its scenario",
+        "a host check gets every record",
+        "a host check gets the records in order, as made",
+        "host checks run to completion",
+    };
+    var passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
+    for (properties) |property| {
+        const line = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
+        passes = passes and std.mem.indexOf(u8, report, line) != null;
+    }
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var same = false;
+    if (count > 0) {
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            same_timelines(&replayed, branches[0..count]);
+    }
+    expect(context, passes and same, "host checks: a timeline's records reach the program's " ++
+        "check on the host, in order and typed, as properties; a replay agrees", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "check", "always",
     }) catch ""});
 }
 

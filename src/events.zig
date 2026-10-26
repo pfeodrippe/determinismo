@@ -78,6 +78,32 @@ last_vtime_ns: u64 = 0,
 behaviors: [behavior_count_max]Behavior = undefined,
 behavior_count: u32 = 0,
 behavior_slots: [behavior_slot_count]u64 = @splat(0),
+/// The checks' inputs (schema.Check), streamed out by the composer as the timeline ends:
+/// decoded into `check_buffer` (the caller's, reserved once), one span per check.
+check_buffer: []u8 = &.{},
+check_used: usize = 0,
+check_inputs: [check_count_max]CheckInput = @splat(.{}),
+
+pub const check_count_max = 8;
+
+pub const CheckInput = struct {
+    start: usize = 0,
+    end: usize = 0,
+    /// The composer said it was all sent (`check_input`), or that there was none.
+    complete: bool = false,
+    missing: bool = false,
+    /// Larger than what was left of the buffer: not checkable.
+    overflow: bool = false,
+};
+
+/// A check's whole input, once the composer sent it all; null when it never did (the timeline
+/// ended first), there was none, or it did not fit.
+pub fn check_input(events: *const Events, index: usize) ?[]const u8 {
+    if (index >= check_count_max) return null;
+    const input = events.check_inputs[index];
+    if (!input.complete or input.missing or input.overflow) return null;
+    return events.check_buffer[input.start..input.end];
+}
 
 const Events = @This();
 
@@ -98,12 +124,20 @@ pub const behavior_label_size = 72;
 pub const behavior_count_max = 8192;
 const behavior_slot_count = 2 * behavior_count_max; // Open addressing, at most half full.
 
-pub const InitOptions = struct { log_fd: ?linux.fd_t };
+pub const InitOptions = struct {
+    log_fd: ?linux.fd_t,
+    /// Room for the checks' inputs (schema.Check), reserved once by the caller; empty: none.
+    check_buffer: []u8 = &.{},
+};
 
 pub fn init(events: *Events, parse_buffer: []u8, options: InitOptions) void {
     if (options.log_fd) |fd| assert(fd >= 0);
     assert(parse_buffer.len == parse_buffer_size);
-    events.* = .{ .log_fd = options.log_fd, .parse_buffer = parse_buffer };
+    events.* = .{
+        .log_fd = options.log_fd,
+        .parse_buffer = parse_buffer,
+        .check_buffer = options.check_buffer,
+    };
     assert(events.property_count == 0);
 }
 
@@ -120,7 +154,9 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     var fba = std.heap.FixedBufferAllocator.init(events.parse_buffer);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), data, .{}) catch
         null;
-    if (events.log_fd) |fd| if (!events.retroactive_hidden(data)) {
+    // Checks' inputs are the host's (they can be megabytes): hashed, not logged.
+    const check_chunk = std.mem.startsWith(u8, data, "{\"event\":\"check_chunk\"");
+    if (events.log_fd) |fd| if (!check_chunk and !events.retroactive_hidden(data)) {
         write_log_line(fd, .{
             .sequence = events.count,
             .moment = moment,
@@ -132,6 +168,7 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     const value = parsed orelse return;
     if (value != .object) return;
     if (value.object.get("event")) |name| {
+        if (name == .string) events.check_event(name.string, value.object.get("details"));
         if (name == .string) {
             const size: u8 = @intCast(@min(name.string.len, events.last_event_name.len));
             @memcpy(events.last_event_name[0..size], name.string[0..size]);
@@ -495,6 +532,41 @@ fn property_get_or_put(events: *Events, kind: Kind, message: []const u8) !*Prope
     events.property_count += 1;
     assert(events.property_count <= property_count_max);
     return property;
+}
+
+/// `check_chunk` and `check_input` events (composer.zig's checks_stream): the inputs collected.
+fn check_event(events: *Events, name: []const u8, details: ?std.json.Value) void {
+    const chunk = std.mem.eql(u8, name, "check_chunk");
+    if (!chunk and !std.mem.eql(u8, name, "check_input")) return;
+    const object = (details orelse return).object;
+    const index_value = object.get("check") orelse return;
+    if (index_value != .integer or index_value.integer < 0) return;
+    const index: usize = @intCast(index_value.integer);
+    if (index >= check_count_max) return;
+    const input = &events.check_inputs[index];
+    if (!chunk) {
+        input.complete = true;
+        input.missing = object.get("missing") != null;
+        return;
+    }
+    const data = object.get("data") orelse return;
+    if (data != .string) return;
+    if (input.start == input.end) {
+        input.start = events.check_used;
+        input.end = events.check_used;
+    }
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(data.string) catch return;
+    if (input.overflow or input.end != events.check_used or events.check_used + size > events.check_buffer.len) {
+        input.overflow = true;
+        return;
+    }
+    decoder.decode(events.check_buffer[events.check_used..][0..size], data.string) catch {
+        input.overflow = true;
+        return;
+    };
+    events.check_used += size;
+    input.end = events.check_used;
 }
 
 /// Built-in property, checked when a timeline ends: the guest finished its scenario, rather than

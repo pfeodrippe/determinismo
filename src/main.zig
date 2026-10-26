@@ -24,6 +24,7 @@ const script = @import("script.zig");
 const tla = @import("tla.zig");
 const query = @import("query.zig");
 const cpus = @import("cpus.zig");
+const checks = @import("checks.zig");
 const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
 const changed = @import("changed.zig");
@@ -341,6 +342,12 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .until = arguments.until,
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
         .builtin_properties = has_system,
+        .checks = if (prepared) |system| system.system.checks else &.{},
+        .check_program = arguments.program_path,
+        .check_buffer = if (prepared != null and prepared.?.system.checks.len > 0)
+            try std.heap.page_allocator.alloc(u8, checks.input_size_max) // Touched as used.
+        else
+            &.{},
         .cpu_modulation = arguments.cpu_modulation,
         .retroactive = retroactive_texts(&arguments),
         .vtime_limit_ns = arguments.timeline_limit_ns,
@@ -356,6 +363,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const scenarios = try scenarios_selected(arena, &arguments, prepared);
     for (scenarios) |scenario| {
         options.cmdline = try cmdline_build(arena, base_cmdline, &arguments, scenario);
+        options.check_scenario = scenario orelse "";
         if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
         switch (arguments.command) {
             .run => try command_run(vm, &options),
@@ -2594,6 +2602,7 @@ test {
     _ = @import("duckdb.zig");
     _ = @import("store.zig");
     _ = @import("cpus.zig");
+    _ = @import("checks.zig");
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
     _ = @import("changed.zig");

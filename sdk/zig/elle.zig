@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MIT
-//! Elle (checkers/elle, Jepsen's checker) from test programs: a history of transactions recorded
-//! as they happen, then Elle's verdict on it as a property. Elle finds every anomaly of the
-//! history (G0, G1a/b/c, G-single, G2, and real-time order for strict serializability); recorded
-//! inside the timeline, an anomaly replays to the moment of every operation in its cycle.
+//! Elle (Jepsen's checker, checkers/elle) as a host check: drivers record a history of
+//! transactions as they happen, and `check` is a check (System.main's `.checks`) that hands each
+//! timeline's history to Elle on the host and asserts its verdict. Elle finds every anomaly of
+//! the history (G0, G1a/b/c, G-single, G2, and real-time order for strict serializability); the
+//! guest pays nothing, and a replay records the same history, so it gets the same verdict, with
+//! every operation of an anomaly at its moment.
 //!
-//!   // The checker, a node without faults:
-//!   default.node(.elle, sdk.elle.node(System.Spec, .{}));
+//!   // The program's checks: Elle on every timeline's history.
+//!   return System.main(init, .{ .describe = ..., .scenarios = ...,
+//!       .checks = .{ .elle = sdk.elle.check(.{ .consistency = "strict-serializable" }) } });
 //!
 //!   // A driver: one operation at a time per process.
-//!   var history: sdk.elle.History = .{};
+//!   const history: sdk.elle.History = .{};
 //!   var process = sdk.elle.process_new();
 //!   const asked = [_]sdk.elle.Mop{
 //!       .{ .append = .{ .key = 3, .value = 17 } }, // Values unique per key.
@@ -20,9 +23,6 @@
 //!   try history.ok(arena, process, &done); // Or fail (it did not happen), or info (unknown:
 //!   process = sdk.elle.process_new();      // the process then goes on as another).
 //!
-//!   // A `finally` command, once drivers are done:
-//!   try sdk.elle.check_assert(context.init.io, arena, context.nodes.elle.address, .{});
-//!
 //! Models: list-append (`append` and `read` of lists) and rw-register (`write` and
 //! `read_register`). Lines are appended with one write each, so parallel drivers never interleave
 //! inside one; an invocation left open (its driver stopped mid-call) is closed as info.
@@ -33,33 +33,131 @@ const sdk = @import("determinismo.zig");
 const schema = @import("schema.zig");
 const tcp = @import("tcp");
 
+/// The service, on the host: one for every run there, started by the first check that needs it.
 pub const port = 7700;
-/// In the runner, where every test command runs.
-pub const history_path_default = "/tmp/elle-history.jsonl";
+const address = [4]u8{ 127, 0, 0, 1 };
+const image = "determinismo-elle";
+const dockerfile = "checkers/elle/Dockerfile";
+const start_lock = "/tmp/determinismo-elle.lock";
+/// Elle reads a timeline's whole history at once: seconds, more for long ones.
+const timeout_ms = 600 * std.time.ms_per_s;
+const anomalies_size_max = 2500;
 
-pub const NodeOptions = struct {
-    /// Paths are relative to where determinismo runs (its repository by default).
-    context: []const u8 = ".",
-    dockerfile: []const u8 = "checkers/elle/Dockerfile",
-    memory_max_mib: ?u32 = null,
+pub const ScenarioConsistency = struct { scenario: []const u8, consistency: []const u8 };
+
+pub const CheckOptions = struct {
+    /// list-append or rw-register.
+    model: []const u8 = "list-append",
+    /// One of Elle's models: strict-serializable, serializable, snapshot-isolation,
+    /// read-committed, ...
+    consistency: []const u8 = "strict-serializable",
+    /// Another consistency model for some scenarios' timelines.
+    by_scenario: []const ScenarioConsistency = &.{},
+    message: []const u8 = "Elle finds no anomaly in the history",
 };
 
-/// The checker as a node: it judges, it is not under test, so it has no faults.
-pub fn node(comptime Spec: type, options: NodeOptions) Spec {
-    return .{
-        .build = .{ .context = options.context, .dockerfile = options.dockerfile },
-        .ready = .{ .tcp = port },
-        .memory_max_mib = options.memory_max_mib,
-        .faults = .{
-            .pause = false,
-            .isolate = false,
-            .partition = false,
-            .degrade = false,
-            .throttle = false,
-            .process_pause = false,
-            .sync_stall = false,
-        },
+/// The check to put in the program's `.checks`: Elle on every timeline's history (the records of
+/// the check's name: History records under "elle", the usual name).
+pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerror!void {
+    return struct {
+        fn run(context: *sdk.Check, history: []const u8) anyerror!void {
+            if (history.len == 0) return;
+            const consistency = for (options.by_scenario) |entry| {
+                if (std.mem.eql(u8, entry.scenario, context.scenario)) break entry.consistency;
+            } else options.consistency;
+            const verdict = try judge(context, history, options.model, consistency);
+            const anomalies = verdict.anomalies[0..@min(verdict.anomalies.len, anomalies_size_max)];
+            sdk.always(verdict.valid != false, options.message, .{
+                .model = options.model,
+                .consistency = consistency,
+                .ops = verdict.ops,
+                .anomaly_types = verdict.anomaly_types,
+                .anomalies = anomalies,
+            });
+            sdk.sometimes(verdict.valid == true, "Elle checked a history and found it valid", .{
+                .ops = verdict.ops,
+            });
+        }
+    }.run;
+}
+
+pub const Verdict = struct {
+    /// Null: Elle could not tell (too little to go on).
+    valid: ?bool,
+    anomaly_types: []const []const u8,
+    ops: u64,
+    /// As Elle prints them.
+    anomalies: []const u8,
+};
+
+/// Elle's verdict on a history (JSON lines), from the service on the host.
+pub fn judge(context: *sdk.Check, history: []const u8, model: []const u8, consistency: []const u8) !Verdict {
+    try service_ensure(context);
+    var path_buffer: [192]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/check?model={s}&consistency={s}", .{
+        model, consistency,
+    });
+    const buffer = try context.arena.alloc(u8, tcp.buffer_size);
+    const response = try tcp.http_with(address, port, "POST", path, history, buffer, .{
+        .timeout_ms = timeout_ms,
+    });
+    const Answer = struct {
+        valid: std.json.Value = .null,
+        anomaly_types: []const []const u8 = &.{},
+        ops: u64 = 0,
+        anomalies: []const u8 = "",
+        @"error": []const u8 = "",
     };
+    const answer = try std.json.parseFromSliceLeaky(Answer, context.arena, response.body, .{
+        .ignore_unknown_fields = true,
+    });
+    if (response.status != 200) {
+        std.debug.print("elle: {s}\n", .{answer.@"error"});
+        return error.ElleFailed;
+    }
+    return .{
+        .valid = if (answer.valid == .bool) answer.valid.bool else null,
+        .anomaly_types = answer.anomaly_types,
+        .ops = answer.ops,
+        .anomalies = answer.anomalies,
+    };
+}
+
+/// The service answers, or is started (built from checkers/elle with podman, relative to where
+/// determinismo runs): once per host, whichever check gets the lock first.
+fn service_ensure(context: *sdk.Check) !void {
+    if (answers()) return;
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const lock = linux.open(start_lock, flags, 0o600);
+    if (linux.errno(lock) != .SUCCESS) return error.LockFailed;
+    defer _ = linux.close(@intCast(lock));
+    while (linux.errno(linux.flock(@intCast(lock), std.posix.LOCK.EX)) == .INTR) {}
+    if (answers()) return; // Another check started it meanwhile.
+    std.debug.print("elle: starting the service on port {d} ({s})\n", .{ port, dockerfile });
+    try command(context, &.{ "podman", "build", "-q", "-t", image, "-f", dockerfile, "." });
+    _ = std.process.run(context.arena, context.io, .{ .argv = &.{ "podman", "rm", "-f", image } }) catch {};
+    try command(context, &.{ "podman", "run", "-d", "--name", image, "--network", "host", image });
+    for (0..120) |_| {
+        if (answers()) return;
+        const pause: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    return error.ElleNotAnswering;
+}
+
+fn answers() bool {
+    var connection: tcp.Connection = undefined;
+    connection.open(address, port, .{ .timeout_ms = 1000 }) catch return false;
+    connection.close();
+    return true;
+}
+
+fn command(context: *sdk.Check, argv: []const []const u8) !void {
+    const result = try std.process.run(context.arena, context.io, .{ .argv = argv });
+    if (!result.term.success()) {
+        std.debug.print("elle: {s} failed:\n{s}\n", .{ argv[0], result.stderr });
+        return error.ToolFailed;
+    }
 }
 
 /// A micro-operation. In an invocation reads have no value yet (null); in an `ok`, what they
@@ -78,8 +176,15 @@ pub fn process_new() u64 {
     return sdk.random_below(1 << 48);
 }
 
+/// The history, as records of the check named "elle" (sdk.record's file): `History.of("other")`
+/// for a check of another name.
 pub const History = struct {
-    path: [:0]const u8 = history_path_default,
+    path: [:0]const u8 = schema.record_path("elle"),
+
+    pub fn of(comptime name: []const u8) History {
+        return .{ .path = schema.record_path(name) };
+    }
+
 
     pub fn invoke(history: *const History, gpa: std.mem.Allocator, process: u64, mops: []const Mop) !void {
         return history.note(gpa, process, .invoke, mops);
@@ -144,90 +249,6 @@ pub fn line_write(writer: *std.Io.Writer, process: u64, kind: Kind, mops: []cons
         }
     }
     try writer.writeAll("]}\n");
-}
-
-pub const Model = enum {
-    list_append,
-    rw_register,
-
-    fn name(model: Model) []const u8 {
-        return switch (model) {
-            .list_append => "list-append",
-            .rw_register => "rw-register",
-        };
-    }
-};
-
-pub const CheckOptions = struct {
-    model: Model = .list_append,
-    /// One of Elle's models: strict-serializable, serializable, snapshot-isolation,
-    /// read-committed, ...
-    consistency: []const u8 = "strict-serializable",
-    history_path: []const u8 = history_path_default,
-    /// Elle reads the whole history at once: seconds, more for long ones.
-    timeout_ms: u32 = 600 * std.time.ms_per_s,
-};
-
-pub const Verdict = struct {
-    /// Null: Elle could not tell (too little to go on).
-    valid: ?bool,
-    anomaly_types: []const []const u8,
-    ops: u64,
-    /// As Elle prints them, cut short.
-    anomalies: []const u8,
-};
-
-/// Posts the history to the checker: its verdict, or null when no history was recorded.
-pub fn check(io: std.Io, arena: std.mem.Allocator, address: [4]u8, options: CheckOptions) !?Verdict {
-    const history = std.Io.Dir.cwd().readFileAlloc(io, options.history_path, arena, .limited(1 << 30)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/check?model={s}&consistency={s}", .{
-        options.model.name(), options.consistency,
-    });
-    const buffer = try arena.alloc(u8, tcp.buffer_size);
-    const response = try tcp.http_with(address, port, "POST", path, history, buffer, .{
-        .timeout_ms = options.timeout_ms,
-    });
-    const Answer = struct {
-        valid: std.json.Value = .null,
-        anomaly_types: []const []const u8 = &.{},
-        ops: u64 = 0,
-        anomalies: []const u8 = "",
-        @"error": []const u8 = "",
-    };
-    const answer = try std.json.parseFromSliceLeaky(Answer, arena, response.body, .{
-        .ignore_unknown_fields = true,
-    });
-    if (response.status != 200) {
-        sdk.event("elle_failed", .{ .status = response.status, .err = answer.@"error" });
-        return error.ElleFailed;
-    }
-    return .{
-        .valid = if (answer.valid == .bool) answer.valid.bool else null,
-        .anomaly_types = answer.anomaly_types,
-        .ops = answer.ops,
-        .anomalies = answer.anomalies,
-    };
-}
-
-/// `check`, with its verdict as properties: `always` that Elle found no anomaly, and `sometimes`
-/// that it checked a valid history.
-pub fn check_assert(io: std.Io, arena: std.mem.Allocator, address: [4]u8, options: CheckOptions) !void {
-    const verdict = (try check(io, arena, address, options)) orelse return;
-    const details = .{
-        .model = options.model.name(),
-        .consistency = options.consistency,
-        .anomaly_types = verdict.anomaly_types,
-        .ops = verdict.ops,
-        .anomalies = verdict.anomalies,
-    };
-    sdk.always(verdict.valid != false, "Elle finds no anomaly in the history", details);
-    sdk.sometimes(verdict.valid == true, "Elle checked a history and found it valid", .{
-        .ops = verdict.ops,
-    });
 }
 
 test line_write {

@@ -20,11 +20,11 @@
 //!                                    skipping revisions)
 //!   recovery                         after faults, a write commits and the members converge
 //!   strict serializability (Elle)    list-append transactions (reads, then one txn guarded by
-//!                                    every key's mod revision), their history checked at the
-//!                                    end by Elle (checkers/elle, Jepsen's checker) for every
+//!                                    every key's mod revision), every timeline's history checked
+//!                                    by Elle on the host (sdk.elle, checkers/elle) for every
 //!                                    anomaly: G0, G1, G-single, G2, real-time order
 //! Faults: the default ones, restarts, graceful stops and crashes (each member's data on its own
-//! disk), and with them stalls and crashes at the members' syncs. The Elle node has none.
+//! disk), and with them stalls and crashes at the members' syncs.
 //!
 //!   determinismo explore ... --program zig-out/bin/etcd-test --scenario kv --branches 64
 const std = @import("std");
@@ -36,7 +36,6 @@ const Nodes = struct {
     @"etcd-1": sdk.Node,
     @"etcd-2": sdk.Node,
     @"etcd-3": sdk.Node,
-    elle: sdk.Node,
 };
 const System = sdk.System(Nodes);
 const member_names = [_][]const u8{ "etcd-1", "etcd-2", "etcd-3" };
@@ -74,7 +73,12 @@ comptime {
 }
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .kv = kv } });
+    return System.main(init, .{
+        .describe = describe,
+        .scenarios = .{ .kv = kv },
+        // Elle, on the host, on every timeline's list-append history.
+        .checks = .{ .elle = sdk.elle.check(.{}) },
+    });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -101,7 +105,6 @@ fn describe(d: *System.Describe) !void {
             .faults = .{ .restart = true, .crash = true, .stop = true },
         });
     }
-    default.node(.elle, sdk.elle.node(System.Spec, .{}));
 }
 
 fn kv(s: *System.Scenario) void {
@@ -113,7 +116,6 @@ fn kv(s: *System.Scenario) void {
     s.anytime("agree", members_agree);
     s.eventually("recover", recovers);
     s.eventually("durable", writes_survive);
-    s.finally("elle", history_checked);
 }
 
 fn addresses(context: *System.Context) [members_count][4]u8 {
@@ -590,12 +592,6 @@ fn monotonic_ns() u64 {
     var now: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &now);
     return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
-}
-
-/// Drivers are done: Elle checks the whole history for strict serializability.
-fn history_checked(context: *System.Context) !void {
-    const arena = context.init.arena.allocator();
-    try sdk.elle.check_assert(context.init.io, arena, context.nodes.elle.address, .{});
 }
 
 // Checks -------------------------------------------------------------------------------------
