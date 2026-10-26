@@ -62,6 +62,8 @@ const append_window_s = 10;
 const append_keys_window = 4;
 /// A watch is read for 1 s to this long; a read waits this long for the next event.
 const watch_seconds_max = 10;
+/// A catch-up batch of this many events still fits a line of the connection's buffer.
+const watch_back_max = 100;
 const watch_read_timeout_ms = 2000;
 const cluster_attempts_max = 300;
 const recovery_attempts_max = 120;
@@ -339,7 +341,9 @@ fn acked_note(kind: []const u8, first: []const u8, second: []const u8, revision:
 
 // Watches ------------------------------------------------------------------------------------
 
-/// A watch on the written keys from a member's current revision, read for a while. The gateway
+/// A watch on the written keys from a member's current revision, or (as Jepsen's watches, each
+/// resumed from where the last ended) from up to `watch_back_max` revisions before it: a watch
+/// behind the store catches up through etcd's unsynced watchers. Read for a while: the gateway
 /// streams it as JSON lines on the open connection (HTTP/1.0: no chunks, the body runs until the
 /// watch ends).
 fn watch_once(context: *System.Context) !void {
@@ -351,7 +355,9 @@ fn watch_once(context: *System.Context) !void {
         if (no_answer(err)) return;
         return err;
     };
-    const start = try revision_of(status.header) + 1;
+    const current = try revision_of(status.header);
+    const back = if (sdk.random_below(2) == 0) 0 else sdk.random_below(@min(current, watch_back_max) + 1);
+    const start = current + 1 - back;
     var connection: sdk.tcp.Connection = undefined;
     connection.open(address, client_port, .{ .timeout_ms = watch_read_timeout_ms }) catch |err| {
         if (sdk.tcp.unavailable(err)) return;
