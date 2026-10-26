@@ -45,10 +45,14 @@ public final class DeterminismoCatalog {
     });
   }
 
+  /** The SDK's own classes, in the default package or copied into a project's (clojure/lang). */
+  private static boolean sdk(String name) {
+    return name.substring(name.lastIndexOf('/') + 1).startsWith(SDK);
+  }
+
   private static boolean skipped(String name) {
-    return name.startsWith(SDK) || name.startsWith("java/") || name.startsWith("javax/")
-        || name.startsWith("jdk/") || name.startsWith("sun/") || name.startsWith("com/sun/")
-        || name.startsWith("clojure/lang/");
+    return sdk(name) || name.startsWith("java/") || name.startsWith("javax/")
+        || name.startsWith("jdk/") || name.startsWith("sun/") || name.startsWith("com/sun/");
   }
 
   /** The (kind, message) of each assertion with a constant message in a class file. */
@@ -379,7 +383,7 @@ public final class DeterminismoCatalog {
       String[] member = reader.member(index);
       String descriptor = member[2];
       int arguments = argumentCount(descriptor);
-      if (op == 184 && member[0].equals(SDK)) {
+      if (op == 184 && (member[0].equals(SDK) || member[0].endsWith("/" + SDK))) {
         String kind = kind(member[1]);
         // The message is the second to last argument: (..., String message, String details).
         if (kind != null && stack.size() >= 2) {

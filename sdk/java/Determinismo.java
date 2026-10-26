@@ -249,6 +249,25 @@ public final class Determinismo {
     return randomBelow(count);
   }
 
+  /**
+   * A buggify point (FoundationDB's BUGGIFY): inside determinismo, true for one decision in four
+   * (named, so the explorer varies it and a strategy steers it); outside, always false. Where it
+   * is true, code takes the rare path on purpose: a pause before a lock, a forced retry.
+   */
+  public static boolean buggify(String name) {
+    return device != null && randomBelowNamed(name, 4) == 0;
+  }
+
+  /** At a buggify point, a pause of up to 9 ms: the other threads run in that window. */
+  public static void buggifyPause(String name) {
+    if (!buggify(name)) return;
+    try {
+      Thread.sleep(randomBelowNamed(name + " (ms)", 10));
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
   /** The system is ready: the platform snapshots here. */
   public static void setupComplete(String details) {
     emit("{\"lifecycle\":\"setup_complete\",\"details\":" + orEmpty(details) + "}");
