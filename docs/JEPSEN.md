@@ -82,7 +82,7 @@ Blind means blind to the results, not to the test: workloads follow Jepsen's pub
 | MySQL | 8.0.34 | Repeatable Read allowing G2-item, G-single, lost update, non-repeatable reads | ✅ rediscovered on the current 26.10.0 already (srv1, seed 7): G2-item and G-single-item at Repeatable Read in 2 of the first 4 timelines, ~2.5 min of virtual time each; Serializable clean in 4 of 4. 8.0.34 (run 86 on srv2): ✅ G-single-item, G2-item and lost-update at Repeatable Read in 10 of the first 15 timelines, from the first |
 | MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | running (run 87 on srv2; examples/galera, Jepsen's configuration; 13.0.2 clean in 8 timelines on srv1) |
 | TiDB | 2.1.7 | automatic retries breaking snapshot isolation: lost updates, read skew | ✅ rediscovered on srv1 (seed 3): G-single-item (read skew), lost-update and incompatible-order in 2 of the first 4 timelines, ~3 min of virtual time each |
-| MongoDB | 4.2.6 | transactions with read skew, cyclic information flow, duplicated effects | next (examples/mongodb) |
+| MongoDB | 4.2.6 | transactions with read skew, cyclic information flow, duplicated effects | next (examples/mongodb; 9.0.4 clean in 4 timelines on srv1) |
 
 ## Order
 
