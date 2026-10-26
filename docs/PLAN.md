@@ -158,7 +158,11 @@ blind, with its findings documented in its README.
      plumbing, primitive-math, io.aviso/pretty, test.check.
 3. **The Clojure compiler and runtime** (clojure/clojure, the JVM implementation): a pinned
    fork with the Java SDK's assertions put where its rare paths are, so that they guide the
-   exploration to them. `sometimes` and `reachable` mark the paths worth reaching (the tree
+   exploration to them. Started: examples/clojure-compiler (Clojure 1.12.6 with clojure.patch:
+   27 assertions in the STM, hash map nodes, lazy seqs, the compiler and reflection, and
+   buggify points in the STM and lazy seqs; scenarios stm, forms and lazy; all properties hold
+   so far). Next: agents and futures (send-off pools, binding conveyance), more compiler paths,
+   and the reached-path counts as the measure of each addition. `sometimes` and `reachable` mark the paths worth reaching (the tree
    returns just after a timeline first reaches one, and a strategy can steer toward one not yet
    reached); `always` checks what must hold there. Candidates, read from the source:
    - Compiler.java: recur in tail and non-tail positions (loop, fn, try bodies), locals
