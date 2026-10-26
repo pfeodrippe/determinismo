@@ -173,13 +173,24 @@ determinismo explore ... --compose tests/antithesis-compat/bank/compose.yaml --s
 
 ## Quickstart (on the host)
 
+One command from your machine sets up a host, from a Hetzner box in its rescue system to an
+end-to-end check (idempotent; `--guest-from det@<host>` gives it another host's guest kernel):
+
+```
+infra/host/setup.sh <ip>
+```
+
+The steps it runs, each one on its own:
+
 ```
 infra/hetzner/install-os.sh <ip>          # Debian 13 on a fresh Hetzner box (rescue mode)
 infra/host/bootstrap.sh <ip>              # packages, user `det`, SSH hardening, firewall
 # On the host, in the repository:
 sudo infra/host/m0-check.sh               # hardware qualification
 infra/host/build-kvm.sh                   # KVM with kernel/patches/*.patch
+infra/host/tools.sh                       # Zig, babashka, TLA+ tools (pinned, checksummed)
 sudo infra/host/load-kvm.sh               # swap in our KVM modules
+sudo infra/host/kvm-at-boot.sh det        # and at every boot
 guest/kernel/build.sh ~/guest             # the guest kernel and det_guest.ko
 zig build -Drelease                       # the VMM, the guest runtime, the examples
 zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko --busybox /usr/bin/busybox --out ~/guest/base.cpio

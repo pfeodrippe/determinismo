@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Sets up a determinismo host from your machine, in one go: from a Hetzner box in its rescue
+# system (or one installed already) to a checked host. Debian, provisioning and hardening, the
+# repository, the toolchain, hardware qualification, our KVM (loaded at every boot), the guest,
+# the build, and an end-to-end check. Idempotent: run it again after a failure, or to update.
+# Usage: infra/host/setup.sh <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>]
+#   --guest-from: the guest kernel and module copied from that host instead of built here, so
+#   every host runs the same guest (the same run inputs, for replays across hosts).
+set -euo pipefail
+
+ip=${1:?usage: $0 <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>]}
+shift
+user=det
+hostname=determinismo
+guest_from=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --user) user=$2 ;;
+    --hostname) hostname=$2 ;;
+    --guest-from) guest_from=$2 ;;
+    *) echo "error: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift 2
+done
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+
+echo "== waiting for $ip to accept SSH"
+until ssh "${ssh_opts[@]}" "root@$ip" true 2>/dev/null \
+   || ssh "${ssh_opts[@]}" "$user@$ip" true 2>/dev/null; do
+  sleep 30
+done
+
+if ssh "${ssh_opts[@]}" "root@$ip" 'test "$(hostname)" = rescue' 2>/dev/null; then
+  echo "== installing Debian (rescue system)"
+  "$repo/infra/hetzner/install-os.sh" "$ip" "$hostname"
+  sleep 60 # The reboot begins.
+fi
+
+echo "== provisioning and hardening"
+"$here/bootstrap.sh" "$ip" "$user"
+
+echo "== the repository"
+rsync -az --delete -e "ssh ${ssh_opts[*]}" \
+  --exclude .git --exclude .zig-cache --exclude zig-out --exclude .determinismo-cache \
+  --exclude todo.md --exclude 'guest/module/*.ko' --exclude 'guest/module/*.o' \
+  --exclude 'guest/module/.*' --exclude 'guest/module/*.mod*' \
+  --exclude guest/module/Module.symvers --exclude guest/module/modules.order \
+  "$repo/" "$user@$ip:determinismo/"
+
+if [ -n "$guest_from" ]; then
+  echo "== the guest, from $guest_from"
+  ssh "${ssh_opts[@]}" "$guest_from" 'tar -C ~/guest -c vmlinuz det_guest.ko' \
+    | ssh "${ssh_opts[@]}" "$user@$ip" 'mkdir -p ~/guest && tar -C ~/guest -x'
+fi
+
+ssh "${ssh_opts[@]}" "$user@$ip" bash -s <<'EOF'
+set -euo pipefail
+cd ~/determinismo
+echo "== toolchain"
+infra/host/tools.sh
+echo "== hardware qualification"
+sudo infra/host/m0-check.sh
+echo "== our KVM"
+infra/host/build-kvm.sh
+grep -q O /sys/module/kvm/taint 2>/dev/null || sudo infra/host/load-kvm.sh # O: ours, loaded.
+sudo infra/host/kvm-at-boot.sh "$USER"
+echo "== the guest and the build"
+[ -f ~/guest/vmlinuz ] && [ -f ~/guest/det_guest.ko ] || guest/kernel/build.sh ~/guest
+~/opt/zig/zig build -Drelease
+zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko \
+  --busybox /usr/bin/busybox --out ~/guest/base.cpio
+echo "== end-to-end check"
+~/opt/zig/zig build e2e -Drelease -Donly=bank
+EOF
+echo "== $ip is a determinismo host ($user@$ip)"
