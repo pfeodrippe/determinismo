@@ -1,0 +1,11 @@
+;; SPDX-License-Identifier: MIT
+;; Elle (github.com/jepsen-io/elle, EPL-2.0), Jepsen's transactional consistency checker, behind
+;; a small HTTP service any workload can post its history to.
+{:paths ["src" "classes"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        elle/elle {:mvn/version "0.2.8"}
+        ;; elle.txn loads unilog as it loads, though Elle 0.2.8 declares it for its dev profile
+        ;; only (as Elle does, without its jackson-core).
+        spootnik/unilog {:mvn/version "0.7.32"
+                         :exclusions [com.fasterxml.jackson.core/jackson-core]}
+        org.clojure/data.json {:mvn/version "2.5.1"}}}

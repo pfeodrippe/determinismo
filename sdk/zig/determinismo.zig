@@ -39,6 +39,8 @@ pub const Node = system.Node;
 pub const Output = system.Output;
 /// TCP connections with timeouts, for protocol clients (see tcp.zig).
 pub const tcp = @import("tcp");
+/// Transaction histories checked by Elle (see elle.zig and checkers/elle).
+pub const elle = @import("elle.zig");
 
 pub const device_path = "/dev/determinismo";
 /// One event or one randomness pull per device call (the guest module's page size limit).
@@ -767,6 +769,7 @@ fn device_get() Device {
 test {
     _ = schema;
     _ = system;
+    _ = elle;
 }
 
 test retry {
