@@ -15,6 +15,8 @@ import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassModel;
 import java.lang.classfile.ClassTransform;
 import java.lang.classfile.instruction.LineNumber;
+import java.lang.classfile.instruction.LocalVariable;
+import java.lang.classfile.instruction.LocalVariableType;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.MethodTypeDesc;
@@ -83,6 +85,10 @@ public final class DeterminismoCoverage {
     ClassFile files = ClassFile.of();
     ClassModel model = files.parse(bytes);
     return files.transformClass(model, ClassTransform.transformingMethodBodies((code, element) -> {
+      // Local variable tables are debugging information only, and dropped: the API sizes the
+      // locals from the code, so a variable only the table names (one Clojure never loads or
+      // stores) would point past them, and the JVM refuses the class (ClassFormatError).
+      if (element instanceof LocalVariable || element instanceof LocalVariableType) return;
       code.with(element);
       if (element instanceof LineNumber number) {
         code.loadConstant(register(className + ":" + number.line()));
