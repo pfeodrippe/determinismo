@@ -39,6 +39,11 @@ frozen: bool,
 branches_offset: u64,
 /// Stop the run when the guest signals setup_complete (to snapshot there).
 stop_at_setup_complete: bool,
+/// A timeline's ceiling of virtual time (TSC): past it, at the next timer interrupt (an exact
+/// point, the same in a replay), the run ends as hung.
+vtime_limit_tsc: ?u64,
+/// The timer interrupt past the ceiling fired.
+over_limit: bool,
 /// Multiverse debugging: the moment (virtual TSC) to stop at, the command to run there, and
 /// where that stands. Without a command the run ends at the moment.
 moment_tsc: ?u64,
@@ -139,6 +144,9 @@ pub const Options = struct {
     /// Retroactive logging: output lines with one of these texts are not written to the events
     /// file (they still count: hash, behaviors, the logging limit); a replay writes them.
     retroactive: []const []const u8 = &.{},
+    /// A timeline's ceiling of virtual time: a guest that never finishes (processes wedged, a
+    /// command waiting forever) ends there as hung.
+    vtime_limit_ns: ?u64 = null,
 };
 
 /// The machine runs `slowdown_permille` thousandths slower than its base rate (each branch
@@ -165,6 +173,7 @@ pub const Outcome = union(enum) {
     shutdown, // A triple fault: how the guest reboots with reboot=t.
     setup_complete, // Only with Options.stop_at_setup_complete.
     moment_reached, // Only with Options.moment_vtime_ns and no command.
+    hung, // Past Options.vtime_limit_ns without finishing.
     command_done, // Only with Options.moment_command: the command at the moment finished.
     debug_exit: u8,
     hlt,
@@ -262,6 +271,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .frozen = false,
         .branches_offset = 0,
         .stop_at_setup_complete = options.stop_at_setup_complete,
+        .vtime_limit_tsc = if (options.vtime_limit_ns) |ns| ns * tsc_per_ns else null,
+        .over_limit = false,
         .moment_tsc = if (options.moment_vtime_ns) |ns| ns * tsc_per_ns else null,
         .moment_command = options.moment_command,
         .moment_reached = false,
@@ -448,6 +459,7 @@ fn run_loop(vm: *VM) !Outcome {
     assert(!vm.frozen);
     defer vm.serial.flush();
     while (true) {
+        if (vm.over_limit) return .hung;
         if (vm.deterministic) try vm.timer_arm();
         _ = kvm.ioctl(vm.vcpu_fd, kvm.RUN, 0) catch |err| switch (err) {
             error.Interrupted => {
@@ -650,6 +662,9 @@ fn timer_due(vm: *VM) !void {
 
 fn timer_fire(vm: *VM) !void {
     assert(vm.pit.armed);
+    if (vm.vtime_limit_tsc) |limit| if (vm.pit.deadline_tsc()) |tsc| {
+        if (tsc >= limit) vm.over_limit = true;
+    };
     try vm.trace("timer", vm.pit.fired);
     vm.pit.fire();
     vm.stats.timer_fires += 1;

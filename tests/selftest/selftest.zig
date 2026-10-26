@@ -16,6 +16,7 @@
 //!   inject     (profile "injectable") faults the scenario asks for (sdk.fault): a pause, a
 //!              graceful stop and a one-way partition, each taking the node away and giving it
 //!              back
+//!   hang       a driver that never ends: the timeline's ceiling of virtual time ends it, hung
 //!   readdress  (profile "movable") restarts the scenario asks for: the node answers at its
 //!              name each time, and sometimes came back at a new address
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
@@ -64,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
             .disk = disk,
             .inject = inject,
             .readdress = readdress,
+            .hang = hang,
             .stress = stress,
             .quiet = quiet_scenario,
             .controller = @import("controller.zig").scenario,
@@ -354,6 +356,15 @@ fn faults_on_request(context: *System.Context) !void {
     try sdk.retry(100, 100, answers, .{echo.address});
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
+}
+
+fn hang(s: *System.Scenario) void {
+    s.singleton_driver("forever", forever);
+}
+
+/// A driver that never ends (an hour of sleep): the timeline's ceiling ends it as hung.
+fn forever(_: *System.Context) !void {
+    sdk.sleep_ms(std.time.ms_per_hour);
 }
 
 fn readdress(s: *System.Scenario) void {

@@ -41,6 +41,8 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
+    \\                            then, in virtual time, ends as hung)
     \\                            [--retroactive '<text>']...   (output lines with it are left out
     \\                            of the events; a replay of a timeline writes them)
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
@@ -146,6 +148,8 @@ const Arguments = struct {
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
+    /// A timeline's ceiling of virtual time: one that has not finished by then ends as hung.
+    timeline_limit_ns: ?u64 = std.time.ns_per_hour,
     /// Retroactive logging: output lines with these texts are left out of an exploration's
     /// events (a replay of one timeline writes them).
     retroactive: [retroactive_max][]const u8 = undefined,
@@ -324,6 +328,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .builtin_properties = has_system,
         .cpu_modulation = arguments.cpu_modulation,
         .retroactive = retroactive_texts(&arguments),
+        .vtime_limit_ns = arguments.timeline_limit_ns,
     };
     const context = Context{
         .arena = arena,
@@ -574,7 +579,7 @@ fn command_run(vm: *VM, options: *const VM.Options) !void {
     switch (outcome) {
         .failed => std.process.exit(1),
         .debug_exit => |status| std.process.exit(status),
-        .shutdown, .hlt, .moment_reached, .command_done => {},
+        .shutdown, .hlt, .moment_reached, .command_done, .hung => {},
         .setup_complete => unreachable,
     }
 }
@@ -1920,6 +1925,8 @@ fn parse_option(
     } else if (eql(u8, flag, "--time-budget")) {
         arguments.time_budget_ns = try duration_parse(value);
         arguments.time_budget_text = value;
+    } else if (eql(u8, flag, "--timeline-limit")) {
+        arguments.timeline_limit_ns = try duration_parse(value);
     } else if (eql(u8, flag, "--retroactive")) {
         if (arguments.retroactive_count == retroactive_max) return error.Usage;
         arguments.retroactive[arguments.retroactive_count] = value;

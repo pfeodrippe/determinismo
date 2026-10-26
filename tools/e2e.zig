@@ -99,7 +99,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
-        .{ "retroactive", check_retroactive },
+        .{ "retroactive", check_retroactive },          .{ "hang", check_hang },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1142,6 +1142,30 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// A timeline that never finishes ends at its ceiling of virtual time, as hung (the finish
+/// property fails), at the same point in a replay.
+fn check_hang(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{
+        "--program", program, "--scenario", "hang", "--seed", "1", "--timeline-limit", "20s",
+    };
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
+    const hung = std.mem.count(u8, report, " hung ") == 2 and std.mem.indexOf(u8, report,
+        "FAIL always                hit in    2/2 branches, failing in    2  the guest " ++
+        "finishes its scenario") != null;
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+    var replayed: [1]Branch = undefined;
+    const same = count == 2 and parse_branches(replay, &replayed) == 1 and
+        same_timelines(&replayed, branches[0..count]);
+    expect(context, hung and same, "hang: a timeline that never finishes ends at its " ++
+        "ceiling, hung, the same in a replay", .{});
+    if (!(hung and same)) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "[branch", "FAIL",
     }) catch ""});
 }
 
