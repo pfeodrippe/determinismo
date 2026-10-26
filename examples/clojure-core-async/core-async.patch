@@ -1,0 +1,239 @@
+diff --git a/src/main/clojure/clojure/core/async.clj b/src/main/clojure/clojure/core/async.clj
+index bf44fed..51e5c60 100644
+--- a/src/main/clojure/clojure/core/async.clj
++++ b/src/main/clojure/clojure/core/async.clj
+@@ -44,6 +44,7 @@ return nil for unexpected contexts."
+   (:refer-clojure :exclude [reduce transduce into merge map take partition
+                             partition-by bounded-count])
+   (:require [clojure.core.async.impl.protocols :as impl]
++            [determinismo :as det]
+             [clojure.core.async.impl.channels :as channels]
+             [clojure.core.async.impl.buffers :as buffers]
+             [clojure.core.async.impl.timers :as timers]
+@@ -262,12 +263,12 @@ return nil for unexpected contexts."
+ 
+ (defn- random-array
+   [n]
+-  (let [rand (ThreadLocalRandom/current)
+-        a (int-array n)]
++  (let [a (int-array n)]
+     (loop [i 1]
+       (if (= i n)
+         a
+-        (let [j (.nextInt rand (inc i))]
++        ;; The order alts! tries its ports in: a platform decision (any order is possible).
++        (let [j (int (det/random-below-named "core.async alts order" (inc i)))]
+           (aset a i (aget a j))
+           (aset a j i)
+           (recur (inc i)))))))
+@@ -339,6 +340,7 @@ return nil for unexpected contexts."
+        (.lock ^Lock flag)
+        (let [got (and (impl/active? flag) (impl/commit flag))]
+          (.unlock ^Lock flag)
++         (det/sometimes got "core.async: alts! took its default" {})
+          (when got
+            (channels/box [(:default opts) :default])))))))
+ 
+diff --git a/src/main/clojure/clojure/core/async/impl/channels.clj b/src/main/clojure/clojure/core/async/impl/channels.clj
+index 0769532..a6352be 100644
+--- a/src/main/clojure/clojure/core/async/impl/channels.clj
++++ b/src/main/clojure/clojure/core/async/impl/channels.clj
+@@ -11,7 +11,8 @@
+   (:require [clojure.datafy :as datafy]
+             [clojure.core.async.impl.protocols :as impl]
+             [clojure.core.async.impl.dispatch :as dispatch]
+-            [clojure.core.async.impl.mutex :as mutex])
++            [clojure.core.async.impl.mutex :as mutex]
++            [determinismo :as det])
+   (:import [java.util LinkedList Queue]
+            [java.util.concurrent.locks Lock]
+            [clojure.lang IDeref]))
+@@ -75,10 +76,12 @@
+    [this val handler]
+    (when (nil? val)
+      (throw (IllegalArgumentException. "Can't put nil on channel")))
++   (det/buggify-pause "core.async: before a put takes the channel's mutex")
+    (.lock mutex)
+    (cleanup this)
+    (if @closed
+      (let [^Lock handler handler]
++       (det/reachable "core.async: a put on a closed channel" {})
+        (.lock handler)
+        (when (impl/active? handler) (impl/commit handler))
+        (.unlock handler)
+@@ -92,6 +95,7 @@
+              (.unlock handler)
+              (if put-cb
+                (let [done? (reduced? (add! buf val))]
++                 (det/reachable "core.async: a put into a buffer with takers waiting" {})
+                  (if (pos? (count buf))
+                    (let [iter (.iterator takes)
+                          take-cbs (loop [takers []]
+@@ -129,7 +133,8 @@
+                                   (loop [^Lock taker (.next iter)]
+                                     (if (< (impl/lock-id handler) (impl/lock-id taker))
+                                       (do (.lock handler) (.lock taker))
+-                                      (do (.lock taker) (.lock handler)))
++                                      (do (det/reachable "core.async: a put locked its taker first (lock order)" {})
++                                          (.lock taker) (.lock handler)))
+                                     (let [ret (when (and (impl/active? handler) (impl/active? taker))
+                                                 [(impl/commit handler) (impl/commit taker)])]
+                                       (.unlock handler)
+@@ -138,11 +143,14 @@
+                                         (do
+                                           (.remove iter)
+                                           ret)
+-                                        (when (.hasNext iter)
+-                                          (recur (.next iter)))))))]
++                                        (do
++                                          (det/reachable "core.async: a put met a parked taker no longer active (an alts! done elsewhere)" {})
++                                          (when (.hasNext iter)
++                                            (recur (.next iter))))))))]
+            (if (and put-cb take-cb)
+              (do
+                (.unlock mutex)
++               (det/buggify-pause "core.async: between a handoff and its taker's callback")
+                (dispatch/run (appm take-cb val))
+                (box true))
+              (if (and buf (not (impl/full? buf)))
+@@ -153,6 +161,7 @@
+                    (if put-cb
+                      (let [done? (reduced? (add! buf val))]
+                        (when done?
++                         (det/reachable "core.async: a transducer ended the channel (reduced)" {})
+                          (abort this))
+                        (.unlock mutex)
+                        (box true))
+@@ -165,6 +174,8 @@
+                                   (str "No more than " impl/MAX-QUEUE-SIZE
+                                        " pending puts are allowed on a single channel."
+                                        " Consider using a windowed buffer."))
++                   (det/sometimes-greater-than (.size puts) 16
++                                               "core.async: more than 16 puts parked on a channel" {})
+                    (.add puts [handler val]))
+                  (.unlock mutex)
+                  nil))))))))
+@@ -172,6 +183,7 @@
+   impl/ReadPort
+   (take!
+    [this handler]
++   (det/buggify-pause "core.async: before a take takes the channel's mutex")
+    (.lock mutex)
+    (cleanup this)
+    (let [^Lock handler handler
+@@ -197,6 +209,8 @@
+                        (if (and (not done?) (not (impl/full? buf)) (.hasNext iter))
+                          (recur cbs (.next iter))
+                          [done? cbs])))))]
++           (when (seq cbs)
++             (det/reachable "core.async: a take refilled the buffer from parked puts" {}))
+            (when done?
+              (abort this))
+            (.unlock mutex)
+@@ -233,6 +247,7 @@
+              (do
+                (when buf (add! buf))
+                (let [has-val (and buf (pos? (count buf)))]
++                 (det/sometimes has-val "core.async: a take drained a closed channel's buffer" {})
+                  (if-let [take-cb (commit-handler)]
+                    (let [val (when has-val (impl/remove! buf))]
+                      (.unlock mutex)
+@@ -262,10 +277,13 @@
+        nil)
+      (do
+        (reset! closed true)
++       (when-not (.isEmpty puts)
++         (det/reachable "core.async: a channel closed with puts parked" {}))
+        (when (and buf (.isEmpty puts))
+          (add! buf))
+        (let [iter (.iterator takes)]
+          (when (.hasNext iter)
++           (det/reachable "core.async: a close woke parked takes" {})
+            (loop [^Lock taker (.next iter)]
+              (.lock taker)
+              (let [take-cb (and (impl/active? taker) (impl/commit taker))]
+diff --git a/src/main/clojure/clojure/core/async/impl/go.clj b/src/main/clojure/clojure/core/async/impl/go.clj
+index 43c671e..d7b3049 100644
+--- a/src/main/clojure/clojure/core/async/impl/go.clj
++++ b/src/main/clojure/clojure/core/async/impl/go.clj
+@@ -17,7 +17,8 @@
+             [clojure.core.async.impl.protocols :as impl]
+             [clojure.core.async.impl.dispatch :as dispatch]
+             [clojure.core.async.impl.ioc-macros :as rt]
+-            [clojure.set :as set])
++            [clojure.set :as set]
++            [determinismo :as det])
+   (:import [java.util.concurrent.locks Lock]
+            [java.util.concurrent.atomic AtomicReferenceArray]
+            [clojure.lang Var]))
+@@ -604,6 +605,8 @@
+ 
+ (defmethod -item-to-ssa :try
+   [{:keys [catches body finally] :as _ast}]
++  (det/sometimes (and finally (seq catches))
++                 "core.async go macro: a try with catches and a finally in a go block" {})
+   (let [make-finally (fn [exit-block rethrow?]
+                        (if finally
+                          (gen-plan
+diff --git a/src/main/clojure/clojure/core/async/impl/ioc_macros.clj b/src/main/clojure/clojure/core/async/impl/ioc_macros.clj
+index 2366ae8..e0cd06e 100644
+--- a/src/main/clojure/clojure/core/async/impl/ioc_macros.clj
++++ b/src/main/clojure/clojure/core/async/impl/ioc_macros.clj
+@@ -11,7 +11,8 @@
+ 
+ (ns ^{:skip-wiki true}
+   clojure.core.async.impl.ioc-macros
+-  (:require [clojure.core.async.impl.protocols :as impl])
++  (:require [clojure.core.async.impl.protocols :as impl]
++            [determinismo :as det])
+   (:import [java.util.concurrent.locks Lock]
+            [java.util.concurrent.atomic AtomicReferenceArray]))
+ 
+@@ -61,6 +62,7 @@
+   (try
+     (run-state-machine state)
+     (catch Throwable ex
++      (det/reachable "core.async: an exception escaped a go block (its channel closes)" {})
+       (impl/close! (aget-object state USER-START-IDX))
+       (throw ex))))
+ 
+@@ -71,7 +73,7 @@
+                                      (run-state-machine-wrapped state))))]
+     (do (aset-all! state VALUE-IDX @cb STATE-IDX blk)
+         :recur)
+-    nil))
++    (det/reachable "core.async: a go block parked on a take" {})))
+ 
+ (defn put! [state blk c val]
+   (if-let [cb (impl/put! c val (fn-handler (fn [ret-val]
+@@ -79,7 +81,7 @@
+                                              (run-state-machine-wrapped state))))]
+     (do (aset-all! state VALUE-IDX @cb STATE-IDX blk)
+         :recur)
+-    nil))
++    (det/reachable "core.async: a go block parked on a put" {})))
+ 
+ (defn return-chan [state value]
+   (let [c (aget-object state USER-START-IDX)]
+diff --git a/src/main/clojure/clojure/core/async/impl/timers.clj b/src/main/clojure/clojure/core/async/impl/timers.clj
+index 897bce9..da78c70 100644
+--- a/src/main/clojure/clojure/core/async/impl/timers.clj
++++ b/src/main/clojure/clojure/core/async/impl/timers.clj
+@@ -9,7 +9,8 @@
+ (ns ^{:skip-wiki true}
+   clojure.core.async.impl.timers
+   (:require [clojure.core.async.impl.protocols :as impl]
+-            [clojure.core.async.impl.channels :as channels])
++            [clojure.core.async.impl.channels :as channels]
++            [determinismo :as det])
+   (:import [java.util.concurrent DelayQueue Delayed TimeUnit ConcurrentSkipListMap]))
+ 
+ (set! *warn-on-reflection* true)
+@@ -62,6 +63,7 @@
+   (let [timeout (+ (System/currentTimeMillis) msecs)
+         me (.ceilingEntry timeouts-map timeout)]
+     (or (when (and me (< (.getKey me) (+ timeout TIMEOUT_RESOLUTION_MS)))
++          (det/reachable "core.async: a timeout shared another's channel (within the resolution)" {})
+           (.channel ^TimeoutQueueEntry (.getValue me)))
+         (let [timeout-channel (channels/chan nil)
+               timeout-entry (TimeoutQueueEntry. timeout-channel timeout)]

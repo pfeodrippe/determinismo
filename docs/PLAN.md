@@ -183,7 +183,16 @@ blind, with its findings documented in its README.
    - Threads, contention and preemption are what determinismo varies (CPU modulation, thread
      pauses), so the STM and lazy-seq paths are the likeliest to fail; the compiler's are the
      likeliest to need guidance to reach at all.
-4. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers.
+4. **core.async in depth** (clojure/core.async, a compiler and a concurrency library in one):
+   a pinned fork with the Clojure SDK's assertions at its rare paths, buggify points in its race
+   windows and alts!'s port order a platform decision. Started: examples/clojure-core-async
+   (core.async 1.9.865 with core-async.patch, 20 sites in channels, alts!, the go runtime and
+   macro, and timers; scenarios channels, alts, pipeline, mult, go and timeout, with what
+   core.async promises as properties: nothing lost or duplicated, order per producer and through
+   pipelines, every mult tap served, catch and finally after parks, no early timeout). Next:
+   pub/sub and mix, put!/take! callbacks, the dispatch pools, more go macro forms (loops, case,
+   nested try parking).
+5. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers.
 
 ## Code: instrumentation, locations, targeted runs
 

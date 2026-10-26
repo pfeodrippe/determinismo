@@ -130,11 +130,12 @@ sessions and interrupts), [examples/clojure-cli-repl](examples/clojure-cli-repl)
 CLI's REPL: editors, watching terminals and the inspector over its nREPL middleware, with plain
 nREPL as the reference), [examples/clojure-libs](examples/clojure-libs) (Clojure's most used
 libraries: core.async, manifold, round trips through cheshire, jsonista, data.json, nippy,
-clj-yaml, and malli; one scenario per library) and
+clj-yaml, and malli; one scenario per library),
 [examples/clojure-compiler](examples/clojure-compiler) (the Clojure compiler and runtime
 themselves, patched with assertions at their rare paths and buggify points in their race
 windows: the STM, hash collision nodes, lazy seqs, generated forms under every compiler
-option).
+option) and [examples/clojure-core-async](examples/clojure-core-async) (core.async patched the
+same way: channels, alts!, pipelines, mults, go blocks parking in try/catch/finally, timeouts).
 
 The services themselves use the SDK of their language for their own assertions, events and
 randomness (every SDK announces its program's assertions as the code loads, before they run, so

@@ -1,0 +1,2 @@
+{:paths ["src"]
+ :deps {org.clojure/core.async {:local/root "/src/core.async"}}}
