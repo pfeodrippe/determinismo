@@ -89,3 +89,19 @@ most timelines and thousands of faults lasted seconds, yet neither bug below app
 Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
 safety), and a snapshot installation livelock (convergence; it needs snapshots and a follower
 far behind, which long timelines now give).
+
+What the double vote needs, read from raft.go. A heartbeat runs `appendEntries` on the
+transport's goroutine, beside the main loop. It checks the term (`a.Term > getCurrentTerm() ||
+getState() != Follower`) and only then sets it (`setCurrentTerm(a.Term)`, which writes the
+stable store first), so the term can go back:
+1. B, a candidate that lost term T-1, gets the first heartbeat of T-1's leader just as C's vote
+   request for T arrives.
+2. The heartbeat passes its check while B is still at T-1. The main loop then moves B to T and
+   votes for C (both written to the store), and the heartbeat writes T-1 after them.
+3. B, a follower at T-1 that does not hear C's heartbeats (C to B cut), times out and runs for
+   T, overwriting its vote for C with one for itself. If A has not voted in T, B wins T, which
+   C already won: two `election won` at T.
+
+The race opens only while a goroutine waits on a store write (fsync), and then needs a cut link
+and a node that has not voted. Each step is common in our runs, but all four together, in that
+order, have not happened yet.
