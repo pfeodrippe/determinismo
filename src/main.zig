@@ -1342,6 +1342,17 @@ fn explore_tree(
         const done = try arena.alloc(*const Summary, summaries.count);
         for (done, summaries.items[0..summaries.count]) |*slot, *summary| slot.* = summary;
         std.sort.insertion(*const Summary, done, {}, summary_before);
+        // What each behavior new this generation was reached by: how many of its timelines.
+        // Every timeline is judged against what earlier generations knew, and what it found
+        // weighs more the fewer of its generation found it too (measured on the self-test maze:
+        // deeper than claiming behaviors in index order, where the first timeline took all the
+        // common ones and the latest of them sat past the decisions that mattered).
+        var reached: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+        for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+            if (seen.contains(behavior.hash)) continue;
+            const entry = try reached.getOrPut(arena, behavior.hash);
+            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+        };
         var candidates: [tree.generation_size]Candidate = undefined;
         var candidate_count: u32 = 0;
         const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
@@ -1353,8 +1364,11 @@ fn explore_tree(
             var changed_moment: ?u64 = null;
             var changed_label: []const u8 = "";
             @memset(hunks_reached, false);
-            // The frontier (Go-Explore): its latest new behavior that leaves room to go on (in
-            // its first four fifths); the branches return just after it.
+            // The frontier (Go-Explore): its rarest new behavior (the fewest of its generation
+            // reached it; latest among equals) that leaves room to go on (in its first four
+            // fifths); the branches return just after it.
+            var score: f64 = 0;
+            var moment_reached: u32 = std.math.maxInt(u32);
             const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
             for (summary.behaviors[0..summary.behavior_count]) |behavior| {
                 // A targeted run: which hunks it ran (counted once), and when it first ran
@@ -1371,17 +1385,19 @@ fn explore_tree(
                         changed_label = behavior.name();
                     }
                 };
-                const known = try seen.getOrPut(arena, behavior.hash);
-                if (known.found_existing) continue;
+                const timelines = reached.get(behavior.hash) orelse continue; // Known before.
                 novel += 1;
-                if (behavior.vtime_ns <= room_end) {
+                score += 1.0 / @as(f64, @floatFromInt(timelines));
+                if (behavior.vtime_ns <= room_end and timelines <= moment_reached) {
                     moment = behavior.vtime_ns;
+                    moment_reached = timelines;
                     label = behavior.name();
                 }
             }
             candidates[candidate_count] = .{
                 .summary = summary,
                 .novel = novel,
+                .score = score,
                 .moment = moment,
                 .label = label,
                 .changed_moment = changed_moment,
@@ -1389,6 +1405,8 @@ fn explore_tree(
             };
             candidate_count += 1;
         }
+        var new_ones = reached.keyIterator();
+        while (new_ones.next()) |hash| try seen.put(arena, hash.*, {});
         const chosen = candidates[0..candidate_count];
         std.sort.insertion(Candidate, chosen, {}, candidate_before);
         const returns = try tree_returns(arena, exploration.strategy, generation, chosen, &random);
@@ -1466,7 +1484,7 @@ fn explore_tree(
         }
         std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
             "({d} known); {d} moments returned to\n", .{
-            generation, done.len, new_behaviors(chosen), seen.count(), made,
+            generation, done.len, reached.count(), seen.count(), made,
         });
         plan = next;
     }
@@ -1484,6 +1502,8 @@ const changed_room_ns = 2 * std.time.ns_per_ms;
 const Candidate = struct {
     summary: *const Summary,
     novel: u32,
+    /// Its new behaviors, each weighing 1 / the timelines of its generation that reached it.
+    score: f64 = 0,
     moment: ?u64,
     label: []const u8,
     /// A targeted run: when it first ran changed code (with room to go on), and which line.
@@ -1555,7 +1575,8 @@ fn tree_returns(
             })
         else if (candidate.moment != null)
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
-                "{s} ({d} behaviors no timeline before it had): its frontier.", .{
+                "{s}, the rarest of the {d} behaviors no timeline before it had: its " ++
+                "frontier.", .{
                 summary.index, candidate.label, candidate.novel,
             })
         else
@@ -1571,18 +1592,12 @@ fn tree_returns(
 fn candidate_before(_: void, a: Candidate, b: Candidate) bool {
     // Timelines that ran changed code first (targeted runs), then the most novel.
     if ((a.changed_moment != null) != (b.changed_moment != null)) return a.changed_moment != null;
-    if (a.novel != b.novel) return a.novel > b.novel;
+    if (a.score != b.score) return a.score > b.score;
     return a.summary.index < b.summary.index;
 }
 
 fn summary_before(_: void, a: *const Summary, b: *const Summary) bool {
     return a.index < b.index;
-}
-
-fn new_behaviors(candidates: []const Candidate) u32 {
-    var sum: u32 = 0;
-    for (candidates) |candidate| sum += candidate.novel;
-    return sum;
 }
 
 /// The overrides of branch `index`'s tape in `directory` (null when it has no tape).
