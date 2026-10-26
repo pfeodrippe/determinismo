@@ -114,6 +114,12 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
     while (true) {
         const client = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(client) != .SUCCESS) continue;
+        // What a request allocates (a query over a big run reads gigabytes) goes with it: the
+        // server's own state is fixed arrays of plain values.
+        var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer request_arena.deinit();
+        server.arena = request_arena.allocator();
+        defer server.arena = arena;
         runs_reap(server);
         handle(server, @intCast(client));
         _ = linux.close(@intCast(client));
@@ -218,12 +224,22 @@ fn run_route(
         return run_extract(server, run, request.body, out);
     }
     if (eql(u8, action, "discovery") and eql(u8, request.method, "GET")) {
-        const events = try std.fs.path.join(server.arena, &.{
-            try run_directory(server, run.id), "events",
-        });
+        // A finished run's never changes: computed once (it reads every event), then kept.
+        const finished = run.status != null;
+        if (finished) if (run_file(server, run.id, "discovery.json")) |kept| {
+            try out.writeAll(kept);
+            return 200;
+        } else |_| {};
+        const directory = try run_directory(server, run.id);
+        const events = try std.fs.path.join(server.arena, &.{ directory, "events" });
         const timelines = try query.timelines_read(server.arena, server.io, events, null);
         const points = try query.discovery(server.arena, timelines);
-        try out.print("{{\"points\":{f}}}\n", .{std.json.fmt(points, .{})});
+        const text = try print(server, "{{\"points\":{f}}}\n", .{std.json.fmt(points, .{})});
+        if (finished) {
+            const path = try std.fs.path.join(server.arena, &.{ directory, "discovery.json" });
+            std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = text }) catch {};
+        }
+        try out.writeAll(text);
         return 200;
     }
     if (eql(u8, action, "findings") and eql(u8, request.method, "GET")) {
