@@ -46,7 +46,8 @@ grep -q '^CONFIG_KVM_INTEL=m' "/boot/config-$(uname -r)" && ok "kvm_intel is a m
 [ -d "/lib/modules/$(uname -r)/build" ] && ok "headers for running kernel" || bad "headers for running kernel"
 grep -q 'TSX disabled\|Not affected' /sys/devices/system/cpu/vulnerabilities/tsx_async_abort && ok "TSX off" || bad "TSX off"
 grep -qw rtm /proc/cpuinfo && bad "RTM hidden" || ok "RTM hidden"
-dmesg | grep -q 'EDAC MC0' && ok "ECC (EDAC)" || bad "ECC (EDAC)" "(not detected)"
+# sysfs, not dmesg: a long kernel log piped into grep -q dies of SIGPIPE, which pipefail reports.
+[ -d /sys/devices/system/edac/mc/mc0 ] && ok "ECC (EDAC)" || bad "ECC (EDAC)" "(not detected)"
 
 echo "== Branch-count repeatability (user mode, 50 runs, each CPU)"
 src=$(dirname "$0")/../../bench/pmu/count_repeat.c
