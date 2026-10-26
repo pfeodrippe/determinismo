@@ -608,8 +608,11 @@ fn timeline_test(arena: std.mem.Allocator, lines: []const []const u8) !query.Tim
     const events = try arena.alloc(query.Event, lines.len);
     for (lines, events, 0..) |line, *event, index| {
         const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
-        const place = .{ .branch = 0, .seq = index, .vtime_ns = index * std.time.ns_per_s };
-        event.* = try query.Event.of(arena, place, value);
+        event.* = try query.Event.of(arena, .{
+            .branch = 0,
+            .seq = index,
+            .vtime_ns = index * std.time.ns_per_s,
+        }, value);
     }
     return .{ .branch = 0, .events = events };
 }
