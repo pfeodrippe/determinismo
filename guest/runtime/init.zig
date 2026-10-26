@@ -39,7 +39,8 @@ pub fn main(init: std.process.Init) !void {
     const status = run(arena, cmdline);
     std.debug.print("[guest] done, status {d}\n", .{status});
     for (node_names) |name| {
-        if (nodes.pid_of(name) != null) sdk.always(true, node_exit_property, .{ .node = name });
+        if (nodes.pid_of(name) == null) continue;
+        sdk.assert_computed(.always, true, node_exit_property, .{ .node = name });
     }
     kernel_check();
     memory_check();
@@ -263,7 +264,8 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
         // and any exit while the node's disk fails (giving up on I/O errors is legitimate).
         const signaled = code == 128 + 9 or code == 128 + 15;
         const expected = code == 0 or signaled or nodes.disk_failing(name);
-        sdk.always(expected, node_exit_property, .{ .node = name, .status = code });
+        const details = .{ .node = name, .status = code };
+        sdk.assert_computed(.always, expected, node_exit_property, details);
         return;
     }
 }
@@ -304,9 +306,9 @@ fn kernel_check() void {
             sdk.assert_computed(.always, false, property, details);
         }
     }
-    if (!seen.get(.oom_kill)) sdk.always(true, oom_property, .{});
-    if (!seen.get(.crash)) sdk.always(true, crash_property, .{});
-    if (!seen.get(.kernel)) sdk.always(true, kernel_property, .{});
+    if (!seen.get(.oom_kill)) sdk.assert_computed(.always, true, oom_property, .{});
+    if (!seen.get(.crash)) sdk.assert_computed(.always, true, crash_property, .{});
+    if (!seen.get(.kernel)) sdk.assert_computed(.always, true, kernel_property, .{});
 }
 
 const KmsgRecord = struct { time_us: u64, text: []const u8 };
@@ -360,7 +362,7 @@ fn memory_check() void {
     const meminfo = read_text("/proc/meminfo", &meminfo_buffer);
     const total = meminfo_total(meminfo) orelse return;
     const details = .{ .peak_mib = peak >> 20, .total_mib = total >> 20 };
-    sdk.always(peak * 100 < total * 95, memory_property, details);
+    sdk.assert_computed(.always, peak * 100 < total * 95, memory_property, details);
 }
 
 /// MemTotal from /proc/meminfo's first line, in bytes.

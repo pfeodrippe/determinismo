@@ -52,8 +52,7 @@ in ANTITHESIS.md yet.
 1. **Guidance assertions**: done in every SDK, used by det-strategy-mutate and the LLM strategy.
    Left: guidance-aware Go-Explore cells (see "Strategy guidance").
 2. **Assertion locations**: done in every SDK (Zig through the return address and its debug
-   info). Left: past the SDK's own helpers (`sdk.retry` reports itself, not its caller) and
-   det-init's built-ins (which have no place in user code).
+   info); the platform's built-in properties carry none (they have no place in user code).
 3. **First pass, first failure**: done in every SDK (opt-in; guidance only when it improves).
 4. **Disk faults**: Antithesis documents restarts that keep durably synced changes or lose all
    of them: `crash` (an ext4 disk per node, shut down without flushing) and `wipe`. Beyond

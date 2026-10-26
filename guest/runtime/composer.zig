@@ -500,7 +500,8 @@ fn report_exit(command: *const Command, status: u32) void {
     const code = if (exited) (status >> 8) & 0xff else 128 + (status & 0x7f);
     const name = command.name;
     sdk.event("command_exit", .{ .command = name, .status = code });
-    sdk.always(code == 0, "test commands exit successfully", .{ .command = name, .status = code });
+    const details = .{ .command = name, .status = code };
+    sdk.assert_computed(.always, code == 0, "test commands exit successfully", details);
 }
 
 fn pause(duration_ns: u64) void {
