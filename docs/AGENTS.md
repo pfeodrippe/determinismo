@@ -105,6 +105,7 @@ use them in other repositories.
   under way ends and none but clock skips start for 5 seconds (`0` ends a quiet period). Every
   link that allows degradation carries a baseline (a small delay with jitter, rare drops) for
   the whole run, as Antithesis's baseline latency; faults end by returning links to it.
+  Durable disks have a baseline too (`disk_baseline`: 0 to 2 ms per I/O, per timeline).
   `--cpu-modulation` (MCP and HTTP `cpu_modulation`) makes branches run at varying speeds: other
   interleavings of the same seed; pass it to replays of such a run too (tapes refuse without).
 - Exit status of explore: 0 every property passed, 3 some failed, anything else an error.

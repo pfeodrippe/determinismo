@@ -51,7 +51,7 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   failing, writes failing, writes acknowledged and never stored, corrupted reads, or a slow
   disk, through device-mapper); graceful stops; clock skips, some
   permanent; custom faults (your programs, run in a node at random times); a baseline of
-  latency, jitter and rare drops on every link, always on; CPU modulation (`--cpu-modulation`:
+  latency, jitter and rare drops on every link, always on, and of latency on durable disks; CPU modulation (`--cpu-modulation`:
   stretches of a slower machine, so preemption lands elsewhere); quiet periods requested from
   any node or command (`$DETERMINISMO_STOP_FAULTS <seconds>`, or the Antithesis name
   `$ANTITHESIS_STOP_FAULTS`; 0 ends one).
