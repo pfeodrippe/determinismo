@@ -10,6 +10,10 @@
 //! CPUs are taken physical cores first: a VM alone on a core runs faster than two on sibling
 //! hyperthreads (each about two thirds as fast), so a host with room gives each VM a core, and a
 //! busy one still uses every thread.
+//!
+//! A process with `DETERMINISMO_CPU_PRIORITY` set (checks, e.g. `zig build e2e`) goes first: while
+//! one waits it holds a shared lock on the pool's `priority` file, and the others leave the next
+//! free CPU to it. Exploration runs never have to stop for a check.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -23,6 +27,9 @@ pub const Pool = struct {
     cpus: [cpus_max]u16 = undefined,
     fds: [cpus_max]linux.fd_t = undefined,
     count: u32 = 0,
+    /// The pool's `priority` file: shared-locked by priority processes while they wait.
+    priority_fd: linux.fd_t = -1,
+    priority: bool = false,
 
     /// Opens the pool of the CPUs this process may run on.
     pub fn open(pool: *Pool) !void {
@@ -53,6 +60,15 @@ pub const Pool = struct {
             pool.count += 1;
         }
         if (pool.count == 0) return error.NoCpus;
+        var priority_buffer: [96]u8 = undefined;
+        const priority_path = try std.fmt.bufPrintSentinel(&priority_buffer, "{s}/priority", .{
+            directory,
+        }, 0);
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+        const priority_fd = linux.open(priority_path, flags, 0o600);
+        if (linux.errno(priority_fd) != .SUCCESS) return error.PoolFile;
+        pool.priority_fd = @intCast(priority_fd);
+        pool.priority = std.c.getenv("DETERMINISMO_CPU_PRIORITY") != null;
         // Each core's first thread, then the siblings (stable: by number within each).
         var order: [cpus_max]u32 = undefined;
         for (order[0..pool.count], 0..) |*slot, index| slot.* = @intCast(index);
@@ -74,6 +90,7 @@ pub const Pool = struct {
 
     pub fn close(pool: *Pool) void {
         for (pool.fds[0..pool.count]) |fd| _ = linux.close(fd);
+        if (pool.priority_fd >= 0) _ = linux.close(pool.priority_fd);
         pool.count = 0;
     }
 
@@ -81,8 +98,19 @@ pub const Pool = struct {
     /// process to it.
     pub fn take(pool: *Pool) Held {
         assert(pool.count > 0);
+        // Waiting with priority: the others see it, and leave free CPUs to it.
+        if (pool.priority) _ = linux.flock(pool.priority_fd, std.posix.LOCK.SH);
+        defer if (pool.priority) {
+            _ = linux.flock(pool.priority_fd, std.posix.LOCK.UN);
+        };
         var wait_ns: u64 = wait_ns_min;
-        while (true) {
+        while (true) : ({
+            // Every CPU runs a VM, or one waits with priority: back-pressure, until one is free.
+            const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
+            _ = linux.nanosleep(&pause, null);
+            wait_ns = @min(wait_ns * 2, wait_ns_max);
+        }) {
+            if (!pool.priority and pool.priority_waiting()) continue;
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
@@ -90,11 +118,15 @@ pub const Pool = struct {
                 pin(pool.cpus[slot]);
                 return .{ .slot = slot };
             }
-            // Every CPU runs a VM: back-pressure, until one is given back.
-            const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
-            _ = linux.nanosleep(&pause, null);
-            wait_ns = @min(wait_ns * 2, wait_ns_max);
         }
+    }
+
+    /// Whether a priority process waits for a CPU (it holds the `priority` file shared).
+    fn priority_waiting(pool: *Pool) bool {
+        const probe = linux.flock(pool.priority_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        if (linux.errno(probe) != .SUCCESS) return true;
+        _ = linux.flock(pool.priority_fd, std.posix.LOCK.UN);
+        return false;
     }
 
     pub fn give(pool: *Pool, held: Held) void {
