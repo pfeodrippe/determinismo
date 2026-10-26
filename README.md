@@ -174,7 +174,9 @@ determinismo explore ... --compose tests/antithesis-compat/bank/compose.yaml --s
 ## Quickstart (on the host)
 
 One command from your machine sets up a host, from a Hetzner box in its rescue system to an
-end-to-end check (idempotent; `--guest-from det@<host>` gives it another host's guest kernel):
+end-to-end check and `determinismo serve` running as a unit (idempotent, and the way to update a
+host: it stops serve and its runs first; `--guest-from det@<host>` gives it another host's guest
+kernel):
 
 ```
 infra/host/setup.sh <ip>
@@ -194,7 +196,11 @@ sudo infra/host/kvm-at-boot.sh det        # and at every boot
 guest/kernel/build.sh ~/guest             # the guest kernel and det_guest.ko
 zig build -Drelease                       # the VMM, the guest runtime, the examples
 zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko --busybox /usr/bin/busybox --out ~/guest/base.cpio
+sudo infra/host/serve.sh det start        # serve as a unit (stop: its runs stop too)
 ```
+
+Runs go to serve with `determinismo explore --serve 127.0.0.1:7878 ...`; its web UI through
+`ssh -L 7878:127.0.0.1:7878 det@<ip>`.
 
 Then explore a system (images are pulled and cached under `--cache` on first use):
 

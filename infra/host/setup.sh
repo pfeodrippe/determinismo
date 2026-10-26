@@ -3,7 +3,8 @@
 # Sets up a determinismo host from your machine, in one go: from a Hetzner box in its rescue
 # system (or one installed already) to a checked host. Debian, provisioning and hardening, the
 # repository, the toolchain, hardware qualification, our KVM (loaded at every boot), the guest,
-# the build, and an end-to-end check. Idempotent: run it again after a failure, or to update.
+# the build, an end-to-end check, and serve (a unit). Idempotent: run it again after a failure,
+# or to update (which stops serve and its runs first).
 # Usage: infra/host/setup.sh <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>]
 #   --guest-from: the guest kernel and module copied from that host instead of built here, so
 #   every host runs the same guest (the same run inputs, for replays across hosts).
@@ -59,6 +60,8 @@ fi
 ssh "${ssh_opts[@]}" "$user@$ip" bash -s <<'EOF'
 set -euo pipefail
 cd ~/determinismo
+echo "== serve stopped (and its runs): the build and KVM change under them"
+sudo infra/host/serve.sh "$USER" stop
 echo "== toolchain"
 infra/host/tools.sh
 echo "== hardware qualification"
@@ -78,5 +81,7 @@ zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko \
   --busybox /usr/bin/busybox --out ~/guest/base.cpio
 echo "== end-to-end check"
 ~/opt/zig/zig build e2e -Drelease -Donly=bank
+echo "== serve"
+sudo infra/host/serve.sh "$USER" start
 EOF
 echo "== $ip is a determinismo host ($user@$ip)"
