@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! A minimal PostgreSQL client (wire protocol 3, simple queries, trust authentication) over the
-//! SDK's TCP connection (sdk/zig/tcp.zig).
+//! SDK's TCP connection (sdk/zig/tcp.zig). It also speaks to what talks PostgreSQL's protocol:
+//! CockroachDB, YugabyteDB's YSQL.
 const std = @import("std");
 const assert = std.debug.assert;
 const tcp = @import("determinismo").tcp;
@@ -13,14 +14,30 @@ socket: tcp.Connection,
 /// The server's message for the last error.ServerError.
 error_message: [256]u8 = undefined,
 error_message_size: u32 = 0,
+/// Its SQLSTATE ("40001": a serialization failure, the transaction did not happen).
+error_code: [5]u8 = @splat('0'),
 
 const Connection = @This();
 
 pub fn open(connection: *Connection, address: [4]u8, port: u16, user: []const u8) !void {
+    return connection.open_with(address, port, user, null, .{ .timeout_ms = timeout_ms });
+}
+
+/// `open` with a database (null: the user's name, PostgreSQL's default) and connection options:
+/// a longer timeout for servers that commit through consensus.
+pub fn open_with(
+    connection: *Connection,
+    address: [4]u8,
+    port: u16,
+    user: []const u8,
+    database: ?[]const u8,
+    options: tcp.Options,
+) !void {
     connection.error_message_size = 0;
-    try connection.socket.open(address, port, .{ .timeout_ms = timeout_ms });
+    connection.error_code = @splat('0');
+    try connection.socket.open(address, port, options);
     errdefer connection.socket.close();
-    try connection.startup(user);
+    try connection.startup(user, database orelse user);
 }
 
 pub fn close(connection: *Connection) void {
@@ -29,6 +46,17 @@ pub fn close(connection: *Connection) void {
 
 pub fn last_error(connection: *const Connection) []const u8 {
     return connection.error_message[0..connection.error_message_size];
+}
+
+/// The last error's SQLSTATE.
+pub fn sqlstate(connection: *const Connection) []const u8 {
+    return &connection.error_code;
+}
+
+/// Runs a query and returns the first column of its first row as text, copied into `cell` (null
+/// for no row or SQL NULL).
+pub fn query_text(connection: *Connection, sql: []const u8, cell: []u8) !?[]const u8 {
+    return connection.query(sql, cell);
 }
 
 /// Runs statements, ignoring any rows.
@@ -44,12 +72,12 @@ pub fn query_integer(connection: *Connection, sql: []const u8) !?i64 {
     return try std.fmt.parseInt(i64, value, 10);
 }
 
-fn startup(connection: *Connection, user: []const u8) !void {
+fn startup(connection: *Connection, user: []const u8, database: []const u8) !void {
     var message: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&message);
     try writer.writeInt(u32, 0, .big); // Length, patched below.
     try writer.writeInt(u32, protocol_version, .big);
-    try writer.print("user\x00{s}\x00database\x00{s}\x00\x00", .{ user, user });
+    try writer.print("user\x00{s}\x00database\x00{s}\x00\x00", .{ user, database });
     const size: u32 = @intCast(writer.end);
     std.mem.writeInt(u32, message[0..4], size, .big);
     try connection.write_all(message[0..size]);
@@ -108,14 +136,15 @@ fn first_cell(body: []const u8, cell: []u8) !?[]const u8 {
 }
 
 fn server_error(connection: *Connection, body: []const u8) error{ServerError} {
-    // Fields: a type byte and a NUL-terminated string each; 'M' is the message.
+    // Fields: a type byte and a NUL-terminated string each; 'M' is the message, 'C' the SQLSTATE.
     var fields = std.mem.splitScalar(u8, body, 0);
     while (fields.next()) |field| {
-        if (field.len < 1 or field[0] != 'M') continue;
+        if (field.len < 1) continue;
+        if (field[0] == 'C' and field.len == 6) @memcpy(&connection.error_code, field[1..6]);
+        if (field[0] != 'M') continue;
         const size = @min(field.len - 1, connection.error_message.len);
         @memcpy(connection.error_message[0..size], field[1..][0..size]);
         connection.error_message_size = @intCast(size);
-        break;
     }
     return error.ServerError;
 }

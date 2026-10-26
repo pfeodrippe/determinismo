@@ -45,6 +45,24 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "tcp", .module = tcp }},
     });
 
+    // A PostgreSQL client (also for CockroachDB and YugabyteDB), and list-append transactions
+    // over SQL checked by Elle, shared by the SQL examples.
+    const pg = b.createModule(.{
+        .root_source_file = b.path("examples/shop/pg.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "determinismo", .module = sdk }},
+    });
+    const sql_append = b.createModule(.{
+        .root_source_file = b.path("examples/sql/append.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "determinismo", .module = sdk },
+            .{ .name = "pg", .module = pg },
+        },
+    });
+
     // An nREPL client, shared by the nREPL and clojure-cli.repl examples.
     const nrepl = b.createModule(.{
         .root_source_file = b.path("examples/nrepl/client.zig"),
@@ -70,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
         .{ .name = "etcd-test", .path = "examples/etcd/etcd_test.zig" },
         .{ .name = "nats-test", .path = "examples/nats/nats_test.zig" },
+        .{ .name = "postgres-test", .path = "examples/postgres/postgres_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },
@@ -93,6 +112,8 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "determinismo", .module = sdk },
                     .{ .name = "resp", .module = resp },
                     .{ .name = "nrepl", .module = nrepl },
+                    .{ .name = "pg", .module = pg },
+                    .{ .name = "sql_append", .module = sql_append },
                 },
             }),
         });
@@ -242,6 +263,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/voidstar.zig",
         "examples/nrepl/bencode.zig",
         "examples/nats/client.zig",
+        "examples/sql/append.zig",
         "examples/shop/pg.zig",
         "tools/e2e.zig",
         "tools/initramfs.zig",
@@ -257,6 +279,7 @@ pub fn build(b: *std.Build) void {
             },
         }) });
         if (std.mem.eql(u8, root, "src/main.zig")) duckdb_link(b, unit_tests.root_module, duckdb);
+        if (std.mem.eql(u8, root, "examples/sql/append.zig")) unit_tests.root_module.addImport("pg", pg);
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
     const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{

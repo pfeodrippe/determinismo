@@ -10,7 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const sdk = @import("determinismo");
-const Postgres = @import("pg.zig");
+const Postgres = @import("pg");
 const Redis = @import("resp");
 
 const Nodes = struct { postgres: sdk.Node, redis: sdk.Node };
