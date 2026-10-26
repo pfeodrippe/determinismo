@@ -4,7 +4,7 @@
 //!
 //! A handler is a struct with `pub const name`, and optionally the methods `hello`, `branch`,
 //! `random`, `event` (the event and its source) and `branch_end` (see `serve`). Missing methods
-//! answer the default.
+//! answer the default. With `reason`, the answer to `random` says why (shown with the decision).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -107,7 +107,11 @@ fn dispatch_random(
     assert(value.len == default_bytes.len);
     try writer.writeAll("{\"hex\":\"");
     for (value) |byte| try writer.print("{x:0>2}", .{byte});
-    try writer.writeAll("\"}");
+    try writer.writeAll("\"");
+    if (@hasDecl(Handler, "reason")) if (handler.reason()) |text| {
+        try writer.print(",\"reason\":{f}", .{std.json.fmt(text, .{})});
+    };
+    try writer.writeAll("}");
 }
 
 var failing_buffer: [failing_count_max][]const u8 = undefined;

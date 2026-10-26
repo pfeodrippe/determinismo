@@ -120,6 +120,11 @@ const Mutate = struct {
     mutated_positions: [mutations_max]u32 = undefined,
     mutated_values: [mutations_max]u64 = undefined,
     mutation_count: u32 = 0,
+    /// The mutation is at the parent's frontier (where new coverage appeared), not anywhere.
+    mutation_frontier: bool = false,
+    /// Why the last answer: set for mutated decisions only (the parent's own are copies).
+    reason_buffer: [200]u8 = undefined,
+    reason_size: u8 = 0,
 
     io: std.Io,
     sync_dir: ?std.Io.Dir = null,
@@ -151,7 +156,9 @@ const Mutate = struct {
         strategy.parent = parent;
         var candidates: [2 * frontier_sources_max]u32 = undefined;
         const candidate_count = frontier_candidates(&strategy.corpus[parent], prng, &candidates);
+        strategy.mutation_frontier = false;
         if (candidate_count > 0 and prng.uintLessThan(u32, 100) < frontier_percent) {
+            strategy.mutation_frontier = true;
             strategy.mutation_count = 1;
             strategy.mutated_positions[0] = candidates[prng.uintLessThan(u32, candidate_count)];
             strategy.mutated_values[0] = value_random(prng);
@@ -183,8 +190,31 @@ const Mutate = struct {
             strategy.current.count += 1;
         }
         if (!steerable or strategy.parent == null) return null;
+        strategy.reason_note(position);
         std.mem.writeInt(u64, &answer, value, .little);
         return &answer;
+    }
+
+    pub fn reason(strategy: *const Mutate) ?[]const u8 {
+        if (strategy.reason_size == 0) return null;
+        return strategy.reason_buffer[0..strategy.reason_size];
+    }
+
+    fn reason_note(strategy: *Mutate, position: u32) void {
+        strategy.reason_size = 0;
+        const mutated = for (strategy.mutated_positions[0..strategy.mutation_count]) |mutated| {
+            if (mutated == position) break true;
+        } else false;
+        if (!mutated) return; // A copy of the parent's decision: nothing to explain.
+        const where = if (strategy.mutation_frontier)
+            "at its frontier (decisions just before it found new coverage)"
+        else
+            "at random";
+        const text = std.fmt.bufPrint(&strategy.reason_buffer, "Mutated decision {d} of " ++
+            "corpus entry {d} (a timeline that found new coverage), {s}.", .{
+            position, strategy.parent.?, where,
+        }) catch return;
+        strategy.reason_size = @intCast(text.len);
     }
 
     /// The parent's value at `position`, unless that position is mutated; null without a parent.
