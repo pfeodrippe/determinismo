@@ -100,6 +100,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
         .{ "retroactive", check_retroactive },          .{ "hang", check_hang },
+        .{ "kubernetes", check_kubernetes },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1142,6 +1143,38 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// The Kubernetes importer: Antithesis-style manifests (Redis, a Service, a client whose image
+/// has the test templates) run unchanged in one K3s node; the setup waits for the workloads, and
+/// the template's commands run in the client's pod (kubectl exec). Whether Redis keeps its
+/// counts under faults is the system's business, not the importer's.
+fn check_kubernetes(context: *Context) !void {
+    const arena = context.arena;
+    const client = "tests/antithesis-compat/kubernetes/client";
+    const built = try std.process.run(arena, context.io, .{ .argv = &.{
+        "podman", "build", "--quiet", "--tag", "localhost/determinismo-k8s-client:1", client,
+    } });
+    if (built.term != .exited or built.term.exited != 0) {
+        std.debug.print("SKIP kubernetes: podman build failed: {s}\n", .{built.stderr});
+        return;
+    }
+    const report = try explore(context, &.{
+        "--k8s",         "tests/antithesis-compat/kubernetes/manifests", "--scenario",
+        "kv",            "--seed",                                        "1",
+        "--branches",    "2",                                             "--memory-mib",
+        "4096",
+    });
+    const setup = std.mem.indexOf(u8, report, "snapshot at setup_complete") != null;
+    const drove = std.mem.indexOf(u8, report, "test command completed: parallel_driver_count") !=
+        null and std.mem.indexOf(u8, report, "PASS reachable") != null;
+    const ended = std.mem.indexOf(u8, report, "test command started: eventually_counted") != null;
+    const passes = setup and drove and ended;
+    expect(context, passes, "kubernetes: manifests run in K3s, the setup waits for the " ++
+        "workloads, and the templates' commands run in their pods", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
+        "FAIL", "PASS", "error", "snapshot", "k8s",
     }) catch ""});
 }
 

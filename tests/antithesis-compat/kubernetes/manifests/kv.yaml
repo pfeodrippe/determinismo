@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# A Kubernetes project as Antithesis takes one (raw manifests, fully qualified images): Redis
+# behind a Service, and a client whose image has the test templates (client/Dockerfile).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kv
+  template:
+    metadata:
+      labels:
+        app: kv
+    spec:
+      containers:
+        - name: redis
+          image: docker.io/library/redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["--save", "", "--appendonly", "no"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv
+spec:
+  selector:
+    app: kv
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: localhost/determinismo-k8s-client:1
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]

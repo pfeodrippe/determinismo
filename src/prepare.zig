@@ -13,12 +13,16 @@ const std = @import("std");
 const assert = std.debug.assert;
 const schema = @import("determinismo").schema;
 const compose = @import("compose.zig");
+const kubernetes = @import("kubernetes.zig");
 
 pub const Options = struct {
     /// The test program (its `--describe`), or else a Compose file whose services become the
     /// nodes and whose images' Antithesis test templates become the scenarios.
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
+    /// Or a directory of Kubernetes manifests (kubernetes.zig): one K3s node runs them, and the
+    /// test templates in their images become the scenarios.
+    kubernetes: ?[]const u8 = null,
     /// A script for the composer and the fault injector (/det/script.json on the system disk).
     script: ?[]const u8 = null,
     /// The profile to resolve; null takes the first one.
@@ -76,7 +80,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     for (profile.nodes, resolved, disk_paths[1..], 0..) |*node, *target, *disk, index| {
         disk.* = try node_resolve(context, node, @intCast(index), target);
         try faults_adjust(&target.faults, node.name, options);
-        if (options.compose != null) {
+        if (options.compose != null or options.kubernetes != null) {
             const tests = try tests_listing(context, disk.*);
             try compose.templates(arena, node.name, tests, &scenarios);
         }
@@ -110,7 +114,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         .script = script,
         .hash = hash,
     });
-    const source = options.program orelse options.compose.?;
+    const source = options.program orelse options.compose orelse options.kubernetes.?;
     try profile_remember(context, source, &system, system_json);
     return .{
         .disk_paths = disk_paths,
@@ -247,6 +251,117 @@ fn image_disk(
     return disk;
 }
 
+/// The K3s node's build context for a directory of manifests (kubernetes.zig), made once per
+/// manifests in the cache: the manifests, every image they name saved as an offline archive,
+/// and each test template of those images as a command that runs it in its workload.
+fn kubernetes_build(context: Context, directory: []const u8) ![]const u8 {
+    const arena = context.arena;
+    const listing = try tool(context, &.{
+        "find", directory, "-type", "f", "(", "-name", "*.yaml", "-o", "-name", "*.yml", ")",
+    });
+    var paths: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+    while (lines.next()) |line| try paths.append(arena, line);
+    std.mem.sort([]const u8, paths.items, {}, string_before);
+    if (paths.items.len == 0) {
+        std.debug.print("[determinismo] --k8s {s}: no manifests (*.yaml, *.yml)\n", .{directory});
+        return error.NoManifests;
+    }
+    const cwd = std.Io.Dir.cwd();
+    var hasher = std.hash.Wyhash.init(0x6b38);
+    hasher.update(kubernetes.dockerfile);
+    const texts = try arena.alloc([]const u8, paths.items.len);
+    for (paths.items, texts) |path, *text| {
+        text.* = try cwd.readFileAlloc(context.io, path, arena, .limited(16 << 20));
+        hasher.update(path);
+        hasher.update(text.*);
+    }
+    const name = try std.fmt.allocPrint(arena, "{x:0>16}", .{hasher.final()});
+    const build = try path_join(context, &.{ context.cache, "kubernetes", name });
+    const done = try path_join(context, &.{ build, "Dockerfile" }); // Written last.
+    if (exists(context, done)) return build;
+    for ([_][]const u8{ "images", "manifests", "tests" }) |part| {
+        try cwd.createDirPath(context.io, try path_join(context, &.{ build, part }));
+    }
+    var workloads: std.ArrayList(kubernetes.Workload) = .empty;
+    for (paths.items, texts, 0..) |path, text, index| {
+        kubernetes.workloads(arena, text, &workloads) catch |err| {
+            std.debug.print("[determinismo] --k8s: {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        // K3s applies its manifests directory's files (flat): numbered, in order.
+        const file = try std.fmt.allocPrint(arena, "{d:0>3}-{s}", .{
+            index, std.fs.path.basename(path),
+        });
+        try cwd.writeFile(context.io, .{
+            .sub_path = try path_join(context, &.{ build, "manifests", file }),
+            .data = text,
+        });
+    }
+    try kubernetes_images(context, build, workloads.items);
+    try cwd.writeFile(context.io, .{ .sub_path = done, .data = kubernetes.dockerfile });
+    return build;
+}
+
+/// Saves every image the workloads name, and writes their containers' test commands.
+fn kubernetes_images(
+    context: Context,
+    build: []const u8,
+    workloads: []const kubernetes.Workload,
+) !void {
+    const arena = context.arena;
+    const cwd = std.Io.Dir.cwd();
+    var saved: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var templates: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (workloads) |*workload| for (workload.containers) |*container| {
+        var config: ImageConfig = .{};
+        var digest: []const u8 = "";
+        const disk = try image_disk(context, container.image, &config, &digest);
+        if (!saved.contains(container.image)) {
+            try saved.put(arena, container.image, {});
+            const archive = try std.fmt.allocPrint(arena, "{s}/images/{d}.tar", .{
+                build, saved.count(),
+            });
+            _ = try tool(context, &.{
+                "podman", "save", "--quiet", "--format", "docker-archive", "--output", archive,
+                container.image,
+            });
+        }
+        for (try tests_listing(context, disk)) |raw| {
+            const path = std.mem.trimStart(u8, raw, "./");
+            if (!std.mem.startsWith(u8, path, kubernetes.templates_root)) continue;
+            const rest = path[kubernetes.templates_root.len..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+            try templates.put(arena, rest[0..slash], {});
+            const target = try path_join(context, &.{ build, "tests", path });
+            try cwd.createDirPath(context.io, std.fs.path.dirname(target).?);
+            try cwd.writeFile(context.io, .{
+                .sub_path = target,
+                .data = try kubernetes.wrapper(arena, workload, container, path),
+            });
+        }
+    };
+    if (templates.count() == 0) {
+        std.debug.print("[determinismo] --k8s: no test templates (/{s}<template>/) in the " ++
+            "manifests' images\n", .{kubernetes.templates_root});
+        return error.NoTestTemplates;
+    }
+    const setup = try kubernetes.setup_script(arena, workloads);
+    for (templates.keys()) |template| {
+        try cwd.writeFile(context.io, .{
+            .sub_path = try path_join(context, &.{
+                build, "tests", kubernetes.templates_root, template, kubernetes.setup_name,
+            }),
+            .data = setup,
+        });
+    }
+    _ = try tool(context, &.{ "chmod", "-R", "755", try path_join(context, &.{ build, "tests" }) });
+}
+
+fn string_before(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
 /// The names of the program's (or Compose file's) profiles.
 pub fn profile_names(arena: std.mem.Allocator, io: std.Io, options: Options) ![]const []const u8 {
     const context = Context{ .arena = arena, .io = io, .cache = options.cache_directory };
@@ -257,6 +372,12 @@ pub fn profile_names(arena: std.mem.Allocator, io: std.Io, options: Options) ![]
 }
 
 fn describe(context: Context, options: Options) !schema.Description {
+    if (options.kubernetes) |directory| {
+        const profiles = try context.arena.alloc(schema.Profile, 1);
+        const build = try kubernetes_build(context, directory);
+        profiles[0] = try kubernetes.profile(context.arena, build);
+        return .{ .profiles = profiles, .scenarios = &.{} };
+    }
     if (options.compose) |path| {
         const profiles = try context.arena.alloc(schema.Profile, 1);
         profiles[0] = try compose.profile(context.arena, context.io, path);

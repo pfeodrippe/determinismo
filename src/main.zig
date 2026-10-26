@@ -80,7 +80,8 @@ const usage =
     \\                            --node <node> [--pid <pid>]   (every thread's stack there)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
-    \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
+    \\  (--program <test program> | --compose <compose.yaml> | --k8s <manifests dir>)
+    \\  [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
     \\  [--faults +restart,+crash,...]   (fault kinds every node also allows)
     \\  [--no-faults <node>,...]   (nodes that get no faults: a client, a monitor)
@@ -194,6 +195,8 @@ const Arguments = struct {
     program_path: ?[]const u8 = null,
     /// Or a Compose file: services become nodes, Antithesis test templates scenarios.
     compose_path: ?[]const u8 = null,
+    /// A directory of Kubernetes manifests (kubernetes.zig).
+    kubernetes_path: ?[]const u8 = null,
     /// Commands and faults follow this script (determinismo script) instead of choosing.
     script_path: ?[]const u8 = null,
     profile: ?[]const u8 = null,
@@ -234,6 +237,7 @@ pub fn main(init: std.process.Init) !void {
     const names = if (all) try prepare.profile_names(arena, init.io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .kubernetes = arguments.kubernetes_path,
         .cache_directory = arguments.cache_directory,
     }) else try list_split(arena, profile);
     const verdicts = try arena.alloc(u32, names.len);
@@ -296,7 +300,8 @@ fn list_split(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
 fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 {
     const arena = init.arena.allocator();
     var arguments = arguments_given;
-    const has_system = arguments.program_path != null or arguments.compose_path != null;
+    const has_system = arguments.program_path != null or arguments.compose_path != null or
+        arguments.kubernetes_path != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
     if (arguments.moment_script_path) |path| {
@@ -374,6 +379,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
     const Request = struct {
         program: ?[]const u8,
         compose: ?[]const u8,
+        kubernetes: ?[]const u8,
         scenario: ?[]const u8,
         profile: ?[]const u8,
         seed: u64,
@@ -394,6 +400,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
     const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .kubernetes = arguments.kubernetes_path,
         .scenario = arguments.scenario,
         .profile = arguments.profile,
         .seed = arguments.seed,
@@ -495,10 +502,14 @@ fn system_prepare(
     arguments: *Arguments,
 ) !prepare.Prepared {
     if (arguments.disk_count > 0) return error.DisksAndProgram;
-    if (arguments.program_path != null and arguments.compose_path != null) return error.Usage;
+    const systems = @as(u32, @intFromBool(arguments.program_path != null)) +
+        @intFromBool(arguments.compose_path != null) +
+        @intFromBool(arguments.kubernetes_path != null);
+    if (systems > 1) return error.Usage;
     const prepared = try prepare.prepare(arena, io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .kubernetes = arguments.kubernetes_path,
         .script = arguments.script_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
@@ -633,6 +644,7 @@ fn command_explore(
             .profile = arguments.profile,
             .program = arguments.program_path,
             .compose = arguments.compose_path,
+            .kubernetes = arguments.kubernetes_path,
             .system = arguments.system,
             .inputs = &hex16(exploration.inputs),
             .seed = &hex16(arguments.seed),
@@ -1951,6 +1963,8 @@ fn parse_option(
         arguments.script_path = value;
     } else if (eql(u8, flag, "--compose")) {
         arguments.compose_path = value;
+    } else if (eql(u8, flag, "--k8s")) {
+        arguments.kubernetes_path = value;
     } else if (eql(u8, flag, "--profile")) {
         arguments.profile = value;
     } else if (eql(u8, flag, "--scenario")) {
@@ -2150,6 +2164,7 @@ test {
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
     _ = @import("changed.zig");
+    _ = @import("kubernetes.zig");
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
     _ = @import("profile.zig");
