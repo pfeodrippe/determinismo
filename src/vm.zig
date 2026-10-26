@@ -96,6 +96,8 @@ blocks: [disks_max]VirtioBlock,
 block_count: u32,
 /// Branch count at which KVM stops the vCPU for the PIT deadline (0: none).
 target_branches: u64,
+/// The armed soft stop (a clock reading, timer_arm), 0 for none.
+soft_tsc: u64,
 decisions: Decisions,
 events: Events,
 stats: Stats,
@@ -340,6 +342,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .blocks = undefined,
         .block_count = @intCast(options.disks.len),
         .target_branches = 0,
+        .soft_tsc = 0,
         .decisions = .{ .seed = options.seed },
         .events = undefined,
         .stats = .{},
@@ -676,7 +679,12 @@ fn modulate(vm: *VM) !void {
     modulation.branches = state.branches;
     modulation.remainder = owed % 1000;
     var extra_tsc = owed / 1000;
-    if (extra_tsc > 0) _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&extra_tsc));
+    if (extra_tsc > 0) {
+        _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&extra_tsc));
+        // A soft stop is a clock reading: it moves with the clock, to where timer_arm would put
+        // it now (and does, after a hold point re-arms it: the timeline is the same either way).
+        if (vm.soft_tsc != 0) try vm.soft_set(vm.soft_tsc + extra_tsc);
+    }
     const tsc = state.tsc + extra_tsc;
     if (tsc < modulation.change_tsc) return;
     var draw: [8]u8 = undefined;
@@ -735,6 +743,7 @@ pub fn target_set(vm: *VM, target_branches: u64) !void {
 fn soft_set(vm: *VM, soft_tsc: u64) !void {
     var soft = soft_tsc;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_SET_SOFT_TSC, @intFromPtr(&soft));
+    vm.soft_tsc = soft_tsc;
 }
 
 /// At an exit the VMM handles anyway (an exact point, like a soft stop): fire a timer whose
