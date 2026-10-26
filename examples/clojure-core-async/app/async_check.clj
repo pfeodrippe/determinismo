@@ -165,6 +165,111 @@
                   {:n n :seen (mapv count seen)}))
     "ok"))
 
+;; --- pub/sub ---------------------------------------------------------------------------------
+
+(defn pubsub-check
+  "Publishers put [topic producer i] on a pub's source; subscribers, all subscribed before, take
+  until their channels close: each gets exactly its topics' values, a producer's in order. One
+  channel per topic: a channel shared by topics closes with the first topic's mult (close?),
+  which may still drop the other topics' last values, by design."
+  []
+  (let [topics (+ 2 (pick "pubsub topics" 4))
+        source (sized-chan (pick "pubsub source buffer" 4))
+        p (if (zero? (pick "pubsub topic buffers" 2))
+            (a/pub source first)
+            (a/pub source first (fn [_topic] (inc (pick "pubsub topic buffer" 4)))))
+        subscribers (vec (for [_ (range (inc (pick "pubsub subscribers" 4)))]
+                           (let [wanted (set (filter (fn [_] (zero? (pick "pubsub wants" 2)))
+                                                     (range topics)))
+                                 readers (doall
+                                          (for [topic wanted]
+                                            (let [ch (sized-chan (pick "pubsub sub buffer" 4))]
+                                              (a/sub p topic ch)
+                                              (a/go-loop [got []]
+                                                (if-some [v (a/<! ch)] (recur (conj got v)) got)))))]
+                             {:wanted wanted
+                              :got (a/go (loop [rs readers got []]
+                                           (if (seq rs)
+                                             (recur (rest rs) (into got (a/<! (first rs))))
+                                             got)))})))
+        producers (inc (pick "pubsub producers" 3))
+        per (inc (pick "pubsub values per producer" 20))
+        sent (vec (for [producer (range producers) i (range per)]
+                    [(pick "pubsub topic" topics) producer i]))]
+    (when (empty? (filter #(seq (:wanted %)) subscribers))
+      (det/sometimes true "core.async pub: no subscriber wanted any topic" {}))
+    (run! deref (doall (for [producer (range producers)]
+                         (future (doseq [v sent :when (= producer (second v))]
+                                   (a/>!! source v))))))
+    (a/close! source)
+    (doseq [{:keys [wanted got]} subscribers]
+      (let [got (a/<!! got)
+            expected (filter #(contains? wanted (first %)) sent)]
+        (det/always (and (= (sort got) (sort expected))
+                         (every? (fn [[_ items]] (or (empty? (rest items))
+                                                     (apply < (map #(nth % 2) items))))
+                                 (group-by (juxt first second) got)))
+                    "core.async pub: each subscriber gets exactly its topics' values, in order"
+                    {:wanted wanted :got (count got) :expected (count expected)})))
+    "ok"))
+
+;; --- put!/take! callbacks, offer!/poll! -------------------------------------------------------
+
+(defn callbacks-check
+  "Producers put! with callbacks (or offer!), consumers take! with callbacks (or poll!), then the
+  channel closes and drains: what was taken is exactly what was accepted, nothing twice."
+  []
+  (let [ch (sized-chan (pick "callbacks buffer" 4))
+        producers (inc (pick "callbacks producers" 4))
+        per (inc (pick "callbacks values per producer" 20))
+        accepted (atom [])
+        taken (atom [])
+        pending (atom 0) ; put!s and take!s whose callbacks have not run yet
+        produce (fn [producer]
+                  (dotimes [i per]
+                    (let [v [producer i]]
+                      (if (zero? (pick "callbacks offer" 3))
+                        (when (a/offer! ch v) (swap! accepted conj v))
+                        (let [done (promise)]
+                          (swap! pending inc)
+                          (a/put! ch v (fn [ok]
+                                         (when ok (swap! accepted conj v))
+                                         (swap! pending dec)
+                                         (deliver done ok))
+                                  (zero? (pick "callbacks on caller" 2)))
+                          ;; Parked puts complete as consumers take; don't wait on them all.
+                          (when (zero? (pick "callbacks wait for the put" 2))
+                            (deref done 200 nil)))))))
+        consume (fn []
+                  (dotimes [_ (* 2 per)]
+                    (if (zero? (pick "callbacks poll" 3))
+                      (when-some [v (a/poll! ch)] (swap! taken conj v))
+                      (let [got (promise)]
+                        (swap! pending inc)
+                        ;; The callback records what it gets: a take given up on still counts.
+                        (a/take! ch (fn [v]
+                                      (when (some? v) (swap! taken conj v))
+                                      (swap! pending dec)
+                                      (deliver got v)))
+                        (deref got 50 nil)))))]
+    (run! deref (doall (concat (for [p (range producers)] (future (produce p)))
+                               (for [_ (range (inc (pick "callbacks consumers" 3)))]
+                                 (future (consume))))))
+    (a/close! ch)
+    ;; Takes still parked (their promise given up) get nil once closed and drained; the rest
+    ;; drains here.
+    (loop [] (when-some [v (a/<!! ch)] (swap! taken conj v) (recur)))
+    (loop [waited 0] ; Every callback issued runs: closed, nothing stays parked.
+      (when (and (pos? @pending) (< waited 5000))
+        (Thread/sleep 10)
+        (recur (+ waited 10))))
+    (det/always (zero? @pending) "core.async: every put! and take! callback runs once closed"
+                {:pending @pending})
+    (det/always (= (sort @accepted) (sort @taken))
+                "core.async: what put! and offer! had accepted is taken, each once"
+                {:accepted (count @accepted) :taken (count @taken)})
+    "ok"))
+
 ;; --- go blocks: parking in try, catch and finally --------------------------------------------
 
 (defn go-check []
@@ -226,6 +331,8 @@
                   "alts" (alts-check)
                   "pipeline" (pipeline-check)
                   "mult" (mult-check)
+                  "pubsub" (pubsub-check)
+                  "callbacks" (callbacks-check)
                   "go" (go-check)
                   "timeout" (timeout-check)
                   "unknown")

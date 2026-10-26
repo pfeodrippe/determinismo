@@ -9,7 +9,7 @@
 //! finally after parks, and no timeout early.
 //!
 //! One scenario per check (`--scenario all` explores them all): channels, alts, pipeline, mult,
-//! go, timeout.
+//! pubsub, callbacks (put!/take! callbacks, offer!/poll!), go, timeout.
 const std = @import("std");
 const sdk = @import("determinismo");
 
@@ -25,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
         .alts = Check("alts").scenario,
         .pipeline = Check("pipeline").scenario,
         .mult = Check("mult").scenario,
+        .pubsub = Check("pubsub").scenario,
+        .callbacks = Check("callbacks").scenario,
         .go = Check("go").scenario,
         .timeout = Check("timeout").scenario,
     } });

@@ -1,5 +1,5 @@
 diff --git a/src/main/clojure/clojure/core/async.clj b/src/main/clojure/clojure/core/async.clj
-index bf44fed..51e5c60 100644
+index bf44fed..0d2ef7e 100644
 --- a/src/main/clojure/clojure/core/async.clj
 +++ b/src/main/clojure/clojure/core/async.clj
 @@ -44,6 +44,7 @@ return nil for unexpected contexts."
@@ -34,6 +34,31 @@ index bf44fed..51e5c60 100644
           (when got
             (channels/box [(:default opts) :default])))))))
  
+@@ -826,9 +828,12 @@ return nil for unexpected contexts."
+          (doseq [[c close?] @cs]
+            (when close? (close! c)))
+          (let [chs (keys @cs)]
++           (when (empty? chs)
++             (det/reachable "core.async mult: a value with no taps was dropped" {}))
+            (reset! dctr (count chs))
+            (doseq [c chs]
+              (when-not (put! c val done)
++               (det/reachable "core.async mult: a tap that closed was removed" {})
+                (untap* m c)))
+            ;;wait for all
+            (when (seq chs)
+@@ -1016,8 +1021,11 @@ return nil for unexpected contexts."
+                (close! (muxch* m)))
+              (let [topic (topic-fn val)
+                    m (get @mults topic)]
++               (when-not m
++                 (det/reachable "core.async pub: a value for a topic nobody subscribed to was dropped" {}))
+                (when m
+                  (when-not (>! (muxch* m) val)
++                   (det/reachable "core.async pub: a topic whose channel closed was removed" {})
+                    (swap! mults dissoc topic)))
+                (recur)))))
+        p)))
 diff --git a/src/main/clojure/clojure/core/async/impl/channels.clj b/src/main/clojure/clojure/core/async/impl/channels.clj
 index 0769532..a6352be 100644
 --- a/src/main/clojure/clojure/core/async/impl/channels.clj
