@@ -159,15 +159,16 @@ places, and assertions carry no location.
    what ran there: the lines first reached between the last moment with a low probability and
    the jump, and every thread's stack at that moment (det-profile), so the report names the
    code that decided the bug, not only when.
-3. **Targeted runs from a diff.** `determinismo explore --changed <git range>`: the diff's hunks
-   become files and lines; coverage maps them to edges and lines in the programs; strategies
-   reward timelines that reach changed code (directed fuzzing: distance to the changed lines in
-   the call graph, as AFLGo does) and fault around it; the report says how many timelines ran
-   each changed line and which properties those timelines checked. For CI: explore a pull
-   request where it changed, and say what of the change no timeline ever ran.
+3. **Targeted runs from a diff.** Done: `explore --changed <diff file | git range>` (CLI, serve,
+   MCP) matches the hunks to line coverage (Python, the JVM, Go through Antithesis's
+   instrumentor and libvoidstar), returns first to timelines that ran changed code, just after
+   they did, and reports which hunks ran in how many timelines and which never ran (e2e
+   `changed`). Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
+   no timeline reaches yet, faults aimed around it, and which properties the timelines that ran
+   it checked; C and Zig edges mapped back to lines.
 4. **More languages.** Rust (an SDK crate over the C ABI, LLVM's coverage for edges), Go (an
-   SDK, and coverage through Go's own `-cover` instrumentation or a source instrumentor, as
-   Antithesis's Go instrumentor), JavaScript (an SDK; V8's coverage).
+   SDK of our own; Antithesis's Go SDK and instrumentor already work, through libvoidstar),
+   JavaScript (an SDK; V8's coverage).
 
 ## Speed
 

@@ -374,6 +374,7 @@ function render() {
     ${sectionHtml("environment", "Environment", environmentSummary(), environmentBody(), isOpen("environment"))}
     ${sectionHtml("utilization", "Utilization", utilizationSummary(), utilizationBody(), isOpen("utilization"))}
     ${sectionHtml("properties", "Properties", propertiesSummary(), propertiesBody(), isOpen("properties"))}
+    ${run.changed ? sectionHtml("changed", "Changed code", changedSummary(run.changed), changedBody(run.changed), isOpen("changed")) : ""}
     ${sectionHtml("map", "Multiverse tree", `${done} timelines from the setup snapshot`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
     ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
     ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}
@@ -411,6 +412,24 @@ function viewTabsWire() {
     await runRefresh();
     runsRefresh();
   });
+}
+
+// A targeted run (--changed): which hunks ran, in how many timelines, and which never did.
+function changedSummary(changed) {
+  const ran = changed.timelines.filter((count) => count > 0).length;
+  return `${ran} of ${changed.hunks.length} hunks ran`;
+}
+function changedBody(changed) {
+  const total = (state.run.branches || []).length || 1;
+  const rows = changed.hunks.map((hunk, index) => {
+    const count = changed.timelines[index];
+    const where = `${escape(hunk.file)}:${hunk.first}${hunk.last > hunk.first ? "-" + hunk.last : ""}`;
+    const badge = count > 0
+      ? `<span class="badge pass">ran in ${count}/${total}</span>`
+      : `<span class="badge fail">never ran</span>`;
+    return `<li style="display:flex;gap:10px;align-items:baseline">${badge}<code>${where}</code></li>`;
+  }).join("");
+  return `<ul style="list-style:none;padding:0;margin:0;display:grid;gap:6px">${rows}</ul>`;
 }
 
 function sectionHtml(id, title, summary, body, open) {

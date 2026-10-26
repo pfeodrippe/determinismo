@@ -23,6 +23,7 @@ const tla = @import("tla.zig");
 const query = @import("query.zig");
 const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
+const changed = @import("changed.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
 const profiler = @import("profile.zig");
@@ -40,6 +41,9 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--changed <diff file | git range>]   (a targeted run: the tree
+    \\                            returns first to timelines that ran changed lines, and says
+    \\                            which hunks ran and which never did)
     \\                            [--branching tree|flat]   (tree, the default: also from moments
     \\                            of earlier branches that reached new behaviors; replay one by
     \\                            its tape)
@@ -138,6 +142,8 @@ const Arguments = struct {
     /// (Antithesis's long timelines). Without it, a drawn number of starts (4 to 64).
     timeline_ms: ?u64 = null,
     timeline_text: ?[]const u8 = null,
+    /// A targeted run: a diff file or git range whose changed lines the tree explores first.
+    changed: ?[]const u8 = null,
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
@@ -370,6 +376,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         from_vtime_ms: ?u64,
         cpu_modulation: bool,
         timeline: ?[]const u8,
+        changed: ?[]const u8,
     };
     const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
         .program = arguments.program_path,
@@ -388,6 +395,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         .from_vtime_ms = arguments.from_vtime_ms,
         .cpu_modulation = arguments.cpu_modulation,
         .timeline = arguments.timeline_text,
+        .changed = arguments.changed,
     }, .{})});
     var buffer: [256]u8 = undefined;
     const tcp = @import("determinismo").tcp;
@@ -803,6 +811,7 @@ fn jobs_count(arguments: *const Arguments) u32 {
 /// Tree branching unless something else plans the branches (a strategy, a tape, a fork, one
 /// branch, shards, a moment): then flat; asked for a tree, an error.
 fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
+    if (arguments.changed != null and arguments.branching != .tree) return changed_needs_tree();
     if (arguments.branching != .tree) return;
     // A strategy in a tree (asked for): its parents are replayed with their tapes.
     if (arguments.branching_given and arguments.strategy_command != null) {
@@ -829,7 +838,14 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
             return error.Usage;
         }
     }
+    if (planned and arguments.changed != null) return changed_needs_tree();
     if (planned) arguments.branching = .flat;
+}
+
+fn changed_needs_tree() error{Usage} {
+    std.debug.print("[determinismo] --changed aims the tree explorer: not with flat branching, " ++
+        "a strategy's plan, shards or a replay\n", .{});
+    return error.Usage;
 }
 
 /// A duration: a number of seconds, or with a unit (`500ms`, `90s`, `10m`, `2h`).
@@ -1239,6 +1255,11 @@ fn explore_tree(
     const base = seed_base(exploration);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     var plan: std.ArrayList(Planned) = .empty;
+    const change: ?changed.Change = if (branches.arguments.changed) |source|
+        try changed.read(arena, context.io, source)
+    else
+        null;
+    const hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0);
     var next_index: u32 = 0;
     while (next_index < total and plan.items.len < tree.generation_size) : (next_index += 1) {
         try plan.append(arena, .{
@@ -1269,21 +1290,36 @@ fn explore_tree(
             try explore_parallel(context, vm, options, mine, workers);
         }
         // In index order (workers finish in any): what each reached that none before it had.
-        const done = summaries.items[0..summaries.count];
-        // In place: a summary is large, and std.mem.sort keeps a cache of them on the stack.
-        std.sort.insertion(Summary, done, {}, summary_before);
+        // Summaries are large: their order is sorted, not them.
+        const done = try arena.alloc(*const Summary, summaries.count);
+        for (done, summaries.items[0..summaries.count]) |*slot, *summary| slot.* = summary;
+        std.sort.insertion(*const Summary, done, {}, summary_before);
         var candidates: [tree.generation_size]Candidate = undefined;
         var candidate_count: u32 = 0;
         const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
         var random: std.Random.DefaultPrng = .init(generation_seed);
-        for (done) |*summary| {
+        for (done) |summary| {
             var novel: u32 = 0;
             var moment: ?u64 = null;
             var label: []const u8 = "";
+            var changed_moment: ?u64 = null;
+            var changed_label: []const u8 = "";
+            @memset(hunks_reached, false);
             // The frontier (Go-Explore): its latest new behavior that leaves room to go on (in
             // its first four fifths); the branches return just after it.
             const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
             for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+                // A targeted run: which hunks it ran (counted once), and when it first ran
+                // changed code itself (not in its parents' prefix), leaving room.
+                if (change) |*target| if (target.hunk_of(arena, behavior.name())) |hunk| {
+                    if (!hunks_reached[hunk]) target.timelines[hunk] += 1;
+                    hunks_reached[hunk] = true;
+                    const own = behavior.vtime_ns > summary.start_ns;
+                    if (own and behavior.vtime_ns <= room_end and changed_moment == null) {
+                        changed_moment = behavior.vtime_ns;
+                        changed_label = behavior.name();
+                    }
+                };
                 const known = try seen.getOrPut(arena, behavior.hash);
                 if (known.found_existing) continue;
                 novel += 1;
@@ -1297,6 +1333,8 @@ fn explore_tree(
                 .novel = novel,
                 .moment = moment,
                 .label = label,
+                .changed_moment = changed_moment,
+                .changed_label = changed_label,
             };
             candidate_count += 1;
         }
@@ -1382,9 +1420,21 @@ fn explore_tree(
         plan = next;
     }
     for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+    if (change) |*target| {
+        target.summarize(next_index);
+        report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
+    }
 }
 
-const Candidate = struct { summary: *const Summary, novel: u32, moment: ?u64, label: []const u8 };
+const Candidate = struct {
+    summary: *const Summary,
+    novel: u32,
+    moment: ?u64,
+    label: []const u8,
+    /// A targeted run: when it first ran changed code (with room to go on), and which line.
+    changed_moment: ?u64 = null,
+    changed_label: []const u8 = "",
+};
 
 const TreeReturn = struct { branch: u32, vtime_ns: u64, why: []const u8 };
 
@@ -1432,14 +1482,23 @@ fn tree_returns(
         const summary = candidate.summary;
         const span = summary.end_ns -| summary.start_ns;
         if (span < 2 * std.time.ns_per_ms) continue;
-        const after = if (candidate.moment) |moment| moment + std.time.ns_per_us else
+        const after = if (candidate.changed_moment) |moment|
+            moment + std.time.ns_per_us
+        else if (candidate.moment) |moment|
+            moment + std.time.ns_per_us
+        else
             summary.start_ns + random.random().uintLessThan(u64, span);
         const at = std.math.clamp(
             after,
             summary.start_ns + std.time.ns_per_ms,
             summary.end_ns - std.time.ns_per_ms,
         );
-        const why = if (candidate.moment != null)
+        const why = if (candidate.changed_moment != null)
+            try std.fmt.allocPrint(arena, "Returned to #{d} just after it first ran changed " ++
+                "code ({s}): a targeted run explores what follows it.", .{
+                summary.index, candidate.changed_label,
+            })
+        else if (candidate.moment != null)
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
                 "{s} ({d} behaviors no timeline before it had): its frontier.", .{
                 summary.index, candidate.label, candidate.novel,
@@ -1455,11 +1514,13 @@ fn tree_returns(
 }
 
 fn candidate_before(_: void, a: Candidate, b: Candidate) bool {
+    // Timelines that ran changed code first (targeted runs), then the most novel.
+    if ((a.changed_moment != null) != (b.changed_moment != null)) return a.changed_moment != null;
     if (a.novel != b.novel) return a.novel > b.novel;
     return a.summary.index < b.summary.index;
 }
 
-fn summary_before(_: void, a: Summary, b: Summary) bool {
+fn summary_before(_: void, a: *const Summary, b: *const Summary) bool {
     return a.index < b.index;
 }
 
@@ -1839,6 +1900,8 @@ fn parse_option(
     } else if (eql(u8, flag, "--time-budget")) {
         arguments.time_budget_ns = try duration_parse(value);
         arguments.time_budget_text = value;
+    } else if (eql(u8, flag, "--changed")) {
+        arguments.changed = value;
     } else if (eql(u8, flag, "--timeline")) {
         arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
         arguments.timeline_text = value;
@@ -1993,6 +2056,7 @@ test {
     _ = @import("query.zig");
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
+    _ = @import("changed.zig");
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
     _ = @import("profile.zig");

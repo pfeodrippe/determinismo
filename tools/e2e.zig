@@ -98,6 +98,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1140,6 +1141,36 @@ fn check_disk(context: *Context) !void {
         "slow, and it works again; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+    }) catch ""});
+}
+
+/// A targeted run (--changed): the Python maze with a diff of three lines, matched by their
+/// line coverage although the diff names repository paths and the image has its own. The line
+/// every timeline runs ran in all, the first digit's in some, and the tree returned to them just
+/// after; the solved maze's line never ran.
+fn check_changed(context: *Context) !void {
+    const arena = context.arena;
+    const record = try std.fmt.allocPrint(arena, "{s}/changed.jsonl", .{context.scratch});
+    const report = try explore(context, &.{
+        "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
+        "--seed", "1", "--branches", "48", "--changed", "tests/changed/maze.diff",
+        "--record", record,
+    });
+    const file = "tests/antithesis-compat/python/client/maze/singleton_driver_maze.py";
+    const every = try std.fmt.allocPrint(arena, "ran in   48/48 timelines  {s}:24-24", .{file});
+    const never = try std.fmt.allocPrint(arena, "NEVER RAN  {s}:23-23", .{file});
+    const some = try std.fmt.allocPrint(arena, "{s}:17-17", .{file});
+    const cwd = std.Io.Dir.cwd();
+    const recorded = cwd.readFileAlloc(context.io, record, arena, .limited(64 << 20)) catch "";
+    const passes = std.mem.indexOf(u8, report, "2 of 3 hunks ran") != null and
+        std.mem.indexOf(u8, report, every) != null and
+        std.mem.indexOf(u8, report, never) != null and
+        std.mem.indexOf(u8, report, some) != null and
+        std.mem.indexOf(u8, recorded, "just after it first ran changed code") != null;
+    expect(context, passes, "changed: a targeted run says which hunks ran and which never did, " ++
+        "and returns to changed code", .{});
+    if (!passes) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
+        "changed code", "ran in", "NEVER", "tree:",
     }) catch ""});
 }
 

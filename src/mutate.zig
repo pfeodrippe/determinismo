@@ -178,9 +178,9 @@ fn explore(
 }
 
 /// The lines a patch changes in each file: its added lines' ranges in the new file.
-const Hunk = struct { file: []const u8, first: u32, last: u32 };
+pub const Hunk = struct { file: []const u8, first: u32, last: u32 };
 
-fn hunks(arena: std.mem.Allocator, patch: []const u8) ![]const Hunk {
+pub fn hunks(arena: std.mem.Allocator, patch: []const u8) ![]const Hunk {
     var found: std.ArrayList(Hunk) = .empty;
     var file: []const u8 = "";
     var lines = std.mem.splitScalar(u8, patch, '\n');
@@ -253,11 +253,18 @@ fn mutated_lines_ran(
     return if (any) false else null;
 }
 
-/// A coverage place (a Python file path, a JVM class name) and a patched file: the same code
-/// when the file's path without its extension, as dots and with Clojure's munging, ends the
-/// place's (or the place begins with it, for a class and its inner classes).
-fn same_source(arena: std.mem.Allocator, place: []const u8, file: []const u8) bool {
+/// A coverage place (a file path, a JVM class name) and a patched file: the same code when the
+/// paths end alike (the whole patched path, or at least its directory and name: a repository's
+/// layout and an image's differ), or when the file's path without its extension, as dots and
+/// with Clojure's munging, ends the place's (or the place begins with it, for a class and its
+/// inner classes).
+pub fn same_source(arena: std.mem.Allocator, place: []const u8, file: []const u8) bool {
     if (std.mem.endsWith(u8, place, file)) return true; // A path.
+    if (path_tail(file, 2)) |tail| {
+        const boundary = place.len == tail.len or
+            (place.len > tail.len and place[place.len - tail.len - 1] == '/');
+        if (std.mem.endsWith(u8, place, tail) and boundary) return true;
+    }
     const stem = file[0 .. std.mem.lastIndexOfScalar(u8, file, '.') orelse file.len];
     const dotted = arena.dupe(u8, stem) catch return false;
     for (dotted) |*byte| {
@@ -278,6 +285,15 @@ fn same_source(arena: std.mem.Allocator, place: []const u8, file: []const u8) bo
     return false;
 }
 
+/// The last `count` components of a path, if it has more.
+fn path_tail(path: []const u8, count: u32) ?[]const u8 {
+    var start = path.len;
+    for (0..count) |_| {
+        start = std.mem.lastIndexOfScalar(u8, path[0..start], '/') orelse return null;
+    }
+    return path[start + 1 ..];
+}
+
 test same_source {
     const arena = std.testing.allocator;
     var state: std.heap.ArenaAllocator = .init(arena);
@@ -287,4 +303,9 @@ test same_source {
     try std.testing.expect(same_source(a, "nrepl.middleware.session$fn__123", session));
     try std.testing.expect(same_source(a, "/app/src/bank.py", "src/bank.py"));
     try std.testing.expect(!same_source(a, "nrepl.server", session));
+    const maze = "tests/antithesis-compat/python/client/maze/singleton_driver_maze.py";
+    const deployed = "/opt/antithesis/test/v1/maze/singleton_driver_maze.py";
+    try std.testing.expect(same_source(a, deployed, maze));
+    try std.testing.expect(!same_source(a, "/opt/other/singleton_driver_maze.py", maze));
+    try std.testing.expect(!same_source(a, "/src/xmaze/singleton_driver_maze.py", maze));
 }

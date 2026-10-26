@@ -1,0 +1,12 @@
+A change to the Python maze, for the e2e "changed" check (explore --changed): its hunks are
+lines of the new file. The first runs in every timeline, the second where the first digit is
+right (one timeline in ten, which the targeted tree returns to), the third only where the maze
+is solved (never, in a run this short).
+--- a/tests/antithesis-compat/python/client/maze/singleton_driver_maze.py
++++ b/tests/antithesis-compat/python/client/maze/singleton_driver_maze.py
+@@ -24 +24 @@
++det.always(not solved, "the maze is never solved")
+@@ -17 +17 @@
++    det.reachable("maze: first digit")
+@@ -23 +23 @@
++                solved = True

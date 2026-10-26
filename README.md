@@ -224,6 +224,9 @@ TLA+ trace validation: a system emits its abstract states (`event "tla"`), and
 of the spec; it reports the first state the spec cannot reach
 ([examples/clojure-bank/tla](examples/clojure-bank/tla)).
 
+Targeted runs: `--changed <diff file | git range>` aims the exploration at a change's lines and
+says which of them ran, in how many timelines, and which never did.
+
 Mutation testing: give mutants as profiles (`--profile default,mutant` or `--profile all`) and
 see which ones the tests catch; or apply a runtime mutant after setup with `--from-exec`, so
 every mutant shares one snapshot.

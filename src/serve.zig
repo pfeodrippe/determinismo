@@ -288,6 +288,8 @@ const RunRequest = struct {
     timeline: ?[]const u8 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
+    /// A targeted run: a diff file or git range on the server (explore's --changed).
+    changed: ?[]const u8 = null,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
     /// Branches at varying CPU speeds (and so their replays too).
@@ -338,6 +340,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     if (asked.jobs) |jobs| {
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
     }
+    if (asked.changed) |source| try argv.appendSlice(server.arena, &.{ "--changed", source });
     if (asked.from_branch) |branch| {
         try argv.appendSlice(server.arena, &.{
             "--from-branch",   try print(server, "{d}", .{branch}),
@@ -382,6 +385,8 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
             try out.print(",\"summary\":{s}", .{line["{\"summary\":".len .. line.len - 1]});
         } else if (std.mem.startsWith(u8, line, "{\"snapshot\":")) {
             try out.print(",\"snapshot\":{s}", .{line["{\"snapshot\":".len .. line.len - 1]});
+        } else if (std.mem.startsWith(u8, line, "{\"changed\":")) {
+            try out.print(",\"changed\":{s}", .{line["{\"changed\":".len .. line.len - 1]});
         }
     }
     try out.writeAll(",\"branches\":[");

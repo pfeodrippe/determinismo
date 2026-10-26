@@ -52,6 +52,10 @@
         "timeline": {
           "type": "string",
           "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
+        },
+        "changed": {
+          "type": "string",
+          "description": "A targeted run: a diff file or git range (on the machine running determinismo) whose changed lines the tree explores first; the result says which hunks ran in how many timelines, and which never ran"
         }
       },
       "required": []

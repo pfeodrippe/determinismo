@@ -48,6 +48,8 @@ const Arguments = struct {
     property: ?[]const u8 = null,
     points: u32 = 8,
     futures: u32 = 16,
+    /// explore: a targeted run, aimed at a diff file's or git range's changed lines.
+    changed: ?[]const u8 = null,
     /// mutate: a JSON lines file of mutants, {"name", "node", "patch"} each.
     mutants: ?[]const u8 = null,
 };
@@ -186,6 +188,7 @@ fn tool_call(
     const known = eql(u8, name, "explore") or eql(u8, name, "fork") or eql(u8, name, "mutate");
     if (!known) return error.UnknownTool;
     if (arguments.time_budget) |budget| try argv.appendSlice(arena, &.{ "--time-budget", budget });
+    if (arguments.changed) |source| try argv.appendSlice(arena, &.{ "--changed", source });
     if (arguments.branches != null or arguments.time_budget == null) {
         const branches = try number(arena, arguments.branches orelse 16);
         try argv.appendSlice(arena, &.{ "--branches", branches });
