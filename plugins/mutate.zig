@@ -359,7 +359,7 @@ const Mutate = struct {
         const format = "[mutate] branch {d}: parent={?d} mutations={d} failing={d} " ++
             "new_features={d} coverage={d} corpus={d}\n";
         std.debug.print(format, .{
-            end.index,             strategy.parent,       strategy.mutation_count, end.failing.len,
+            end.index,             strategy.parent,        strategy.mutation_count, end.failing.len,
             strategy.features_new, strategy.feature_count, strategy.corpus_count,
         });
         return false;

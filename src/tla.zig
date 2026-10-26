@@ -55,9 +55,9 @@ pub fn check(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const 
     const jar_absolute = try std.fs.path.resolve(arena, &.{jar});
     const result = try std.process.run(arena, io, .{
         .argv = &.{
-            "java",   "-XX:+UseParallelGC", "-cp",     jar_absolute,  "tlc2.TLC",
-            "-config", "TraceCheck.cfg",    "-workers", "1",           "-metadir",
-            "states", "TraceCheck.tla",
+            "java",    "-XX:+UseParallelGC", "-cp",      jar_absolute, "tlc2.TLC",
+            "-config", "TraceCheck.cfg",     "-workers", "1",          "-metadir",
+            "states",  "TraceCheck.tla",
         },
         .cwd = .{ .path = work },
     });

@@ -21,10 +21,9 @@ const runtime = [_][]const u8{
     "det-stop-faults", "det-profile", "det-core",
 };
 const directories = [_][]const u8{
-    "bin",                  "sbin",                     "etc", "proc", "sys", "dev",
-    "run",                  "tmp",                      "det", "root", "opt", "opt/determinismo",
-    "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib",
-    "opt/determinismo/coverage",
+    "bin",                  "sbin",                     "etc",                  "proc",                      "sys", "dev",
+    "run",                  "tmp",                      "det",                  "root",                      "opt", "opt/determinismo",
+    "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib", "opt/determinismo/coverage",
 };
 const applets_max = 1024;
 

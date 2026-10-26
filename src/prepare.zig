@@ -182,8 +182,7 @@ fn node_resolve(
     else if (node.source.build) |build| disk: {
         const built = try image_build(context, try mutant_build(context, node, build));
         break :disk try image_disk(context, built, &image, &target.digest);
-    }
-    else if (node.source.directory) |directory|
+    } else if (node.source.directory) |directory|
         try directory_disk(context, node.name, directory, &target.digest)
     else
         try binary_disk(context, node.name, node.source.binary.?, &image, &target.digest);
@@ -441,9 +440,9 @@ fn mutant_build(context: Context, node: *const schema.Node, build: schema.Build)
         _ = tool(context, &.{ "rm", "-rf", staging }) catch {};
         const source = try std.fmt.allocPrint(context.arena, "{s}/", .{build.context});
         _ = try tool(context, &.{
-            "rsync",     "-a",                "--exclude", ".git",                    "--exclude",
-            "zig-out",   "--exclude",         ".zig-cache", "--exclude", ".determinismo-cache",
-            source,      staging,
+            "rsync",   "-a",        "--exclude",  ".git",      "--exclude",
+            "zig-out", "--exclude", ".zig-cache", "--exclude", ".determinismo-cache",
+            source,    staging,
         });
         const absolute = try cwd.realPathFileAlloc(context.io, patch_path, context.arena);
         _ = try tool(context, &.{ "git", "-C", staging, "apply", "--unsafe-paths", absolute });

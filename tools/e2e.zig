@@ -105,7 +105,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
-        .{ "retroactive", check_retroactive },          .{ "hang", check_hang },
+        .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1232,8 +1232,7 @@ fn check_hang(context: *Context) !void {
         "--program", program, "--scenario", "hang", "--seed", "1", "--timeline-limit", "20s",
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
-    const hung = std.mem.count(u8, report, " hung ") == 2 and std.mem.indexOf(u8, report,
-        "FAIL always                hit in    2/2 branches, failing in    2  the guest " ++
+    const hung = std.mem.count(u8, report, " hung ") == 2 and std.mem.indexOf(u8, report, "FAIL always                hit in    2/2 branches, failing in    2  the guest " ++
         "finishes its scenario") != null;
     var branches: [2]Branch = undefined;
     const count = parse_branches(report, &branches);
@@ -1327,8 +1326,8 @@ fn check_changed(context: *Context) !void {
     const record = try std.fmt.allocPrint(arena, "{s}/changed.jsonl", .{context.scratch});
     const report = try explore(context, &.{
         "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
-        "--seed", "1", "--branches", "48", "--changed", "tests/changed/maze.diff",
-        "--record", record,
+        "--seed",    "1",                                           "--branches", "48",
+        "--changed", "tests/changed/maze.diff",                     "--record",   record,
     });
     const file = "tests/antithesis-compat/python/client/maze/singleton_driver_maze.py";
     const every = try std.fmt.allocPrint(arena, "ran in   48/48 timelines  {s}:24-24", .{file});
@@ -1374,8 +1373,9 @@ fn check_voidstar(context: *Context) !void {
             context.scratch, attempt,
         });
         const report = try explore(context, &.{
-            "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "bank",
-            "--seed", "1", "--branch", "0", "--until", "event=command_start", "--exec", code,
+            "--compose",    "tests/antithesis-compat/python/compose.yaml", "--scenario", "bank",
+            "--seed",       "1",                                           "--branch",   "0",
+            "--until",      "event=command_start",                         "--exec",     code,
             "--events-dir", events,
         });
         output.* = try lines_with(arena, report, &.{"voidstar"});
