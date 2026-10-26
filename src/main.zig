@@ -911,8 +911,8 @@ fn cpus_available() u32 {
 }
 
 /// Forks `jobs` workers after the snapshot: each makes its own VMs from it (copy-on-write) and
-/// runs branches `index % jobs == worker`, then sends its results through a pipe. A branch's
-/// timeline does not depend on which worker runs it.
+/// runs the next branch not yet taken until none is left, then sends its results through a
+/// pipe. A branch's timeline does not depend on which worker runs it.
 fn explore_parallel(
     context: Context,
     vm: *VM,
@@ -921,6 +921,16 @@ fn explore_parallel(
     jobs: u32,
 ) !void {
     assert(jobs > 1 and jobs <= jobs_max);
+    // The workers' shared counter of positions (branch_place).
+    const protection: linux.PROT = .{ .READ = true, .WRITE = true };
+    const shared_flags: linux.MAP = .{ .TYPE = .SHARED, .ANONYMOUS = true };
+    const shared = linux.mmap(null, std.heap.page_size_min, protection, shared_flags, -1, 0);
+    if (linux.errno(shared) != .SUCCESS) return error.Mmap;
+    defer _ = linux.munmap(@ptrFromInt(shared), std.heap.page_size_min);
+    const counter: *std.atomic.Value(u32) = @ptrFromInt(shared);
+    counter.* = .init(0);
+    var shared_branches = branches;
+    shared_branches.next = counter;
     var readers: [jobs_max]linux.fd_t = undefined;
     var pids: [jobs_max]linux.pid_t = undefined;
     for (0..jobs) |worker| {
@@ -930,7 +940,7 @@ fn explore_parallel(
         if (linux.errno(pid) != .SUCCESS) return error.Fork;
         if (pid == 0) {
             _ = linux.close(pipe[0]);
-            worker_run(context, vm, options, branches, .{
+            worker_run(context, vm, options, shared_branches, .{
                 .worker = @intCast(worker),
                 .jobs = jobs,
                 .results_fd = pipe[1],
@@ -1087,9 +1097,14 @@ const Branches = struct {
     plan: ?[]const Planned = null,
     /// Where the branches of a plan tell how they went (behaviors, for the next generation).
     summaries: ?*Summaries = null,
-    /// This process runs the branches whose index modulo `jobs` is `worker`.
+    /// This process runs the branches whose index modulo `jobs` is `worker`; or, with `next`,
+    /// whichever comes next.
     worker: u32 = 0,
     jobs: u32 = 1,
+    /// Shared by parallel workers (memory mapped before they fork): the next position to run.
+    /// A timeline is the same whichever worker runs it, so a worker that finished takes the
+    /// next instead of idling while others run long ones.
+    next: ?*std.atomic.Value(u32) = null,
 };
 
 const jobs_max = 256;
@@ -1104,7 +1119,14 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         try moment_after_snapshot(branches.snapshot, ms * std.time.ns_per_ms);
     }
     const total = if (branches.plan) |plan| plan.len else count;
-    for (0..total) |position| {
+    var position_next: usize = 0;
+    while (true) {
+        const position: usize = if (branches.next) |counter|
+            counter.fetchAdd(1, .monotonic)
+        else
+            position_next;
+        position_next += 1;
+        if (position >= total) break;
         const place = branch_place(branches, first + position, single, position) orelse continue;
         const index = place.index;
         if (branches.deadline_ns) |deadline| {
@@ -1187,15 +1209,16 @@ fn branch_announce(
 /// Where the branch at `position` starts, if this worker (and shard) runs it: the snapshot, or
 /// (a tree explorer's branch) a moment of another.
 fn branch_place(branches: Branches, index_flat: usize, single: bool, position: usize) ?Planned {
+    const mine = branches.next != null or position % branches.jobs == branches.worker;
     if (branches.plan) |plan| {
-        if (position % branches.jobs != branches.worker) return null;
+        if (!mine) return null;
         return plan[position];
     }
     const index: u32 = @intCast(index_flat);
     const shards = if (single) 1 else branches.arguments.shard_count;
     const shard = if (single) 0 else branches.arguments.shard_index;
     if (index % shards != shard) return null;
-    if (index / shards % branches.jobs != branches.worker) return null;
+    if (branches.next == null and index / shards % branches.jobs != branches.worker) return null;
     const exploration = branches.exploration;
     const replay = exploration.replay;
     return .{
