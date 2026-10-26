@@ -576,6 +576,9 @@ const RunRequest = struct {
     /// When the run ends on its own (its budget), another starts: the same request, a fresh
     /// seed. Continuous testing; a run stopped on request does not repeat.
     repeat: bool = false,
+    /// The program as asked, when `program` is the copy the run kept (artifact_keep): a
+    /// repeat starts from the program as asked, the host's current build.
+    program_asked: ?[]const u8 = null,
     /// Timelines (at most, with a time budget).
     branches: ?u32 = null,
     /// Explore until then: "90s", "10m", "2h".
@@ -612,7 +615,13 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         std.Io.random(server.io, std.mem.asBytes(&seed));
         asked.seed = seed;
     }
-    // As run: the seed drawn is in it, for its replays.
+    // The files it boots, kept by content: a deploy replaces the host's, never a run's.
+    if (asked.program) |path| {
+        if (asked.program_asked == null) asked.program_asked = path;
+        asked.program = try artifact_keep(server, asked.program_asked.?);
+    }
+    const machine = try machine_kept(server);
+    // As run: the seed drawn is in it, and the program it ran, for its replays.
     const request_json = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     const shared = server.shared;
     shared.lock();
@@ -626,7 +635,11 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, "request.json" }),
         .data = request_json,
     });
-    const argv = try explore_arguments(server, &asked, directory);
+    try std.Io.Dir.cwd().writeFile(server.io, .{
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, "machine.json" }),
+        .data = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(machine, .{})}),
+    });
+    const argv = try explore_arguments(server, &asked, directory, machine);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     const pid = try spawn(server.arena, argv, output, &.{});
     // For a restarted server to find it still running (runs_load).
@@ -644,10 +657,11 @@ fn explore_arguments(
     server: *Server,
     asked: *const RunRequest,
     directory: []const u8,
+    machine: []const []const u8,
 ) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
-    try argv.appendSlice(server.arena, server.options.machine);
+    try argv.appendSlice(server.arena, machine);
     try system_arguments(server.arena, &argv, asked);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed.?}) });
     if (asked.time_budget) |budget| {
@@ -760,7 +774,7 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     });
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
-    try argv.appendSlice(server.arena, server.options.machine);
+    try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
@@ -807,7 +821,7 @@ fn run_extract(server: *Server, run: *const Run, body: []const u8, out: *std.Io.
         .{ .ignore_unknown_fields = true },
     );
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(server.arena, server.options.machine);
+    try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
@@ -845,7 +859,7 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     );
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, &.{ server.options.self, "causality" });
-    try argv.appendSlice(server.arena, server.options.machine);
+    try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
@@ -1324,6 +1338,7 @@ fn run_repeat(server: *Server, id: u32) !void {
     }) catch return;
     if (!asked.repeat) return;
     asked.seed = null;
+    asked.program = asked.program_asked orelse asked.program; // The current build.
     const body = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     var out: std.Io.Writer.Allocating = .init(server.arena);
     _ = try run_create(server, body, &out.writer);
@@ -1430,6 +1445,48 @@ fn notebook_evaluate(
     }
     try out.writeAll(result.stdout);
     return 200;
+}
+
+/// The machine arguments a run booted with (machine.json: its kept kernel and initramfs); for a
+/// run from before they were kept, the host's.
+fn run_machine(server: *Server, id: u32) ![]const []const u8 {
+    const json = run_file(server, id, "machine.json") catch return server.options.machine;
+    return std.json.parseFromSliceLeaky([]const []const u8, server.arena, json, .{});
+}
+
+/// The host's machine arguments, with the kernel and the initramfs kept (artifact_keep).
+fn machine_kept(server: *Server) ![]const []const u8 {
+    const argv = try server.arena.dupe([]const u8, server.options.machine);
+    var index: usize = 0;
+    while (index + 1 < argv.len) : (index += 1) {
+        const flag = argv[index];
+        if (!std.mem.eql(u8, flag, "--kernel") and !std.mem.eql(u8, flag, "--initrd")) continue;
+        argv[index + 1] = try artifact_keep(server, argv[index + 1]);
+        index += 1;
+    }
+    return argv;
+}
+
+/// A copy of the file named by its content, under the data directory's `artifacts`, made once:
+/// runs of one build share it, and a deploy, which replaces the original, leaves it be.
+fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const bytes = try cwd.readFileAlloc(server.io, path, server.arena, .unlimited);
+    const directory = try std.fs.path.join(server.arena, &.{ server.options.data_directory, "artifacts" });
+    try cwd.createDirPath(server.io, directory);
+    const name = try std.fmt.allocPrint(server.arena, "{x:0>16}-{s}", .{
+        std.hash.Wyhash.hash(0, bytes), std.fs.path.basename(path),
+    });
+    const kept = try std.fs.path.join(server.arena, &.{ directory, name });
+    cwd.access(server.io, kept, .{}) catch {
+        const staging = try std.fmt.allocPrintSentinel(server.arena, "{s}.staging", .{kept}, 0);
+        try cwd.writeFile(server.io, .{ .sub_path = staging, .data = bytes });
+        // Executable: a test program is run from its kept copy.
+        const mode = linux.fchmodat(linux.AT.FDCWD, staging, 0o755);
+        if (linux.errno(mode) != .SUCCESS) return error.ChmodFailed;
+        try cwd.rename(staging, cwd, kept, server.io);
+    };
+    return kept;
 }
 
 fn run_file(server: *Server, id: u32, name: []const u8) ![]const u8 {

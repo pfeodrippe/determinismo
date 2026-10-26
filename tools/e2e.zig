@@ -436,7 +436,16 @@ fn check_serve(context: *Context) !void {
     try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address });
     try argv.appendSlice(arena, &.{ "--data", data });
     if (context.bb) |bb| try argv.appendSlice(arena, &.{ "--bb", bb });
-    try argv.appendSlice(arena, context.machine);
+    // Its own initramfs: replaced below, as a deploy replaces the host's.
+    const initrd = try std.fs.path.join(arena, &.{ context.scratch, "serve-initrd.cpio" });
+    const machine = try arena.dupe([]const u8, context.machine);
+    for (machine[0 .. machine.len - 1], 0..) |flag, index| {
+        if (!std.mem.eql(u8, flag, "--initrd")) continue;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(context.io, machine[index + 1], arena, .unlimited);
+        try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = initrd, .data = bytes });
+        machine[index + 1] = initrd;
+    }
+    try argv.appendSlice(arena, machine);
     var server = try std.process.spawn(context.io, .{
         .argv = argv.items,
         .stdout = .ignore,
@@ -470,6 +479,17 @@ fn check_serve(context: *Context) !void {
         std.mem.indexOf(u8, answer, "\"events\":0,") == null;
     expect(context, ui and finished and queried, "serve: the UI, a run over HTTP, and a query " ++
         "of its events ({s})", .{std.mem.trim(u8, answer, "\n")});
+    // A deploy replaces the initramfs: the run's replays still boot what it booted (kept by
+    // content), to the same events.
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = initrd, .data = "not the run's" });
+    const replayed = try curl(context, &.{ "-X", "POST", "-d", "{\"branch\":0}", url ++ "/runs/1/replay" });
+    const hash_at = std.mem.indexOf(u8, replayed, "events_hash=");
+    const hash = if (hash_at) |at| replayed[at + "events_hash=".len ..][0..16] else "";
+    const record_path = try std.fs.path.join(arena, &.{ data, "runs", "1", "record.jsonl" });
+    const record = try std.Io.Dir.cwd().readFileAlloc(context.io, record_path, arena, .limited(1 << 24));
+    const same = hash.len == 16 and std.mem.indexOf(u8, record, hash) != null;
+    expect(context, same, "serve: a run replays after a deploy replaced its initramfs " ++
+        "(events hash {s})", .{hash});
     // The run's notebook: none at first, then what was saved.
     const empty = try curl(context, &.{url ++ "/runs/1/notebook"});
     const cells = "{\"source\":\"print(1)\\n// %%\\nprint(2)\"}";
