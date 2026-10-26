@@ -1,3 +1,53 @@
+diff --git a/src/jvm/clojure/lang/Agent.java b/src/jvm/clojure/lang/Agent.java
+index 0f508eb..8dc59fc 100644
+--- a/src/jvm/clojure/lang/Agent.java
++++ b/src/jvm/clojure/lang/Agent.java
+@@ -146,9 +146,14 @@ static class Action implements Runnable{
+ 			while(!popped)
+ 				{
+ 				ActionQueue prior = action.agent.aq.get();
++				Determinismo.buggifyPause("clojure agent: between reading and popping the action queue");
+ 				next = new ActionQueue(prior.q.pop(), error);
+ 				popped = action.agent.aq.compareAndSet(prior, next);
++				if(!popped)
++					Determinismo.reachable("agent: popping a finished action retried (a send raced it)", null);
+ 				}
++			if(error != null)
++				Determinismo.reachable("agent: an action failed in :fail mode (the agent stops)", null);
+ 
+ 			if(error == null && next.q.count() > 0)
+ 				((Action) next.q.peek()).execute();
+@@ -225,7 +230,10 @@ synchronized public Object restart(Object newState, boolean clearActions){
+ 			}
+ 
+ 		if(prior.q.count() > 0)
++			{
++			Determinismo.reachable("agent: a restart resumed the actions queued behind a failure", null);
+ 			((Action) prior.q.peek()).execute();
++			}
+ 		}
+ 
+ 	return newState;
+@@ -261,7 +269,10 @@ void enqueue(Action action){
+ 	while(!queued)
+ 		{
+ 		prior = aq.get();
++		Determinismo.buggifyPause("clojure agent: between reading and swapping the action queue");
+ 		queued = aq.compareAndSet(prior, new ActionQueue((IPersistentStack)prior.q.cons(action), prior.error));
++		if(!queued)
++			Determinismo.reachable("agent: a send's enqueue retried (another send or a pop raced it)", null);
+ 		}
+ 
+ 	if(prior.q.count() == 0 && prior.error == null)
+@@ -276,6 +287,8 @@ static public int releasePendingSends(){
+ 	IPersistentVector sends = nested.get();
+ 	if(sends == null)
+ 		return 0;
++	Determinismo.sometimes(sends.count() > 0,
++			"agent: an action's own sends were held until it finished", null);
+ 	for(int i=0;i<sends.count();i++)
+ 		{
+ 		Action a = (Action) sends.valAt(i);
 diff --git a/src/jvm/clojure/lang/Compiler.java b/src/jvm/clojure/lang/Compiler.java
 index 4d58fcf..06578e8 100644
 --- a/src/jvm/clojure/lang/Compiler.java

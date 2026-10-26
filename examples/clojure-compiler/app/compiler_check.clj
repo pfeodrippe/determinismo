@@ -23,6 +23,11 @@
   [name n]
   (det/random-below-named name n))
 
+(defn per-sender-increasing?
+  "Within each sender, the sequence numbers increase."
+  [values]
+  (every? (fn [[_ items]] (apply < (map second items))) (group-by first values)))
+
 ;; --- STM ------------------------------------------------------------------------------------
 
 (def account-count 8)
@@ -226,6 +231,62 @@
                 {:limit limit :counts (mapv count results)})
     "ok"))
 
+;; --- Agents ----------------------------------------------------------------------------------
+
+(defn agents-check
+  "Senders send actions to agents (send or send-off). Each action first sends to a relay agent
+  (held until it finishes: out if it succeeds, dropped if it fails), and in :fail mode one planned
+  action throws: the agent stops, senders restart it and send again, and the actions queued
+  behind the failure resume."
+  []
+  (let [agent-count (inc (pick "agents" 3))
+        senders (inc (pick "agent senders" 4))
+        per (inc (pick "agent sends per sender" 15))
+        fail-mode (zero? (pick "agent fail mode" 3))
+        failing (when fail-mode [(pick "agent failing sender" senders) (pick "agent failing send" per)])
+        agents (vec (repeatedly agent-count #(agent [] :error-mode (if fail-mode :fail :continue))))
+        relay (agent [])
+        accepted (atom [])
+        act (fn [state sender i]
+              (send relay conj [sender i])
+              (when (= [sender i] failing) (throw (ex-info "a planned failure" {})))
+              (conj state [sender i]))
+        send! (fn [target sender i]
+                (loop []
+                  (when-not (try
+                              (if (zero? (pick "agent send or send-off" 2))
+                                (send target act sender i)
+                                (send-off target act sender i))
+                              true
+                              (catch RuntimeException _failed ; "Agent is failed, needs restart"
+                                (try (restart-agent target @target)
+                                     (catch RuntimeException _restarted)) ; Another sender did.
+                                false))
+                    (recur))))
+        work (fn [sender]
+               (dotimes [i per]
+                 (send! (agents (pick "agent target" agent-count)) sender i)
+                 (swap! accepted conj [sender i])))]
+    (run! deref (doall (for [sender (range senders)] (future (work sender)))))
+    ;; The planned failure may come after the senders finish: restart whatever failed, until
+    ;; every agent has run all it was sent (await's own action queued behind a failure waits).
+    (loop []
+      (doseq [target agents :when (agent-error target)]
+        (try (restart-agent target @target) (catch RuntimeException _restarted)))
+      (when-not (try (apply await-for 1000 agents) (catch RuntimeException _failed false))
+        (recur)))
+    (await relay)
+    (let [ran (mapcat deref agents)
+          expected (remove #{failing} @accepted)]
+      (det/always (and (= (sort ran) (sort expected))
+                       (every? #(per-sender-increasing? @%) agents))
+                  "agent: each accepted send runs once, a sender's in the order sent"
+                  {:ran (count ran) :expected (count expected) :failing failing})
+      (det/always (= (sort @relay) (sort ran))
+                  "agent: an action's own sends go out once it succeeds, never if it fails"
+                  {:relay (count @relay) :ran (count ran)}))
+    "ok"))
+
 ;; --- Service --------------------------------------------------------------------------------
 
 (defn handle [socket]
@@ -239,6 +300,7 @@
                   "skew" (skew-check)
                   "form" (form-check)
                   "lazy" (lazy-check)
+                  "agents" (agents-check)
                   "unknown")
                 (catch Throwable thrown
                   (str "error " (.getName (class thrown)) " " (.getMessage thrown)))))))
@@ -246,7 +308,9 @@
 (defn -main [& _arguments]
   ;; Clojure's own assertions sit on hot paths: their first pass and first failure are enough.
   (det/first-pass-first-failure!)
-  (set! clojure.lang.Determinismo/firstPassFirstFailure true)
+  (when-let [patched (try (Class/forName "clojure.lang.Determinismo") ; Stock Clojure lacks it.
+                          (catch ClassNotFoundException _stock nil))]
+    (.setBoolean (.getField patched "firstPassFirstFailure") nil true))
   (let [server (ServerSocket. 7100)]
     (loop []
       (let [socket (.accept server)]

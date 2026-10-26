@@ -8,7 +8,8 @@
 //!
 //! Scenarios: `stm` (transfers and write skew between refs, from concurrent requests), `forms`
 //! (generated forms evaluated under every compiler option set), `lazy` (one lazy seq realized by
-//! several threads). `--scenario all` explores them all.
+//! several threads), `agents` (sends, nested sends, a failure and restarts). `--scenario all`
+//! explores them all.
 const std = @import("std");
 const sdk = @import("determinismo");
 
@@ -23,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
         .stm = Check(&.{ "stm", "skew" }).scenario,
         .forms = Check(&.{"form"}).scenario,
         .lazy = Check(&.{"lazy"}).scenario,
+        .agents = Check(&.{"agents"}).scenario,
     } });
 }
 
