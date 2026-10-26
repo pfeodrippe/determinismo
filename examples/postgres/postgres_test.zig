@@ -21,6 +21,7 @@ const System = sdk.System(Nodes);
 
 const port = 5432;
 const image = "docker.io/library/postgres:18.6-alpine";
+const image_jepsen = "docker.io/library/postgres:12.3-alpine";
 const schema_attempts_max = 300;
 
 pub fn main(init: std.process.Init) !void {
@@ -38,14 +39,18 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
+/// `default`: PostgreSQL 18.6. `jepsen`: 12.3, the version of Jepsen's analysis (2020: G2-item at
+/// Serializable), to measure what determinismo finds blind of what Jepsen reported.
 fn describe(d: *System.Describe) !void {
-    const default = try d.profile("default");
-    default.node(.postgres, .{
-        .image = image,
-        .env = &.{"POSTGRES_HOST_AUTH_METHOD=trust"},
-        .ready = .{ .tcp = port },
-        .faults = .{ .restart = true, .crash = true, .stop = true },
-    });
+    inline for (.{ .{ "default", image }, .{ "jepsen", image_jepsen } }) |entry| {
+        const profile = try d.profile(entry[0]);
+        profile.node(.postgres, .{
+            .image = entry[1],
+            .env = &.{"POSTGRES_HOST_AUTH_METHOD=trust"},
+            .ready = .{ .tcp = port },
+            .faults = .{ .restart = true, .crash = true, .stop = true },
+        });
+    }
 }
 
 fn Isolation(comptime level: []const u8) type {

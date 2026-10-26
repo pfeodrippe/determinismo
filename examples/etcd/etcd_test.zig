@@ -81,11 +81,21 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
+/// `default`: etcd v3.7.3. `jepsen`: v3.4.3, the version of Jepsen's analysis (2020), to measure
+/// what determinismo finds blind of what Jepsen reported.
 fn describe(d: *System.Describe) !void {
-    const default = try d.profile("default");
+    inline for (.{
+        .{ "default", "examples/etcd/Dockerfile" },
+        .{ "jepsen", "examples/etcd/Dockerfile.3.4.3" },
+    }) |entry| {
+        try members(try d.profile(entry[0]), entry[1]);
+    }
+}
+
+fn members(profile: *System.Profile, comptime dockerfile: []const u8) !void {
     inline for (member_names) |name| {
-        default.node(@field(System.Name, name), .{
-            .build = .{ .context = ".", .dockerfile = "examples/etcd/Dockerfile" },
+        profile.node(@field(System.Name, name), .{
+            .build = .{ .context = ".", .dockerfile = dockerfile },
             .command = &.{
                 "--name",                        name,
                 "--data-dir",                    "/var/lib/etcd",

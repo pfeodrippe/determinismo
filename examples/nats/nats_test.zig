@@ -52,13 +52,19 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "sync" }) |profile_name| {
-        const profile = try d.profile(profile_name);
+    // `jepsen`: v2.12.1 with its defaults, the version and setup of Jepsen's analysis (2025),
+    // to measure what determinismo finds blind of what Jepsen reported.
+    inline for (.{
+        .{ "default", "examples/nats/Dockerfile", "default" },
+        .{ "sync", "examples/nats/Dockerfile", "sync" },
+        .{ "jepsen", "examples/nats/Dockerfile.2.12.1", "default" },
+    }) |entry| {
+        const profile = try d.profile(entry[0]);
         inline for (server_names) |name| {
             profile.node(@field(System.Name, name), .{
-                .build = .{ .context = ".", .dockerfile = "examples/nats/Dockerfile" },
+                .build = .{ .context = ".", .dockerfile = entry[1] },
                 .command = &.{
-                    "-c",                  "/etc/nats/" ++ profile_name ++ ".conf",
+                    "-c",                  "/etc/nats/" ++ entry[2] ++ ".conf",
                     "-n",                  name,
                     "-js",                 "--cluster_name",
                     "determinismo",        "--cluster",

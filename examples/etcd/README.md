@@ -31,4 +31,41 @@ What is checked:
 
 ## Findings
 
-None yet.
+### Found: a member loses applied writes after a power loss that follows a snapshot install
+
+etcd v3.7.3, blind: `explore ... --scenario kv --seed 4 --timeline 2m`, timeline 0. After
+faults stopped the members never converged: etcd-3, the leader, at revision 66 with applied index
+111, the others at 68 with the same applied index; their keyspace hashes differ. etcd-3 had
+silently lost two applied revisions, and every later write got a revision two lower there than
+on the others: a permanent divergence of the state machine, on the member serving linearizable
+reads. Replay and files: srv1:~/findings/etcd-revision-loss-2026-10-26 (REPLAY.md).
+
+What happened to etcd-3, every step from its own logs, its files (extracted at moments of the
+replay, read with bbolt and a WAL reader) and etcd's code:
+
+1. 110.16 s, restarted after a stop: its backend `member/snap/db` has consistent index 97 and
+   current revision 64.
+2. 110.27 s: the leader sends a snapshot (index 101); etcd-3 saves it as
+   `0000000000000065.snap.db` and installs it: `OpenSnapshotBackend` renames it over `db`
+   (`os.Rename`, server/storage/backend.go) and syncs nothing (not the directory). Restored:
+   consistent index 102, current revision 66.
+3. 110.30 s: `applySnapshot` closes the old backend in a goroutine
+   (server/etcdserver/server.go). Its last commit runs the pre-commit hook that saves the
+   consistent index, already 102 from the new backend, into the old file, and syncs it. The old
+   file now claims index 102 while its data stops at revision 64.
+4. Entries 103 to 106 are applied on the new backend (entry 106 a put: revision 67); its WAL is
+   synced as it goes. At 114.0 s: `db` has consistent index 106, revision 67.
+5. 115.43 s, a power loss (5.1 s after the rename, no journal commit since): the rename is
+   lost. After it, `db` is the old file again (consistent index 102, data to revision 64), and
+   the newer backend is back under its old name, `0000000000000065.snap.db` (consistent index
+   106, revision 67, the same 75 entries as at 114.0 s).
+6. 122.38 s, restart: `restore consistentIndex 102`; `RecoverSnapshotBackend` compares it with
+   the snapshot's index 101 and logs `Skipping snapshot backend`: it keeps the old file, and
+   replays its WAL only past 102. Revision 65 (in the snapshot) and revision 66 (entry 102's
+   txn) are gone for good; the next write, entry 106's put, becomes revision 65 there.
+
+Two causes together: the rename that installs a snapshot backend is not made durable (the
+directory is not synced), and closing the old backend writes the new consistent index into it.
+Either alone would leave the member able to recover (with a durable rename the old file is gone;
+with the old index kept, at 97, the restart recovers from the snapshot file). Kept in this
+repository, not reported upstream.

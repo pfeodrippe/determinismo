@@ -156,6 +156,23 @@ and a node that has not voted. Each step is common in our runs, but all four tog
 order, have not happened yet: 938 timelines of runs 8 to 12, 45 and 46 evaluated election
 safety, none failing.
 
+### Found: the double vote (run 77 on srv2, timeline 22)
+
+Blind, with the durability-point faults and CPU modulation (two-hour runs that repeat with fresh
+seeds, all on one host's CPU pool): at 445.5 s of virtual time `[election-safety] at most one
+leader per term` failed, term 180 with leaders node-1 and node-2. From the timeline's own logs:
+node-2 won term 180 at 433.45 s with node-0's vote (node-1 was still at 179); node-1, after
+power losses that each brought it back at term 179 (`recovered log from disk: last-term=179`),
+kept campaigning in 180; at 445.49 s, partitioned from node-2, it won term 180 with node-0's vote
+again. So node-0 voted twice in term 180. In between, at 440.32 s, node-0's stale vote requests
+of terms 176 to 179 all completed at once as a partition healed. What made node-0 forget its vote
+(its term going back through the off-loop heartbeat, as below, or its stable store) is not
+known yet: the timeline cannot be replayed any more, since srv2 was redeployed and its guest
+image replaced (the tape says so: its inputs differ), and that run's image was built from a
+working tree, not a commit. Its events, all of them, are in the run's database. Next: each run
+keeps the files it booted (serve), so that a finding replays after any deploy; meanwhile the
+hunts go on to find it again.
+
 So the window itself is now a fault: `sync_stall` (on by default, ARCHITECTURE.md §9) holds a
 node's fsyncs for a drawn time while its other goroutines run, and `durable_crash` (with
 `+crash`) crashes the node at one. bbolt syncs every transaction (each `SetUint64` of the term

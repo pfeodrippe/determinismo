@@ -58,10 +58,10 @@ build e2e` tests it.
    goroutine dump) and the log divergence from off-loop heartbeats (#695, with three-minute
    timelines and a pause right after an election), and the snapshot installation livelock
    (#697, with fifteen-minute timelines and up to 32 drivers; it replays from its tape);
-   tests/antithesis-compat/README.md. Not yet: the double vote (#695's second mechanism, an
-   interleaving: a heartbeat goroutine preempted between its term check and its write while
-   the main loop votes). Runs now use in-run snapshots, half of them with CPU modulation, which
-   varies where goroutines are preempted.
+   tests/antithesis-compat/README.md. And the double vote (#695's second mechanism), found in
+   run 77 on srv2 (timeline 22: two leaders in term 180), with the durability-point faults and
+   CPU modulation, in runs that repeat with fresh seeds on the host's shared CPU pool: all four of
+   the POC's known bugs, blind.
 
 ## Antithesis parity found missing
 
@@ -138,12 +138,11 @@ Each gets a test program in `examples/` (or a separate repository when it grows)
 blind, with its findings documented in its README.
 
 - **Faults at durability points** (done: `sync_stall`, `durable_crash`; ARCHITECTURE.md §9): the
-  Raft POC's remaining bug (two leaders in a term) is an interleaving that opens only while a
-  goroutine waits on a store write (tests/antithesis-compat/README.md); random pauses hit it by
-  luck (no failure in 938 timelines, the assertion evaluated in each). The guest module makes a
-  node's fsyncs and sync writes seeded decisions: stalls there widen exactly those windows, and
-  crashes there hit act-then-persist bugs. Any system's, not Raft's alone. Next: measure how
-  often the Raft hunts reach the double vote with them.
+  Raft POC's remaining bug (two leaders in a term) opens only while a goroutine waits on a store
+  write (tests/antithesis-compat/README.md); random pauses had not hit it in 938 timelines. The
+  guest module makes a node's fsyncs and sync writes seeded decisions: stalls there widen those
+  windows, crashes there hit act-then-persist bugs. With them, the double vote was found (run 77,
+  timeline 22). Any system's, not Raft's alone.
 
 1. **Raft**: HashiCorp Raft (examples/raft, at the article's upstream commit 4c8f61ac), then
    OpenRaft, MicroRaft, Aeron Cluster.
