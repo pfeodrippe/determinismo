@@ -4,6 +4,9 @@
 A strategy is an object with any of these methods; missing ones answer the default:
 
     hello(exploration_seed)                   once, at start (seeds are ints)
+    returns(generation, candidates, count)    the tree's next moments: [(branch, vtime_ns,
+                                              reason), ...]; with `wants = ["behaviors"]` each
+                                              candidate has its behaviors (docs/PLUGINS.md)
     branch(index, seed)                       before each branch
     random(pull, default, source, moment[, decision])
                                               a decision: return bytes to override, or None;
@@ -36,7 +39,14 @@ def _dispatch(strategy, name, request):
     if method == "hello":
         if hasattr(strategy, "hello"):
             strategy.hello(int(request["exploration_seed"], 16))
-        return {"name": name}
+        reply = {"name": name}
+        # A strategy that only chooses where the tree returns: `decides = False` (no request per
+        # decision or event); `wants = ["behaviors"]` gives `returns` each candidate's behaviors.
+        if hasattr(strategy, "decides"):
+            reply["decides"] = bool(strategy.decides)
+        if hasattr(strategy, "wants"):
+            reply["wants"] = list(strategy.wants)
+        return reply
     if method == "branch":
         if hasattr(strategy, "branch"):
             arguments = [request["index"], int(request["seed"], 16)]

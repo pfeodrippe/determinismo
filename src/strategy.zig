@@ -26,6 +26,11 @@ parse_buffer: [parse_buffer_size]u8,
 /// The reason the last overriding answer gave, if any.
 reason: [reason_size_max]u8 = undefined,
 reason_size: u8 = 0,
+/// From its hello: whether it is asked for decisions and told events (a plugin that only
+/// chooses where the tree returns says no: no round trip per decision), and whether the tree's
+/// `returns` gives it each candidate's behaviors.
+decides: bool = true,
+wants_behaviors: bool = false,
 
 const Strategy = @This();
 
@@ -141,6 +146,16 @@ pub fn hello(strategy: *Strategy, exploration_seed: u64) !void {
     const reply = try strategy.call(writer.buffered());
     const name = reply.get("name") orelse return error.BadPluginReply;
     if (name != .string) return error.BadPluginReply;
+    strategy.decides = true;
+    strategy.wants_behaviors = false;
+    if (reply.get("decides")) |decides| if (decides == .bool) {
+        strategy.decides = decides.bool;
+    };
+    if (reply.get("wants")) |wants| if (wants == .array) for (wants.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, "behaviors")) {
+            strategy.wants_behaviors = true;
+        }
+    };
     std.debug.print("[determinismo] strategy: {s}\n", .{name.string});
 }
 
@@ -169,6 +184,17 @@ pub const Candidate = struct {
     novel: u32,
     moment_ns: ?u64,
     label: []const u8,
+    /// With `"wants": ["behaviors"]` in its hello: the behaviors it reached itself (after it
+    /// began), each with how many timelines of the generation reached it when no earlier
+    /// generation had (0: known before), and how many timelines reached it before.
+    behaviors: []const Behavior = &.{},
+};
+
+pub const Behavior = struct {
+    label: []const u8,
+    vtime_ns: u64,
+    new_in_generation: u32,
+    timelines_before: u32,
 };
 
 /// A moment of a branch to return to, and why.
@@ -184,10 +210,11 @@ pub fn returns(
     candidates: []const Candidate,
     count: u32,
 ) ![]const Return {
-    var writer: std.Io.Writer = .fixed(&strategy.request);
-    try writer.print("{{\"method\":\"returns\",\"generation\":{d},\"count\":{d}," ++
+    // Not the fixed request buffer: with behaviors, a generation's candidates run to megabytes.
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try writer.writer.print("{{\"method\":\"returns\",\"generation\":{d},\"count\":{d}," ++
         "\"candidates\":{f}}}", .{ generation, count, std.json.fmt(candidates, .{}) });
-    const reply = try strategy.call(writer.buffered());
+    const reply = try strategy.call_long(writer.written());
     const list = reply.get("returns") orelse return &.{};
     if (list != .array) return error.BadPluginReply;
     var chosen: std.ArrayList(Return) = .empty;
@@ -290,8 +317,13 @@ pub fn branch_end(strategy: *Strategy, end: BranchEnd) !bool {
 /// Sends one request line and parses the one reply line. The reply lives in parse_buffer until
 /// the next call.
 fn call(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
-    assert(request.len > 0);
     assert(request.len < line_size_max);
+    return strategy.call_long(request);
+}
+
+/// `call` for a request of any size (the reply still fits the fixed buffers).
+fn call_long(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
+    assert(request.len > 0);
     try write_all(strategy.to_plugin, request);
     try write_all(strategy.to_plugin, "\n");
     const line = try strategy.read_line();

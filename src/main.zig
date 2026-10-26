@@ -1302,6 +1302,8 @@ fn explore_tree(
     const total = branches.arguments.branches;
     const base = seed_base(exploration);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    // How many timelines reached each behavior (what a strategy's `returns` is told).
+    var visits: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     var plan: std.ArrayList(Planned) = .empty;
     const change: ?changed.Change = if (branches.arguments.changed) |source|
         try changed.read(arena, context.io, source)
@@ -1409,7 +1411,13 @@ fn explore_tree(
         while (new_ones.next()) |hash| try seen.put(arena, hash.*, {});
         const chosen = candidates[0..candidate_count];
         std.sort.insertion(Candidate, chosen, {}, candidate_before);
-        const returns = try tree_returns(arena, exploration.strategy, generation, chosen, &random);
+        const counts = Counts{ .reached = &reached, .visits = &visits };
+        const plugin = exploration.strategy;
+        const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random);
+        for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+            const entry = try visits.getOrPut(arena, behavior.hash);
+            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+        };
         // The nodes are made at once, each replay in a child process (`jobs` at a time); then
         // their branches are numbered in the returns' order, as if made one after the other.
         const makings = try arena.alloc(NodeMaking, returns.len);
@@ -1516,11 +1524,19 @@ const TreeReturn = struct { branch: u32, vtime_ns: u64, why: []const u8 };
 /// Where the next generation returns: the strategy's choice when it makes one; else the
 /// branches with the most new behaviors, just after the last of them that leaves room (Go-
 /// Explore's frontier), or a random moment of a branch when nothing was new.
+/// A generation's behavior counts: how many of its timelines reached each behavior new to it,
+/// and how many timelines of earlier generations reached each.
+const Counts = struct {
+    reached: *const std.AutoHashMapUnmanaged(u64, u32),
+    visits: *const std.AutoHashMapUnmanaged(u64, u32),
+};
+
 fn tree_returns(
     arena: std.mem.Allocator,
     strategy: ?*Strategy,
     generation: u32,
     chosen: []const Candidate,
+    counts: Counts,
     random: *std.Random.DefaultPrng,
 ) ![]const TreeReturn {
     var list: std.ArrayList(TreeReturn) = .empty;
@@ -1533,6 +1549,10 @@ fn tree_returns(
             .novel = candidate.novel,
             .moment_ns = candidate.moment,
             .label = candidate.label,
+            .behaviors = if (plugin.wants_behaviors)
+                try behaviors_offered(arena, candidate.summary, counts)
+            else
+                &.{},
         };
         const answer = try plugin.returns(arena, generation, offered[0..chosen.len], tree.nodes);
         for (answer) |back| {
@@ -1587,6 +1607,25 @@ fn tree_returns(
         try list.append(arena, .{ .branch = summary.index, .vtime_ns = at, .why = why });
     }
     return list.items;
+}
+
+/// A timeline's own behaviors (after it began), with their counts, for a strategy's `returns`.
+fn behaviors_offered(
+    arena: std.mem.Allocator,
+    summary: *const Summary,
+    counts: Counts,
+) ![]const Strategy.Behavior {
+    var offered: std.ArrayList(Strategy.Behavior) = .empty;
+    for (summary.behaviors[0..summary.behavior_count]) |*behavior| {
+        if (behavior.vtime_ns <= summary.start_ns) continue; // Its parents'.
+        try offered.append(arena, .{
+            .label = behavior.name(),
+            .vtime_ns = behavior.vtime_ns,
+            .new_in_generation = counts.reached.get(behavior.hash) orelse 0,
+            .timelines_before = counts.visits.get(behavior.hash) orelse 0,
+        });
+    }
+    return offered.items;
 }
 
 fn candidate_before(_: void, a: Candidate, b: Candidate) bool {

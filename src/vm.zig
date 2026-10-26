@@ -873,7 +873,9 @@ fn handle_request(vm: *VM, address: u32) !void {
                 if (vm.until != null and !vm.until_hit and !vm.moment_reached) {
                     vm.until_hit = vm.until_matches(moment_now, line);
                 }
-                if (vm.strategy) |strategy| try strategy.event(moment_now, source, line);
+                if (vm.strategy) |strategy| if (strategy.decides) {
+                    try strategy.event(moment_now, source, line);
+                };
                 if (vm.moment_printing) {
                     std.debug.print("[guest @ {d}ns] {s}\n", .{ moment_now.vtime_ns, line });
                 }
@@ -959,6 +961,7 @@ fn decide_random(vm: *VM, value: []u8, source: []const u8) !void {
             if (overrides.reason(pull)) |reason| try vm.decision_event(pull, source, label, reason);
         }
     } else if (vm.strategy) |strategy| {
+        if (!strategy.decides) return; // It only chooses where the tree returns.
         if (value.len > Strategy.override_size_max) return; // Too large to override.
         if (try strategy.random(pull, try vm.moment(), source, label, value)) {
             const reason = strategy.reason[0..strategy.reason_size];
