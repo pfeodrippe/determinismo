@@ -88,12 +88,17 @@ pub fn start(
     const output_pipes = try output.pipes();
     var sync: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&sync, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    // Closed in the child by its exec (or its death): until then its root is not the node's,
+    // and a command run in the node (through /proc/<pid>/root) would not find its files.
+    var running: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&running, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
     const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
         linux.CLONE.NEWNET | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD);
     const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
     if (linux.errno(result) != .SUCCESS) return error.Clone;
     if (result == 0) {
         _ = linux.close(sync[1]);
+        _ = linux.close(running[0]);
         // Other nodes' mounts go first, before it is in the node's cgroup within reach of its
         // faults: a copy held here keeps another node's disk alive after its crash (its remount
         // gets the old, shut down filesystem back, or the disk is busy), and a fault may stop
@@ -109,6 +114,8 @@ pub fn start(
         launch.exec(output_pipes.stdout[1], output_pipes.stderr[1]); // Never returns.
     }
     const pid: linux.pid_t = @intCast(result);
+    _ = linux.close(running[1]); // Before the forwarder's fork: only the child holds it.
+    defer _ = linux.close(running[0]);
     try output.forward(node.name, paths.output, output_pipes);
     for ([_][2]linux.fd_t{ output_pipes.stdout, output_pipes.stderr }) |pipe| {
         for (pipe) |fd| _ = linux.close(fd);
@@ -117,8 +124,10 @@ pub fn start(
     defer _ = linux.close(sync[1]);
     try cgroup_join(&paths, pid);
     try network_connect(system, node, pid);
-    try file_write(paths.pid, try std.fmt.allocPrint(arena, "{d}\n", .{pid}));
     _ = linux.write(sync[1], "g", 1);
+    var byte: [1]u8 = undefined;
+    _ = linux.read(running[0], &byte, 1); // End of file: it runs the node's program (or died).
+    try file_write(paths.pid, try std.fmt.allocPrint(arena, "{d}\n", .{pid}));
     sdk.event("node_start", .{ .node = node.name, .pid = pid });
 }
 
@@ -1248,10 +1257,14 @@ const Launch = struct {
             if (linux.errno(linux.setuid(uid)) != .SUCCESS) die("setuid", error.Setuid);
         }
         if (linux.errno(linux.chdir(launch.workdir)) != .SUCCESS) _ = linux.chdir("/");
+        var failure: linux.E = .NOENT;
         for (launch.executables) |path| {
-            _ = linux.execve(path, launch.argv, launch.envp);
+            failure = linux.errno(linux.execve(path, launch.argv, launch.envp));
         }
-        die("exec", error.ExecutableNotFound);
+        std.debug.print("det-nodes: exec {s} failed: {s}\n", .{
+            launch.argv[0].?, @tagName(failure),
+        });
+        linux.exit_group(127);
     }
 
     fn mounts_detach_other_nodes(launch: *const Launch) !void {
