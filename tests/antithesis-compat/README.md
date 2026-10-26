@@ -76,6 +76,14 @@ applied index, 1984, with different state machines (1597 blocks on node-2, 1596 
 others: `[fsm-convergence] cluster failed to converge`). Log matching, leader completeness and
 state machine safety: the properties Antithesis's post lists for this bug.
 
+### Exploration so far
+
+Run 15 (2026-10-26): three hours, 1,872 timelines of three minutes (53 hours of simulated time),
+with Go coverage through libvoidstar, faults lasting up to 10 s, and the tree weighing a
+generation's finds by rarity. The divergence (#695) in 3 timelines, twice carried to
+different state machines; the deadlock (#696) in 46. Snapshots were installed on followers in
+most timelines and thousands of faults lasted seconds, yet neither bug below appeared.
+
 ### Not found yet
 
 Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
