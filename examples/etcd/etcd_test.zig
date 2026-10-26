@@ -654,21 +654,29 @@ fn recovers(context: *System.Context) !void {
     };
 }
 
+/// The same revision on every member, and the same keyspace hash where the gateway serves
+/// hashkv (etcd 3.4's, the `jepsen` profile, does not).
 fn converged(all: *const [members_count][4]u8) !void {
     var revision_first: ?u64 = null;
-    var hash_first: u32 = 0;
+    var hash_first: ?u32 = null;
     for (all) |address| {
         var buffer: [4096]u8 = undefined;
         const status = try call(StatusResponse, address, "/v3/maintenance/status", "{}", &buffer);
         const revision = try revision_of(status.header);
         var body_buffer: [64]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buffer, "{{\"revision\":\"{d}\"}}", .{revision});
-        const hash = try call(HashResponse, address, "/v3/maintenance/hashkv", body, &buffer);
+        const hash: ?u32 = if (call(HashResponse, address, "/v3/maintenance/hashkv", body, &buffer)) |answer|
+            answer.hash
+        else |err| switch (err) {
+            error.NoAnswer => null,
+            else => return err,
+        };
         if (revision_first) |first| {
-            if (first != revision or hash_first != hash.hash) return error.NotConverged;
+            if (first != revision) return error.NotConverged;
+            if (hash_first != null and hash != null and hash_first.? != hash.?) return error.NotConverged;
         } else {
             revision_first = revision;
-            hash_first = hash.hash;
+            hash_first = hash;
         }
     }
 }

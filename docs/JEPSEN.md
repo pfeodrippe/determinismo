@@ -75,8 +75,8 @@ determinismo rediscovers and how long it takes; the current version is then hunt
 |---|---|---|---|
 | Raft (Antithesis's POC) | hashicorp/raft 4c8f61ac | leadership-transfer deadlock, log divergence, snapshot livelock, double vote | 4 of 4 |
 | PostgreSQL | 12.3 | G2-item at Serializable | running |
-| NATS JetStream | 2.12.1, default sync | acknowledged writes lost and replicas split after power losses | running |
-| etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | running |
+| NATS JetStream | 2.12.1, default sync | acknowledged writes lost and replicas split after power losses | ✅ rediscovered in the first hour (run 81 on srv2): acknowledged messages lost in 6 timelines, three sequences each acknowledged for two messages, `corrupt state file` on recovery after power losses |
+| etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | running (its gateway has no hashkv: convergence compares revisions there) |
 
 ## Order
 
