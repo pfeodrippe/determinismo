@@ -342,7 +342,9 @@ public final class Determinismo {
   private static String location(String message) {
     if (!located.add(message)) return "";
     return StackWalker.getInstance().walk(frames -> frames
-        .filter(frame -> !frame.getClassName().equals("Determinismo"))
+        // The SDK's own frames, in the default package or copied into a project's.
+        .filter(frame -> !frame.getClassName().equals("Determinismo")
+            && !frame.getClassName().endsWith(".Determinismo"))
         .findFirst()
         .map(frame -> ",\"location\":{\"file\":" + quote(String.valueOf(frame.getFileName()))
             + ",\"line\":" + frame.getLineNumber() + ",\"function\":"

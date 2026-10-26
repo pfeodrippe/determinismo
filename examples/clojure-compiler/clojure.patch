@@ -1,0 +1,275 @@
+diff --git a/src/jvm/clojure/lang/Compiler.java b/src/jvm/clojure/lang/Compiler.java
+index 4d58fcf..06578e8 100644
+--- a/src/jvm/clojure/lang/Compiler.java
++++ b/src/jvm/clojure/lang/Compiler.java
+@@ -4385,6 +4385,8 @@ static class InvokeExpr implements Expr{
+ 				if(args.count() == arity)
+ 					{
+ 					String primc = FnMethod.primInterface(args);
++					if(primc != null)
++						Determinismo.reachable("compiler: a call through a primitive interface (invokePrim)", null);
+ 					if(primc != null)
+ 						return analyze(context,
+ 						               ((IObj)RT.listStar(Symbol.intern(".invokePrim"),
+@@ -5679,6 +5681,7 @@ static public class ObjExpr implements Expr{
+ 				gen.getField(objtype, lb.name, OBJECT_TYPE);
+ 				if(onceOnly && clear && lb.canBeCleared)
+ 					{
++					Determinismo.reachable("compiler: a once-only closure clears a closed-over local", null);
+ 					gen.loadThis();
+ 					gen.visitInsn(Opcodes.ACONST_NULL);
+ 					gen.putField(objtype, lb.name, OBJECT_TYPE);
+@@ -6967,6 +6970,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
+ 							{
+ 							if(recurMismatches != null && RT.booleanCast(recurMismatches.nth(i/2)))
+ 								{
++								Determinismo.reachable("compiler: a loop local was re-analyzed boxed (recur mismatch)", null);
+ 								init = new StaticMethodExpr("", 0, 0, null, RT.class, "box", RT.vector(init), false);
+ 								if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+ 									RT.errPrintWriter().println("Auto-boxing loop arg: " + sym);
+@@ -9392,6 +9396,8 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
+ 		Collection<Expr> returns = new ArrayList(thens.values());
+ 		returns.add(defaultExpr);
+ 		this.returnType = maybeJavaClass(returns);
++        Determinismo.sometimes(RT.count(skipCheck) > 0,
++                "compiler: a case with colliding test hashes (sequential checks)", null);
+         if(RT.count(skipCheck) > 0 && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+             {
+             RT.errPrintWriter()
+diff --git a/src/jvm/clojure/lang/LazySeq.java b/src/jvm/clojure/lang/LazySeq.java
+index cb8c617..4c6a631 100644
+--- a/src/jvm/clojure/lang/LazySeq.java
++++ b/src/jvm/clojure/lang/LazySeq.java
+@@ -84,6 +84,7 @@ final private void realize() {
+ 		try {
+             //must re-examine under lock
+             if(lock != null) {
++                Determinismo.buggifyPause("clojure lazy seq: realizing under its lock");
+                 force();
+                 Object ls = sv;
+                 sv = null;
+@@ -92,6 +93,8 @@ final private void realize() {
+                 s = RT.seq(ls);
+                 lock = null;
+                 }
++            else
++                Determinismo.reachable("lazy seq: another thread realized it while this one waited", null);
+ 		    }
+         finally {
+ 			l.unlock();
+diff --git a/src/jvm/clojure/lang/LockingTransaction.java b/src/jvm/clojure/lang/LockingTransaction.java
+index e76e904..da1d2f1 100644
+--- a/src/jvm/clojure/lang/LockingTransaction.java
++++ b/src/jvm/clojure/lang/LockingTransaction.java
+@@ -115,7 +115,10 @@ void tryWriteLock(Ref ref){
+ 	try
+ 		{
+ 		if(!ref.lock.writeLock().tryLock(LOCK_WAIT_MSECS, TimeUnit.MILLISECONDS))
++			{
++			Determinismo.reachable("STM: a write lock wait timed out", null);
+ 			throw retryex;
++			}
+ 		}
+ 	catch(InterruptedException e)
+ 		{
+@@ -129,13 +132,17 @@ Object lock(Ref ref){
+ 	releaseIfEnsured(ref);
+ 
+ 	boolean unlocked = true;
++	Determinismo.buggifyPause("clojure STM: before taking a write lock");
+ 	try
+ 		{
+ 		tryWriteLock(ref);
+ 		unlocked = false;
+ 
+ 		if(ref.tvals != null && ref.tvals.point > readPoint)
++			{
++			Determinismo.reachable("STM: a write found a value committed after its read point", null);
+ 			throw retryex;
++			}
+ 		Info refinfo = ref.tinfo;
+ 
+ 		//write lock conflict
+@@ -159,6 +166,7 @@ Object lock(Ref ref){
+ }
+ 
+ private Object blockAndBail(Info refinfo){
++	Determinismo.reachable("STM: a transaction waited on another's write and retried", null);
+ //stop prior to blocking
+ 	stop(RETRY);
+ 	try
+@@ -197,7 +205,10 @@ private boolean barge(Info refinfo){
+ 		{
+         barged = refinfo.status.compareAndSet(RUNNING, KILLED);
+         if(barged)
++            {
++            Determinismo.reachable("STM: an older transaction killed a younger one (barging)", null);
+             refinfo.latch.countDown();
++            }
+ 		}
+ 	return barged;
+ }
+@@ -271,6 +282,7 @@ Object run(Callable fn) throws Exception{
+ 				}
+ 			info = new Info(RUNNING, startPoint);
+ 			ret = fn.call();
++			Determinismo.buggifyPause("clojure STM: between a transaction's body and its commit");
+ 			//make sure no one has killed us before this point, and can't from now on
+ 			if(info.status.compareAndSet(RUNNING, COMMITTING))
+ 				{
+@@ -285,7 +297,10 @@ Object run(Callable fn) throws Exception{
+ 					tryWriteLock(ref);
+ 					locked.add(ref);
+ 					if(wasEnsured && ref.tvals != null && ref.tvals.point > readPoint)
++						{
++						Determinismo.reachable("STM: a commute on an ensured ref found it changed", null);
+ 						throw retryex;
++						}
+ 
+ 					Info refinfo = ref.tinfo;
+ 					if(refinfo != null && refinfo != info && refinfo.running())
+@@ -316,6 +331,10 @@ Object run(Callable fn) throws Exception{
+ 				//at this point, all values calced, all refs to be written locked
+ 				//no more client code to be called
+ 				long commitPoint = getCommitPoint();
++				Determinismo.always(commitPoint > readPoint,
++						"STM: a commit point follows its transaction's read point", null);
++				Determinismo.sometimesGreaterThan(i, 8,
++						"STM: a transaction committed after more than 8 retries", null);
+ 				for(Map.Entry<Ref, Object> e : vals.entrySet())
+ 					{
+ 					Ref ref = e.getKey();
+@@ -331,6 +350,8 @@ Object run(Callable fn) throws Exception{
+ 							|| hcount < ref.minHistory)
+ 						{
+ 						ref.tvals = new Ref.TVal(newval, commitPoint, ref.tvals);
++						Determinismo.sometimes(hcount + 1 == ref.maxHistory,
++								"STM: a ref's history grew to its maximum", null);
+ 						ref.faults.set(0);
+ 						}
+ 					else
+@@ -350,6 +371,7 @@ Object run(Callable fn) throws Exception{
+ 		catch(RetryEx retry)
+ 			{
+ 			//eat this so we retry rather than fall out
++			Determinismo.reachable("STM: a transaction retried", null);
+ 			}
+ 		finally
+ 			{
+@@ -386,7 +408,10 @@ Object run(Callable fn) throws Exception{
+ 			}
+ 		}
+ 	if(!done)
++		{
++		Determinismo.reachable("STM: a transaction gave up at the retry limit", null);
+ 		throw Util.runtimeException("Transaction failed after reaching retry limit");
++		}
+ 	return ret;
+ }
+ 
+@@ -416,6 +441,7 @@ Object doGet(Ref ref){
+ 		ref.lock.readLock().unlock();
+ 		}
+ 	//no version of val precedes the read point
++	Determinismo.reachable("STM: a read found no value as old as its read point", null);
+ 	ref.faults.incrementAndGet();
+ 	throw retryex;
+ 
+@@ -445,6 +471,7 @@ void doEnsure(Ref ref){
+ 	//someone completed a write after our snapshot
+ 	if(ref.tvals != null && ref.tvals.point > readPoint) {
+         ref.lock.readLock().unlock();
++        Determinismo.reachable("STM: an ensure found a value committed after its read point", null);
+         throw retryex;
+     }
+ 
+@@ -459,6 +486,7 @@ void doEnsure(Ref ref){
+ 			{
+ 			blockAndBail(refinfo); 
+ 			}
++		Determinismo.reachable("STM: a transaction ensured a ref it writes", null);
+ 		}
+ 	else
+ 		ensures.add(ref);
+diff --git a/src/jvm/clojure/lang/PersistentHashMap.java b/src/jvm/clojure/lang/PersistentHashMap.java
+index 8f15944..a531b7f 100644
+--- a/src/jvm/clojure/lang/PersistentHashMap.java
++++ b/src/jvm/clojure/lang/PersistentHashMap.java
+@@ -534,6 +534,7 @@ final static class ArrayNode implements INode{
+ 
+ 
+ 	private INode pack(AtomicReference<Thread> edit, int idx) {
++		Determinismo.reachable("hash map: an array node packed back into a bitmap node", null);
+ 		Object[] newArray = new Object[2*(count - 1)];
+ 		int j = 1;
+ 		int bitmap = 0;
+@@ -726,6 +727,7 @@ final static class BitmapIndexedNode implements INode{
+ 							nodes[i] = EMPTY.assoc(shift + 5, hash(array[j]), array[j], array[j+1], addedLeaf);
+ 						j += 2;
+ 					}
++				Determinismo.reachable("hash map: a bitmap node grew into an array node", null);
+ 				return new ArrayNode(null, n + 1, nodes);
+ 			} else {
+ 				Object[] newArray = new Object[2*(n+1)];
+@@ -885,6 +887,7 @@ final static class BitmapIndexedNode implements INode{
+ 							nodes[i] = EMPTY.assoc(edit, shift + 5, hash(array[j]), array[j], array[j+1], addedLeaf);
+ 						j += 2;
+ 					}
++				Determinismo.reachable("transient hash map: a bitmap node grew into an array node", null);
+ 				return new ArrayNode(edit, n + 1, nodes);
+ 			} else {
+ 				Object[] newArray = new Object[2*(n+4)];
+@@ -954,6 +957,7 @@ final static class HashCollisionNode implements INode{
+ 			newArray[2 * count] = key;
+ 			newArray[2 * count + 1] = val;
+ 			addedLeaf.val = addedLeaf;
++			Determinismo.reachable("hash map: a collision node holds three keys or more", null);
+ 			return new HashCollisionNode(edit, hash, count + 1, newArray);
+ 		}
+ 		// nest it in a bitmap node
+@@ -967,6 +971,7 @@ final static class HashCollisionNode implements INode{
+ 			return this;
+ 		if(count == 1)
+ 			return null;
++		Determinismo.sometimes(count == 2, "hash map: a collision node shrank to one key", null);
+ 		return new HashCollisionNode(null, hash, count - 1, removePair(array, idx/2));
+ 	}
+ 
+@@ -1200,7 +1205,10 @@ private static Object[] removePair(Object[] array, int i) {
+ private static INode createNode(int shift, Object key1, Object val1, int key2hash, Object key2, Object val2) {
+ 	int key1hash = hash(key1);
+ 	if(key1hash == key2hash)
++		{
++		Determinismo.reachable("hash map: two keys with one hash share a collision node", null);
+ 		return new HashCollisionNode(null, key1hash, 2, new Object[] {key1, val1, key2, val2});
++		}
+ 	Box addedLeaf = new Box(null);
+ 	AtomicReference<Thread> edit = new AtomicReference<Thread>();
+ 	return BitmapIndexedNode.EMPTY
+@@ -1211,7 +1219,10 @@ private static INode createNode(int shift, Object key1, Object val1, int key2has
+ private static INode createNode(AtomicReference<Thread> edit, int shift, Object key1, Object val1, int key2hash, Object key2, Object val2) {
+ 	int key1hash = hash(key1);
+ 	if(key1hash == key2hash)
++		{
++		Determinismo.reachable("transient hash map: two keys with one hash share a collision node", null);
+ 		return new HashCollisionNode(null, key1hash, 2, new Object[] {key1, val1, key2, val2});
++		}
+ 	Box addedLeaf = new Box(null);
+ 	return BitmapIndexedNode.EMPTY
+ 		.assoc(edit, shift, key1hash, key1, val1, addedLeaf)
+diff --git a/src/jvm/clojure/lang/Reflector.java b/src/jvm/clojure/lang/Reflector.java
+index 14cef15..9f77dd9 100644
+--- a/src/jvm/clojure/lang/Reflector.java
++++ b/src/jvm/clojure/lang/Reflector.java
+@@ -172,9 +172,11 @@ static Object invokeMatchingMethod(String methodName, List methods, Class contex
+ 		}
+ 	else //overloaded w/same arity
+ 		{
++		Determinismo.reachable("reflection: a call chose among overloads of one arity", null);
+ 		m = matchMethod(methods, args);
+ 		if(m == null) // widen boxed args and re-try matchMethod
+ 			{
++			Determinismo.reachable("reflection: a call matched only after widening boxed args", null);
+ 			args = widenBoxedArgs(args);
+ 			m = matchMethod(methods, args);
+ 			}
