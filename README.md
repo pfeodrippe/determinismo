@@ -203,6 +203,9 @@ zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko --busy
 sudo infra/host/serve.sh det start        # serve as a unit (stop: its runs stop too)
 ```
 
+To update a host's build without stopping its runs (the VMM, the guest runtime, the examples;
+not the KVM patch or the tools, which need `setup.sh`): `infra/host/update.sh <ip>`.
+
 Runs go to serve with `determinismo explore --serve 127.0.0.1:7878 ...`; its web UI through
 `ssh -L 7878:127.0.0.1:7878 det@<ip>`.
 
