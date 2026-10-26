@@ -33,7 +33,7 @@ until ssh "${ssh_opts[@]}" "root@$ip" true 2>/dev/null \
   sleep 30
 done
 
-if ssh "${ssh_opts[@]}" "root@$ip" 'test "$(hostname)" = rescue' 2>/dev/null; then
+if ssh "${ssh_opts[@]}" "root@$ip" 'test -x /root/.oldroot/nfs/install/installimage' 2>/dev/null; then
   echo "== installing Debian (rescue system)"
   "$repo/infra/hetzner/install-os.sh" "$ip" "$hostname"
   sleep 60 # The reboot begins.

@@ -10,7 +10,9 @@ hostname=${2:-determinismo}
 conf=${3:-$(dirname "$0")/installimage.conf}
 ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
-ssh "${ssh_opts[@]}" "root@$ip" 'test "$(hostname)" = rescue' \
+# The rescue system has the installer (its hostname changes once installimage ran).
+installer=/root/.oldroot/nfs/install/installimage
+ssh "${ssh_opts[@]}" "root@$ip" "test -x $installer" \
   || { echo "error: $ip is not in the Hetzner rescue system" >&2; exit 1; }
 
 scp "${ssh_opts[@]}" "$conf" "root@$ip:/tmp/installimage.conf"
@@ -29,7 +31,8 @@ image=$(ls /root/.oldroot/nfs/images/Debian-13*-amd64-base.tar.zst | sort -V | t
   cat /tmp/installimage.conf
 } > /tmp/autosetup.conf
 echo "installing $image on" $disks
-TERM=xterm /root/.oldroot/nfs/install/installimage -a -c /tmp/autosetup.conf
+# Its input is not this script's (which bash reads from the same stdin).
+TERM=xterm /root/.oldroot/nfs/install/installimage -a -c /tmp/autosetup.conf < /dev/null
 nohup sh -c 'sleep 2; reboot' >/dev/null 2>&1 & # Once this session closed cleanly.
 EOF
 

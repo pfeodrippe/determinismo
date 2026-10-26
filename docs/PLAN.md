@@ -13,8 +13,9 @@ build e2e` tests it.
    and choose the moments to return to (`returns`), with reasons. Behaviors: assertion
    outcomes, categorical events (coverage lines and edges included), guidance distances, and
    new kinds of output lines. Next steps for it:
-   - Snapshot during the run when a timeline first reaches something new, instead of replaying
-     to the moment after the generation (no replay; the same tree).
+   - Done: in-run snapshots (holders, ARCHITECTURE.md §8): a node is a memory copy instead of a
+     replay of its parent to the moment (minutes with fifteen-minute timelines). Next: return
+     to more moments per generation now that a node costs little.
    - Measured with bench/tree.py (the self-test maze, eight seeds; plugins/python/tree_rarity.py
      tries a rule without rebuilding). Kept: a generation's finds weighed by how few of its
      timelines found them (second digit 16.6 against 14.6). Dropped: rarity summed over all
@@ -52,8 +53,7 @@ build e2e` tests it.
    writes, one per driver), syncs that took no virtual time (the double vote needs a
    heartbeat handled while the main loop syncs), and three-minute timelines where the POC is
    tuned for fifteen. All three changed; run 17 (eight hours, fifteen-minute timelines) is the
-   test. The tree makes its nodes in parallel; in-run snapshots (item 2) would remove those
-   replays altogether.
+   test. The tree makes its nodes from in-run snapshots (item 2), without replays.
 
 ## Antithesis parity found missing
 

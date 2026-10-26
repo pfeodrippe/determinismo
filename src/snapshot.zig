@@ -41,9 +41,25 @@ pub fn take(snapshot: *Snapshot, vm: *VM) !void {
     assert(!vm.frozen);
     try complete_pending_io(vm);
     if (vm.target_branches != 0) try vm.target_set(0); // Branches re-arm their own timer.
+    try snapshot.state_save(vm, vm.memory_fd);
+    vm.frozen = true;
+}
+
+/// Everything but memory of a running VM paused at a hold point, which then goes on: the state a
+/// replay stopped at that moment would be frozen in (its console flushed as a run's end does).
+/// The memory is copied later from a copy-on-write fork of the process (main.zig's holders).
+pub fn capture(snapshot: *Snapshot, vm: *VM) !void {
+    assert(vm.deterministic);
+    assert(!vm.frozen);
+    assert(vm.target_branches == 0); // Paused at a hold point: no stop armed, no I/O pending.
+    try snapshot.state_save(vm, -1);
+    snapshot.serial.output_count = 0;
+}
+
+fn state_save(snapshot: *Snapshot, vm: *VM, memory_fd: std.os.linux.fd_t) !void {
     const state = try vm.det_state();
     snapshot.* = .{
-        .memory_fd = vm.memory_fd,
+        .memory_fd = memory_fd,
         .memory_size = vm.memory.len,
         .regs = undefined,
         .sregs = undefined,
@@ -71,8 +87,15 @@ pub fn take(snapshot: *Snapshot, vm: *VM) !void {
         chip.* = .{ .chip_id = @intCast(index), .chip = undefined };
         _ = try kvm.ioctl(vm.vm_fd, kvm.GET_IRQCHIP, @intFromPtr(chip));
     }
-    vm.frozen = true;
     assert(snapshot.msrs.count > 0);
+}
+
+/// A captured snapshot's memory: a copy of `memory` (this process's copy-on-write view of the
+/// VM's) in a memfd of its own.
+pub fn capture_memory(snapshot: *Snapshot, memory: []align(std.heap.page_size_min) u8) !void {
+    assert(snapshot.memory_fd == -1);
+    assert(memory.len == snapshot.memory_size);
+    snapshot.memory_fd = try memory_copy(memory);
 }
 
 /// Freezes a branch: its memory is a private copy-on-write mapping, so it is first copied into a

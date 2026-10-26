@@ -71,8 +71,15 @@ decision_source_size: u32,
 /// The event count at the last exec_done handled: later doorbells (with no event) keep exec_done
 /// as the last event, and must not finish the next command.
 exec_done_handled: u64,
-/// Whether the armed branch-count target is the moment (true) or the PIT deadline (false).
-target_is_moment: bool,
+/// What the armed branch-count target is for.
+target_kind: Deadline.Kind,
+/// An in-run snapshot point (main.zig's holders): virtual time (TSC) where the run pauses for
+/// `hold` and goes on. It stops where a replay to that moment stops (an exact branch count,
+/// or within an idle skip), and the guest cannot tell: the timeline is the same as without it.
+hold_tsc: ?u64,
+hold: ?*const Hold,
+/// Behaviors the hold's owner was told of (Hold.behaviors).
+hold_behaviors: u32,
 deterministic: bool,
 builtin_properties: bool,
 tsc_per_branch: u32,
@@ -287,7 +294,10 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .decision_source = undefined,
         .decision_source_size = 0,
         .exec_done_handled = 0,
-        .target_is_moment = false,
+        .target_kind = .timer,
+        .hold_tsc = null,
+        .hold = null,
+        .hold_behaviors = 0,
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
         .tsc_per_branch = options.tsc_per_branch,
@@ -476,6 +486,7 @@ fn run_loop(vm: *VM) !Outcome {
             .io => {
                 if (try vm.handle_io()) |outcome| return outcome;
                 try vm.timer_due();
+                try vm.hold_notice();
             },
             .mmio => {
                 try vm.handle_mmio();
@@ -484,12 +495,19 @@ fn run_loop(vm: *VM) !Outcome {
             .det_target => {
                 assert(vm.deterministic);
                 vm.stats.exits.getPtr(.det_target).* += 1;
-                if (vm.target_is_moment) {
-                    vm.target_branches = 0;
-                    if (try vm.moment_arrive()) |outcome| return outcome;
-                } else {
-                    try vm.target_set(0); // A soft stop leaves the hard one armed.
-                    try vm.timer_fire();
+                switch (vm.target_kind) {
+                    .moment => {
+                        vm.target_branches = 0;
+                        if (try vm.moment_arrive()) |outcome| return outcome;
+                    },
+                    .hold => {
+                        vm.target_branches = 0;
+                        try vm.hold_reach();
+                    },
+                    .timer => {
+                        try vm.target_set(0); // A soft stop leaves the hard one armed.
+                        try vm.timer_fire();
+                    },
                 }
             },
             .hlt => {
@@ -523,22 +541,45 @@ pub fn det_state(vm: *VM) !kvm.DetState {
     return state;
 }
 
-const Deadline = struct { tsc: u64, is_moment: bool };
+const Deadline = struct {
+    tsc: u64,
+    kind: Kind,
+
+    const Kind = enum {
+        timer,
+        moment,
+        hold,
+
+        /// Moments and hold points stop at their exact branch count; timers have slack.
+        fn exact(kind: Kind) bool {
+            return kind != .timer;
+        }
+    };
+};
 const tsc_per_ns = cpuid.tsc_hz / std.time.ns_per_s;
 
-/// The next thing the VMM must do at a precise moment: fire the PIT, or reach the moment.
+/// The next thing the VMM must do at a precise moment: fire the PIT, reach the moment, or pause
+/// at a hold point. The earliest; at the same time the moment, then the timer: a timer may fire
+/// at a clock read past its deadline, and a hold point stopping first would move it.
 fn deadline_next(vm: *const VM) ?Deadline {
     const timer: ?Deadline = if (vm.pit.deadline_tsc()) |tsc| .{
         .tsc = tsc,
-        .is_moment = false,
+        .kind = .timer,
     } else null;
     const stop: ?Deadline = if (vm.moment_reached) null else if (vm.moment_tsc) |tsc| .{
         .tsc = tsc,
-        .is_moment = true,
+        .kind = .moment,
     } else null;
-    if (timer == null) return stop;
-    if (stop == null) return timer;
-    return if (stop.?.tsc <= timer.?.tsc) stop else timer;
+    const hold: ?Deadline = if (vm.hold_tsc) |tsc| .{
+        .tsc = tsc,
+        .kind = .hold,
+    } else null;
+    var next: ?Deadline = null;
+    for ([_]?Deadline{ stop, timer, hold }) |candidate| {
+        const deadline = candidate orelse continue;
+        if (next == null or deadline.tsc < next.?.tsc) next = deadline;
+    }
+    return next;
 }
 
 /// Asks KVM to stop the vCPU at the next deadline. A moment stops at its exact branch count. A
@@ -550,15 +591,19 @@ fn timer_arm(vm: *VM) !void {
     if (vm.target_branches != 0) return;
     const deadline = vm.deadline_next() orelse return;
     const state = try vm.det_state();
-    if (deadline.tsc <= state.tsc) {
-        if (deadline.is_moment) {
+    if (deadline.tsc <= state.tsc) switch (deadline.kind) {
+        .moment => {
             vm.moment_tsc = state.tsc; // Already past: the moment is now.
-            vm.target_is_moment = true;
+            vm.target_kind = .moment;
             return vm.target_set(state.branches + 1); // Stop right after the next branch.
-        }
-        return vm.timer_fire();
-    }
-    const slack_tsc = if (deadline.is_moment) 0 else vm.timer_slack_tsc;
+        },
+        .hold => { // Past (not where a replay would stop): none, a replay makes the node.
+            vm.hold_tsc = null;
+            return vm.timer_arm();
+        },
+        .timer => return vm.timer_fire(),
+    };
+    const slack_tsc = if (deadline.kind.exact()) 0 else vm.timer_slack_tsc;
     const hard_tsc = deadline.tsc + slack_tsc;
     // With CPU modulation a branch takes more virtual time than the guest's clock shows until
     // the next exit adds it: count branches at the modulated rate, and place the soft stop
@@ -568,9 +613,9 @@ fn timer_arm(vm: *VM) !void {
     const branches_left = std.math.divCeil(u64, (hard_tsc - state.tsc) * 1000, per_branch) catch
         unreachable;
     assert(branches_left > 0);
-    vm.target_is_moment = deadline.is_moment;
+    vm.target_kind = deadline.kind;
     try vm.target_set(state.branches + branches_left);
-    if (!deadline.is_moment and slack_tsc > 0) {
+    if (!deadline.kind.exact() and slack_tsc > 0) {
         try vm.soft_set(state.tsc + (deadline.tsc - state.tsc) * 1000 / permille);
     }
 }
@@ -608,7 +653,7 @@ fn modulate(vm: *VM) !void {
 fn moment_arrive(vm: *VM) !?Outcome {
     assert(!vm.moment_reached);
     vm.moment_reached = true;
-    vm.target_is_moment = false;
+    vm.target_kind = .timer;
     const moment_now = try vm.moment();
     if (vm.until != null and !vm.until_hit) {
         std.debug.print("[determinismo] until: timed out, the condition did not hold\n", .{});
@@ -651,7 +696,7 @@ fn soft_set(vm: *VM, soft_tsc: u64) !void {
 /// deadline has passed instead of waiting for its soft or hard stop.
 fn timer_due(vm: *VM) !void {
     if (!vm.deterministic or vm.timer_slack_tsc == 0) return; // No slack: stops are exact.
-    if (vm.target_branches == 0 or vm.target_is_moment) return;
+    if (vm.target_branches == 0 or vm.target_kind != .timer) return;
     const deadline = vm.pit.deadline_tsc() orelse return;
     const state = try vm.det_state();
     if (state.tsc < deadline) return;
@@ -673,23 +718,68 @@ fn timer_fire(vm: *VM) !void {
 
 const Idle = enum { timer, moment, none };
 
-/// The guest halted with nothing to do: jump virtual time to the next deadline.
+/// The guest halted with nothing to do: jump virtual time to the next deadline. A hold point on
+/// the way pauses there and the skip goes on: the guest does not wake (resuming it would run its
+/// idle loop once more, which a timeline without the hold point does not).
 fn idle_skip(vm: *VM) !Idle {
     assert(vm.deterministic);
-    const deadline = vm.deadline_next() orelse return .none;
-    const state = try vm.det_state();
-    if (deadline.tsc > state.tsc) {
-        var skipped_tsc = deadline.tsc - state.tsc;
-        _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&skipped_tsc));
-        vm.stats.idle_tsc += skipped_tsc;
+    while (true) {
+        const deadline = vm.deadline_next() orelse return .none;
+        const state = try vm.det_state();
+        if (deadline.tsc > state.tsc) {
+            var skipped_tsc = deadline.tsc - state.tsc;
+            _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&skipped_tsc));
+            vm.stats.idle_tsc += skipped_tsc;
+        }
+        if (vm.target_branches != 0) try vm.target_set(0);
+        assert(vm.target_branches == 0);
+        try vm.trace("idle", deadline.tsc);
+        vm.stats.idle_skips += 1;
+        switch (deadline.kind) {
+            .moment => return .moment,
+            .hold => try vm.hold_reach(),
+            .timer => {
+                try vm.timer_fire();
+                return .timer;
+            },
+        }
     }
-    if (vm.target_branches != 0) try vm.target_set(0);
-    assert(vm.target_branches == 0);
-    try vm.trace("idle", deadline.tsc);
-    vm.stats.idle_skips += 1;
-    if (deadline.is_moment) return .moment;
-    try vm.timer_fire();
-    return .timer;
+}
+
+/// Owner of a timeline's hold points (main.zig's holders): told when the timeline reached new
+/// behaviors (it may arm a hold point then, `hold_arm`), and called at the hold point.
+pub const Hold = struct {
+    context: *anyopaque,
+    behaviors: *const fn (context: *anyopaque, vm: *VM, first_new: u32) anyerror!void,
+    reached: *const fn (context: *anyopaque, vm: *VM) anyerror!void,
+};
+
+/// Pauses the run at `vtime_ns` (later than now) for the hold's owner, in place of a hold point
+/// armed already (one at a time).
+pub fn hold_arm(vm: *VM, vtime_ns: u64) !void {
+    assert(vm.deterministic);
+    assert(vm.hold != null);
+    vm.hold_tsc = vtime_ns * tsc_per_ns;
+    // An armed stop is re-armed with the new hold point in view (a timer's at the same branch
+    // count: timer_arm counts from the deadline, not from now).
+    if (vm.target_branches != 0 and vm.target_kind != .moment) try vm.target_set(0);
+}
+
+/// After an exit that may have brought events: new behaviors are the hold point owner's news.
+fn hold_notice(vm: *VM) !void {
+    const hold = vm.hold orelse return;
+    const count = vm.events.behavior_count;
+    if (count == vm.hold_behaviors) return;
+    const first_new = vm.hold_behaviors;
+    vm.hold_behaviors = count;
+    try hold.behaviors(hold.context, vm, first_new);
+}
+
+fn hold_reach(vm: *VM) !void {
+    vm.hold_tsc = null;
+    vm.target_kind = .timer;
+    const hold = vm.hold orelse return;
+    try hold.reached(hold.context, vm);
 }
 
 fn now_tsc(vm: *VM) !u64 {

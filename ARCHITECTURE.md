@@ -245,6 +245,14 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   KVM rejects VM fds from another process (`kvm->mm != current->mm`), so `fork()` is not enough.
 - Dirty tracking via KVM dirty ring → cheap delta snapshots.
 - Base snapshot taken at `setup_complete`; every exploration starts from it.
+- In-run snapshots (`src/holders.zig`): the tree explorer returns just after a timeline's new
+  behaviors, so a running timeline pauses there (a *hold point*: the exact branch count a replay
+  to that moment stops at, or inside an idle skip, invisible to the guest), forks a holder that
+  keeps the machine copy-on-write, and goes on. A node is then a memory copy, not a replay from
+  the parent's start; a moment between holders replays from the nearest one. Holders are spaced
+  (a timeline's length over 64, plus one every eighth when nothing is new), at most 8 per
+  timeline, none under 8 GB of available memory, and the OOM killer's first victims. The tree is
+  the same as with replays (the e2e tree check, and bench/tree.py's identical numbers).
 - Expected cost: milliseconds per branch. If it becomes the bottleneck → in-kernel VM fork
   (ownership level 2) behind the same "branch" interface.
 

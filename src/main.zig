@@ -14,6 +14,7 @@ const report = @import("report.zig");
 const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
 const fd_pass = @import("fd_pass.zig");
+const holders = @import("holders.zig");
 const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
@@ -1101,6 +1102,10 @@ const Branches = struct {
     /// whichever comes next.
     worker: u32 = 0,
     jobs: u32 = 1,
+    /// The tree's in-run snapshots (holders.zig): where holders register, and the behaviors the
+    /// tree knew before this generation. Null: none (no tree, or a strategy, or CPU modulation).
+    holders: ?*const linux.sockaddr.un = null,
+    seen: ?*const std.AutoHashMapUnmanaged(u64, void) = null,
     /// Shared by parallel workers (memory mapped before they fork): the next position to run.
     /// A timeline is the same whichever worker runs it, so a worker that finished takes the
     /// next instead of idling while others run long ones.
@@ -1119,6 +1124,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         try moment_after_snapshot(branches.snapshot, ms * std.time.ns_per_ms);
     }
     const total = if (branches.plan) |plan| plan.len else count;
+    // A holder's capture (one at a time: each holder keeps its own copy, forked).
+    const capture = if (branches.holders != null) try context.arena.create(Snapshot) else undefined;
+    var maker = HolderMaker{ .arena = context.arena, .options = options };
     var position_next: usize = 0;
     while (true) {
         const position: usize = if (branches.next) |counter|
@@ -1155,6 +1163,23 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             }
         }
         defer if (branches.arguments.events_directory != null) close(vm.events.log_fd.?);
+        var owner: holders.Owner = undefined;
+        if (branches.holders) |address| {
+            owner = .{
+                .address = address,
+                .seen = branches.seen.?,
+                .branch = index,
+                .seed = place.seed,
+                .start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s),
+                .spacing_ns = holders.Owner.spacing(if (branches.arguments.timeline_ms) |ms|
+                    ms * std.time.ns_per_ms
+                else
+                    null),
+                .snapshot = capture,
+                .make = .{ .context = &maker, .function = HolderMaker.make },
+            };
+            try owner.attach(vm);
+        }
         vm.strategy = exploration.strategy;
         if (exploration.replay) |replay| vm.overrides = replay.overrides;
         try branch_announce(context, vm, exploration, place);
@@ -1318,6 +1343,12 @@ fn explore_tree(
             .snapshot = branches.snapshot,
         });
     }
+    // In-run snapshots (holders.zig): not with a strategy (its decisions replay from its tape, as
+    // holders do not) or CPU modulation (whose time an extra stop would move).
+    var listener: holders.Listener = undefined;
+    const holding = exploration.strategy == null and !options.cpu_modulation;
+    if (holding) try listener.init();
+    defer if (holding) listener.deinit();
     var generation: u32 = 0;
     const items = try arena.alloc(Summary, tree.generation_size);
     // Parents' tapes are read into this (a strategy's overrides), one at a time.
@@ -1333,12 +1364,17 @@ fn explore_tree(
         var mine = branches;
         mine.plan = plan.items;
         mine.summaries = &summaries;
+        if (holding) {
+            mine.holders = &listener.address;
+            mine.seen = &seen;
+        }
         const workers: u32 = @intCast(@min(jobs, plan.items.len));
         if (workers == 1) {
             try explore_branches(context, vm, options, mine);
         } else {
             try explore_parallel(context, vm, options, mine, workers);
         }
+        if (holding) listener.collect();
         // In index order (workers finish in any): what each reached that none before it had.
         // Summaries are large: their order is sorted, not them.
         const done = try arena.alloc(*const Summary, summaries.count);
@@ -1423,6 +1459,7 @@ fn explore_tree(
         const makings = try arena.alloc(NodeMaking, returns.len);
         var making_count: u32 = 0;
         var finished: u32 = 0;
+        var held: u32 = 0;
         for (returns) |back| {
             const parent = for (plan.items) |entry| {
                 if (entry.index == back.branch) break entry;
@@ -1431,6 +1468,19 @@ fn explore_tree(
                 node_make_finish(arena, &makings[finished]);
                 finished += 1;
             }
+            // A holder of the parent at the moment, or a little before it: no replay from the
+            // parent's start.
+            if (holding) if (listener.take(back.branch, back.vtime_ns)) |taken| {
+                makings[making_count] = .{
+                    .back = back,
+                    .parent = parent,
+                    .pid = taken.pid,
+                    .socket = taken.socket,
+                };
+                making_count += 1;
+                held += 1;
+                continue;
+            };
             // A strategy's decisions in the parent are in its tape: replayed to the moment.
             const overrides = if (exploration.strategy != null) try tape_overrides(
                 context,
@@ -1445,6 +1495,7 @@ fn explore_tree(
         while (finished < making_count) : (finished += 1) {
             node_make_finish(arena, &makings[finished]);
         }
+        if (holding) listener.release(); // Their memory, before the next generation runs.
         var next: std.ArrayList(Planned) = .empty;
         var made: u32 = 0;
         for (makings[0..making_count]) |*making| {
@@ -1491,8 +1542,8 @@ fn explore_tree(
             });
         }
         std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
-            "({d} known); {d} moments returned to\n", .{
-            generation, done.len, reached.count(), seen.count(), made,
+            "({d} known); {d} moments returned to ({d} from in-run snapshots)\n", .{
+            generation, done.len, reached.count(), seen.count(), made, held,
         });
         plan = next;
     }
@@ -1687,8 +1738,26 @@ fn node_make(
     return snapshot;
 }
 
+/// What a holder replays with, to a moment later than its own (node_make, in the holder).
+const HolderMaker = struct {
+    arena: std.mem.Allocator,
+    options: *const VM.Options,
+
+    fn make(
+        context: *anyopaque,
+        vm: *VM,
+        from: *const Snapshot,
+        seed: u64,
+        vtime_ns: u64,
+    ) anyerror!*const Snapshot {
+        const maker: *HolderMaker = @ptrCast(@alignCast(context));
+        return node_make(maker.arena, vm, maker.options, from, seed, vtime_ns, null);
+    }
+};
+
 /// A tree node in the making: a child process replays its parent to the moment, freezes it and
-/// hands the snapshot over (its memory's memfd through the socket, fd_pass).
+/// hands the snapshot over (its memory's memfd through the socket, fd_pass); or a holder of the
+/// parent at or before the moment does (holders.zig), with the same protocol.
 const NodeMaking = struct {
     back: TreeReturn,
     parent: Planned,

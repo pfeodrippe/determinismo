@@ -1006,9 +1006,13 @@ fn check_tree(context: *Context) !void {
     const same = count == 40 and parse_branches(many, &parallel) == count and
         same_timelines(sequential[0..count], parallel[0..count]);
     const deep = try deepest_replays(context, program, record, tapes, sequential[0..count]);
-    expect(context, same and deep.depth >= 1 and deep.replays, "tree: {d} timelines, up to " ++
-        "{d} deep, the same with one worker or four; #{?d} replays alone from its tape", .{
-        count, deep.depth, deep.index,
+    // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
+    // from their parents' start would make, which the deepest timeline's lone replay checks.
+    const held = held_nodes(one) > 0 and held_nodes(many) > 0;
+    expect(context, same and deep.depth >= 1 and deep.replays and held, "tree: {d} timelines, " ++
+        "up to {d} deep, the same with one worker or four; #{?d} replays alone from its tape; " ++
+        "{d} nodes from in-run snapshots", .{
+        count, deep.depth, deep.index, held_nodes(one),
     });
     // With a strategy (overriding decisions): nodes replay their parents with their tapes, and
     // a deep timeline still replays alone, without the strategy.
@@ -1036,6 +1040,19 @@ fn check_tree(context: *Context) !void {
         "replays from its tape (its ancestors' decisions from theirs)", .{
         steered_count, steered_deep.depth, steered_deep.index,
     });
+}
+
+/// The tree's nodes made from in-run snapshots, over its generations ("(n from in-run
+/// snapshots)" in each generation's line).
+fn held_nodes(report: []const u8) u64 {
+    var total: u64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        const end = std.mem.indexOf(u8, line, " from in-run snapshots)") orelse continue;
+        const start = (std.mem.lastIndexOfScalar(u8, line[0..end], '(') orelse continue) + 1;
+        total += std.fmt.parseInt(u64, line[start..end], 10) catch 0;
+    }
+    return total;
 }
 
 /// The deepest timeline of a tree exploration (from its record), and whether it replays alone
