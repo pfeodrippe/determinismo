@@ -19,6 +19,8 @@ import json
 import random
 import os
 import sys
+import threading
+import time
 
 DEVICE_PATH = "/dev/determinismo"
 MESSAGE_SIZE_MAX = 4096 - 16  # One event or one randomness pull per device call.
@@ -252,11 +254,28 @@ def random_below_named(name, count):
     return random_below(count)
 
 
+_buggify_lock = threading.Lock()
+_buggified = {}  # name -> (random.Random, or None when inactive; end of the stretch, ns)
+_BUGGIFY_PERIOD_NS = 2_000_000_000
+
+
 def buggify(name):
-    """A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a
-    named decision; outside always False. Where it is true, take a rare path the real system can
+    """A buggify point (FoundationDB's BUGGIFY): inside determinismo, a point is active one
+    stretch of two seconds (virtual time) in four, a named decision ("buggify <name>") at the
+    stretch's first evaluation; while active, it is True one evaluation in four, drawn from its own
+    generator seeded by the platform for the stretch (a hot point costs a decision a stretch).
+    Outside determinismo, always False. Where it is True, take a rare path the real system can
     take too (a pause, a retry), never one it cannot."""
-    return _device_fd() is not None and random_below_named(name, 4) == 0
+    if _device_fd() is None:
+        return False
+    now = time.monotonic_ns()  # Virtual time inside determinismo.
+    with _buggify_lock:
+        generator, until = _buggified.get(name, (None, 0))
+        if now >= until:
+            active = random_below_named("buggify " + name, 4) == 0
+            generator = random.Random(random_u64()) if active else None
+            _buggified[name] = (generator, now + _BUGGIFY_PERIOD_NS)
+        return generator is not None and generator.randrange(4) == 0
 
 
 def setup_complete(details=None):

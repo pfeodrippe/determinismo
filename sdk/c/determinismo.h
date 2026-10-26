@@ -77,9 +77,12 @@ void det_sometimes_all(const char *const *names, const int *values, size_t count
 size_t det_decide(const char *name, const char *const *options, size_t count);
 uint64_t det_random_below_named(const char *name, uint64_t count);
 
-/* A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a named
-   decision; outside always false. Where it is true, take a rare path the real system can take
-   too (a pause, a retry), never one it cannot. */
+/* A buggify point (FoundationDB's BUGGIFY): inside determinismo, a point is active one stretch of
+   two seconds (virtual time) in four, a named decision ("buggify <name>") at the stretch's first
+   evaluation; while active, it is true one evaluation in four, drawn from its own generator
+   seeded by the platform for the stretch. Outside determinismo, always false. `name` is a string
+   that lives as long as the program (a literal); up to 256 points. Where it is true, take a rare
+   path the real system can take too (a pause, a retry), never one it cannot. */
 int det_buggify(const char *name);
 
 /* The assertion catalog: one entry per call site, in the det_catalog section (the layout the Zig
@@ -176,6 +179,7 @@ struct det_catalog_entry {
 #include <string.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DET_DEVICE_PATH "/dev/determinismo"
@@ -432,8 +436,47 @@ size_t det_decide(const char *name, const char *const *options, size_t count) {
   return (size_t)det_random_below(count);
 }
 
+struct det_buggify_point {
+  const char *name;
+  uint64_t until_ns;
+  uint64_t state; /* xorshift64* while active, 0 when not */
+};
+static struct det_buggify_point det_buggify_points[256];
+static size_t det_buggify_point_count;
+static int det_buggify_lock; /* A spinlock (__atomic builtins): taken briefly, rarely contended. */
+
 int det_buggify(const char *name) {
-  return det_device_fd() >= 0 && det_random_below_named(name, 4) == 0;
+  if (det_device_fd() < 0) return 0;
+  /* Virtual time inside determinismo, in whole seconds (standard C's time(): no feature macros
+     needed, and enough for stretches of two seconds). */
+  uint64_t now = (uint64_t)time(0) * 1000000000u;
+  while (__atomic_test_and_set(&det_buggify_lock, __ATOMIC_ACQUIRE)) {
+  }
+  struct det_buggify_point *point = 0;
+  for (size_t index = 0; index < det_buggify_point_count && !point; index++) {
+    if (strcmp(det_buggify_points[index].name, name) == 0) point = &det_buggify_points[index];
+  }
+  if (!point && det_buggify_point_count < sizeof det_buggify_points / sizeof *point) {
+    point = &det_buggify_points[det_buggify_point_count++];
+    *point = (struct det_buggify_point){name, 0, 0};
+  }
+  int fires = 0;
+  if (point) {
+    if (now >= point->until_ns) {
+      char label[DET_MESSAGE_SIZE_MAX];
+      snprintf(label, sizeof label, "buggify %s", name);
+      point->state = det_random_below_named(label, 4) == 0 ? (det_random_u64() | 1) : 0;
+      point->until_ns = now + 2000000000u;
+    }
+    if (point->state) {
+      point->state ^= point->state >> 12;
+      point->state ^= point->state << 25;
+      point->state ^= point->state >> 27;
+      fires = (point->state * 0x2545F4914F6CDD1Dull) % 4 == 0;
+    }
+  }
+  __atomic_clear(&det_buggify_lock, __ATOMIC_RELEASE);
+  return fires;
 }
 
 uint64_t det_random_below_named(const char *name, uint64_t count) {

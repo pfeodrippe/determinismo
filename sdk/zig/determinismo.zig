@@ -78,13 +78,43 @@ pub fn random_below_named(name: []const u8, count: u64) u64 {
     return random_below(count);
 }
 
-/// A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a named
-/// decision; outside always false. Where it is true, take a rare path the real system can take
-/// too (a pause, a retry), never one it cannot.
+/// A buggify point (FoundationDB's BUGGIFY): inside determinismo, a point is active one stretch
+/// of two seconds (virtual time) in four, a named decision ("buggify <name>") at the stretch's
+/// first evaluation; while active, it is true one evaluation in four, drawn from its own
+/// generator seeded by the platform for the stretch. Outside determinismo, always false. `name`
+/// lives as long as the program (a literal); up to 64 points. Where it is true, take a rare path
+/// the real system can take too (a pause, a retry), never one it cannot.
 pub fn buggify(name: []const u8) bool {
     if (device_get() != .fd) return false;
-    return random_below_named(name, 4) == 0;
+    var now_spec: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now_spec); // Virtual time inside determinismo.
+    const now_ns: u64 = @intCast(now_spec.sec * std.time.ns_per_s + now_spec.nsec);
+    const point = for (buggify_points[0..buggify_point_count]) |*known| {
+        if (std.mem.eql(u8, known.name, name)) break known;
+    } else blk: {
+        if (buggify_point_count == buggify_points.len) return false;
+        const added = &buggify_points[buggify_point_count];
+        buggify_point_count += 1;
+        added.* = .{ .name = name, .until_ns = 0, .state = 0 };
+        break :blk added;
+    };
+    if (now_ns >= point.until_ns) {
+        var label_buffer: [message_size_max]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buffer, "buggify {s}", .{name}) catch name;
+        point.state = if (random_below_named(label, 4) == 0) random_u64() | 1 else 0;
+        point.until_ns = now_ns + 2 * std.time.ns_per_s;
+    }
+    if (point.state == 0) return false;
+    point.state ^= point.state >> 12; // xorshift64*
+    point.state ^= point.state << 25;
+    point.state ^= point.state >> 27;
+    return (point.state *% 0x2545F4914F6CDD1D) % 4 == 0;
 }
+
+/// Buggify points' state for the current stretch: the generator, 0 when inactive.
+const BuggifyPoint = struct { name: []const u8, until_ns: u64, state: u64 };
+var buggify_points: [64]BuggifyPoint = undefined;
+var buggify_point_count: u32 = 0;
 
 fn decision_announce(name: []const u8, what: anytype) void {
     if (device_get() != .fd) return; // Only the platform's strategies read labels.

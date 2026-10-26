@@ -258,23 +258,68 @@ public final class Determinismo {
     return randomBelow(count);
   }
 
-  /**
-   * A buggify point (FoundationDB's BUGGIFY): inside determinismo, true for one decision in four
-   * (named, so the explorer varies it and a strategy steers it); outside, always false. Where it
-   * is true, code takes the rare path on purpose: a pause before a lock, a forced retry.
-   */
-  public static boolean buggify(String name) {
-    return device != null && randomBelowNamed(name, 4) == 0;
+  /** A buggify point's state for a stretch of time: active with its own generator, or not. */
+  private static final class BuggifyPoint {
+    final java.util.SplittableRandom random;
+    final long untilNanos;
+
+    BuggifyPoint(java.util.SplittableRandom random, long untilNanos) {
+      this.random = random;
+      this.untilNanos = untilNanos;
+    }
   }
 
-  /** At a buggify point, a pause of up to 9 ms: the other threads run in that window. */
+  private static final java.util.concurrent.ConcurrentHashMap<String, BuggifyPoint> buggified =
+      new java.util.concurrent.ConcurrentHashMap<>();
+  private static final long BUGGIFY_PERIOD_NANOS = 2_000_000_000L;
+
+  /**
+   * A buggify point (FoundationDB's BUGGIFY): inside determinismo, a point is active one stretch
+   * of two seconds (virtual time) in four, a named decision ("buggify &lt;name&gt;") at the
+   * stretch's first evaluation, which the explorer varies and a strategy steers; while active,
+   * it is true one evaluation in four, drawn from its own generator, seeded by the platform for
+   * the stretch (a hot point costs a decision a stretch, not one a call). Outside determinismo,
+   * always false. Where it is true, take a rare path the real system can take too (a pause before
+   * a lock, a forced retry), never one it cannot.
+   */
+  public static boolean buggify(String name) {
+    java.util.SplittableRandom random = buggifyGenerator(name);
+    if (random == null) return false;
+    synchronized (random) {
+      return random.nextInt(4) == 0;
+    }
+  }
+
+  /**
+   * At a buggify point, a pause of up to 9 ms one evaluation in 32 while the point is active
+   * (rarer than buggify: pause points sit on hot paths, and a few pauses a stretch are enough for
+   * the other threads to run in the window).
+   */
   public static void buggifyPause(String name) {
-    if (!buggify(name)) return;
+    java.util.SplittableRandom random = buggifyGenerator(name);
+    if (random == null) return;
+    long ms;
+    synchronized (random) {
+      if (random.nextInt(32) != 0) return;
+      ms = random.nextInt(10);
+    }
     try {
-      Thread.sleep(randomBelowNamed(name + " (ms)", 10));
+      Thread.sleep(ms);
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
     }
+  }
+
+  private static java.util.SplittableRandom buggifyGenerator(String name) {
+    if (device == null) return null;
+    long now = System.nanoTime(); // Virtual time inside determinismo.
+    BuggifyPoint point = buggified.compute(name, (key, current) -> {
+      if (current != null && now < current.untilNanos) return current;
+      boolean active = randomBelowNamed("buggify " + key, 4) == 0;
+      return new BuggifyPoint(active ? new java.util.SplittableRandom(randomLong()) : null,
+          now + BUGGIFY_PERIOD_NANOS);
+    });
+    return point.random;
   }
 
   /** The system is ready: the platform snapshots here. */

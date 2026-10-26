@@ -244,6 +244,9 @@
                   (str "error " (.getName (class thrown)) " " (.getMessage thrown)))))))
 
 (defn -main [& _arguments]
+  ;; Clojure's own assertions sit on hot paths: their first pass and first failure are enough.
+  (det/first-pass-first-failure!)
+  (set! clojure.lang.Determinismo/firstPassFirstFailure true)
   (let [server (ServerSocket. 7100)]
     (loop []
       (let [socket (.accept server)]
