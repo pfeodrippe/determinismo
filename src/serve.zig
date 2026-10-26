@@ -604,6 +604,9 @@ const RunRequest = struct {
     from_vtime_ms: ?u64 = null,
     /// Branches at varying CPU speeds (and so their replays too).
     cpu_modulation: bool = false,
+    /// The guest's memory, instead of the server's (explore's --memory-mib): for systems of
+    /// several large nodes. Kept in the run's machine arguments, so its replays boot the same.
+    memory_mib: ?u32 = null,
 };
 
 fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
@@ -620,7 +623,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         if (asked.program_asked == null) asked.program_asked = path;
         asked.program = try artifact_keep(server, asked.program_asked.?);
     }
-    const machine = try machine_kept(server);
+    const machine = try machine_kept(server, asked.memory_mib);
     // As run: the seed drawn is in it, and the program it ran, for its replays.
     const request_json = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     const shared = server.shared;
@@ -1465,17 +1468,20 @@ fn run_machine(server: *Server, id: u32) ![]const []const u8 {
     return std.json.parseFromSliceLeaky([]const []const u8, server.arena, json, .{});
 }
 
-/// The host's machine arguments, with the kernel and the initramfs kept (artifact_keep).
-fn machine_kept(server: *Server) ![]const []const u8 {
-    const argv = try server.arena.dupe([]const u8, server.options.machine);
+/// The host's machine arguments, with the kernel and the initramfs kept (artifact_keep), and
+/// the memory asked for (the last --memory-mib is explore's).
+fn machine_kept(server: *Server, memory_mib: ?u32) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(server.arena, server.options.machine);
     var index: usize = 0;
-    while (index + 1 < argv.len) : (index += 1) {
-        const flag = argv[index];
+    while (index + 1 < argv.items.len) : (index += 1) {
+        const flag = argv.items[index];
         if (!std.mem.eql(u8, flag, "--kernel") and !std.mem.eql(u8, flag, "--initrd")) continue;
-        argv[index + 1] = try artifact_keep(server, argv[index + 1]);
+        argv.items[index + 1] = try artifact_keep(server, argv.items[index + 1]);
         index += 1;
     }
-    return argv;
+    if (memory_mib) |mib| try argv.appendSlice(server.arena, &.{ "--memory-mib", try print(server, "{d}", .{mib}) });
+    return argv.items;
 }
 
 /// A copy of the file named by its content, under the data directory's `artifacts`, made once:
