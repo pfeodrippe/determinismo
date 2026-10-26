@@ -75,3 +75,12 @@ directory is not synced), and closing the old backend writes the new consistent 
 Either alone would leave the member able to recover (with a durable rename the old file is gone;
 with the old index kept, at 97, the restart recovers from the snapshot file). The same two
 causes as etcd-io/etcd#22498.
+
+### Found blind on 3.4.3, known and fixed upstream: a member that cannot restart after a power loss
+
+The `jepsen` profile (etcd 3.4.3), run 83 on srv2, timeline 87: after a power loss etcd-1 panics
+at every start, `state.commit 367 is out of range [249, 259]`: it recovered from the snapshot at
+index 249 while its hard state says 367 were committed. A snapshot file can reach the disk without
+its WAL record; the restart then picks a snapshot the WAL does not match. Reported as
+etcd-io/etcd#10219 and fixed by #11888 (May 2020, after 3.4.3); Jepsen's 3.4.3 analysis did not
+report it.

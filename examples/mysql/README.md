@@ -29,4 +29,5 @@ syncs.
 Jepsen's 2023 finding holds in 26.10.0, rediscovered blind: at Repeatable Read, Elle finds
 G2-item and G-single-item (MySQL's Repeatable Read reads a snapshot but writes the latest
 versions), in 2 of the first 4 timelines (`--scenario repeatable_read --seed 7`). Serializable:
-4 of 4 timelines clean.
+4 of 4 timelines clean. On 8.0.34, the version Jepsen analyzed (`--profile jepsen`, run 86 on
+srv2): G-single-item, G2-item and lost-update in 10 of the first 15 timelines.

@@ -42,7 +42,7 @@ bugs are. Status: ✅ running, 🟡 next, blank later.
 | Redpanda / Kafka | Redpanda 21.10 (2022), Bufstream 0.1 (2024), Kafka post (2013) | duplicate writes, inconsistent offsets, aborted reads, lost/stale messages; in Kafka's transaction protocol itself, write loss and torn transactions (KAFKA-17754) | list-append (transactions), queue | 🟡 Redpanda and Apache Kafka (KRaft) |
 | MySQL, MariaDB Galera, Percona | MySQL 8.0.34 (2023), Galera 12.1.2 (2026), 2015 posts | Repeatable Read allowing G2-item, G-single, lost update, non-monotonic views; Galera losing committed transactions on crashes (no flush before ack) and with partitions, lost update, stale read | append, mav, nonrepeatable-read, closed-predicate | ✅ examples/mysql (26.10.0), examples/galera (13.0.2, Jepsen's configuration from jepsen-io/mysql's `antithesis/`) |
 | PostgreSQL (and Stolon, RDS) | 12.3 (2020), RDS 17.4 (2025), 2013 post | serializable allowing G2-item (fixed); RDS multi-AZ violating snapshot isolation (long fork); Stolon ledger | append, ledger | ✅ examples/postgres (18.6, single node); next: HA (Patroni or Stolon) |
-| MongoDB | 4.2.6 (2020), 3.6.4, 3.4.0-rc3, earlier posts | transactions with read skew, cyclic information flow, duplicate effects from retries; lost majority writes in old replication protocols | list-append (single and multi-node) | |
+| MongoDB | 4.2.6 (2020), 3.6.4, 3.4.0-rc3, earlier posts | transactions with read skew, cyclic information flow, duplicate effects from retries; lost majority writes in old replication protocols | list-append (single and multi-node) | ✅ examples/mongodb (9.0.4, Jepsen's replica set settings and workload, our own wire client) |
 | TiDB | 2.1.7 (2019) | auto-retry re-applying conflicting updates: read skew, lost updates | bank, long fork, register, sequential, set, append | ✅ examples/tidb (v8.5.8, Jepsen's configurations from jepsen-io/tidb) |
 | YugabyteDB | 1.1.9, 1.3.1 (2019) | read skew, lost inserts with partitions, DDL races (defaults as NULL), undercounting | append, bank, counter, long fork, set, rw | |
 | CockroachDB | beta 2016 | serializability violations | bank, register, sequential, sets, monotonic, adya | 🟡 examples/cockroachdb (v26.3.3) |
@@ -76,12 +76,13 @@ Blind means blind to the results, not to the test: workloads follow Jepsen's pub
 | System | Version (profile `jepsen`) | Jepsen reported | Found blind |
 |---|---|---|---|
 | Raft (Antithesis's POC) | hashicorp/raft 4c8f61ac | leadership-transfer deadlock, log divergence, snapshot livelock, double vote | 4 of 4 |
-| PostgreSQL | 12.3 | G2-item at Serializable | none in run 80's first 22 timelines, on our first workload (one table, upserts by primary key); rerunning on Jepsen's workload shape (three tables, reads and updates by primary or secondary key, update-insert-update under savepoints, autocommit single operations) |
+| PostgreSQL | 12.3 | G2-item at Serializable | none in run 80's first 22 timelines, on our first workload (one table, upserts by primary key); running on Jepsen's workload shape (run 85 on srv2) |
 | NATS JetStream | 2.12.1, default sync | acknowledged writes lost and replicas split after power losses | ✅ rediscovered in the first hour (run 81 on srv2): acknowledged messages lost in 6 timelines, three sequences each acknowledged for two messages, `corrupt state file` on recovery after power losses |
-| etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | running (its gateway has no hashkv: convergence compares revisions there) |
-| MySQL | 8.0.34 | Repeatable Read allowing G2-item, G-single, lost update, non-repeatable reads | ✅ rediscovered on the current 26.10.0 already (srv1, seed 7): G2-item and G-single-item at Repeatable Read in 2 of the first 4 timelines, ~2.5 min of virtual time each; Serializable clean in 4 of 4. 8.0.34 next |
-| MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | next (examples/galera, Jepsen's configuration; 13.0.2 clean in 8 timelines on srv1) |
+| etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | watches clean so far (149 timelines, run 83 on srv2). Found besides, blind: a member that cannot restart after a power loss (`panic: state.commit 367 is out of range [249, 259]`, timeline 87), known upstream (etcd-io/etcd#10219, fixed by #11888 in 2020, after 3.4.3) |
+| MySQL | 8.0.34 | Repeatable Read allowing G2-item, G-single, lost update, non-repeatable reads | ✅ rediscovered on the current 26.10.0 already (srv1, seed 7): G2-item and G-single-item at Repeatable Read in 2 of the first 4 timelines, ~2.5 min of virtual time each; Serializable clean in 4 of 4. 8.0.34 (run 86 on srv2): ✅ G-single-item, G2-item and lost-update at Repeatable Read in 10 of the first 15 timelines, from the first |
+| MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | running (run 87 on srv2; examples/galera, Jepsen's configuration; 13.0.2 clean in 8 timelines on srv1) |
 | TiDB | 2.1.7 | automatic retries breaking snapshot isolation: lost updates, read skew | next (examples/tidb, Jepsen's configurations) |
+| MongoDB | 4.2.6 | transactions with read skew, cyclic information flow, duplicated effects | next (examples/mongodb) |
 
 ## Order
 
