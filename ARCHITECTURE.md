@@ -441,7 +441,10 @@ determinism makes state recomputable.
 - **Production-like**: Hetzner **EX131** (Xeon Gold 6731P, 32 cores, ECC, €279 setup).
 - **Bursts later**: AWS `*.metal` (per-second), Vultr / Latitude.sh (hourly bare metal).
 - **Replay portability**: guaranteed on the same CPU model only; cross-model replay is a later
-  feature gated by the self-tests (§14).
+  feature gated by the self-tests (§14). Measured 2026-10-26 on Skylake (E3-1275 v5) and
+  Cascade Lake (W-2295) with byte-identical kernel, initramfs and system disk: the self-test
+  maze's counts agreed, but all 16 timelines of the bank example diverged (different event
+  hashes). Inputs keep pinning the host CPU model.
 
 ---
 
@@ -482,7 +485,9 @@ determinism makes state recomputable.
 
 ## 16. Open questions
 
-- CPUID baseline across CPU models (only one model tested so far).
+- CPUID baseline across CPU models: two models now, and the same timeline differs on them
+  (bank example, 2026-10-26). Suspects: features the Skylake baseline leaves visible (AVX-512 on
+  Cascade Lake, the XSAVE area's size), and the counter's skid handling tuned on Skylake.
 - Hard stops still single-step `margin - skid` branches (about 500 VM exits, ~1.5 µs each).
   Measured: handling those steps in KVM's exit fastpath (done) saves little, since the VMX
   round trip itself dominates; branch stepping (TF + BTF) is unsafe, because exceptions the
