@@ -31,6 +31,11 @@ pub const Options = struct {
     /// ("client,monitor"): what an Antithesis launch says outside its Compose file.
     faults_added: ?[]const u8 = null,
     faults_none: ?[]const u8 = null,
+    /// A pinned system (`explore --system`): what an earlier prepare resolved and the node disks
+    /// it booted (its pin, `<cache>/systems/<hash>.pin.json`), used as is: nothing is described,
+    /// pulled or built, so a run replays on another host (of the same CPU model) without its
+    /// images or Dockerfiles. Faults were adjusted when it was pinned.
+    pinned: ?[]const u8 = null,
 };
 
 pub const Prepared = struct {
@@ -40,6 +45,17 @@ pub const Prepared = struct {
     system_json: []const u8,
     /// Identifies the resolved system: snapshots and runs are keyed by it.
     hash: u64,
+    /// Its pin (`Options.pinned`).
+    pin_path: []const u8,
+};
+
+/// A resolved system with its node disks: their paths, absolute or relative to the pin's
+/// directory (a kit: the pin and the disks side by side).
+pub const Pin = struct {
+    /// The resolved system's JSON, byte for byte: it is hashed.
+    system_json: []const u8,
+    /// One per node, in node order.
+    disks: []const []const u8,
 };
 
 const Context = struct {
@@ -64,6 +80,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     for ([_][]const u8{ "images", "systems", "staging", "profiles", "mutants" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ context.cache, directory }));
     }
+    if (options.pinned) |path| return pinned_prepare(context, options, path);
     const description = try describe(context, options);
     if (description.schema != schema.version) return error.SchemaVersion;
     const profile = try profile_find(&description, options.profile);
@@ -92,12 +109,28 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     var writer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(system, .{ .emit_null_optional_fields = false }, &writer.writer);
     const system_json = writer.written();
+    const prepared = try system_finish(context, options, system, system_json, disk_paths);
+    const source = options.program orelse options.compose.?;
+    try profile_remember(context, source, &system, system_json);
+    return prepared;
+}
+
+/// The system disk (the system, the program, the script) and the pin, for a resolved system
+/// whose node disks are `disk_paths[1..]`.
+fn system_finish(
+    context: Context,
+    options: Options,
+    system: schema.System,
+    system_json: []const u8,
+    disk_paths: [][]const u8,
+) !Prepared {
+    const cwd = std.Io.Dir.cwd();
     const program = if (options.program) |path|
-        try cwd.readFileAlloc(io, path, arena, .unlimited)
+        try cwd.readFileAlloc(context.io, path, context.arena, .unlimited)
     else
         "";
     const script = if (options.script) |path|
-        try cwd.readFileAlloc(io, path, arena, .limited(1 << 20))
+        try cwd.readFileAlloc(context.io, path, context.arena, .limited(1 << 20))
     else
         null;
     var hasher = std.hash.Wyhash.init(0);
@@ -111,14 +144,51 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         .script = script,
         .hash = hash,
     });
-    const source = options.program orelse options.compose.?;
-    try profile_remember(context, source, &system, system_json);
+    // The pin names the node disks by absolute path: it is valid wherever it is copied to on
+    // this host (a kit for another host has them beside it, by name).
+    const disks = try context.arena.alloc([]const u8, disk_paths.len - 1);
+    for (disk_paths[1..], disks) |disk, *absolute| {
+        absolute.* = try cwd.realPathFileAlloc(context.io, disk, context.arena);
+    }
+    var writer: std.Io.Writer.Allocating = .init(context.arena);
+    const pin: Pin = .{ .system_json = system_json, .disks = disks };
+    try std.json.Stringify.value(pin, .{}, &writer.writer);
+    const pin_name = try std.fmt.allocPrint(context.arena, "{x:0>16}.pin.json", .{hash});
+    const pin_path = try path_join(context, &.{ context.cache, "systems", pin_name });
+    if (!exists(context, pin_path)) {
+        const staging = try std.fmt.allocPrint(context.arena, "{s}.partial", .{pin_path});
+        try cwd.writeFile(context.io, .{ .sub_path = staging, .data = writer.written() });
+        try cwd.rename(staging, cwd, pin_path, context.io);
+    }
     return .{
         .disk_paths = disk_paths,
         .system = system,
         .system_json = system_json,
         .hash = hash,
+        .pin_path = pin_path,
     };
+}
+
+/// `Options.pinned`: the pin's system and node disks, as they are.
+fn pinned_prepare(context: Context, options: Options, path: []const u8) !Prepared {
+    const cwd = std.Io.Dir.cwd();
+    const limit: std.Io.Limit = .limited(description_size_max);
+    const pin = try schema.parse(Pin, context.arena, try cwd.readFileAlloc(context.io, path, context.arena, limit));
+    const system = try schema.parse(schema.System, context.arena, pin.system_json);
+    if (pin.disks.len != system.nodes.len) return error.PinDisks;
+    const disk_paths = try context.arena.alloc([]const u8, pin.disks.len + 1);
+    const directory = std.fs.path.dirname(path) orelse ".";
+    for (pin.disks, disk_paths[1..]) |disk, *target| {
+        target.* = if (std.fs.path.isAbsolute(disk) and exists(context, disk))
+            disk
+        else
+            try path_join(context, &.{ directory, std.fs.path.basename(disk) });
+        if (!exists(context, target.*)) {
+            std.debug.print("[determinismo] the pinned disk {s} is not there\n", .{disk});
+            return error.PinnedDiskMissing;
+        }
+    }
+    return system_finish(context, options, system, pin.system_json, disk_paths);
 }
 
 fn profile_find(description: *const schema.Description, name: ?[]const u8) !*const schema.Profile {

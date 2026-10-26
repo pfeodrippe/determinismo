@@ -776,6 +776,7 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
+    try pin_arguments(server, &argv, run.id);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
@@ -823,6 +824,7 @@ fn run_extract(server: *Server, run: *const Run, body: []const u8, out: *std.Io.
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
+    try pin_arguments(server, &argv, run.id);
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     }
@@ -861,6 +863,7 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     try argv.appendSlice(server.arena, &.{ server.options.self, "causality" });
     try argv.appendSlice(server.arena, try run_machine(server, run.id));
     try system_arguments(server.arena, &argv, &original);
+    try pin_arguments(server, &argv, run.id);
     try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
@@ -1445,6 +1448,14 @@ fn notebook_evaluate(
     }
     try out.writeAll(result.stdout);
     return 200;
+}
+
+/// The system a run booted (its pin, in its events): its replays boot the same node disks,
+/// whatever the images and Dockerfiles have become since.
+fn pin_arguments(server: *Server, argv: *std.ArrayList([]const u8), id: u32) !void {
+    const pin = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "events", "system.pin.json" });
+    std.Io.Dir.cwd().access(server.io, pin, .{}) catch return; // A run from before pins.
+    try argv.appendSlice(server.arena, &.{ "--system", pin });
 }
 
 /// The machine arguments a run booted with (machine.json: its kept kernel and initramfs); for a

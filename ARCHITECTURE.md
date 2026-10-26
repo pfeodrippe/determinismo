@@ -507,6 +507,12 @@ determinism makes state recomputable.
   the host CPU's vendor and signature. **A change to the vtime function or exit
   semantics is a new determinism-ABI version**; old versions stay runnable, or the bug moment is
   pinned as a full snapshot.
+- A run pins what it booted. Its system: prepare writes a pin (`<cache>/systems/<hash>.pin.json`:
+  the resolved system's JSON and its node disks, named by content), copied into the run's events
+  directory; `explore --system <pin>` boots it as is, with nothing described, pulled or built,
+  since rebuilding images is not reproducible (build times, packages fetched later). Its machine:
+  serve keeps each run's kernel, initramfs and program by content (`<data>/artifacts`), and its
+  replays, extracts and causality runs use those and its pin, whatever was deployed since.
 
 ---
 
@@ -521,7 +527,11 @@ determinism makes state recomputable.
 - **Production-like**: Hetzner **EX131** (Xeon Gold 6731P, 32 cores, ECC, €279 setup).
 - **Bursts later**: AWS `*.metal` (per-second), Vultr / Latitude.sh (hourly bare metal).
 - **Replay portability**: guaranteed on the same CPU model only; cross-model replay is a later
-  feature gated by the self-tests (§14). Measured 2026-10-26 on Skylake (E3-1275 v5) and
+  feature gated by the self-tests (§14). On the same model, a kit replays anywhere: the kernel,
+  initramfs, program and determinismo binary, and the pin with its node disks beside it (a pin
+  whose disks are not at their paths finds them by name in its own directory). Checked
+  2026-10-26 with the etcd finding: from an empty cache, no images and no Dockerfiles, the same
+  10,787 events (hash 3a2f4783e2045326). Measured 2026-10-26 on Skylake (E3-1275 v5) and
   Cascade Lake (W-2295) with byte-identical kernel, initramfs and system disk: the self-test
   maze's counts agreed, but all 16 timelines of the bank example diverged (different event
   hashes). Inputs keep pinning the host CPU model.

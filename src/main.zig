@@ -69,7 +69,10 @@ const usage =
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
     \\                            by a replay and compare them, to check holders; slower)
     \\                            [--serve <host:port>]   (a run of that serve, in its web UI)
-    \\                            [--events-dir <dir>]   (every branch's events, for query)
+    \\                            [--events-dir <dir>]   (every branch's events, for query, and
+    \\                            the system's pin)
+    \\                            [--system <pin.json>]   (a pinned system and its node disks,
+    \\                            booted as is: replays on another host of the same CPU model)
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
@@ -139,6 +142,8 @@ const Arguments = struct {
     branches_given: bool = false,
     /// `<node>=<patch>`: that node built from a patched copy of its build context (a mutant).
     mutant: ?[]const u8 = null,
+    /// A pinned system (`--system <pin.json>`, prepare.zig): booted as is, nothing built.
+    pinned: ?[]const u8 = null,
     /// Fault kinds every node also allows, and nodes that allow none (prepare.zig).
     faults_added: ?[]const u8 = null,
     faults_none: ?[]const u8 = null,
@@ -312,7 +317,8 @@ fn list_split(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
 fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 {
     const arena = init.arena.allocator();
     var arguments = arguments_given;
-    const has_system = arguments.program_path != null or arguments.compose_path != null;
+    const has_system = arguments.program_path != null or arguments.compose_path != null or
+        arguments.pinned != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
     if (arguments.moment_script_path) |path| {
@@ -530,14 +536,23 @@ fn system_prepare(
         .mutant = arguments.mutant,
         .faults_added = arguments.faults_added,
         .faults_none = arguments.faults_none,
+        .pinned = arguments.pinned,
     });
     if (prepared.disk_paths.len > VM.disks_max) return error.TooManyDisks;
+    // With the run's events: what replays it (serve's replays, a kit for another host).
+    if (arguments.events_directory) |directory| {
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(io, directory);
+        const pin = try std.fs.path.join(arena, &.{ directory, "system.pin.json" });
+        try cwd.copyFile(prepared.pin_path, cwd, pin, io, .{});
+    }
     const system_json = prepared.system_json;
     arguments.system = try std.json.parseFromSliceLeaky(std.json.Value, arena, system_json, .{});
     for (prepared.disk_paths, 0..) |path, index| arguments.disk_paths[index] = path;
     arguments.disk_count = @intCast(prepared.disk_paths.len);
-    std.debug.print("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}\n", .{
-        prepared.hash, prepared.system.profile, prepared.system.nodes.len, prepared.disk_paths[0],
+    std.debug.print("[determinismo] system {x:0>16}: profile {s}, {d} nodes, disk {s}, pin {s}\n", .{
+        prepared.hash,          prepared.system.profile, prepared.system.nodes.len,
+        prepared.disk_paths[0], prepared.pin_path,
     });
     return prepared;
 }
@@ -2423,6 +2438,8 @@ fn parse_option(
         arguments.branches_given = true;
     } else if (eql(u8, flag, "--mutant")) {
         arguments.mutant = value;
+    } else if (eql(u8, flag, "--system")) {
+        arguments.pinned = value;
     } else if (eql(u8, flag, "--faults")) {
         arguments.faults_added = value;
     } else if (eql(u8, flag, "--no-faults")) {
