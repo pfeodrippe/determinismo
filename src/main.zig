@@ -41,6 +41,8 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--retroactive '<text>']...   (output lines with it are left out
+    \\                            of the events; a replay of a timeline writes them)
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
     \\                            returns first to timelines that ran changed lines, and says
     \\                            which hunks ran and which never did)
@@ -144,6 +146,10 @@ const Arguments = struct {
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
+    /// Retroactive logging: output lines with these texts are left out of an exploration's
+    /// events (a replay of one timeline writes them).
+    retroactive: [retroactive_max][]const u8 = undefined,
+    retroactive_count: u32 = 0,
     /// Run only this branch (to replay one timeline of an exploration).
     branch_only: ?u32 = null,
     strategy_command: ?[]const u8 = null,
@@ -317,6 +323,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .disks = try open_disks(arena, arguments.disk_paths[0..arguments.disk_count]),
         .builtin_properties = has_system,
         .cpu_modulation = arguments.cpu_modulation,
+        .retroactive = retroactive_texts(&arguments),
     };
     const context = Context{
         .arena = arena,
@@ -377,6 +384,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         cpu_modulation: bool,
         timeline: ?[]const u8,
         changed: ?[]const u8,
+        retroactive: []const []const u8,
     };
     const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
         .program = arguments.program_path,
@@ -396,6 +404,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         .cpu_modulation = arguments.cpu_modulation,
         .timeline = arguments.timeline_text,
         .changed = arguments.changed,
+        .retroactive = arguments.retroactive[0..arguments.retroactive_count],
     }, .{})});
     var buffer: [256]u8 = undefined;
     const tcp = @import("determinismo").tcp;
@@ -840,6 +849,17 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     }
     if (planned and arguments.changed != null) return changed_needs_tree();
     if (planned) arguments.branching = .flat;
+}
+
+const retroactive_max = 16;
+
+/// The texts retroactive logging hides: none when looking at one timeline (a replay, a moment, a
+/// tape), which writes everything.
+fn retroactive_texts(arguments: *const Arguments) []const []const u8 {
+    const one = arguments.branch_only != null or arguments.tape_path != null or
+        arguments.moment_vtime_ms != null or arguments.until != null;
+    if (one) return &.{};
+    return arguments.retroactive[0..arguments.retroactive_count];
 }
 
 fn changed_needs_tree() error{Usage} {
@@ -1900,6 +1920,10 @@ fn parse_option(
     } else if (eql(u8, flag, "--time-budget")) {
         arguments.time_budget_ns = try duration_parse(value);
         arguments.time_budget_text = value;
+    } else if (eql(u8, flag, "--retroactive")) {
+        if (arguments.retroactive_count == retroactive_max) return error.Usage;
+        arguments.retroactive[arguments.retroactive_count] = value;
+        arguments.retroactive_count += 1;
     } else if (eql(u8, flag, "--changed")) {
         arguments.changed = value;
     } else if (eql(u8, flag, "--timeline")) {

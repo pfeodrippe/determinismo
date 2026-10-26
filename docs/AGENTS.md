@@ -80,6 +80,8 @@ use them in other repositories.
   `--faults +restart,+crash,+disk` adds kinds to every node,
   `--no-faults client,monitor` takes them all from some (an Antithesis launch's
   `exclude_faults`).
+- Verbose systems: `explore --retroactive 'Applied block'` leaves such output lines out of the
+  events (queries stay fast); replay a timeline (`--branch`, its tape) to see them.
 - Targeted runs: `explore --changed <diff file | git range>` aims the tree at a change's lines
   (line coverage: Python, the JVM, Go built with Antithesis's instrumentor) and reports which
   hunks ran in how many timelines and which never did (`{"changed":...}` in the record).

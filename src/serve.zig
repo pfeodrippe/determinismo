@@ -306,6 +306,9 @@ const RunRequest = struct {
     strategy: ?[]const u8 = null,
     /// A targeted run: a diff file or git range on the server (explore's --changed).
     changed: ?[]const u8 = null,
+    /// Retroactive logging (explore's --retroactive): output lines with these texts are left
+    /// out of the run's events; replays write them.
+    retroactive: []const []const u8 = &.{},
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
     /// Branches at varying CPU speeds (and so their replays too).
@@ -357,6 +360,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
     }
     if (asked.changed) |source| try argv.appendSlice(server.arena, &.{ "--changed", source });
+    for (asked.retroactive) |text| try argv.appendSlice(server.arena, &.{ "--retroactive", text });
     if (asked.from_branch) |branch| {
         try argv.appendSlice(server.arena, &.{
             "--from-branch",   try print(server, "{d}", .{branch}),

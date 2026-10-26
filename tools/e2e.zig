@@ -99,6 +99,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "profile", check_profile },               .{ "catalog", check_catalog },
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
+        .{ "retroactive", check_retroactive },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1142,6 +1143,56 @@ fn check_disk(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
     }) catch ""});
+}
+
+/// Retroactive logging: output lines with a hidden text are not written while exploring (the
+/// timelines are the same: events hash), and a replay of a timeline writes them.
+fn check_retroactive(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "21" };
+    const text = "Ready to accept";
+    var hidden_dirs: [2][]const u8 = undefined;
+    var reports: [2][]const u8 = undefined;
+    for (&hidden_dirs, &reports, 0..) |*dir, *report, index| {
+        dir.* = try std.fmt.allocPrint(arena, "{s}/retroactive-{d}", .{ context.scratch, index });
+        const extra: []const []const u8 = if (index == 0) &.{ "--retroactive", text } else &.{};
+        report.* = try explore(context, try std.mem.concat(arena, []const u8, &.{
+            &system, &.{ "--branches", "2", "--branching", "flat", "--events-dir", dir.* }, extra,
+        }));
+    }
+    const replay_dir = try std.fmt.allocPrint(arena, "{s}/retroactive-replay", .{context.scratch});
+    _ = try explore(context, &(system ++ [_][]const u8{
+        "--branch", "0", "--retroactive", text, "--events-dir", replay_dir,
+    }));
+    const hidden = try directory_has(context, hidden_dirs[0], text);
+    const shown = try directory_has(context, hidden_dirs[1], text);
+    const replayed = try directory_has(context, replay_dir, text);
+    var with: [2]Branch = undefined;
+    var without: [2]Branch = undefined;
+    const same = parse_branches(reports[0], &with) == 2 and
+        parse_branches(reports[1], &without) == 2 and same_timelines(&with, &without);
+    const passes = !hidden and shown and replayed and same;
+    expect(context, passes, "retroactive: hidden output stays out of an exploration's events, " ++
+        "the timelines unchanged, and a replay writes it", .{});
+    if (!passes) std.debug.print("hidden {} shown {} replayed {} same {}\n", .{
+        hidden, shown, replayed, same,
+    });
+}
+
+/// Whether some events file of an events directory has `text`.
+fn directory_has(context: *Context, directory: []const u8, text: []const u8) !bool {
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(context.io, directory, .{ .iterate = true }) catch return false;
+    defer dir.close(context.io);
+    var iterator = dir.iterate();
+    while (try iterator.next(context.io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const path = try std.fs.path.join(context.arena, &.{ directory, entry.name });
+        const content = try cwd.readFileAlloc(context.io, path, context.arena, .limited(1 << 30));
+        if (std.mem.indexOf(u8, content, text) != null) return true;
+    }
+    return false;
 }
 
 /// Antithesis's "restarted nodes may change IP addresses": restarts asked for by the scenario;

@@ -50,6 +50,8 @@ const Arguments = struct {
     futures: u32 = 16,
     /// explore: a targeted run, aimed at a diff file's or git range's changed lines.
     changed: ?[]const u8 = null,
+    /// explore: output lines with these texts are left out of its events (replays write them).
+    retroactive: []const []const u8 = &.{},
     /// mutate: a JSON lines file of mutants, {"name", "node", "patch"} each.
     mutants: ?[]const u8 = null,
 };
@@ -189,6 +191,7 @@ fn tool_call(
     if (!known) return error.UnknownTool;
     if (arguments.time_budget) |budget| try argv.appendSlice(arena, &.{ "--time-budget", budget });
     if (arguments.changed) |source| try argv.appendSlice(arena, &.{ "--changed", source });
+    for (arguments.retroactive) |text| try argv.appendSlice(arena, &.{ "--retroactive", text });
     if (arguments.branches != null or arguments.time_budget == null) {
         const branches = try number(arena, arguments.branches orelse 16);
         try argv.appendSlice(arena, &.{ "--branches", branches });

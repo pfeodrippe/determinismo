@@ -136,6 +136,9 @@ pub const Options = struct {
     /// Antithesis's CPU modulation: branches run slower for stretches of virtual time, each
     /// stretch's speed a decision, so preemption lands at other points of the code.
     cpu_modulation: bool = false,
+    /// Retroactive logging: output lines with one of these texts are not written to the events
+    /// file (they still count: hash, behaviors, the logging limit); a replay writes them.
+    retroactive: []const []const u8 = &.{},
 };
 
 /// The machine runs `slowdown_permille` thousandths slower than its base rate (each branch
@@ -227,6 +230,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     try vm.det_enable(options, .{ .tsc_base = snapshot.tsc });
     if (options.cpu_modulation) vm.modulation = .{};
     vm.events.log_fd = options.events_fd;
+    vm.events.retroactive = options.retroactive;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
     assert(vm.branches_offset == snapshot.branches);
 }
@@ -293,6 +297,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .overrides = null,
     };
     vm.events.init(options.events_parse_buffer, .{ .log_fd = options.events_fd });
+    vm.events.retroactive = options.retroactive;
     if (options.disks.len > disks_max) return error.TooManyDisks;
     for (options.disks, vm.blocks[0..options.disks.len]) |disk, *block| {
         block.init(disk.fd, disk.size);

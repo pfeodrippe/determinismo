@@ -64,10 +64,8 @@ in ANTITHESIS.md yet.
    a time per node; any fault on request from a scenario). Restarted nodes may take a new address
    (`new_address`). Left: CPU modulation changing the relative speed of instructions, not only
    the clock.
-5. **Retroactive logging**: verbose output (lines matching a regex, or whole nodes) goes to a
-   black hole during exploration, not stored; replaying a branch regenerates it for the Logs
-   view, a query, or a file. Antithesis measured virtual time per wall time going from 0.16 to
-   1.01 on a verbose test.
+5. **Retroactive logging**: done (`--retroactive '<text>'`): verbose lines stay out of an
+   exploration's events and come back in a replay.
 6. **Agent skills**: properties, workload and debug are in `.claude/skills/`. Left: a
    mutation-testing skill (with item 7), and trying each on a system it has not seen.
 7. **Mutation testing campaigns** (antithesis.com/blog/2026/mutation-testing): an agent reads the

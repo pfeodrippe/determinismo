@@ -56,6 +56,13 @@
         "changed": {
           "type": "string",
           "description": "A targeted run: a diff file or git range (on the machine running determinismo) whose changed lines the tree explores first; the result says which hunks ran in how many timelines, and which never ran"
+        },
+        "retroactive": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Retroactive logging: output lines containing any of these texts are left out of the exploration's events (they still count for behaviors and the logging limit); replay a timeline to see them"
         }
       },
       "required": []

@@ -54,6 +54,8 @@ pub const Property = struct {
 };
 
 log_fd: ?linux.fd_t,
+/// Output lines with one of these texts are not written (VM.Options.retroactive).
+retroactive: []const []const u8 = &.{},
 count: u64 = 0,
 hash: std.hash.Wyhash = .init(0),
 properties: [property_count_max]Property = undefined,
@@ -110,9 +112,9 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     if (events.first_vtime_ns == null) events.first_vtime_ns = moment.vtime_ns;
     events.hash.update(std.mem.asBytes(&moment));
     events.hash.update(data);
-    if (events.log_fd) |fd| {
+    if (events.log_fd) |fd| if (!events.retroactive_hidden(data)) {
         write_log_line(fd, .{ .sequence = events.count, .moment = moment, .data = data });
-    }
+    };
 
     events.last_event_name_size = 0;
     var fba = std.heap.FixedBufferAllocator.init(events.parse_buffer);
@@ -140,6 +142,16 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
             events.on_lifecycle(moment, .{ .string = "setup_complete" });
         }
     }
+}
+
+/// Retroactive logging: an output line with a text it hides, not written while exploring.
+fn retroactive_hidden(events: *const Events, data: []const u8) bool {
+    if (events.retroactive.len == 0) return false;
+    if (!std.mem.startsWith(u8, data, "{\"output\":")) return false;
+    for (events.retroactive) |text| {
+        if (std.mem.indexOf(u8, data, text) != null) return true;
+    }
+    return false;
 }
 
 fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
