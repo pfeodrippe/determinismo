@@ -11,3 +11,4 @@
     - [ ] send input from external (and/or modify it, see point below in `make memory readable/modifiable`) so we can check it quickly without having to restart the app service
   - [ ] make memory readable/modifiable (via instrumentation as well) so then we can rewind, start a new timeline and modify it in a atomic way (e.g. before calling a function so some value from a struct/map/whatever changes) or that we can modify a request
   - [ ] for all cases above, how to make it so that the timelike "likely" follows the path that it was following? maybe we could have some way to define which points we want to be called and that (because the service is instrumented), then we are able to confirm it, backtracking again a little bit and restarting with another seed if not the case ?
+- [ ] does the elle append_many needs to be this complex or it's because the API for a custom check is not yet good enough ?
