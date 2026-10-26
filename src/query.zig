@@ -380,36 +380,66 @@ pub fn timelines_read(
     directory: []const u8,
     only_branch: ?u32,
 ) ![]const Timeline {
-    const cwd = std.Io.Dir.cwd();
-    var prefix: std.ArrayList(Event) = .empty;
-    for ([_][]const u8{ "setup.jsonl", "fork.jsonl" }) |name| {
-        const path = try std.fs.path.join(arena, &.{ directory, name });
-        const source = cwd.readFileAlloc(io, path, arena, .unlimited) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
+    var reader = try Reader.init(arena, io, directory, only_branch);
+    var timelines: std.ArrayList(Timeline) = .empty;
+    while (try reader.next()) |timeline| try timelines.append(arena, timeline);
+    return timelines.items;
+}
+
+/// The timelines of an events directory one at a time, in branch order: a search can stop
+/// once it has what it wants without reading the rest.
+pub const Reader = struct {
+    arena: std.mem.Allocator,
+    prefix: []const Event,
+    branches: []const u32,
+    own: Own,
+    at: usize = 0,
+
+    pub fn init(
+        arena: std.mem.Allocator,
+        io: std.Io,
+        directory: []const u8,
+        only_branch: ?u32,
+    ) !Reader {
+        const cwd = std.Io.Dir.cwd();
+        var prefix: std.ArrayList(Event) = .empty;
+        for ([_][]const u8{ "setup.jsonl", "fork.jsonl" }) |name| {
+            const path = try std.fs.path.join(arena, &.{ directory, name });
+            const source = cwd.readFileAlloc(io, path, arena, .unlimited) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            try events_parse(arena, source, 0, &prefix);
+        }
+        var branches: std.ArrayList(u32) = .empty;
+        var dir = try cwd.openDir(io, directory, .{ .iterate = true });
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "branch-")) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+            const number = entry.name["branch-".len .. entry.name.len - ".jsonl".len];
+            const branch = std.fmt.parseInt(u32, number, 10) catch continue;
+            if (only_branch) |wanted| if (branch != wanted) continue;
+            try branches.append(arena, branch);
+        }
+        std.mem.sort(u32, branches.items, {}, std.sort.asc(u32));
+        return .{
+            .arena = arena,
+            .prefix = prefix.items,
+            .branches = branches.items,
+            .own = .{ .arena = arena, .io = io, .directory = directory },
         };
-        try events_parse(arena, source, 0, &prefix);
     }
-    var branches: std.ArrayList(u32) = .empty;
-    var dir = try cwd.openDir(io, directory, .{ .iterate = true });
-    defer dir.close(io);
-    var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, "branch-")) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
-        const number = entry.name["branch-".len .. entry.name.len - ".jsonl".len];
-        const branch = std.fmt.parseInt(u32, number, 10) catch continue;
-        if (only_branch) |wanted| if (branch != wanted) continue;
-        try branches.append(arena, branch);
-    }
-    std.mem.sort(u32, branches.items, {}, std.sort.asc(u32));
-    var own: Own = .{ .arena = arena, .io = io, .directory = directory };
-    const timelines = try arena.alloc(Timeline, branches.items.len);
-    for (branches.items, timelines) |branch, *timeline| {
-        const mine = try own.get(branch);
+
+    pub fn next(reader: *Reader) !?Timeline {
+        if (reader.at == reader.branches.len) return null;
+        const branch = reader.branches[reader.at];
+        reader.at += 1;
+        const mine = try reader.own.get(branch);
         var events: std.ArrayList(Event) = .empty;
-        try events.ensureTotalCapacity(arena, prefix.items.len + mine.events.len);
-        for (prefix.items) |event| {
+        try events.ensureTotalCapacity(reader.arena, reader.prefix.len + mine.events.len);
+        for (reader.prefix) |event| {
             var shared = event;
             shared.branch = branch;
             events.appendAssumeCapacity(shared);
@@ -418,20 +448,19 @@ pub fn timelines_read(
         // the next one branched from it, then its own.
         var from: u64 = 0;
         for (mine.path) |step| {
-            const ancestor = try own.get(step.branch);
+            const ancestor = try reader.own.get(step.branch);
             for (ancestor.events) |event| {
                 if (event.vtime_ns < from or event.vtime_ns > step.vtime_ns) continue;
                 var shared = event;
                 shared.branch = branch;
-                try events.append(arena, shared);
+                try events.append(reader.arena, shared);
             }
             from = step.vtime_ns;
         }
-        try events.appendSlice(arena, mine.events);
-        timeline.* = .{ .branch = branch, .events = events.items };
+        try events.appendSlice(reader.arena, mine.events);
+        return .{ .branch = branch, .events = events.items };
     }
-    return timelines;
-}
+};
 
 /// Each branch's own events (its file), and its path when it began inside others; read once.
 const Own = struct {
@@ -481,11 +510,15 @@ fn events_parse(
     branch: u32,
     events: *std.ArrayList(Event),
 ) !void {
+    // One allocation for the file's cells (as many as its lines, at most).
+    const cells = try arena.alloc(Event.Cell, std.mem.count(u8, source, "\n") + 1);
+    var used: usize = 0;
     var lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (lines.next()) |text| {
         // Lines that are not JSON events (plain logs, a path header) carry nothing to query.
         const place = line_place(text) orelse continue;
-        const cell = try arena.create(Event.Cell);
+        const cell = &cells[used];
+        used += 1;
         cell.* = .{ .arena = arena };
         try events.append(arena, .{
             .branch = branch,
@@ -656,9 +689,9 @@ pub fn answer(
         .output = request.output,
         .json = true,
     };
-    const timelines = try timelines_read(arena, io, directory, request.branch);
+    var reader = try Reader.init(arena, io, directory, request.branch);
     var out: std.Io.Writer.Allocating = .init(arena);
-    _ = try search(&query, timelines, &out.writer);
+    _ = try search(&query, &reader, &out.writer);
     return out.written();
 }
 
@@ -678,10 +711,10 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, arguments: []const [:0]const u8
         return 0;
     }
     const request = try arguments_parse(arena, arguments);
-    const timelines = try timelines_read(arena, io, request.directory, request.only_branch);
+    var reader = try Reader.init(arena, io, request.directory, request.only_branch);
     var buffer: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
-    const total = try search(&request, timelines, &stdout.interface);
+    const total = try search(&request, &reader, &stdout.interface);
     try stdout.interface.flush();
     return if (total > 0) 0 else 1;
 }
@@ -750,10 +783,23 @@ fn option_parse(
 }
 
 /// Writes what the query asks for; returns how many events matched.
-pub fn search(request: *const Query, timelines: []const Timeline, out: *std.Io.Writer) !u64 {
-    var total: u64 = 0;
-    var branches_matching: u64 = 0;
-    for (timelines) |timeline| {
+/// A search over timelines fed one at a time (Reader): its matches written as they are found.
+pub const Search = struct {
+    request: *const Query,
+    out: *std.Io.Writer,
+    total: u64 = 0,
+    branches_matching: u64 = 0,
+    timelines: u64 = 0,
+
+    /// Whether more timelines could change the answer: not once the events shown reached the
+    /// limit.
+    pub fn wants_more(state: *const Search) bool {
+        return state.request.output != .events or state.total < state.request.limit;
+    }
+
+    pub fn feed(state: *Search, timeline: Timeline) !void {
+        const request = state.request;
+        state.timelines += 1;
         var in_timeline: u64 = 0;
         var first: ?*const Event = null;
         for (timeline.events, 0..) |*event, at| {
@@ -762,23 +808,35 @@ pub fn search(request: *const Query, timelines: []const Timeline, out: *std.Io.W
             if (!temporal_holds(request.temporals, timeline.events, at)) continue;
             in_timeline += 1;
             if (first == null) first = event;
-            const shown = request.output == .events and total + in_timeline <= request.limit;
-            if (shown) try event_print(out, event, request.json);
+            const shown = request.output == .events and state.total + in_timeline <= request.limit;
+            if (shown) try event_print(state.out, event, request.json);
         }
-        total += in_timeline;
-        if (in_timeline > 0) branches_matching += 1;
-        if (request.output != .branches) continue;
-        if (first) |event| try branch_print(out, event, in_timeline, request.json);
+        state.total += in_timeline;
+        if (in_timeline > 0) state.branches_matching += 1;
+        if (request.output != .branches) return;
+        if (first) |event| try branch_print(state.out, event, in_timeline, request.json);
     }
-    if (request.output == .count) {
-        const counts = .{ total, branches_matching, timelines.len };
-        if (request.json) {
-            try out.print("{{\"events\":{d},\"branches\":{d},\"timelines\":{d}}}\n", counts);
+
+    pub fn finish(state: *const Search) !void {
+        if (state.request.output != .count) return;
+        const counts = .{ state.total, state.branches_matching, state.timelines };
+        if (state.request.json) {
+            try state.out.print("{{\"events\":{d},\"branches\":{d},\"timelines\":{d}}}\n", counts);
         } else {
-            try out.print("{d} events in {d} of {d} timelines\n", counts);
+            try state.out.print("{d} events in {d} of {d} timelines\n", counts);
         }
     }
-    return total;
+};
+
+/// Searches the timelines of `reader` (stopping once the events shown reach the limit).
+pub fn search(request: *const Query, reader: *Reader, out: *std.Io.Writer) !u64 {
+    var state = Search{ .request = request, .out = out };
+    while (state.wants_more()) {
+        const timeline = try reader.next() orelse break;
+        try state.feed(timeline);
+    }
+    try state.finish();
+    return state.total;
 }
 
 fn seconds_to_ns(text: []const u8) !u64 {
