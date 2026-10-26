@@ -225,6 +225,15 @@ public final class Determinismo {
   }
 
   /**
+   * One of the items, a platform decision (Antithesis's Random.randomChoice): null for none. To
+   * name the decision for strategies, {@link #decide}.
+   */
+  public static <T> T randomChoice(java.util.List<T> items) {
+    if (items.isEmpty()) return null;
+    return items.get((int) randomBelow(items.size()));
+  }
+
+  /**
    * A named decision among options (which fault, which account, which node): the index chosen,
    * a platform decision announced with the options' names, for strategies.
    */

@@ -214,6 +214,18 @@
   [name n]
   (Determinismo/randomBelowNamed name (long n)))
 
+(defn buggify
+  "A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a named
+  decision; outside always false. Where it is true, take the rare path the real system can take
+  too (a pause, a retry), never one it cannot."
+  [name]
+  (Determinismo/buggify name))
+
+(defn buggify-pause
+  "At a buggify point, a pause of up to 9 ms: the other threads run in that window."
+  [name]
+  (Determinismo/buggifyPause name))
+
 (defn choice
   "A random element of a non-empty collection."
   [coll]
