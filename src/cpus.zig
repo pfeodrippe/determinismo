@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MIT
+//! The host's CPUs, shared by every run on it: a process holds a CPU while it runs a VM (a
+//! timeline, a tree node's replay), pinned to it, and gives it back after. Any number of runs
+//! then share the host with never two VMs on one CPU, and a lone run takes them all.
+//!
+//! A CPU is a lock on a file of its own (flock), named by the CPU's number, in a directory of
+//! the user's: every process agrees on the CPUs, and the kernel gives a CPU back when its holder
+//! dies. Locks belong to an open file, so each process opens the pool itself (never inherited).
+//!
+//! CPUs are taken physical cores first: a VM alone on a core runs faster than two on sibling
+//! hyperthreads (each about two thirds as fast), so a host with room gives each VM a core, and a
+//! busy one still uses every thread.
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+
+const cpus_max = 1024;
+const wait_ns_min = std.time.ns_per_ms;
+const wait_ns_max = 100 * std.time.ns_per_ms;
+
+pub const Pool = struct {
+    /// The CPUs this process may run on, and their lock files.
+    cpus: [cpus_max]u16 = undefined,
+    fds: [cpus_max]linux.fd_t = undefined,
+    count: u32 = 0,
+
+    /// Opens the pool of the CPUs this process may run on.
+    pub fn open(pool: *Pool) !void {
+        pool.* = .{};
+        var available: linux.cpu_set_t = undefined;
+        const size = @sizeOf(linux.cpu_set_t);
+        if (linux.errno(linux.sched_getaffinity(0, size, &available)) != .SUCCESS) {
+            return error.Affinity;
+        }
+        var directory_buffer: [64]u8 = undefined;
+        const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-{d}", .{
+            linux.getuid(),
+        }, 0);
+        const made = linux.mkdir(directory, 0o700);
+        if (linux.errno(made) != .SUCCESS and linux.errno(made) != .EXIST) return error.PoolDirectory;
+        errdefer pool.close();
+        const bits = @bitSizeOf(@TypeOf(available[0]));
+        for (0..available.len * bits) |cpu| {
+            if (available[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) continue;
+            if (pool.count == cpus_max) break;
+            var path_buffer: [96]u8 = undefined;
+            const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/cpu-{d}", .{ directory, cpu }, 0);
+            const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+            const fd = linux.open(path, flags, 0o600);
+            if (linux.errno(fd) != .SUCCESS) return error.PoolFile;
+            pool.cpus[pool.count] = @intCast(cpu);
+            pool.fds[pool.count] = @intCast(fd);
+            pool.count += 1;
+        }
+        if (pool.count == 0) return error.NoCpus;
+        // Each core's first thread, then the siblings (stable: by number within each).
+        var order: [cpus_max]u32 = undefined;
+        for (order[0..pool.count], 0..) |*slot, index| slot.* = @intCast(index);
+        std.sort.insertion(u32, order[0..pool.count], pool, sibling_after);
+        const cpus = pool.cpus;
+        const fds = pool.fds;
+        for (order[0..pool.count], 0..) |from, to| {
+            pool.cpus[to] = cpus[from];
+            pool.fds[to] = fds[from];
+        }
+    }
+
+    fn sibling_after(pool: *const Pool, a: u32, b: u32) bool {
+        const a_sibling = sibling(pool.cpus[a]);
+        const b_sibling = sibling(pool.cpus[b]);
+        if (a_sibling != b_sibling) return !a_sibling;
+        return pool.cpus[a] < pool.cpus[b];
+    }
+
+    pub fn close(pool: *Pool) void {
+        for (pool.fds[0..pool.count]) |fd| _ = linux.close(fd);
+        pool.count = 0;
+    }
+
+    /// Takes a free CPU (the first, physical cores first), waiting while none is, and pins this
+    /// process to it.
+    pub fn take(pool: *Pool) Held {
+        assert(pool.count > 0);
+        var wait_ns: u64 = wait_ns_min;
+        while (true) {
+            for (0..pool.count) |index| {
+                const slot: u32 = @intCast(index);
+                const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
+                if (linux.errno(locked) != .SUCCESS) continue;
+                pin(pool.cpus[slot]);
+                return .{ .slot = slot };
+            }
+            // Every CPU runs a VM: back-pressure, until one is given back.
+            const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
+            _ = linux.nanosleep(&pause, null);
+            wait_ns = @min(wait_ns * 2, wait_ns_max);
+        }
+    }
+
+    pub fn give(pool: *Pool, held: Held) void {
+        assert(held.slot < pool.count);
+        _ = linux.flock(pool.fds[held.slot], std.posix.LOCK.UN);
+    }
+};
+
+pub const Held = struct { slot: u32 };
+
+/// Whether the CPU is a core's second hyperthread (not the first of its siblings).
+fn sibling(cpu: u16) bool {
+    var path_buffer: [96]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/sys/devices/system/cpu/cpu{d}/" ++
+        "topology/thread_siblings_list", .{cpu}, 0) catch return false;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var text: [64]u8 = undefined;
+    const size = linux.read(@intCast(fd), &text, text.len);
+    if (linux.errno(size) != .SUCCESS) return false;
+    // "0,18" or "0-1": the first is the core's first thread.
+    const end = std.mem.indexOfAny(u8, text[0..size], ",-\n") orelse size;
+    const first = std.fmt.parseInt(u16, text[0..end], 10) catch return false;
+    return cpu != first;
+}
+
+fn pin(cpu: u16) void {
+    var set: linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(@TypeOf(set[0]));
+    set[cpu / bits] = @as(@TypeOf(set[0]), 1) << @intCast(cpu % bits);
+    linux.sched_setaffinity(0, &set) catch {}; // Best effort: the lock is what counts.
+}
+
+/// Lets this process run on any CPU (a process that holds none, after a pinned parent).
+pub fn unpin() void {
+    var set: linux.cpu_set_t = @splat(~@as(@TypeOf(@as(linux.cpu_set_t, undefined)[0]), 0));
+    linux.sched_setaffinity(0, &set) catch {};
+}
+
+test "a CPU is held by one process at a time, and given back" {
+    var first: Pool = undefined;
+    try first.open();
+    defer first.close();
+    var second: Pool = undefined;
+    try second.open();
+    defer second.close();
+    const held = first.take();
+    // The same CPU is taken: another process (another open file) finds another, or waits.
+    const lock = linux.flock(second.fds[held.slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
+    try std.testing.expect(linux.errno(lock) == .AGAIN);
+    first.give(held);
+    const again = linux.flock(second.fds[held.slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
+    try std.testing.expect(linux.errno(again) == .SUCCESS);
+    _ = linux.flock(second.fds[held.slot], std.posix.LOCK.UN);
+    unpin();
+}

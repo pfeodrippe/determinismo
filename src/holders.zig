@@ -15,6 +15,7 @@ const linux = std.os.linux;
 const Snapshot = @import("snapshot.zig");
 const VM = @import("vm.zig");
 const fd_pass = @import("fd_pass.zig");
+const cpus = @import("cpus.zig");
 
 /// Holders a timeline keeps at most: past it, the one closest to the one before it goes, so the
 /// replays from a holder to a later moment stay short wherever the moment is.
@@ -202,7 +203,11 @@ pub const Owner = struct {
         const at = address(owner.explorer, owner.worker, id);
         const listener = listen(&at) orelse return;
         const pid = linux.fork();
-        if (pid == 0) owner.serve(vm, listener, moment);
+        if (pid == 0) {
+            // It waits; it runs only for whoever asks, who holds a CPU meanwhile (cpus.zig).
+            cpus.unpin();
+            owner.serve(vm, listener, moment);
+        }
         _ = linux.close(listener);
         if (linux.errno(pid) != .SUCCESS) return;
         owner.kept[owner.kept_count] = .{

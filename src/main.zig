@@ -23,6 +23,7 @@ const merge = @import("merge.zig");
 const script = @import("script.zig");
 const tla = @import("tla.zig");
 const query = @import("query.zig");
+const cpus = @import("cpus.zig");
 const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
 const changed = @import("changed.zig");
@@ -1000,12 +1001,20 @@ fn worker_run(
     branches: Branches,
     worker: Worker,
 ) noreturn {
-    cpu_pin(worker.worker);
+    // The host's CPUs, shared with every other run's workers: one per timeline (cpus.zig).
+    var pool: cpus.Pool = undefined;
+    pool.open() catch |err| {
+        std.debug.print("[determinismo] worker {d}: the CPU pool: {s}\n", .{
+            worker.worker, @errorName(err),
+        });
+        linux.exit_group(1);
+    };
     var exploration = branches.exploration.*;
     var mine = branches;
     mine.exploration = &exploration;
     mine.worker = worker.worker;
     mine.jobs = worker.jobs;
+    mine.pool = &pool;
     mine.multiverse.* = .{};
     var summaries: Summaries = undefined;
     if (branches.summaries) |all| {
@@ -1035,26 +1044,6 @@ fn worker_explore(
         return false;
     };
     return true;
-}
-
-/// Spreads workers over CPUs (VMs run faster when not migrated); best effort.
-fn cpu_pin(worker: u32) void {
-    var available: linux.cpu_set_t = undefined;
-    const size = @sizeOf(linux.cpu_set_t);
-    if (linux.errno(linux.sched_getaffinity(0, size, &available)) != .SUCCESS) return;
-    const bits_per_word = @bitSizeOf(@TypeOf(available[0]));
-    var seen: u32 = 0;
-    for (0..available.len * bits_per_word) |cpu| {
-        const word = available[cpu / bits_per_word];
-        if (word >> @intCast(cpu % bits_per_word) & 1 == 0) continue;
-        if (seen == worker % cpus_available()) {
-            var set: linux.cpu_set_t = @splat(0);
-            set[cpu / bits_per_word] = @as(@TypeOf(set[0]), 1) << @intCast(cpu % bits_per_word);
-            _ = linux.sched_setaffinity(0, &set) catch {};
-            return;
-        }
-        seen += 1;
-    }
 }
 
 fn read_exact(fd: linux.fd_t, target: []u8) bool {
@@ -1111,6 +1100,8 @@ const Branches = struct {
     arguments: *const Arguments,
     /// No branch starts after this (monotonic_ns): the time budget.
     deadline_ns: ?u64 = null,
+    /// A worker's: each timeline runs on a CPU taken from it (and given back after).
+    pool: ?*cpus.Pool = null,
     /// The tree explorer's generation: which branches run, and where each starts. Null: the
     /// branches `0..arguments.branches`, all from `snapshot`.
     plan: ?[]const Planned = null,
@@ -1159,6 +1150,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (branches.deadline_ns) |deadline| {
             if (monotonic_ns() >= deadline) break;
         }
+        const held = if (branches.pool) |pool| pool.take() else null;
+        defer if (held) |cpu| branches.pool.?.give(cpu);
         options.seed = place.seed;
         const moment_ms = branches.arguments.moment_vtime_ms;
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
@@ -1856,6 +1849,10 @@ fn node_make_start(
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
         close(pair[0]);
+        // A replay to the node's moment: on a CPU of the host's (cpus.zig), until it exits.
+        var pool: cpus.Pool = undefined;
+        pool.open() catch linux.exit_group(1);
+        _ = pool.take();
         const parent = making.parent;
         const at = making.back.vtime_ns;
         const from = parent.snapshot;
@@ -2435,6 +2432,7 @@ test {
     _ = @import("query.zig");
     _ = @import("duckdb.zig");
     _ = @import("store.zig");
+    _ = @import("cpus.zig");
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
     _ = @import("changed.zig");
