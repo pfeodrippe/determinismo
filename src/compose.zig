@@ -69,6 +69,7 @@ fn node_from_service(
         .name = service.key,
         .source = .{},
         .faults = .{ .new_address = true },
+        .antithesis_library = true,
     };
     // As Antithesis does, an image is used by name (built beforehand, as the project's own
     // scripts build it, or pulled); `build` only when no image is named.

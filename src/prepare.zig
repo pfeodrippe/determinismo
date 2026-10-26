@@ -174,6 +174,7 @@ fn node_resolve(
         .faults = node.faults,
         .memory_max_mib = node.memory_max_mib,
         .privileged = node.privileged,
+        .antithesis_library = node.antithesis_library,
     };
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|

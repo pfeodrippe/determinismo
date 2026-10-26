@@ -90,8 +90,9 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(guest_exe);
     }
 
-    // libvoidstar.so, Antithesis's native library for the system's processes (every node has it
-    // at /usr/lib/libvoidstar.so): no libc, so any program can load it. Beside the runtime.
+    // libvoidstar.so, Antithesis's native library for the system's processes (nodes with
+    // antithesis_library have it at /usr/lib/libvoidstar.so): no libc, so any program can load
+    // it. Beside the runtime.
     const voidstar = b.addLibrary(.{
         .name = "voidstar",
         .linkage = .dynamic,

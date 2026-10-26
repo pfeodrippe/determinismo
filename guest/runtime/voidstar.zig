@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! libvoidstar.so: the native library Antithesis gives every container, here talking to
-//! determinismo. Antithesis's SDKs use it when /usr/lib/libvoidstar.so exists (every node has
-//! this one there), and programs built with Antithesis's instrumentation call it:
+//! determinismo. Antithesis's SDKs use it when /usr/lib/libvoidstar.so exists (nodes with
+//! Node.antithesis_library have this one there: Compose projects), and programs built with
+//! Antithesis's instrumentation call it:
 //!
 //!   fuzz_json_data, fuzz_flush   an SDK message (assertions, setup, events): an event
 //!   fuzz_get_random              randomness: a platform decision (strategies steer it, tapes

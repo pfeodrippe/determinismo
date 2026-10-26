@@ -53,6 +53,11 @@ pub const Node = struct {
     /// /sys and the node's cgroups writable, as for a privileged container: for nodes that run
     /// containers themselves (K3s, Docker in Docker).
     privileged: bool = false,
+    /// Antithesis's native library at /usr/lib/libvoidstar.so (determinismo's): Antithesis's
+    /// SDKs then send through it, and instrumented programs report coverage. Imported Compose
+    /// projects have it, as on Antithesis. Off by default: a static program with Antithesis's
+    /// Go SDK (K3s, through etcd) cannot load a library, and the SDK stops it when one is there.
+    antithesis_library: bool = false,
 };
 
 /// Where a node's root filesystem comes from: exactly one field is set.
@@ -201,6 +206,7 @@ pub const Resolved = struct {
     faults: Faults = .{},
     memory_max_mib: ?u32 = null,
     privileged: bool = false,
+    antithesis_library: bool = false,
 };
 
 pub fn node_address(index: u32) [4]u8 {

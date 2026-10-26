@@ -1134,6 +1134,7 @@ const Launch = struct {
     uid: ?u32,
     gid: ?u32,
     privileged: bool,
+    antithesis_library: bool,
 
     fn init(arena: std.mem.Allocator, node: *const schema.Resolved, paths: *const Paths) !Launch {
         if (node.command.len == 0 or node.command.len >= arguments_max) return error.BadCommand;
@@ -1161,6 +1162,7 @@ const Launch = struct {
             .uid = if (ids) |i| i.uid else null,
             .gid = if (ids) |i| i.gid else null,
             .privileged = node.privileged,
+            .antithesis_library = node.antithesis_library,
         };
     }
 
@@ -1223,13 +1225,15 @@ const Launch = struct {
         const remount = linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY;
         try mount(null, platform, null, remount, null);
         // Antithesis's native library, where its SDKs and instrumented programs look for it.
-        try mkdir_all(try print_z(&buffer, "{s}/usr/lib", .{launch.root}));
-        const voidstar = try print_z(&buffer, "{s}/usr/lib/libvoidstar.so", .{launch.root});
-        const create: linux.O = .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true };
-        const created = linux.open(voidstar, create, 0o644);
-        if (linux.errno(created) == .SUCCESS) _ = linux.close(@intCast(created));
-        try mount(voidstar_path, voidstar, null, linux.MS.BIND, null);
-        try mount(null, voidstar, null, remount, null);
+        if (launch.antithesis_library) {
+            try mkdir_all(try print_z(&buffer, "{s}/usr/lib", .{launch.root}));
+            const voidstar = try print_z(&buffer, "{s}/usr/lib/libvoidstar.so", .{launch.root});
+            const create: linux.O = .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true };
+            const created = linux.open(voidstar, create, 0o644);
+            if (linux.errno(created) == .SUCCESS) _ = linux.close(@intCast(created));
+            try mount(voidstar_path, voidstar, null, linux.MS.BIND, null);
+            try mount(null, voidstar, null, remount, null);
+        }
         // What container runtimes add to /dev (bash process substitution needs /dev/fd).
         const links = [_]struct { path: []const u8, target: [:0]const u8 }{
             .{ .path = "dev/fd", .target = "/proc/self/fd" },
