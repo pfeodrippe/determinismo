@@ -7,8 +7,11 @@
 //!   fuzz_get_random              randomness: a platform decision (strategies steer it, tapes
 //!                                replay it)
 //!   init_coverage_module,        coverage from Antithesis's instrumentors (Go's): each edge, the
-//!   notify_coverage              first time a process runs it, a "coverage" event, as a source
-//!                                line when the module's symbol table (/symbols/<name>) says
+//!   notify_coverage              first time the timeline runs it (a bitmap per module in
+//!                                /opt/determinismo/coverage, shared by every process of every
+//!                                node: test commands start often, nodes restart),
+//!                                a "coverage" event, as a source line when the module's symbol
+//!                                table (/symbols/<name>) says
 //!   __sanitizer_cov_trace_pc_guard[_init]
 //!                                clang's trace-pc-guard callbacks (C and C++ built for Antithesis
 //!                                link against this library): an "edge <n>" event per edge
@@ -72,6 +75,8 @@ const Module = struct {
     rows: []u32 = &.{},
     name: [128]u8 = undefined,
     name_size: u8 = 0,
+    /// One bit per edge, shared by every process: set once reported (empty: per process).
+    reported: []u8 = &.{},
 };
 
 var modules: [modules_max]Module = undefined;
@@ -89,6 +94,7 @@ export fn init_coverage_module(edge_count: usize, symbols: [*:0]const u8) u64 {
     module.name_size = @intCast(@min(name.len, module.name.len));
     @memcpy(module.name[0..module.name_size], name[0..module.name_size]);
     table_load(&module, name);
+    module.reported = bitmap_open(name, edge_count);
     modules[count] = module;
     module_count.store(count + 1, .release);
     edges_total += edge_count;
@@ -107,6 +113,12 @@ export fn notify_coverage(edge: usize) bool {
 }
 
 fn edge_report(module: *const Module, edge: u64) void {
+    if (module.reported.len > 0) {
+        const byte = &module.reported[edge / 8];
+        const bit: u8 = @as(u8, 1) << @intCast(edge % 8);
+        const before = @atomicRmw(u8, byte, .Or, bit, .monotonic);
+        if (before & bit != 0) return; // Another process reported it.
+    }
     var buffer: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.writeAll("{\"event\":\"coverage\",\"details\":{\"name\":\"") catch return;
@@ -172,6 +184,25 @@ fn table_load(module: *Module, name: []const u8) void {
     }
     module.table = table;
     module.rows = rows;
+}
+
+/// The timeline's shared bitmap for a module: /opt/determinismo/coverage/<name>, created by the
+/// first process that loads it (empty when it cannot be: each process reports its own edges).
+fn bitmap_open(name: []const u8, edge_count: u64) []u8 {
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return &.{};
+    var path_buffer: [256]u8 = undefined;
+    const format = "/opt/determinismo/coverage/{s}";
+    const path = std.fmt.bufPrintSentinel(&path_buffer, format, .{name}, 0) catch return &.{};
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o666);
+    if (linux.errno(fd) != .SUCCESS) return &.{};
+    defer _ = linux.close(@intCast(fd));
+    const size = std.mem.alignForward(u64, (edge_count + 7) / 8, std.heap.page_size_min);
+    if (linux.errno(linux.ftruncate(@intCast(fd), @intCast(size))) != .SUCCESS) return &.{};
+    const protection: linux.PROT = .{ .READ = true, .WRITE = true };
+    const address = linux.mmap(null, size, protection, .{ .TYPE = .SHARED }, @intCast(fd), 0);
+    if (linux.errno(address) != .SUCCESS) return &.{};
+    return @as([*]u8, @ptrFromInt(address))[0..size];
 }
 
 /// A read-only mapping of `fd`, or zeroed anonymous memory without one.

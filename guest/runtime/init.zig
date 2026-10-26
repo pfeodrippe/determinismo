@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
     const cmdline = read_cmdline(&cmdline_buffer);
     for (modules) |module| module_load(module, cmdline);
     sdk_output_mount();
+    coverage_mount();
     _ = spawn(&.{bin ++ "det-agent"}); // Multiverse debugging; asleep unless pushed to.
     const status = run(arena, cmdline);
     std.debug.print("[guest] done, status {d}\n", .{status});
@@ -137,6 +138,17 @@ fn sdk_output_mount() void {
     const result = linux.mount("detfs", directory, "detfs", 0, 0);
     if (linux.errno(result) != .SUCCESS) {
         std.debug.print("[guest] detfs: {s}\n", .{@tagName(linux.errno(result))});
+    }
+}
+
+/// Where libvoidstar keeps which edges were reported, shared by every process of every node for
+/// the whole timeline (a node restarted, or a test command started again, reports nothing new):
+/// a writable tmpfs under /opt/determinismo, which nodes see through their bind of it.
+fn coverage_mount() void {
+    const target = "/opt/determinismo/coverage";
+    const result = linux.mount("tmpfs", target, "tmpfs", 0, @intFromPtr("mode=1777"));
+    if (linux.errno(result) != .SUCCESS) {
+        std.debug.print("[guest] coverage: {s}\n", .{@tagName(linux.errno(result))});
     }
 }
 

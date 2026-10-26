@@ -24,6 +24,7 @@ const directories = [_][]const u8{
     "bin",                  "sbin",                     "etc", "proc", "sys", "dev",
     "run",                  "tmp",                      "det", "root", "opt", "opt/determinismo",
     "opt/determinismo/bin", "opt/determinismo/modules", "opt/determinismo/lib",
+    "opt/determinismo/coverage",
 };
 const applets_max = 1024;
 
