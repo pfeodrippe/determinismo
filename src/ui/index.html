@@ -185,9 +185,11 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
       <label>Time budget<input name="time_budget" placeholder="e.g. 10m"></label>
       <label>Timelines (at most)<input name="branches" type="number" value="64" min="1"></label>
-      <label>Seed<input name="seed" type="number" value="0" min="0"></label>
+      <label>Seed<input name="seed" type="number" min="0" placeholder="fresh"></label>
       <label>Workers<input name="jobs" type="number" placeholder="all CPUs" min="1"></label>
     </div>
+    <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" name="repeat" style="width:auto">
+      Repeat: when it ends, another starts with a fresh seed (continuous testing)</label>
     <label>Branching<select name="branching"><option value="tree">Tree: also from moments of earlier timelines that reached new behaviors</option>
       <option value="flat">Flat: every timeline from the setup snapshot</option></select></label>
     <label>Strategy (optional; it plans its own branches, so the branching is flat)<input name="strategy" placeholder="det-strategy-mutate --sync-dir /tmp/corpus   or   @my-strategy --flag"></label>
@@ -1497,7 +1499,9 @@ $("#strategy-file").addEventListener("change", async (event) => {
 $("#run-form").addEventListener("submit", async (event) => {
   if (event.submitter && event.submitter.value === "cancel") return;
   const form = new FormData($("#run-form"));
-  const request = { [form.get("kind")]: form.get("path"), seed: Number(form.get("seed")) };
+  const request = { [form.get("kind")]: form.get("path") };
+  if (form.get("seed")) request.seed = Number(form.get("seed")); // Else a fresh one.
+  if (form.get("repeat")) request.repeat = true;
   if (form.get("branches")) request.branches = Number(form.get("branches"));
   for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline"]) if (form.get(key)) request[key] = form.get(key);
   request.branching = request.strategy ? "flat" : form.get("branching");

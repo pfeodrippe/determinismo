@@ -225,7 +225,8 @@ fn watch(shared: *Shared) void {
         };
         assert(linux.errno(linux.nanosleep(&interval, null)) != .INVAL);
         shared.lock();
-        runs_reap(shared);
+        var ended: [16]u32 = undefined;
+        const ended_count = runs_reap(shared, &ended);
         var count: usize = 0;
         for (shared.runs[0..shared.run_count]) |*run| {
             if (run.complete) continue;
@@ -235,6 +236,21 @@ fn watch(shared: *Shared) void {
             if (run.status != null) run.complete = true;
         }
         shared.unlock();
+        for (ended[0..ended_count]) |id| {
+            var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer request_arena.deinit();
+            var server: Server = .{
+                .shared = shared,
+                .options = shared.options,
+                .io = shared.io,
+                .arena = request_arena.allocator(),
+            };
+            run_repeat(&server, id) catch |err| {
+                std.debug.print("[determinismo] run {d} could not repeat: {s}\n", .{
+                    id, @errorName(err),
+                });
+            };
+        }
         for (ids[0..count]) |id| {
             var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer request_arena.deinit();
@@ -554,7 +570,12 @@ const RunRequest = struct {
     compose: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
-    seed: u64 = 0,
+    /// Absent: a fresh one, drawn by the server and kept in the run's request.json (as
+    /// Antithesis's runs: each explores anew, and every moment of it replays).
+    seed: ?u64 = null,
+    /// When the run ends on its own (its budget), another starts: the same request, a fresh
+    /// seed. Continuous testing; a run stopped on request does not repeat.
+    repeat: bool = false,
     /// Timelines (at most, with a time budget).
     branches: ?u32 = null,
     /// Explore until then: "90s", "10m", "2h".
@@ -583,9 +604,16 @@ const RunRequest = struct {
 };
 
 fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
-    const asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, body, .{
+    var asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     });
+    if (asked.seed == null) {
+        var seed: u64 = 0;
+        std.Io.random(server.io, std.mem.asBytes(&seed));
+        asked.seed = seed;
+    }
+    // As run: the seed drawn is in it, for its replays.
+    const request_json = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     const shared = server.shared;
     shared.lock();
     defer shared.unlock(); // Until the run is in the list: ids are given once.
@@ -596,7 +624,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     try std.Io.Dir.cwd().createDirPath(server.io, directory);
     try std.Io.Dir.cwd().writeFile(server.io, .{
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, "request.json" }),
-        .data = body,
+        .data = request_json,
     });
     const argv = try explore_arguments(server, &asked, directory);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
@@ -621,7 +649,7 @@ fn explore_arguments(
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, server.options.machine);
     try system_arguments(server.arena, &argv, asked);
-    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed}) });
+    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{asked.seed.?}) });
     if (asked.time_budget) |budget| {
         try argv.appendSlice(server.arena, &.{ "--time-budget", budget });
     }
@@ -734,7 +762,7 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     try argv.appendSlice(server.arena, &.{ server.options.self, "explore" });
     try argv.appendSlice(server.arena, server.options.machine);
     try system_arguments(server.arena, &argv, &original);
-    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed}) });
+    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     }
@@ -819,7 +847,7 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     try argv.appendSlice(server.arena, &.{ server.options.self, "causality" });
     try argv.appendSlice(server.arena, server.options.machine);
     try system_arguments(server.arena, &argv, &original);
-    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed}) });
+    try argv.appendSlice(server.arena, &.{ "--seed", try print(server, "{d}", .{original.seed orelse 0}) });
     if (original.scenario) |scenario| {
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     }
@@ -1235,8 +1263,10 @@ fn recorded_status(record: []const u8) u32 {
     return if (record[digit] == '0') 0 else 3; // As explore exits.
 }
 
-/// Marks the runs and jobs that ended (the watcher's, under the lock).
-fn runs_reap(shared: *Shared) void {
+/// Marks the runs and jobs that ended (the watcher's, under the lock); the runs that ended on
+/// their own (passed or failed: not stopped, not an error) go in `ended`, how many returned.
+fn runs_reap(shared: *Shared, ended: []u32) usize {
+    var ended_count: usize = 0;
     var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer request_arena.deinit();
     var server: Server = .{
@@ -1257,6 +1287,10 @@ fn runs_reap(shared: *Shared) void {
             if (linux.errno(linux.kill(run.pid, @fromBackingInt(0))) != .SRCH) continue;
             const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
+            if (run_ended_itself(run) and ended_count < ended.len) {
+                ended[ended_count] = run.id;
+                ended_count += 1;
+            }
             continue;
         }
         var status: i32 = 0;
@@ -1269,7 +1303,31 @@ fn runs_reap(shared: *Shared) void {
                 run.id, @errorName(err),
             });
         };
+        if (run_ended_itself(run) and ended_count < ended.len) {
+            ended[ended_count] = run.id;
+            ended_count += 1;
+        }
     }
+    return ended_count;
+}
+
+fn run_ended_itself(run: *const Run) bool {
+    const status = run.status orelse return false;
+    return !run.stopped and (status == 0 or status == 3);
+}
+
+/// A run asked to repeat that ended on its own: the next, with its request and a fresh seed.
+fn run_repeat(server: *Server, id: u32) !void {
+    const request_json = run_file(server, id, "request.json") catch return;
+    var asked = std.json.parseFromSliceLeaky(RunRequest, server.arena, request_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return;
+    if (!asked.repeat) return;
+    asked.seed = null;
+    const body = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
+    var out: std.Io.Writer.Allocating = .init(server.arena);
+    _ = try run_create(server, body, &out.writer);
+    std.debug.print("[determinismo] run {d} repeats as {s}", .{ id, out.written() });
 }
 
 /// Hands a finished run's directory to the archive command (in the background).
