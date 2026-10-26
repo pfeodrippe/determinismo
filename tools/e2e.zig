@@ -1311,10 +1311,32 @@ fn check_voidstar(context: *Context) !void {
     const answered = std.mem.indexOf(u8, outputs[0], "voidstar ") != null and
         std.mem.indexOf(u8, outputs[0], "False") != null;
     const same = std.mem.eql(u8, outputs[0], outputs[1]);
-    const passes = answered and events_found and same;
+    // Thread-local state would be the host program's (static-pie: local-exec): none at all.
+    const library = try std.fs.path.join(arena, &.{ context.bin, "libvoidstar.so" });
+    const tls_free = !(try elf_has_tls(context, library));
+    const passes = answered and events_found and same and tls_free;
     expect(context, passes, "voidstar: a node's Python loads libvoidstar.so; its message, " ++
         "decision and coverage reach the timeline, the same twice", .{});
-    if (!passes) std.debug.print("{s}\n{s}\n", .{ outputs[0], outputs[1] });
+    if (!passes) std.debug.print("tls free: {}\n{s}\n{s}\n", .{
+        tls_free, outputs[0], outputs[1],
+    });
+}
+
+/// Whether an ELF file has a PT_TLS program header.
+fn elf_has_tls(context: *Context, path: []const u8) !bool {
+    const cwd = std.Io.Dir.cwd();
+    const bytes = try cwd.readFileAlloc(context.io, path, context.arena, .limited(64 << 20));
+    if (bytes.len < 64 or !std.mem.eql(u8, bytes[0..4], "\x7fELF")) return error.NotElf;
+    const offset = std.mem.readInt(u64, bytes[0x20..][0..8], .little);
+    const size = std.mem.readInt(u16, bytes[0x36..][0..2], .little);
+    const count = std.mem.readInt(u16, bytes[0x38..][0..2], .little);
+    for (0..count) |index| {
+        const at = offset + index * size;
+        if (at + 4 > bytes.len) return error.NotElf;
+        const kind = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        if (kind == 7) return true; // PT_TLS
+    }
+    return false;
 }
 
 /// Branches give the same timelines whether one worker runs them or one per CPU does.
