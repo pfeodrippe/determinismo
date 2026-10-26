@@ -602,10 +602,10 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
         "--branch", "4", "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
     });
     const report = try explore(context, extra.items);
-    const holds: u64 = @intFromFloat(number_after(report, "the condition holds at ") orelse 0);
-    const target: u64 = @intFromFloat(number_after(report, "; the moment is ") orelse 0);
+    const holds: u64 = @trunc(number_after(report, "the condition holds at ") orelse 0);
+    const target: u64 = @trunc(number_after(report, "; the moment is ") orelse 0);
     const last = std.mem.lastIndexOf(u8, report, "at moment vtime=") orelse 0;
-    const reached: u64 = @intFromFloat(number_after(report[last..], "at moment vtime=") orelse 0);
+    const reached: u64 = @trunc(number_after(report[last..], "at moment vtime=") orelse 0);
     // The guest runs on while the command does: the rewind leaves it room to end first.
     const exact = holds > target and holds - target == 50 * std.time.ns_per_ms and
         reached >= target and reached - target < std.time.ns_per_ms;
@@ -1493,7 +1493,7 @@ fn snapshot_vtime_ms(report: []const u8) ?u64 {
     const start = (std.mem.indexOf(u8, report, key) orelse return null) + key.len;
     const end = std.mem.indexOfScalarPos(u8, report, start, 's') orelse return null;
     const seconds = std.fmt.parseFloat(f64, report[start..end]) catch return null;
-    return @intFromFloat(seconds * std.time.ms_per_s);
+    return @trunc(seconds * std.time.ms_per_s);
 }
 
 /// Self-test level 1 (§14): the HTTP API under faults keeps every run and its result.
@@ -1614,7 +1614,7 @@ fn check_fork(context: *Context) !void {
     const ok_times = setup_s > 0 and branch_end_s > setup_s;
     expect(context, ok_times, "fork: the parent branch runs past its snapshot", .{});
     if (!ok_times) return;
-    const middle_ms: u64 = @intFromFloat((setup_s + branch_end_s) / 2 * 1000);
+    const middle_ms: u64 = @trunc((setup_s + branch_end_s) / 2 * 1000);
     const middle = try std.fmt.allocPrint(context.arena, "{d}", .{middle_ms});
     const fork = common ++ [_][]const u8{ "--from-branch", "0", "--from-vtime-ms", middle };
     const children = try explore(context, &(fork ++ [_][]const u8{ "--branches", "4" }));

@@ -64,7 +64,7 @@ pub fn run(
             try out.print(format, .{ moment_ms, request.futures, failing, probability });
         } else {
             var bar: [40]u8 = @splat(' ');
-            const filled: usize = @intFromFloat(probability * bar.len);
+            const filled: usize = @trunc(probability * bar.len);
             @memset(bar[0..filled], '#');
             try out.print("  {d:>8}ms  {d:>5.1}%  |{s}|  ({d}/{d})\n", .{
                 moment_ms, probability * 100, &bar, failing, request.futures,
@@ -137,8 +137,8 @@ fn failure_find(
         return error.NoSnapshot;
     const moment_ns = number_after(result.stderr, "at moment vtime=") orelse return null;
     return .{
-        .snapshot_ms = @intFromFloat(snapshot_s * 1000),
-        .failure_ms = @intFromFloat(moment_ns / std.time.ns_per_ms),
+        .snapshot_ms = @trunc(snapshot_s * 1000),
+        .failure_ms = @trunc(moment_ns / std.time.ns_per_ms),
     };
 }
 

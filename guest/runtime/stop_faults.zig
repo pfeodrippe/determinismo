@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (arguments.len != 2) return usage();
     const seconds = std.fmt.parseFloat(f64, arguments[1]) catch return usage();
     if (!(seconds >= 0 and seconds <= seconds_max)) return usage();
-    const duration_ns: u64 = @intFromFloat(seconds * std.time.ns_per_s);
+    const duration_ns: u64 = @trunc(seconds * std.time.ns_per_s);
     const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
     const fd = linux.open(control_path, flags, 0);
     if (linux.errno(fd) != .SUCCESS) return 0; // No injector running: nothing to stop.

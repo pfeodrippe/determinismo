@@ -912,7 +912,7 @@ fn runs_reap(server: *Server) void {
     for (server.runs[0..server.run_count]) |*run| {
         if (run.status != null) continue;
         if (run.adopted) {
-            if (linux.errno(linux.kill(run.pid, @enumFromInt(0))) != .SRCH) continue;
+            if (linux.errno(linux.kill(run.pid, @fromBackingInt(0))) != .SRCH) continue;
             const record = run_file(server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
             continue;

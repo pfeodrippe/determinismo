@@ -45,7 +45,7 @@ pub fn forward(source: []const u8, log_path: [:0]const u8, from: Pipes) !void {
     var name_buffer: [16]u8 = @splat(0);
     const name_size = @min(source.len, name_buffer.len - 1);
     @memcpy(name_buffer[0..name_size], source[0..name_size]);
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr(&name_buffer), 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.SET_NAME), @intFromPtr(&name_buffer), 0, 0, 0);
     run(source, log_path, from.stdout[0], from.stderr[0]);
     linux.exit_group(0);
 }

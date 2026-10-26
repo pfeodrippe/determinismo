@@ -271,7 +271,7 @@ fn guidance_hash(value: std.json.Value) ?u64 {
         else => return null,
     };
     const bucket: i32 = if (!(distance > 0)) -1 else bucket: {
-        break :bucket @intFromFloat(@floor(@log2(@min(distance, 1e300))));
+        break :bucket @floor(@log2(@min(distance, 1e300)));
     };
     var hasher = std.hash.Wyhash.init(0x6775696465);
     hasher.update(message);

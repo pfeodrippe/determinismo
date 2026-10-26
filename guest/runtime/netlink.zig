@@ -257,7 +257,7 @@ pub const Socket = struct {
         if (kind != message_error) return error.NetlinkUnexpectedReply;
         const code = std.mem.readInt(i32, reply[header_size..][0..4], .little);
         if (code == 0) return;
-        const errno: linux.E = @enumFromInt(-code);
+        const errno: linux.E = @fromBackingInt(@intCast(-code));
         if (errno == .EXIST) return error.Exists;
         std.debug.print("netlink request failed: {s}\n", .{@tagName(errno)});
         return error.NetlinkRequestFailed;

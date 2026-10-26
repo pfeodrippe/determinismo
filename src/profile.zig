@@ -266,7 +266,7 @@ fn frame_draw(
         \\<g><title>{s} ({d} samples)</title><rect x="{d:.1}" y="{d}" width="{d:.1}" height="15"
         \\ fill="rgb(230,{d},{d})"/>
     , .{ name, frame.count, x, y, width, 90 + hash % 120, 40 + (hash >> 8) % 50 });
-    const characters: usize = @intFromFloat(@max(0, (width - 6) / text_width_per_char));
+    const characters: usize = @trunc(@max(0, (width - 6) / text_width_per_char));
     if (characters >= 3) {
         const fits = frame.name.len <= characters;
         const shown = try escape(arena, if (fits) frame.name else frame.name[0 .. characters - 2]);

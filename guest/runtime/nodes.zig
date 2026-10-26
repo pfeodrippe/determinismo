@@ -93,7 +93,7 @@ pub fn start(
     var running: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&running, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
     const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
-        linux.CLONE.NEWNET | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD);
+        linux.CLONE.NEWNET | linux.CLONE.NEWPID | @backingInt(linux.SIG.CHLD);
     const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
     if (linux.errno(result) != .SUCCESS) return error.Clone;
     if (result == 0) {
@@ -928,7 +928,7 @@ fn pid_read(name: []const u8) ?linux.pid_t {
     var buffer: [32]u8 = undefined;
     const text = read_small(paths.pid, &buffer) orelse return null;
     const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return null;
-    if (linux.errno(linux.kill(pid, @enumFromInt(0))) != .SUCCESS) return null;
+    if (linux.errno(linux.kill(pid, @fromBackingInt(0))) != .SUCCESS) return null;
     return pid;
 }
 

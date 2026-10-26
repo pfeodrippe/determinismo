@@ -106,7 +106,7 @@ pub fn read(block: *const VirtioBlock, offset: u64, data: []u8) void {
     assert(offset < address_size);
     assert(data.len >= 1 and data.len <= 8);
     if (offset >= config_offset) return block.read_config(offset - config_offset, data);
-    const value: u32 = switch (@as(Register, @enumFromInt(offset))) {
+    const value: u32 = switch (@as(Register, @fromBackingInt(@intCast(offset)))) {
         .magic => magic,
         .version => version,
         .device_id => device_id_block,
@@ -145,7 +145,7 @@ pub fn write(block: *VirtioBlock, offset: u64, data: []const u8, memory: GuestMe
     if (offset >= config_offset) return false; // Our config space is read-only.
     if (data.len != 4) return false; // The transport's registers are 32 bits wide.
     const value = std.mem.readInt(u32, data[0..4], .little);
-    switch (@as(Register, @enumFromInt(offset))) {
+    switch (@as(Register, @fromBackingInt(@intCast(offset)))) {
         .device_features_select => block.device_features_select = value,
         .driver_features_select => block.driver_features_select = value,
         .driver_features => switch (block.driver_features_select) {
@@ -343,7 +343,7 @@ test "reads a sector through the ring" {
         fn set(device: *VirtioBlock, mem: []u8, which: Register, value: u32) void {
             var bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &bytes, value, .little);
-            _ = device.write(@intFromEnum(which), &bytes, .{ .bytes = mem });
+            _ = device.write(@backingInt(which), &bytes, .{ .bytes = mem });
         }
     }.set;
     register(&block, &memory, .queue_size, 8);
@@ -370,7 +370,7 @@ test "reads a sector through the ring" {
     std.mem.writeInt(u16, memory[0x2002..][0..2], 1, .little); // idx = 1
     var notify: [4]u8 = @splat(0);
     const guest = GuestMemory{ .bytes = &memory };
-    const notified = block.write(@intFromEnum(Register.queue_notify), &notify, guest);
+    const notified = block.write(@backingInt(Register.queue_notify), &notify, guest);
     try std.testing.expect(notified);
     try std.testing.expectEqual(@as(u8, status_ok), memory[0x6000]);
     try std.testing.expectEqual(@as(u8, 2), memory[0x5000]);

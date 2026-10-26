@@ -107,7 +107,7 @@ fn memory_mib(text: []const u8) !u32 {
     for (shifts) |entry| {
         if (!std.ascii.eqlIgnoreCase(suffix, entry[0])) continue;
         const bytes = std.math.shlExact(u64, number, entry[1]) catch return error.BadMemLimit;
-        const mib = std.math.divCeil(u64, bytes, 1 << 20) catch unreachable;
+        const mib = @divCeil(bytes, 1 << 20);
         return std.math.cast(u32, mib) orelse error.BadMemLimit;
     }
     return error.BadMemLimit;

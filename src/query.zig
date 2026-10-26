@@ -697,7 +697,7 @@ pub fn answer(
 
 fn seconds_to_ns_float(seconds: f64) !u64 {
     if (seconds < 0) return error.NegativeTime;
-    return @intFromFloat(seconds * std.time.ns_per_s);
+    return @trunc(seconds * std.time.ns_per_s);
 }
 
 /// The command: arguments after `query`. Exit status 0 when something matched, 1 when nothing
@@ -842,7 +842,7 @@ pub fn search(request: *const Query, reader: *Reader, out: *std.Io.Writer) !u64 
 fn seconds_to_ns(text: []const u8) !u64 {
     const seconds = try std.fmt.parseFloat(f64, text);
     if (seconds < 0) return error.NegativeTime;
-    return @intFromFloat(seconds * std.time.ns_per_s);
+    return @trunc(seconds * std.time.ns_per_s);
 }
 
 /// The event, where it happened, and how to branch from there.

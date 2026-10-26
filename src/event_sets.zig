@@ -173,7 +173,7 @@ fn seconds_ns(value: std.json.Value) !u64 {
         else => return error.BadTimeout,
     };
     if (!(seconds >= 0)) return error.BadTimeout;
-    return @intFromFloat(seconds * std.time.ns_per_s);
+    return @trunc(seconds * std.time.ns_per_s);
 }
 
 /// Where the sets come from, and what `through` needs to run programs.

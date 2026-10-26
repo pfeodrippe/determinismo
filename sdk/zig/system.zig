@@ -199,8 +199,8 @@ pub fn System(comptime Nodes: type) type {
             specs: [field_names.len]?Spec = @splat(null),
 
             pub fn node(p: *Profile, comptime name: Name, spec: Spec) void {
-                assert(p.specs[@intFromEnum(name)] == null); // Each node once per profile.
-                p.specs[@intFromEnum(name)] = spec;
+                assert(p.specs[@backingInt(name)] == null); // Each node once per profile.
+                p.specs[@backingInt(name)] = spec;
             }
         };
 
