@@ -98,6 +98,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "nats-test", .path = "examples/nats/nats_test.zig" },
         .{ .name = "postgres-test", .path = "examples/postgres/postgres_test.zig" },
         .{ .name = "mysql-test", .path = "examples/mysql/mysql_test.zig" },
+        .{ .name = "galera-test", .path = "examples/galera/galera_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },

@@ -1,0 +1,17 @@
+# Jepsen's (jepsen-io/mysql, antithesis/db/galera.cnf), adapted from MariaDB's 60-galera.cnf.
+[galera]
+wsrep_cluster_name       = "jepsen cluster"
+
+# Mandatory settings
+wsrep_provider           = /usr/lib/galera/libgalera_smm.so
+binlog_format            = ROW
+wsrep_on                 = ON
+default_storage_engine   = InnoDB
+
+bind-address = 0.0.0.0
+
+# Performance related settings (MariaDB's recommendation for Galera: durability through the
+# cluster, the log is not flushed at each commit)
+innodb_autoinc_lock_mode = 2
+innodb_flush_log_at_trx_commit = 0
+wsrep_slave_threads = 4

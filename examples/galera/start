@@ -1,0 +1,13 @@
+#!/bin/bash
+# A Galera node, as Jepsen's test starts them: every node joins gcomm://n1,n2,n3, and n1 starts
+# a new cluster on its first start only (a marker on its data disk). Jepsen's wrapper meant the
+# same; a typo there ($SRAN_FILE) made n1 start a new cluster at every restart.
+set -e
+marker=/var/lib/mysql/.bootstrapped
+arguments=(mariadbd --wsrep-cluster-address=gcomm://n1,n2,n3)
+if [ "$GALERA_NODE" = n1 ] && [ ! -e "$marker" ]; then
+  mkdir -p /var/lib/mysql
+  touch "$marker"
+  arguments+=(--wsrep-new-cluster)
+fi
+exec docker-entrypoint.sh "${arguments[@]}"

@@ -80,7 +80,7 @@ Blind means blind to the results, not to the test: workloads follow Jepsen's pub
 | NATS JetStream | 2.12.1, default sync | acknowledged writes lost and replicas split after power losses | ✅ rediscovered in the first hour (run 81 on srv2): acknowledged messages lost in 6 timelines, three sequences each acknowledged for two messages, `corrupt state file` on recovery after power losses |
 | etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | running (its gateway has no hashkv: convergence compares revisions there) |
 | MySQL | 8.0.34 | Repeatable Read allowing G2-item, G-single, lost update, non-repeatable reads | ✅ rediscovered on the current 26.10.0 already (srv1, seed 7): G2-item and G-single-item at Repeatable Read in 2 of the first 4 timelines, ~2.5 min of virtual time each; Serializable clean in 4 of 4. 8.0.34 next |
-| MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | next (examples/galera, Jepsen's configuration) |
+| MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | next (examples/galera, Jepsen's configuration; 13.0.2 clean in 8 timelines on srv1) |
 | TiDB | 2.1.7 | automatic retries breaking snapshot isolation: lost updates, read skew | next (examples/tidb, Jepsen's configurations) |
 
 ## Order

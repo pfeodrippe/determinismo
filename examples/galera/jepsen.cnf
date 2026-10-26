@@ -1,0 +1,9 @@
+# Jepsen's (jepsen-io/mysql, antithesis/db/my.cnf), without its general query log (every
+# statement written to a file: diagnostics only) and with the error log on stderr (in the run's
+# events) rather than in a file.
+[mysqld]
+max_connections = 4096
+
+[mariadb]
+innodb_lock_wait_timeout = 1
+log-bin

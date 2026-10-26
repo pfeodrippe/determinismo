@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# MariaDB 13.0.2 with Galera 4 (the official image), configured as Jepsen's Galera test
+# (jepsen-io/mysql, antithesis/db): MariaDB's recommended Galera settings, the binary log, and
+# iproute2 (ss), which rsync state transfers need.
+FROM docker.io/library/mariadb:13.0.2
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+COPY examples/galera/jepsen.cnf /etc/mysql/conf.d/90-jepsen.cnf
+COPY examples/galera/galera.cnf /etc/mysql/conf.d/99-jepsen-galera.cnf
+COPY examples/galera/start /usr/local/bin/galera-start
+ENTRYPOINT ["/usr/local/bin/galera-start"]
