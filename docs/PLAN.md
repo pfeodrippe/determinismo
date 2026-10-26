@@ -36,12 +36,13 @@ build e2e` tests it.
    with restarts), with the tree explorer and the strategies; findings documented in each
    example's README. Antithesis's own Raft project (antithesishq/hashicorp-raft-poc) runs
    unchanged through the Compose importer (its Go SDK writes to detfs, a regular file; its
-   client declares the setup, where the snapshot is taken). Found blind in its first hour: the
-   leadership-transfer deadlock (hashicorp/raft#696), explained by a replay's goroutine dump
-   (tests/antithesis-compat/README.md). Not yet: the async-heartbeat divergence (#695) and
-   the snapshot livelock (#697), which need long timelines (`--timeline`, the project's
-   "15-minute timelines"): runs with them next. Long timelines make the tree's replays to a
-   moment expensive, which makes in-run snapshots (item 2) the next speed item.
+   client declares the setup, where the snapshot is taken). Found blind: the
+   leadership-transfer deadlock (hashicorp/raft#696, first hour, explained by a replay's
+   goroutine dump) and the log divergence from off-loop heartbeats (#695, with three-minute
+   timelines and a pause right after an election); tests/antithesis-compat/README.md. Not
+   yet: the double vote (#695's second mechanism) and the snapshot livelock (#697): runs with
+   long timelines and Go coverage (libvoidstar) next. The tree now makes its nodes in
+   parallel; in-run snapshots (item 2) would remove those replays altogether.
 
 ## Antithesis parity found missing
 
