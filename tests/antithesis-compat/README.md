@@ -84,6 +84,19 @@ generation's finds by rarity. The divergence (#695) in 3 timelines, twice carrie
 different state machines; the deadlock (#696) in 46. Snapshots were installed on followers in
 most timelines and thousands of faults lasted seconds, yet neither bug below appeared.
 
+Run 16 (2026-10-26, stopped after five hours): 2,574 timelines of three minutes. The
+divergence in 12 timelines, five carried to different state machines; the deadlock in 27. It
+showed a bug of ours: in 15 timelines a node did not come back from a crash, because a process
+pause had stopped another node's launcher (just restarted, before it ran its program) while it
+still held every node's mounts. Fixed (the launcher drops them first). No liveness failure was
+among those 15 timelines.
+
+Two differences with Antithesis's setup, changed for the next runs. The POC is tuned for
+15-minute timelines (snapshots every 5 s past 128 entries, 16 trailing logs, in raft-node's
+main.go); ours were three minutes. And a node's durable disk lived in guest memory, so a sync
+took no virtual time and no other goroutine ran during it: durable disks now take 0 to 2 ms per
+I/O, drawn per timeline.
+
 ### Not found yet
 
 Antithesis's post reports two more: double votes from the same off-loop heartbeats (election
