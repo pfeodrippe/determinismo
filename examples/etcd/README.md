@@ -26,12 +26,18 @@ What is checked:
 | Revisions grow | each acknowledged put of a driver has a higher revision than its earlier ones |
 | The counter counts | compare-and-swap increments: the final value is at least the acknowledged ones, at most those and the unknown ones |
 | Members agree | anytime: the members' `hashkv` at the lowest revision they all reached are equal |
+| Watches miss nothing | a watch from the current revision, or up to 100 before it (etcd's catch-up path, as Jepsen's resumed watches), delivers events in revision order and every acknowledged write in its range |
 | Recovery | after faults, a write commits and the members reach the same revision and hash |
 | Strict serializability | list-append transactions (reads, then one txn guarded by every key's mod revision), the whole history checked by Elle at the end of each timeline |
 
 ## Findings
 
-### Found: a member loses applied writes after a power loss that follows a snapshot install
+### Found blind, known upstream: a member loses applied writes after a power loss that follows a snapshot install
+
+Not new: reported on 2026-09-29 as etcd-io/etcd#22498 (against 3.7.2, reproduced by simulating
+the lost rename with hard links), with fixes proposed (#22499, #22518) and not in 3.7.3.
+determinismo found it on its own, without being told where to look, from a power loss at a
+moment it chose, and showed what follows (below).
 
 etcd v3.7.3, blind: `explore ... --scenario kv --seed 4 --timeline 2m`, timeline 0. After
 faults stopped the members never converged: etcd-3, the leader, at revision 66 with applied index
@@ -67,5 +73,5 @@ replay, read with bbolt and a WAL reader) and etcd's code:
 Two causes together: the rename that installs a snapshot backend is not made durable (the
 directory is not synced), and closing the old backend writes the new consistent index into it.
 Either alone would leave the member able to recover (with a durable rename the old file is gone;
-with the old index kept, at 97, the restart recovers from the snapshot file). Kept in this
-repository, not reported upstream.
+with the old index kept, at 97, the restart recovers from the snapshot file). The same two
+causes as etcd-io/etcd#22498.

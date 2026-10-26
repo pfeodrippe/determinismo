@@ -37,13 +37,13 @@ bugs are. Status: ✅ running, 🟡 next, blank later.
 
 | System | Jepsen | What Jepsen found (short) | Their workloads | Status |
 |---|---|---|---|---|
-| etcd | 3.4.3 (2020), jetcd 0.8.2 (2025), 2014 post | watches with revision 0 skipped events; locks unsafe by design; the Java client's retries ran transactions twice | append, register, set, lock, watch, wr | ✅ examples/etcd (v3.7.3): found a member losing applied writes after a power loss following a snapshot install |
+| etcd | 3.4.3 (2020), jetcd 0.8.2 (2025), 2014 post | watches with revision 0 skipped events; locks unsafe by design; the Java client's retries ran transactions twice | append, register, set, lock, watch, wr | ✅ examples/etcd (v3.7.3): found blind a member losing applied writes after a power loss following a snapshot install (known upstream: etcd-io/etcd#22498, open) |
 | NATS JetStream | 2.12.1 (2025) | write loss when a minority's files were truncated or corrupted; split-brain and lost writes after coordinated power loss or one OS crash with delays, from flushing every two minutes | queue | ✅ examples/nats (v2.15.2) |
 | Redpanda / Kafka | Redpanda 21.10 (2022), Bufstream 0.1 (2024), Kafka post (2013) | duplicate writes, inconsistent offsets, aborted reads, lost/stale messages; in Kafka's transaction protocol itself, write loss and torn transactions (KAFKA-17754) | list-append (transactions), queue | 🟡 Redpanda and Apache Kafka (KRaft) |
-| MySQL, MariaDB Galera, Percona | MySQL 8.0.34 (2023), Galera 12.1.2 (2026), 2015 posts | Repeatable Read allowing G2-item, G-single, lost update, non-monotonic views; Galera losing committed transactions on crashes (no flush before ack) and with partitions, lost update, stale read | append, mav, nonrepeatable-read, closed-predicate | 🟡 Galera: `durable_crash` again |
+| MySQL, MariaDB Galera, Percona | MySQL 8.0.34 (2023), Galera 12.1.2 (2026), 2015 posts | Repeatable Read allowing G2-item, G-single, lost update, non-monotonic views; Galera losing committed transactions on crashes (no flush before ack) and with partitions, lost update, stale read | append, mav, nonrepeatable-read, closed-predicate | ✅ examples/mysql (26.10.0), examples/galera (13.0.2, Jepsen's configuration from jepsen-io/mysql's `antithesis/`) |
 | PostgreSQL (and Stolon, RDS) | 12.3 (2020), RDS 17.4 (2025), 2013 post | serializable allowing G2-item (fixed); RDS multi-AZ violating snapshot isolation (long fork); Stolon ledger | append, ledger | ✅ examples/postgres (18.6, single node); next: HA (Patroni or Stolon) |
 | MongoDB | 4.2.6 (2020), 3.6.4, 3.4.0-rc3, earlier posts | transactions with read skew, cyclic information flow, duplicate effects from retries; lost majority writes in old replication protocols | list-append (single and multi-node) | |
-| TiDB | 2.1.7 (2019) | auto-retry re-applying conflicting updates: read skew, lost updates | bank, long fork, register, sequential, set, append | |
+| TiDB | 2.1.7 (2019) | auto-retry re-applying conflicting updates: read skew, lost updates | bank, long fork, register, sequential, set, append | ✅ examples/tidb (v8.5.8, Jepsen's configurations from jepsen-io/tidb) |
 | YugabyteDB | 1.1.9, 1.3.1 (2019) | read skew, lost inserts with partitions, DDL races (defaults as NULL), undercounting | append, bank, counter, long fork, set, rw | |
 | CockroachDB | beta 2016 | serializability violations | bank, register, sequential, sets, monotonic, adya | 🟡 examples/cockroachdb (v26.3.3) |
 | ScyllaDB | 4.2-rc3 (2020) | LWT split-brain (healthy clusters, then with membership changes), aborted LWT reads, non-isolated writes | cas-register, list-append, counter, batch | |
@@ -70,13 +70,18 @@ The measure of the explorer, as the Raft POC is (its four known bugs found witho
 where: the last, the double vote, in run 77 on srv2): each workload also runs, blind, against the
 version Jepsen analyzed (its `jepsen` profile), and we record which of Jepsen's reported issues
 determinismo rediscovers and how long it takes; the current version is then hunted for new ones.
+Blind means blind to the results, not to the test: workloads follow Jepsen's published clients
+(jepsen-io/stolon, jepsen-io/sql, ...), as anyone rerunning Jepsen's tests would.
 
 | System | Version (profile `jepsen`) | Jepsen reported | Found blind |
 |---|---|---|---|
 | Raft (Antithesis's POC) | hashicorp/raft 4c8f61ac | leadership-transfer deadlock, log divergence, snapshot livelock, double vote | 4 of 4 |
-| PostgreSQL | 12.3 | G2-item at Serializable | running |
+| PostgreSQL | 12.3 | G2-item at Serializable | none in run 80's first 22 timelines, on our first workload (one table, upserts by primary key); rerunning on Jepsen's workload shape (three tables, reads and updates by primary or secondary key, update-insert-update under savepoints, autocommit single operations) |
 | NATS JetStream | 2.12.1, default sync | acknowledged writes lost and replicas split after power losses | ✅ rediscovered in the first hour (run 81 on srv2): acknowledged messages lost in 6 timelines, three sequences each acknowledged for two messages, `corrupt state file` on recovery after power losses |
 | etcd | 3.4.3 | watches from revision 0 skipping events; locks unsafe | running (its gateway has no hashkv: convergence compares revisions there) |
+| MySQL | 8.0.34 | Repeatable Read allowing G2-item, G-single, lost update, non-repeatable reads | next (examples/mysql) |
+| MariaDB Galera | 12.1.2 | committed transactions lost on coordinated crashes; lost update, stale read | next (examples/galera, Jepsen's configuration) |
+| TiDB | 2.1.7 | automatic retries breaking snapshot isolation: lost updates, read skew | next (examples/tidb, Jepsen's configurations) |
 
 ## Order
 
