@@ -24,6 +24,8 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
 | vtime | Virtual time; a pure function of the guest's execution history. |
 | Moment | `(tape hash, vtime)` — an immutable instant in the multiverse. |
 | Branch | A timeline that forks from a moment and continues with different inputs. |
+| Tree node | A snapshot at a moment of an earlier timeline that the tree explorer returns to; its branches start there. |
+| Holder | An in-run snapshot (§8): a forked process keeping a running timeline's machine, copy-on-write, at a moment the tree may return to, so that node costs a memory copy rather than a replay of the timeline from its start. Our name; not an Antithesis term. |
 | Decision point | A point where an input may enter: a pull (guest request) or a push (exact branch count). |
 | Profile | A complete, typed description of a system under test (nodes, artifacts, dependencies, networks, faults, scenarios), returned by a test program's `describe` phase (§10). |
 | Node | One service instance in the guest: a root filesystem, a command, an identity on the guest network. Unit of fault scoping. |

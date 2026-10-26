@@ -13,11 +13,14 @@ Raft at their commit 142e831, three nodes, a client with Go SDK assertions, a Py
 checking Raft's safety properties) runs unchanged: its images built with its own
 `antithesis/build.sh`, then
 
-    determinismo explore --compose raft-poc/antithesis/config/docker-compose.yaml \
-      --scenario raft --seed 1 --time-budget 60m \
-      --no-faults raft-client,raft-monitor --faults +restart,+stop,+crash
+    determinismo explore --serve 127.0.0.1:7878 \
+      --compose ~/raft-poc/antithesis/config/docker-compose.yaml --scenario raft --seed 1 \
+      --time-budget 8h --timeline 15m --retroactive "Applied block" \
+      --no-faults raft-client,raft-monitor --faults +restart,+stop,+crash [--cpu-modulation]
 
-(faults on the Raft nodes only, as their launch excludes the client and the monitor). The
+(faults on the Raft nodes only, as their launch excludes the client and the monitor; fifteen-
+minute timelines; the FSM's line per applied block counted but written only by replays; CPU
+modulation on in some runs, for the interleavings the double vote needs). The
 client declares the setup once a leader is elected (`antithesis_setup`), where the snapshot is
 taken; its Go SDK writes to detfs.
 
