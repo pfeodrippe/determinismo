@@ -200,7 +200,15 @@ blind, with its findings documented in its README.
    pipelines, every mult tap served, catch and finally after parks, no early timeout). Next:
    pub/sub and mix, put!/take! callbacks, the dispatch pools, more go macro forms (loops, case,
    nested try parking).
-5. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers.
+5. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers. Started:
+   examples/etcd (etcd v3.7.3, three members with restarts, stops and crashes, and the
+   durability-point faults): acknowledged writes survive, linearizable reads see earlier writes,
+   revisions grow, a compare-and-swap counter counts, members' keyspace hashes agree, recovery;
+   and list-append transactions whose whole history Elle checks for strict serializability
+   (checkers/elle: Jepsen's checker as a node any workload can post its history to); watches
+   deliver in revision order and miss no acknowledged write. All hold so far. Next: leases and
+   locks (unsafe by design: reported, not failed). The rest of Jepsen's systems, ranked, with
+   their workloads: docs/JEPSEN.md.
 
 ## Code: instrumentation, locations, targeted runs
 

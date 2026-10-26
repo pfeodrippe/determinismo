@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "clojure-bank-test", .path = "examples/clojure-bank/clojure_bank_test.zig" },
         .{ .name = "k3s-test", .path = "examples/k3s/k3s_test.zig" },
         .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
+        .{ .name = "etcd-test", .path = "examples/etcd/etcd_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },
