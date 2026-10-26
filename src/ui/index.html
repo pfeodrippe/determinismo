@@ -993,6 +993,9 @@ function treeSvg(model, view, width) {
       <path d="M${rootPoint.x},${rootPoint.y} C${rootPoint.x + fan * 0.6},${rootPoint.y} ${start - fan * 0.4},${yy} ${start},${yy} L${Math.max(start, end)},${yy}" fill="none" stroke="${color(b)}" stroke-opacity=".65" stroke-width="${stroke}"/>${hit}</g>`;
   }).join("");
   const size = Math.max(3, Math.min(10, rowHeight * 0.75));
+  // One mark per few pixels of a row and kind: marks that would overlap are not told apart, and
+  // big runs have tens of thousands.
+  const drawn = new Set();
   const mark = (e, kind) => {
     const row = rowOf.get(e.branch);
     if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) return "";
@@ -1000,6 +1003,9 @@ function treeSvg(model, view, width) {
     const parent = rows[row].parent;
     if (parent && e.vtime_ns <= parent.vtime_ns) return "";
     const xx = x(e.vtime_ns), yy = y(row);
+    const bucket = `${kind}:${row}:${Math.round(xx / 3)}`;
+    if (drawn.has(bucket)) return "";
+    drawn.add(bucket);
     const html = kind === "fault" ? faultTip(e, model.decisionFor(e)) : failureTip(e);
     return kind === "fault"
       ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(html)}></rect>`
