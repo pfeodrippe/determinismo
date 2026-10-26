@@ -1317,28 +1317,26 @@ fn explore_tree(
         });
     }
     var generation: u32 = 0;
-    // A generation's summaries: its roots' (run early, while the previous generation's nodes
-    // were made) and then its children's. Two buffers: the next generation's roots fill one
-    // while this generation's is read.
-    var items = try arena.alloc(Summary, tree.generation_size);
-    var items_next = try arena.alloc(Summary, tree.generation_size);
-    var early_count: u32 = 0;
-    var early: []const Planned = &.{};
+    const items = try arena.alloc(Summary, tree.generation_size);
     // Parents' tapes are read into this (a strategy's overrides), one at a time.
     const tape_buffer = if (exploration.strategy != null)
         try arena.create(tape.Overrides)
     else
         undefined;
-    while (plan.items.len > 0 or early_count > 0) : (generation += 1) {
+    while (plan.items.len > 0) : (generation += 1) {
         if (branches.deadline_ns) |deadline| {
             if (monotonic_ns() >= deadline) break;
         }
-        var summaries = Summaries{ .items = items, .count = early_count };
-        if (plan.items.len > 0) {
-            try tree_run(context, vm, options, branches, plan.items, &summaries, jobs);
+        var summaries = Summaries{ .items = items };
+        var mine = branches;
+        mine.plan = plan.items;
+        mine.summaries = &summaries;
+        const workers: u32 = @intCast(@min(jobs, plan.items.len));
+        if (workers == 1) {
+            try explore_branches(context, vm, options, mine);
+        } else {
+            try explore_parallel(context, vm, options, mine, workers);
         }
-        // Every branch of the generation, for finding parents: its roots, then its children.
-        const ran = try std.mem.concat(arena, Planned, &.{ early, plan.items });
         // In index order (workers finish in any): what each reached that none before it had.
         // Summaries are large: their order is sorted, not them.
         const done = try arena.alloc(*const Summary, summaries.count);
@@ -1400,7 +1398,7 @@ fn explore_tree(
         var making_count: u32 = 0;
         var finished: u32 = 0;
         for (returns) |back| {
-            const parent = for (ran) |entry| {
+            const parent = for (plan.items) |entry| {
                 if (entry.index == back.branch) break entry;
             } else continue;
             if (making_count - finished == jobs) {
@@ -1417,25 +1415,6 @@ fn explore_tree(
             makings[making_count] = .{ .back = back, .parent = parent };
             try node_make_start(arena, vm, options, &makings[making_count], overrides);
             making_count += 1;
-        }
-        // Meanwhile the next generation's roots (from the setup snapshot: they need no node) run,
-        // numbered first, so the workers are not idle while the nodes are made.
-        var roots: std.ArrayList(Planned) = .empty;
-        while (next_index < total and roots.items.len < tree.roots) : (next_index += 1) {
-            try roots.append(arena, .{
-                .index = next_index,
-                .seed = branch_seed(base, next_index),
-                .snapshot = branches.snapshot,
-                .generation = generation + 1,
-                .why = "From the setup snapshot: some timelines of every generation start " ++
-                    "over, so the tree does not only deepen.",
-            });
-        }
-        const in_time = if (branches.deadline_ns) |deadline| monotonic_ns() < deadline else true;
-        if (!in_time) roots.clearRetainingCapacity();
-        var roots_summaries = Summaries{ .items = items_next };
-        if (roots.items.len > 0) {
-            try tree_run(context, vm, options, branches, roots.items, &roots_summaries, jobs);
         }
         while (finished < making_count) : (finished += 1) {
             node_make_finish(arena, &makings[finished]);
@@ -1473,40 +1452,29 @@ fn explore_tree(
             }
         }
         // This generation's snapshots served their branches, and their children's snapshots.
-        for (ran) |entry| node_free(entry.snapshot, branches.snapshot);
+        for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+        // The rest of the generation starts over from the setup snapshot.
+        while (next_index < total and next.items.len < tree.generation_size) : (next_index += 1) {
+            try next.append(arena, .{
+                .index = next_index,
+                .seed = branch_seed(base, next_index),
+                .snapshot = branches.snapshot,
+                .generation = generation + 1,
+                .why = "From the setup snapshot: some timelines of every generation start " ++
+                    "over, so the tree does not only deepen.",
+            });
+        }
         std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
             "({d} known); {d} moments returned to\n", .{
             generation, done.len, new_behaviors(chosen), seen.count(), made,
         });
         plan = next;
-        early = roots.items;
-        early_count = roots_summaries.count;
-        std.mem.swap([]Summary, &items, &items_next);
     }
     for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
     if (change) |*target| {
         target.summarize(next_index);
         report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
     }
-}
-
-/// Runs some of a tree generation's branches (by its workers, or here with one), their
-/// summaries added to `summaries`.
-fn tree_run(
-    context: Context,
-    vm: *VM,
-    options: *VM.Options,
-    branches: Branches,
-    plan: []const Planned,
-    summaries: *Summaries,
-    jobs: u32,
-) !void {
-    var mine = branches;
-    mine.plan = plan;
-    mine.summaries = summaries;
-    const workers: u32 = @intCast(@min(jobs, plan.len));
-    if (workers == 1) return explore_branches(context, vm, options, mine);
-    return explore_parallel(context, vm, options, mine, workers);
 }
 
 /// After changed code, the least virtual time a timeline must go on for the tree to return
