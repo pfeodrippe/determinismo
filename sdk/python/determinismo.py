@@ -252,6 +252,13 @@ def random_below_named(name, count):
     return random_below(count)
 
 
+def buggify(name):
+    """A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a
+    named decision; outside always False. Where it is true, take a rare path the real system can
+    take too (a pause, a retry), never one it cannot."""
+    return _device_fd() is not None and random_below_named(name, 4) == 0
+
+
 def setup_complete(details=None):
     """The system is ready: the platform snapshots here and starts exploring."""
     _emit({"lifecycle": "setup_complete", "details": details or {}})

@@ -77,6 +77,11 @@ void det_sometimes_all(const char *const *names, const int *values, size_t count
 size_t det_decide(const char *name, const char *const *options, size_t count);
 uint64_t det_random_below_named(const char *name, uint64_t count);
 
+/* A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a named
+   decision; outside always false. Where it is true, take a rare path the real system can take
+   too (a pause, a retry), never one it cannot. */
+int det_buggify(const char *name);
+
 /* The assertion catalog: one entry per call site, in the det_catalog section (the layout the Zig
    SDK uses too); the magic tells entries from the linker's padding. */
 struct det_catalog_entry {
@@ -425,6 +430,10 @@ size_t det_decide(const char *name, const char *const *options, size_t count) {
     }
   }
   return (size_t)det_random_below(count);
+}
+
+int det_buggify(const char *name) {
+  return det_device_fd() >= 0 && det_random_below_named(name, 4) == 0;
 }
 
 uint64_t det_random_below_named(const char *name, uint64_t count) {

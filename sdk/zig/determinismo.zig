@@ -78,6 +78,14 @@ pub fn random_below_named(name: []const u8, count: u64) u64 {
     return random_below(count);
 }
 
+/// A buggify point (FoundationDB's BUGGIFY): inside determinismo true one time in four, a named
+/// decision; outside always false. Where it is true, take a rare path the real system can take
+/// too (a pause, a retry), never one it cannot.
+pub fn buggify(name: []const u8) bool {
+    if (device_get() != .fd) return false;
+    return random_below_named(name, 4) == 0;
+}
+
 fn decision_announce(name: []const u8, what: anytype) void {
     if (device_get() != .fd) return; // Only the platform's strategies read labels.
     var buffer: [message_size_max]u8 = undefined;
