@@ -20,6 +20,11 @@ build e2e` tests it.
    - Done: holders with CPU modulation (Antithesis turns modulation on with faults, and the Raft
      double vote is an interleaving): stops computed from the effective time, the modulation
      stepped at the guest's own exits only, and carried on in a holder's replay.
+   - Memory: runs on a host share its CPUs (src/cpus.zig) but not a memory budget; workers
+     waiting for a turn and holders keep their VMs' memory, so runs added for CPUs exhaust it
+     (srv2, 2026-10-26: about 1,000 explore processes, 0 GB available; stopping one run gave
+     back 14 GB). Next: the pool admits a VM only with its memory available (MemAvailable less
+     a reserve), and holders are given up oldest first when it runs short.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,
