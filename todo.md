@@ -2,3 +2,5 @@
 - [ ] test determinismo itself (nested kvm)
 - [ ] can we do load/perf test with it ?
 - [ ] writing tests in clojure (using zig or some abstraction that communicates using something else?)
+- [ ] raft reproduction
+  - https://antithesis.com/blog/2026/finding-bugs-in-raft-implementations/
