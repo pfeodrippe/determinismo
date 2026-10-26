@@ -56,14 +56,12 @@ build e2e` tests it.
    client declares the setup, where the snapshot is taken). Found blind: the
    leadership-transfer deadlock (hashicorp/raft#696, first hour, explained by a replay's
    goroutine dump) and the log divergence from off-loop heartbeats (#695, with three-minute
-   timelines and a pause right after an election); tests/antithesis-compat/README.md. Not
-   yet: the double vote (#695's second mechanism) and the snapshot livelock (#697). Runs 15
-   and 16 (eight hours, 4,400 timelines of three minutes) showed why they could not happen
-   here: four parallel drivers at most (the livelock needs a cut-off leader holding 16
-   writes, one per driver), syncs that took no virtual time (the double vote needs a
-   heartbeat handled while the main loop syncs), and three-minute timelines where the POC is
-   tuned for fifteen. All three changed; run 17 (eight hours, fifteen-minute timelines) is the
-   test. The tree makes its nodes from in-run snapshots (item 2), without replays.
+   timelines and a pause right after an election), and the snapshot installation livelock
+   (#697, with fifteen-minute timelines and up to 32 drivers; it replays from its tape);
+   tests/antithesis-compat/README.md. Not yet: the double vote (#695's second mechanism, an
+   interleaving: a heartbeat goroutine preempted between its term check and its write while
+   the main loop votes). Runs now use in-run snapshots, half of them with CPU modulation, which
+   varies where goroutines are preempted.
 
 ## Antithesis parity found missing
 
@@ -158,7 +156,30 @@ blind, with its findings documented in its README.
    - Storage clients: next.jdbc (Postgres), carmine (Redis), core.cache and core.memoize.
    - Templates and the rest: hiccup, selmer, aero, environ, potemkin, riddley, slingshot,
      plumbing, primitive-math, io.aviso/pretty, test.check.
-3. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers.
+3. **The Clojure compiler and runtime** (clojure/clojure, the JVM implementation): a pinned
+   fork with the Java SDK's assertions put where its rare paths are, so that they guide the
+   exploration to them. `sometimes` and `reachable` mark the paths worth reaching (the tree
+   returns just after a timeline first reaches one, and a strategy can steer toward one not yet
+   reached); `always` checks what must hold there. Candidates, read from the source:
+   - Compiler.java: recur in tail and non-tail positions (loop, fn, try bodies), locals
+     clearing (once-only closures, branches that clear differently), primitive locals and
+     return hints (boxing, unchecked math, long/double fallbacks), reflection fallbacks,
+     `case` with hash collisions (shift/mask, skip-check), keyword and protocol call-site
+     caches, deftype mutable fields under closures, macroexpansion that throws.
+   - The runtime: PersistentHashMap collision nodes and array-node packing, transients after
+     persistent!, chunked seqs crossing chunk boundaries, LazySeq realized from several threads,
+     STM (LockingTransaction retries, barging, commute and ensure, history growth), agents
+     (send-off pool, errors, restart-agent), Var bindings conveyed to futures, locking.
+   - The workload: a test program generates Clojure forms (test.check generators, Clojure's own
+     test suite as a corpus) and evaluates them in the guest, with properties that need no
+     reference answer: the same form gives the same result with direct linking on and off,
+     locals clearing on and off, and interpreted against compiled (`eval` of the form and of
+     `(fn [] form)`); STM transfers conserve their totals under contention; nothing throws an
+     internal error (`ClassFormatError`, `VerifyError`, an NPE inside the compiler).
+   - Threads, contention and preemption are what determinismo varies (CPU modulation, thread
+     pauses), so the STM and lazy-seq paths are the likeliest to fail; the compiler's are the
+     likeliest to need guidance to reach at all.
+4. **More systems**: etcd, a Jepsen-tested store, Kafka-compatible brokers.
 
 ## Code: instrumentation, locations, targeted runs
 
