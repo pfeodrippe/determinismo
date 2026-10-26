@@ -46,9 +46,14 @@ build e2e` tests it.
    leadership-transfer deadlock (hashicorp/raft#696, first hour, explained by a replay's
    goroutine dump) and the log divergence from off-loop heartbeats (#695, with three-minute
    timelines and a pause right after an election); tests/antithesis-compat/README.md. Not
-   yet: the double vote (#695's second mechanism) and the snapshot livelock (#697): runs with
-   long timelines and Go coverage (libvoidstar) next. The tree now makes its nodes in
-   parallel; in-run snapshots (item 2) would remove those replays altogether.
+   yet: the double vote (#695's second mechanism) and the snapshot livelock (#697). Runs 15
+   and 16 (eight hours, 4,400 timelines of three minutes) showed why they could not happen
+   here: four parallel drivers at most (the livelock needs a cut-off leader holding 16
+   writes, one per driver), syncs that took no virtual time (the double vote needs a
+   heartbeat handled while the main loop syncs), and three-minute timelines where the POC is
+   tuned for fifteen. All three changed; run 17 (eight hours, fifteen-minute timelines) is the
+   test. The tree makes its nodes in parallel; in-run snapshots (item 2) would remove those
+   replays altogether.
 
 ## Antithesis parity found missing
 
