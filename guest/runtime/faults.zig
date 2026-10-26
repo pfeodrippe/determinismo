@@ -40,7 +40,13 @@ const faults_max = 256;
 const injections_max = 10_000;
 const delay_ns_min = 10 * std.time.ns_per_ms;
 const delay_ns_max = 300 * std.time.ns_per_ms;
-const duration_ns_max = 500 * std.time.ns_per_ms;
+/// Most faults are short, interleaving with the system's steps; one in `long_one_in` may last
+/// up to `duration_ns_max` (Antithesis's example partition: 10 s), outlasting election
+/// timeouts, retries and snapshot intervals, so nodes come back far behind or with messages
+/// queued.
+const duration_short_ns_max = 500 * std.time.ns_per_ms;
+const duration_ns_max = 10 * std.time.ns_per_s;
+const long_one_in = 4;
 const clock_skip_ns_max = 60 * std.time.ns_per_s;
 
 const Kind = enum {
@@ -231,7 +237,7 @@ fn draw(fault: *const Fault) Applied {
         .node = fault.node,
         .peer = fault.peer,
         .program = fault.program,
-        .duration_ns = sdk.random_below_named("fault.duration_ns", duration_ns_max),
+        .duration_ns = duration_draw(),
     };
     switch (fault.kind) {
         .throttle => {
@@ -244,6 +250,8 @@ fn draw(fault: *const Fault) Applied {
         .thread_pause => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
             applied.thread_index = @intCast(sdk.random_below(threads_max));
+            // Antithesis: "Threads are paused for small periods of time."
+            applied.duration_ns = @min(applied.duration_ns, duration_short_ns_max);
         },
         .degrade => {
             const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
@@ -280,6 +288,12 @@ fn draw(fault: *const Fault) Applied {
         else => {},
     }
     return applied;
+}
+
+fn duration_draw() u64 {
+    const long = sdk.random_below_named("fault.duration_long", long_one_in) == 0;
+    const max: u64 = if (long) duration_ns_max else duration_short_ns_max;
+    return sdk.random_below_named("fault.duration_ns", max);
 }
 
 /// Two or three groups over the endpoints that allow partitions, never all in one.
