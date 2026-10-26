@@ -91,6 +91,21 @@ pub const Registry = struct {
         }
     }
 
+    /// The holders of branches `first` to `last` that nobody took go (their memory: a
+    /// generation judged; a generation's branches are numbered one after the other).
+    pub fn release_branches(registry: *Registry, first: u32, last: u32) void {
+        assert(first <= last);
+        var kept: u32 = 0;
+        for (registry.entries[0..registry.count]) |entry| {
+            const theirs = entry.branch >= first and entry.branch <= last;
+            if (!theirs) {
+                registry.entries[kept] = entry;
+                kept += 1;
+            } else if (!entry.taken) kill(entry.held.pid);
+        }
+        registry.count = kept;
+    }
+
     /// The holders nobody took go (their memory, before the next generation runs).
     pub fn release(registry: *Registry) void {
         for (registry.entries[0..registry.count]) |*entry| {

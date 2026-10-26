@@ -1005,7 +1005,7 @@ fn check_tree(context: *Context) !void {
     const tapes = try std.fmt.allocPrint(arena, "{s}/tree-tapes", .{context.scratch});
     const record = try std.fmt.allocPrint(arena, "{s}/tree.jsonl", .{context.scratch});
     const common = [_][]const u8{
-        "--program",   program, "--scenario", "bank", "--seed", "5", "--branches", "40",
+        "--program",   program, "--scenario", "bank", "--seed", "5", "--branches", "64",
         "--branching", "tree",
     };
     const one = try explore(context, &(common ++ [_][]const u8{
@@ -1015,7 +1015,8 @@ fn check_tree(context: *Context) !void {
     var sequential: [branches_max]Branch = undefined;
     var parallel: [branches_max]Branch = undefined;
     const count = parse_branches(one, &sequential);
-    const same = count == 40 and parse_branches(many, &parallel) == count and
+    // Past the first generations in flight (all from the setup snapshot), the tree deepens.
+    const same = count == 64 and parse_branches(many, &parallel) == count and
         same_timelines(sequential[0..count], parallel[0..count]);
     const deep = try deepest_replays(context, program, record, tapes, sequential[0..count], &.{});
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
@@ -1055,7 +1056,7 @@ fn check_tree(context: *Context) !void {
         steered_branches[0..steered_count],
         &.{},
     );
-    const steered_ok = steered_count == 40 and steered_deep.depth >= 1 and steered_deep.replays;
+    const steered_ok = steered_count == 64 and steered_deep.depth >= 1 and steered_deep.replays;
     expect(context, steered_ok, "tree with a strategy: {d} timelines, up to {d} deep; #{?d} " ++
         "replays from its tape (its ancestors' decisions from theirs)", .{
         steered_count, steered_deep.depth, steered_deep.index,
@@ -1084,7 +1085,7 @@ fn check_tree(context: *Context) !void {
     );
     const modulated_verified = std.mem.indexOf(u8, modulated, "ns: the same") != null and
         std.mem.indexOf(u8, modulated, "DIFFERENT") == null;
-    const modulated_ok = modulated_count == 40 and modulated_deep.depth >= 1 and
+    const modulated_ok = modulated_count == 64 and modulated_deep.depth >= 1 and
         modulated_deep.replays and held_nodes(modulated) > 0 and modulated_verified;
     expect(context, modulated_ok, "tree with cpu modulation: {d} timelines, up to {d} deep; " ++
         "#{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the one a " ++

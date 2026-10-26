@@ -42,7 +42,7 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
                          └──────┼──────────────────────┼───────────────────┼─────────────────────┘
                                 │ worker protocol (also implemented by a fake backend, §14)
              ┌──────────────────▼──────────── one bare-metal host ────────────────────────────┐
-             │ worker (Zig): N VMs, one per physical core                                      │
+             │ worker (Zig): VMs, one per hardware thread taken from the host's CPU pool       │
              │   ┌──────────────────────────┐   ┌──────────────────────────┐                  │
              │   │ Zig VMM #1  (core 0)     │   │ Zig VMM #2  (core 1) ... │   userspace      │
              │   └────────────┬─────────────┘   └────────────┬─────────────┘                  │
@@ -283,6 +283,20 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
 
 - **Explorer** keeps the multiverse tree: branch points, observations (coverage, assertion
   states, events, state hashes), and schedules segments on workers.
+- **CPUs** (`src/cpus.zig`): every run on a host takes CPUs from one pool. A timeline (or a tree
+  node's replay) holds one hardware thread while it runs, pinned to it, and gives it back after:
+  a lock on a file per CPU (flock: the kernel releases a dead holder's). Physical cores first,
+  then their hyperthread siblings: a VM alone on a core is fastest, and once every core is busy
+  the siblings add throughput. Never more VMs running than hardware threads, whatever the number
+  of runs; a lone run takes them all.
+- **The tree's generations** are judged in order, each once complete (a seed gives the same
+  tree), but they no longer stop the workers: when generation g is judged, g + 3 is planned,
+  and the generations between run meanwhile. Each timeline runs in a process of its own, forked
+  as a CPU frees up (node snapshots made since are inherited). A generation's slowest timeline
+  used to leave the others' workers idle (busy 13 to 23% of the time).
+- **Repeats**: a timeline whose whole trace equals an earlier one's is never returned to, and
+  branch points come before a timeline's last randomness pull (past it, every child would be the
+  same timeline).
 - **Strategy plugins** choose where to branch and which inputs to apply. **Fault plugins** decide
   what to inject and when. Built-ins first: random, coverage-guided, swarm-style fault mixes.
 - **Fault set** (target): network latency/partition/clog/restore, node pause/kill/stop/throttle,

@@ -1360,254 +1360,409 @@ fn explore_tree(
 ) !void {
     const arena = context.arena;
     const exploration = branches.exploration;
-    const total = branches.arguments.branches;
-    const base = seed_base(exploration);
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    // The traces explored: a timeline that repeats one is never returned to (its first was).
-    var traces: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    // How many timelines reached each behavior (what a strategy's `returns` is told).
-    var visits: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    var plan: std.ArrayList(Planned) = .empty;
-    const change: ?changed.Change = if (branches.arguments.changed) |source|
-        try changed.read(arena, context.io, source)
-    else
-        null;
-    const hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0);
     const size = branches.arguments.generation_size;
-    var next_index: u32 = 0;
-    while (next_index < total and plan.items.len < size) : (next_index += 1) {
-        try plan.append(arena, .{
-            .index = next_index,
-            .seed = branch_seed(base, next_index),
-            .snapshot = branches.snapshot,
-        });
-    }
     // In-run snapshots (holders.zig): not with a strategy (its decisions replay from its tape, as
     // holders do not).
     var registry: holders.Registry = undefined;
     const holding = exploration.strategy == null;
     if (holding) try registry.init();
     defer if (holding) registry.release();
-    var generation: u32 = 0;
-    const items = try arena.alloc(Summary, size);
-    const candidates = try arena.alloc(Candidate, size);
-    // Parents' tapes are read into this (a strategy's overrides), one at a time.
-    const tape_buffer = if (exploration.strategy != null)
-        try arena.create(tape.Overrides)
+    const change: ?changed.Change = if (branches.arguments.changed) |source|
+        try changed.read(arena, context.io, source)
     else
-        undefined;
-    while (plan.items.len > 0) : (generation += 1) {
-        if (branches.deadline_ns) |deadline| {
-            if (monotonic_ns() >= deadline) break;
-        }
-        var summaries = Summaries{ .items = items };
-        var mine = branches;
-        mine.plan = plan.items;
-        mine.summaries = &summaries;
-        if (holding) {
-            mine.holders = registry.explorer;
-            mine.seen = &seen;
-        }
-        const workers: u32 = @intCast(@min(jobs, plan.items.len));
-        if (workers == 1) {
-            try explore_branches(context, vm, options, mine);
-        } else {
-            try explore_parallel(context, vm, options, mine, workers);
-        }
-        // In index order (workers finish in any): what each reached that none before it had.
-        // Summaries are large: their order is sorted, not them.
-        const done = try arena.alloc(*const Summary, summaries.count);
-        for (done, summaries.items[0..summaries.count]) |*slot, *summary| slot.* = summary;
-        std.sort.insertion(*const Summary, done, {}, summary_before);
-        if (holding) for (done) |summary| {
-            registry.add(summary.index, summary.holders[0..summary.holder_count]);
-        };
-        // What each behavior new this generation was reached by: how many of its timelines.
-        // Every timeline is judged against what earlier generations knew, and what it found
-        // weighs more the fewer of its generation found it too (measured on the self-test maze:
-        // deeper than claiming behaviors in index order, where the first timeline took all the
-        // common ones and the latest of them sat past the decisions that mattered).
-        var reached: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-        for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-            if (seen.contains(behavior.hash)) continue;
-            const entry = try reached.getOrPut(arena, behavior.hash);
-            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-        };
-        var candidate_count: u32 = 0;
-        const generation_seed = base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
-        var random: std.Random.DefaultPrng = .init(generation_seed);
-        for (done) |summary| {
-            if ((try traces.getOrPut(arena, summary.trace_hash)).found_existing) continue;
-            var novel: u32 = 0;
-            var moment: ?u64 = null;
-            var label: []const u8 = "";
-            var changed_moment: ?u64 = null;
-            var changed_label: []const u8 = "";
-            @memset(hunks_reached, false);
-            // The frontier (Go-Explore): its rarest new behavior (the fewest of its generation
-            // reached it; latest among equals) that leaves room to go on (in its first four
-            // fifths); the branches return just after it.
-            var score: f64 = 0;
-            var moment_reached: u32 = std.math.maxInt(u32);
-            const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
-            for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-                // A targeted run: which hunks it ran (counted once), and when it first ran
-                // changed code itself (not in its parents' prefix). Any moment with a little
-                // room after it: what follows changed code is what a targeted run explores,
-                // however late it ran.
-                if (change) |*target| if (target.hunk_of(arena, behavior.name())) |hunk| {
-                    if (!hunks_reached[hunk]) target.timelines[hunk] += 1;
-                    hunks_reached[hunk] = true;
-                    const own = behavior.vtime_ns > summary.start_ns;
-                    const room = behavior.vtime_ns + changed_room_ns < summary.end_ns and
-                        behavior.vtime_ns < summary.last_pull_ns;
-                    if (own and room and changed_moment == null) {
-                        changed_moment = behavior.vtime_ns;
-                        changed_label = behavior.name();
-                    }
-                };
-                const timelines = reached.get(behavior.hash) orelse continue; // Known before.
-                novel += 1;
-                score += 1.0 / @as(f64, @floatFromInt(timelines));
-                // A moment past its last randomness pull returns to the same timeline.
-                const open = behavior.vtime_ns < summary.last_pull_ns;
-                if (behavior.vtime_ns <= room_end and open and timelines <= moment_reached) {
-                    moment = behavior.vtime_ns;
-                    moment_reached = timelines;
-                    label = behavior.name();
-                }
-            }
-            candidates[candidate_count] = .{
-                .summary = summary,
-                .novel = novel,
-                .score = score,
-                .moment = moment,
-                .label = label,
-                .changed_moment = changed_moment,
-                .changed_label = changed_label,
-            };
-            candidate_count += 1;
-        }
-        var new_ones = reached.keyIterator();
-        while (new_ones.next()) |hash| try seen.put(arena, hash.*, {});
-        const chosen = candidates[0..candidate_count];
-        std.sort.insertion(Candidate, chosen, {}, candidate_before);
-        const counts = Counts{ .reached = &reached, .visits = &visits };
-        const plugin = exploration.strategy;
-        const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, size);
-        for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-            const entry = try visits.getOrPut(arena, behavior.hash);
-            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-        };
-        // The nodes are made at once, each replay in a child process (`jobs` at a time); then
-        // their branches are numbered in the returns' order, as if made one after the other.
-        const makings = try arena.alloc(NodeMaking, returns.len);
-        var making_count: u32 = 0;
-        var finished: u32 = 0;
-        var held: u32 = 0;
-        for (returns) |back| {
-            const parent = for (plan.items) |entry| {
-                if (entry.index == back.branch) break entry;
-            } else continue;
-            if (making_count - finished == jobs) {
-                node_make_finish(arena, &makings[finished]);
-                finished += 1;
-            }
-            // A holder of the parent at the moment, or a little before it: no replay from the
-            // parent's start.
-            if (holding) if (registry.take(back.branch, back.vtime_ns)) |taken| {
-                makings[making_count] = .{
-                    .back = back,
-                    .parent = parent,
-                    .held = true,
-                    .pid = taken.pid,
-                    .socket = taken.socket,
-                };
-                making_count += 1;
-                held += 1;
-                continue;
-            };
-            // A strategy's decisions in the parent are in its tape: replayed to the moment.
-            const overrides = if (exploration.strategy != null) try tape_overrides(
-                context,
-                branches.arguments.tape_directory.?,
-                parent.index,
-                tape_buffer,
-            ) else null;
-            makings[making_count] = .{ .back = back, .parent = parent };
-            try node_make_start(arena, vm, options, &makings[making_count], overrides);
-            making_count += 1;
-        }
-        while (finished < making_count) : (finished += 1) {
-            node_make_finish(arena, &makings[finished]);
-        }
-        if (holding) registry.release(); // Their memory, before the next generation runs.
-        if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
-            const held_node = making.snapshot orelse continue;
-            if (!making.held) continue;
-            var replayed: NodeMaking = .{ .back = making.back, .parent = making.parent };
-            try node_make_start(arena, vm, options, &replayed, null);
-            node_make_finish(arena, &replayed);
-            const replay_node = replayed.snapshot orelse continue;
-            snapshots_compare(making.back, held_node, replay_node);
-            node_free(replay_node, branches.snapshot);
-        };
-        var next: std.ArrayList(Planned) = .empty;
-        var made: u32 = 0;
-        for (makings[0..making_count]) |*making| {
-            const snapshot = making.snapshot orelse continue;
-            if (next_index >= total) {
-                node_free(snapshot, branches.snapshot); // Not needed after all.
-                continue;
-            }
-            const parent = making.parent;
-            const back = making.back;
-            const at = back.vtime_ns;
-            made += 1;
-            const path = try arena.alloc(tape.Segment, parent.path.len + 1);
-            @memcpy(path[0..parent.path.len], parent.path);
-            path[parent.path.len] = .{
-                .branch = parent.index,
-                .seed = parent.seed,
-                .vtime_ns = at,
-            };
-            for (0..tree.children) |_| {
-                if (next_index >= total) break;
-                try next.append(arena, .{
-                    .index = next_index,
-                    .seed = branch_seed(base, next_index),
-                    .snapshot = snapshot,
-                    .path = path,
-                    .generation = generation + 1,
-                    .why = back.why,
-                });
-                next_index += 1;
-            }
-        }
-        // This generation's snapshots served their branches, and their children's snapshots.
-        for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
-        // The rest of the generation starts over from the setup snapshot.
-        while (next_index < total and next.items.len < size) : (next_index += 1) {
-            try next.append(arena, .{
-                .index = next_index,
-                .seed = branch_seed(base, next_index),
+        null;
+    var state: TreeState = .{
+        .base = seed_base(exploration),
+        .total = branches.arguments.branches,
+        .size = size,
+        .jobs = jobs,
+        .holding = holding,
+        .registry = &registry,
+        .change = change,
+        .hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0),
+        .candidates = try arena.alloc(Candidate, size),
+        .tape_buffer = if (exploration.strategy != null)
+            try arena.create(tape.Overrides)
+        else
+            undefined,
+    };
+    // Generations in flight (a ring): the first ones all start from the setup snapshot. Judged
+    // in order, each once complete: a seed gives the same tree.
+    var flight: [pipeline_depth]InFlight = undefined;
+    for (&flight, 0..) |*slot, number| {
+        slot.* = .{ .generation = @intCast(number), .items = try arena.alloc(Summary, size) };
+        slot.summaries = .{ .items = slot.items };
+        while (state.next_index < state.total and slot.plan.items.len < size) {
+            try slot.plan.append(arena, .{
+                .index = state.next_index,
+                .seed = branch_seed(state.base, state.next_index),
                 .snapshot = branches.snapshot,
-                .generation = generation + 1,
-                .why = "From the setup snapshot: some timelines of every generation start " ++
-                    "over, so the tree does not only deepen.",
+                .generation = @intCast(number),
             });
+            state.next_index += 1;
         }
-        std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
-            "({d} known); {d} moments returned to ({d} from in-run snapshots)\n", .{
-            generation, done.len, reached.count(), seen.count(), made, held,
-        });
-        plan = next;
     }
-    for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
-    if (change) |*target| {
-        target.summarize(next_index);
+    var oldest: u32 = 0;
+    var running: [jobs_max]Running = undefined;
+    var running_count: u32 = 0;
+    while (true) {
+        // Timelines start as CPUs free up, the oldest generation's first; none past the budget.
+        const late = if (branches.deadline_ns) |deadline| monotonic_ns() >= deadline else false;
+        while (!late and running_count < jobs) {
+            const slot = for (0..pipeline_depth) |offset| {
+                const candidate = &flight[(oldest + offset) % pipeline_depth];
+                if (candidate.started < candidate.plan.items.len) break candidate;
+            } else break;
+            var mine = branches;
+            mine.plan = slot.plan.items[slot.started..][0..1];
+            if (holding) {
+                mine.holders = registry.explorer;
+                mine.seen = &state.seen;
+            }
+            running[running_count] = try timeline_start(context, vm, options, mine, slot);
+            running_count += 1;
+            slot.started += 1;
+        }
+        if (running_count == 0) break; // Out of time, or of timelines.
+        const finished = try timeline_wait(running[0..running_count], branches.multiverse);
+        running[finished] = running[running_count - 1];
+        running_count -= 1;
+        // The oldest generation, once every timeline of it finished: judged, and its slot
+        // planned with the generation `pipeline_depth` after it.
+        while (!late) {
+            const slot = &flight[oldest % pipeline_depth];
+            if (slot.plan.items.len == 0) break;
+            if (slot.summaries.count < slot.plan.items.len) break;
+            const judged = slot.generation;
+            const next = try tree_judge(context, vm, options, branches, &state, judged, slot);
+            slot.* = .{ .generation = judged + pipeline_depth, .items = slot.items, .plan = next };
+            slot.summaries = .{ .items = slot.items };
+            oldest += 1;
+        }
+    }
+    for (&flight) |*slot| {
+        for (slot.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+    }
+    if (state.change) |*target| {
+        target.summarize(state.next_index);
         report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
     }
+}
+
+/// A timeline running in a process of its own (explore_tree): where its summary comes back.
+const Running = struct { pid: linux.pid_t, results: linux.fd_t, slot: *InFlight };
+
+/// Starts the one timeline of `branches.plan` in a child process: a worker of one timeline, on a
+/// CPU of the host's (cpus.zig); its results come back through a pipe.
+fn timeline_start(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    slot: *InFlight,
+) !Running {
+    assert(branches.plan.?.len == 1);
+    var pipe: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.Fork;
+    if (pid == 0) {
+        _ = linux.close(pipe[0]);
+        var one = Summaries{ .items = slot.items[slot.summaries.count..][0..1] };
+        var mine = branches;
+        mine.summaries = &one;
+        mine.next = null;
+        worker_run(context, vm, options, mine, .{ .worker = 0, .jobs = 1, .results_fd = pipe[1] });
+    }
+    _ = linux.close(pipe[1]);
+    return .{ .pid = @intCast(pid), .results = pipe[0], .slot = slot };
+}
+
+/// Waits for one of the running timelines to finish: its results in the run's multiverse, its
+/// summary in its generation's. Returns which.
+fn timeline_wait(running: []const Running, multiverse: *report.Multiverse) !usize {
+    assert(running.len > 0);
+    var polled: [jobs_max]linux.pollfd = undefined;
+    for (running, polled[0..running.len]) |timeline, *entry| {
+        entry.* = .{ .fd = timeline.results, .events = linux.POLL.IN | linux.POLL.HUP, .revents = 0 };
+    }
+    while (true) {
+        const ready = linux.poll(&polled, @intCast(running.len), -1);
+        if (linux.errno(ready) == .INTR) continue;
+        if (linux.errno(ready) != .SUCCESS) return error.Poll;
+        break;
+    }
+    const at = for (polled[0..running.len], 0..) |entry, index| {
+        if (entry.revents != 0) break index;
+    } else unreachable;
+    const timeline = running[at];
+    const results = try std.heap.page_allocator.create(report.Multiverse);
+    defer std.heap.page_allocator.destroy(results);
+    const summaries = &timeline.slot.summaries;
+    var count: u32 = 0;
+    var received = read_exact(timeline.results, std.mem.asBytes(results));
+    received = received and read_exact(timeline.results, std.mem.asBytes(&count));
+    received = received and count <= 1 and summaries.count + count <= summaries.items.len;
+    if (received and count == 1) {
+        received = read_exact(timeline.results, std.mem.asBytes(&summaries.items[summaries.count]));
+        summaries.count += 1;
+    }
+    _ = linux.close(timeline.results);
+    var status: i32 = 0;
+    _ = linux.waitpid(timeline.pid, &status, 0);
+    if (!received or status != 0) return error.WorkerFailed;
+    try multiverse.absorb(results);
+    return at;
+}
+
+/// The tree explorer's state across generations (explore_tree, tree_judge).
+const TreeState = struct {
+    base: u64,
+    total: u32,
+    size: u32,
+    jobs: u32,
+    holding: bool,
+    registry: *holders.Registry,
+    seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The traces explored: a timeline that repeats one is never returned to (its first was).
+    traces: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// How many timelines reached each behavior (what a strategy's `returns` is told).
+    visits: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    change: ?changed.Change,
+    hunks_reached: []bool,
+    candidates: []Candidate,
+    /// Parents' tapes are read into this (a strategy's overrides), one at a time.
+    tape_buffer: *tape.Overrides,
+    next_index: u32 = 0,
+};
+
+/// Generations in flight at once: when one is judged, the one `pipeline_depth` after it is
+/// planned, and meanwhile the generations between run. Timelines of very different lengths
+/// (Raft's: half a minute to six) no longer leave workers idle at each generation's tail (they
+/// were busy 13 to 23% of the time). The cost: the tree deepens from the generation
+/// `pipeline_depth` on (the ones before all start from the setup snapshot).
+const pipeline_depth = 3;
+
+/// A generation in flight: its plan, how many of its timelines started, and their summaries
+/// (in `items`, kept for the slot's next generations).
+const InFlight = struct {
+    generation: u32,
+    plan: std.ArrayList(Planned) = .empty,
+    started: u32 = 0,
+    items: []Summary,
+    summaries: Summaries = .{ .items = &.{} },
+};
+
+/// A generation, every timeline of it finished: what each reached that none before it had,
+/// the moments returned to (nodes made), and the plan of the generation `pipeline_depth` after.
+fn tree_judge(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    state: *TreeState,
+    generation: u32,
+    slot: *const InFlight,
+) !std.ArrayList(Planned) {
+    const plan = &slot.plan;
+    const summaries = &slot.summaries;
+    const arena = context.arena;
+    const exploration = branches.exploration;
+    // In index order (workers finish in any): what each reached that none before it had.
+    // Summaries are large: their order is sorted, not them.
+    const done = try arena.alloc(*const Summary, summaries.count);
+    for (done, summaries.items[0..summaries.count]) |*entry, *summary| entry.* = summary;
+    std.sort.insertion(*const Summary, done, {}, summary_before);
+    if (state.holding) for (done) |summary| {
+        state.registry.add(summary.index, summary.holders[0..summary.holder_count]);
+    };
+    // What each behavior new this generation was reached by: how many of its timelines.
+    // Every timeline is judged against what earlier generations knew, and what it found
+    // weighs more the fewer of its generation found it too (measured on the self-test maze:
+    // deeper than claiming behaviors in index order, where the first timeline took all the
+    // common ones and the latest of them sat past the decisions that mattered).
+    var reached: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+        if (state.seen.contains(behavior.hash)) continue;
+        const entry = try reached.getOrPut(arena, behavior.hash);
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    };
+    var candidate_count: u32 = 0;
+    const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
+    var random: std.Random.DefaultPrng = .init(generation_seed);
+    for (done) |summary| {
+        if ((try state.traces.getOrPut(arena, summary.trace_hash)).found_existing) continue;
+        var novel: u32 = 0;
+        var moment: ?u64 = null;
+        var label: []const u8 = "";
+        var changed_moment: ?u64 = null;
+        var changed_label: []const u8 = "";
+        @memset(state.hunks_reached, false);
+        // The frontier (Go-Explore): its rarest new behavior (the fewest of its generation
+        // reached it; latest among equals) that leaves room to go on (in its first four
+        // fifths); the branches return just after it.
+        var score: f64 = 0;
+        var moment_reached: u32 = std.math.maxInt(u32);
+        const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
+        for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+            // A targeted run: which hunks it ran (counted once), and when it first ran
+            // changed code itself (not in its parents' prefix). Any moment with a little
+            // room after it: what follows changed code is what a targeted run explores,
+            // however late it ran.
+            if (state.change) |*target| if (target.hunk_of(arena, behavior.name())) |hunk| {
+                if (!state.hunks_reached[hunk]) target.timelines[hunk] += 1;
+                state.hunks_reached[hunk] = true;
+                const own = behavior.vtime_ns > summary.start_ns;
+                const room = behavior.vtime_ns + changed_room_ns < summary.end_ns and
+                    behavior.vtime_ns < summary.last_pull_ns;
+                if (own and room and changed_moment == null) {
+                    changed_moment = behavior.vtime_ns;
+                    changed_label = behavior.name();
+                }
+            };
+            const timelines = reached.get(behavior.hash) orelse continue; // Known before.
+            novel += 1;
+            score += 1.0 / @as(f64, @floatFromInt(timelines));
+            // A moment past its last randomness pull returns to the same timeline.
+            const open = behavior.vtime_ns < summary.last_pull_ns;
+            if (behavior.vtime_ns <= room_end and open and timelines <= moment_reached) {
+                moment = behavior.vtime_ns;
+                moment_reached = timelines;
+                label = behavior.name();
+            }
+        }
+        state.candidates[candidate_count] = .{
+            .summary = summary,
+            .novel = novel,
+            .score = score,
+            .moment = moment,
+            .label = label,
+            .changed_moment = changed_moment,
+            .changed_label = changed_label,
+        };
+        candidate_count += 1;
+    }
+    var new_ones = reached.keyIterator();
+    while (new_ones.next()) |hash| try state.seen.put(arena, hash.*, {});
+    const chosen = state.candidates[0..candidate_count];
+    std.sort.insertion(Candidate, chosen, {}, candidate_before);
+    const counts = Counts{ .reached = &reached, .visits = &state.visits };
+    const plugin = exploration.strategy;
+    const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, state.size);
+    for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+        const entry = try state.visits.getOrPut(arena, behavior.hash);
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    };
+    // The nodes are made at once, each replay in a child process (`state.jobs` at a time); then
+    // their branches are numbered in the returns' order, as if made one after the other.
+    const makings = try arena.alloc(NodeMaking, returns.len);
+    var making_count: u32 = 0;
+    var finished: u32 = 0;
+    var held: u32 = 0;
+    for (returns) |back| {
+        const parent = for (plan.items) |entry| {
+            if (entry.index == back.branch) break entry;
+        } else continue;
+        if (making_count - finished == state.jobs) {
+            node_make_finish(arena, &makings[finished]);
+            finished += 1;
+        }
+        // A holder of the parent at the moment, or a little before it: no replay from the
+        // parent's start.
+        if (state.holding) if (state.registry.take(back.branch, back.vtime_ns)) |taken| {
+            makings[making_count] = .{
+                .back = back,
+                .parent = parent,
+                .held = true,
+                .pid = taken.pid,
+                .socket = taken.socket,
+            };
+            making_count += 1;
+            held += 1;
+            continue;
+        };
+        // A strategy's decisions in the parent are in its tape: replayed to the moment.
+        const overrides = if (exploration.strategy != null) try tape_overrides(
+            context,
+            branches.arguments.tape_directory.?,
+            parent.index,
+            state.tape_buffer,
+        ) else null;
+        makings[making_count] = .{ .back = back, .parent = parent };
+        try node_make_start(arena, vm, options, &makings[making_count], overrides);
+        making_count += 1;
+    }
+    while (finished < making_count) : (finished += 1) {
+        node_make_finish(arena, &makings[finished]);
+    }
+    // Their memory: this generation's (the ones in flight keep theirs).
+    if (state.holding) {
+        const first = plan.items[0].index;
+        const last = plan.items[plan.items.len - 1].index;
+        assert(last - first + 1 == plan.items.len); // One after the other.
+        state.registry.release_branches(first, last);
+    }
+    if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
+        const held_node = making.snapshot orelse continue;
+        if (!making.held) continue;
+        var replayed: NodeMaking = .{ .back = making.back, .parent = making.parent };
+        try node_make_start(arena, vm, options, &replayed, null);
+        node_make_finish(arena, &replayed);
+        const replay_node = replayed.snapshot orelse continue;
+        snapshots_compare(making.back, held_node, replay_node);
+        node_free(replay_node, branches.snapshot);
+    };
+    var next: std.ArrayList(Planned) = .empty;
+    var made: u32 = 0;
+    for (makings[0..making_count]) |*making| {
+        const snapshot = making.snapshot orelse continue;
+        if (state.next_index >= state.total) {
+            node_free(snapshot, branches.snapshot); // Not needed after all.
+            continue;
+        }
+        const parent = making.parent;
+        const back = making.back;
+        const at = back.vtime_ns;
+        made += 1;
+        const path = try arena.alloc(tape.Segment, parent.path.len + 1);
+        @memcpy(path[0..parent.path.len], parent.path);
+        path[parent.path.len] = .{
+            .branch = parent.index,
+            .seed = parent.seed,
+            .vtime_ns = at,
+        };
+        for (0..tree.children) |_| {
+            if (state.next_index >= state.total) break;
+            try next.append(arena, .{
+                .index = state.next_index,
+                .seed = branch_seed(state.base, state.next_index),
+                .snapshot = snapshot,
+                .path = path,
+                .generation = generation + pipeline_depth,
+                .why = back.why,
+            });
+            state.next_index += 1;
+        }
+    }
+    // This generation's snapshots served their branches, and their children's snapshots.
+    for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
+    // While generations are in flight, the setup snapshot is everyone's: never freed.
+    // The rest of the generation starts over from the setup snapshot.
+    while (state.next_index < state.total and next.items.len < state.size) : (state.next_index += 1) {
+        try next.append(arena, .{
+            .index = state.next_index,
+            .seed = branch_seed(state.base, state.next_index),
+            .snapshot = branches.snapshot,
+            .generation = generation + pipeline_depth,
+            .why = "From the setup snapshot: some timelines of every generation start " ++
+                "over, so the tree does not only deepen.",
+        });
+    }
+    std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
+        "({d} known); {d} moments returned to ({d} from in-run snapshots)\n", .{
+        generation, done.len, reached.count(), state.seen.count(), made, held,
+    });
+    return next;
 }
 
 /// After changed code, the least virtual time a timeline must go on for the tree to return
@@ -1974,6 +2129,10 @@ fn field_same(comptime name: []const u8, held: *const Snapshot, replayed: *const
             }
         }
         return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    }
+    // By value: an optional's padding is whatever its writer left there.
+    if (comptime std.mem.eql(u8, name, "modulation")) {
+        return std.meta.eql(held.modulation, replayed.modulation);
     }
     const a = std.mem.asBytes(&@field(held, name));
     const b = std.mem.asBytes(&@field(replayed, name));
