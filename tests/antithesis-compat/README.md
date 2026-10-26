@@ -21,6 +21,11 @@ checking Raft's safety properties) runs unchanged: its images built with its own
 client declares the setup once a leader is elected (`antithesis_setup`), where the snapshot is
 taken; its Go SDK writes to detfs.
 
+The images carry the tags of Antithesis's registry only because the Compose file names them so;
+nothing is pulled. To run the very same system on another host (the same inputs, so the same
+timelines), copy them rather than build them again: `podman save --multi-image-archive <the
+four tags> | ssh <host> podman load`.
+
 ### Found, blind (before reading Antithesis's post)
 
 **A leader that rejects every write, forever, after a leadership transfer was cut short**
