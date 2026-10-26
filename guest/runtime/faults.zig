@@ -1415,15 +1415,16 @@ test faults_collect {
     var faults: [faults_max]Fault = undefined;
     // a: pause, restart, throttle, process pause; with the runner and with b: partition and
     // degrade both ways (6). b: pause, isolate, throttle, process pause; with the runner:
-    // partition and degrade both ways (3). Thread pauses where process pauses are (2). A clog
-    // of b (it allows isolation), groups across the runner, a and b. Clock skip. A restore.
-    try std.testing.expectEqual(@as(u32, 23), faults_collect(&system, &scenario, &faults));
-    const groups = faults[0..23];
+    // partition and degrade both ways (3). Thread pauses where process pauses are (2). Sync
+    // stalls (on by default) on both (2). A clog of b (it allows isolation), groups across the
+    // runner, a and b. Clock skip. A restore.
+    try std.testing.expectEqual(@as(u32, 25), faults_collect(&system, &scenario, &faults));
+    const groups = faults[0..25];
     const has_groups = for (groups) |fault| {
         if (fault.kind == .partition_groups) break true;
     } else false;
     try std.testing.expect(has_groups);
-    try std.testing.expectEqual(Kind.restore, faults[22].kind);
+    try std.testing.expectEqual(Kind.restore, faults[24].kind); // The last one.
 }
 
 test harsher {
