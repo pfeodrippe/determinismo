@@ -23,3 +23,10 @@ blind-rediscovery benchmark in docs/JEPSEN.md).
 Faults: Antithesis's set, restarts, graceful stops and power losses (InnoDB syncs its log at each
 commit, so committed transactions must survive), and stalls and power losses at the server's
 syncs.
+
+## Findings
+
+Jepsen's 2023 finding holds in 26.10.0, rediscovered blind: at Repeatable Read, Elle finds
+G2-item and G-single-item (MySQL's Repeatable Read reads a snapshot but writes the latest
+versions), in 2 of the first 4 timelines (`--scenario repeatable_read --seed 7`). Serializable:
+4 of 4 timelines clean.
