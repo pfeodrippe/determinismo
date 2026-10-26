@@ -15,8 +15,14 @@ build e2e` tests it.
    new kinds of output lines. Next steps for it:
    - Snapshot during the run when a timeline first reaches something new, instead of replaying
      to the moment after the generation (no replay; the same tree).
-   - Rarity weighting (Go-Explore's cell selection), and a budget split between depth and fresh
-     starts learned from what found new behaviors.
+   - Measured with bench/tree.py (the self-test maze, eight seeds; plugins/python/tree_rarity.py
+     tries a rule without rebuilding). Kept: a generation's finds weighed by how few of its
+     timelines found them (second digit 16.6 against 14.6). Dropped: rarity summed over all
+     behaviors (2.5), returning to the least visited behavior when nothing is new (15.1),
+     numbering the next roots first to run them during node making (4.6), and running them then
+     with the numbering kept (the same tree, no clear wall-time gain: forking twice a generation
+     costs what the overlap saves). Left: a budget split between depth and fresh starts learned
+     from what found new behaviors.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
