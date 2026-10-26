@@ -91,7 +91,12 @@ pause had stopped another node's launcher (just restarted, before it ran its pro
 still held every node's mounts. Fixed (the launcher drops them first). No liveness failure was
 among those 15 timelines.
 
-Two differences with Antithesis's setup, changed for the next runs. The POC is tuned for
+Three differences with Antithesis's setup, changed for the next runs. The livelock (#697)
+needs a follower whose stale, uncommitted entries reach the index of the leader's next
+snapshot. In a three-node cluster only a cut-off leader keeps such entries: the writes it took
+before stepping down, at most one per apply driver (each sends one write at a time and waits).
+The snapshot reaches past the 16 trailing logs, so it needs 16 or more: with our composer's
+four drivers at most, never. Timelines now draw 1 to 32 drivers at once (Antithesis bounds none). The POC is tuned for
 15-minute timelines (snapshots every 5 s past 128 entries, 16 trailing logs, in raft-node's
 main.go); ours were three minutes. And a node's durable disk lived in guest memory, so a sync
 took no virtual time and no other goroutine ran during it: durable disks now take 0 to 2 ms per
