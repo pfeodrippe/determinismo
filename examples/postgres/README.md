@@ -4,7 +4,10 @@ PostgreSQL 18.6 (the official image), one server whose data is on its own disk, 
 Jepsen's PostgreSQL 12.3 analysis (2020: Serializable allowed G2-item, fixed in 12.4). Clients
 run list-append transactions (`examples/sql/append.zig`, shared with CockroachDB and YugabyteDB:
 anything that speaks PostgreSQL's protocol), and Elle checks every timeline's history on the
-host (`sdk.elle`).
+host (`sdk.elle`). The transactions are Jepsen's (jepsen-io/stolon, jepsen-io/sql): keys over
+three tables, read and updated by primary or secondary key, appended by update-insert-update
+(under a savepoint) or `ON CONFLICT`, one-operation transactions in autocommit, and up to 32
+clients at once.
 
 ```
 zig build -Drelease

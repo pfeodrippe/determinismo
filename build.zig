@@ -53,6 +53,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "determinismo", .module = sdk }},
     });
+    // A MySQL client (also for MariaDB, Galera, Percona, TiDB).
+    const mysql = b.createModule(.{
+        .root_source_file = b.path("examples/sql/mysql.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "determinismo", .module = sdk }},
+    });
     const sql_append = b.createModule(.{
         .root_source_file = b.path("examples/sql/append.zig"),
         .target = target,
@@ -60,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "determinismo", .module = sdk },
             .{ .name = "pg", .module = pg },
+            .{ .name = "mysql", .module = mysql },
         },
     });
 
@@ -89,6 +97,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "etcd-test", .path = "examples/etcd/etcd_test.zig" },
         .{ .name = "nats-test", .path = "examples/nats/nats_test.zig" },
         .{ .name = "postgres-test", .path = "examples/postgres/postgres_test.zig" },
+        .{ .name = "mysql-test", .path = "examples/mysql/mysql_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },
@@ -264,6 +273,7 @@ pub fn build(b: *std.Build) void {
         "examples/nrepl/bencode.zig",
         "examples/nats/client.zig",
         "examples/sql/append.zig",
+        "examples/sql/mysql.zig",
         "examples/shop/pg.zig",
         "tools/e2e.zig",
         "tools/initramfs.zig",
@@ -279,7 +289,10 @@ pub fn build(b: *std.Build) void {
             },
         }) });
         if (std.mem.eql(u8, root, "src/main.zig")) duckdb_link(b, unit_tests.root_module, duckdb);
-        if (std.mem.eql(u8, root, "examples/sql/append.zig")) unit_tests.root_module.addImport("pg", pg);
+        if (std.mem.eql(u8, root, "examples/sql/append.zig")) {
+            unit_tests.root_module.addImport("pg", pg);
+            unit_tests.root_module.addImport("mysql", mysql);
+        }
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
     const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{

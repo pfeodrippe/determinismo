@@ -16,6 +16,8 @@ error_message: [256]u8 = undefined,
 error_message_size: u32 = 0,
 /// Its SQLSTATE ("40001": a serialization failure, the transaction did not happen).
 error_code: [5]u8 = @splat('0'),
+/// The rows the last statement affected: its command tag's count ("UPDATE 2"), 0 without one.
+rows: u64 = 0,
 
 const Connection = @This();
 
@@ -64,6 +66,12 @@ pub fn exec(connection: *Connection, sql: []const u8) !void {
     _ = try connection.query(sql, null);
 }
 
+/// Runs a statement and returns the rows it affected (UPDATE, INSERT, DELETE).
+pub fn exec_rows(connection: *Connection, sql: []const u8) !u64 {
+    _ = try connection.query(sql, null);
+    return connection.rows;
+}
+
 /// Runs a query and returns the first column of its first row as an integer (null for no row
 /// or SQL NULL).
 pub fn query_integer(connection: *Connection, sql: []const u8) !?i64 {
@@ -105,6 +113,7 @@ fn query(connection: *Connection, sql: []const u8, cell: ?[]u8) !?[]const u8 {
     @memcpy(message[5..][0..sql.len], sql);
     message[5 + sql.len] = 0;
     try connection.write_all(message[0 .. sql.len + 6]);
+    connection.rows = 0;
     var value: ?[]const u8 = null;
     var failed = false;
     while (true) {
@@ -117,10 +126,24 @@ fn query(connection: *Connection, sql: []const u8, cell: ?[]u8) !?[]const u8 {
                 _ = connection.server_error(reply.body) catch {};
                 failed = true;
             },
+            'C' => connection.rows = tag_rows(reply.body),
             'Z' => return if (failed) error.ServerError else value,
-            else => {}, // Row description, command complete, notices.
+            else => {}, // Row description, notices.
         }
     }
+}
+
+/// A command tag's count, its last word: "UPDATE 2", "INSERT 0 1", "SELECT 3".
+fn tag_rows(body: []const u8) u64 {
+    const tag = std.mem.sliceTo(body, 0);
+    const space = std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return 0;
+    return std.fmt.parseInt(u64, tag[space + 1 ..], 10) catch 0;
+}
+
+test tag_rows {
+    try std.testing.expectEqual(2, tag_rows("UPDATE 2\x00"));
+    try std.testing.expectEqual(1, tag_rows("INSERT 0 1\x00"));
+    try std.testing.expectEqual(0, tag_rows("BEGIN\x00"));
 }
 
 fn first_cell(body: []const u8, cell: []u8) !?[]const u8 {
