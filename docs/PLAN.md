@@ -16,6 +16,12 @@ build e2e` tests it.
    - Done: in-run snapshots (holders, ARCHITECTURE.md §8): a node is a memory copy instead of a
      replay of its parent to the moment (minutes with fifteen-minute timelines). Next: return
      to more moments per generation now that a node costs little.
+   - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
+     216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
+     several runs per machine fill each other's gaps. Next: larger generations (`--generation`,
+     several timelines per worker) and the next generation's roots started early (a quarter of
+     it: the rest depends on its results); planning from whatever finished first would fill
+     more but make the tree depend on timing.
    - Measured with bench/tree.py (the self-test maze, eight seeds; plugins/python/tree_rarity.py
      tries a rule without rebuilding). Kept: a generation's finds weighed by how few of its
      timelines found them (second digit 16.6 against 14.6). Dropped: rarity summed over all
