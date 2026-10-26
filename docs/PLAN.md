@@ -225,6 +225,13 @@ places, and assertions carry no location.
 
 ## Speed
 
+- The tree's generation barrier: a generation (16 timelines) runs, the explorer waits for all
+  of them, then plans the next; Raft's timelines take 0.5 to 6.5 minutes, so most workers idle
+  at each generation's tail (the CPU pool lends them to other runs, not to this one). Next:
+  commit timelines in index order; when timeline i and all before it are done, judge it and
+  plan its branches at once, and workers take planned work as they free up. Decisions depend on
+  the committed prefix only: a seed still gives the same tree, with no wait but for a slow
+  timeline next in order when nothing else is planned.
 - One host, many runs (done, cpus.zig): workers take a CPU from one pool shared by every run on
   the host before a timeline (or a node's replay), pinned to it, physical cores first; never
   more VMs running than CPUs. Before it, every run pinned worker i to CPU i: seven runs of five
