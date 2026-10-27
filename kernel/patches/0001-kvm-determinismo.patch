@@ -49,7 +49,7 @@ index 3f83e36..f6185fc 100644
  
  struct kvm_x86_init_ops vt_init_ops __initdata = {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 84420bf..a589438 100644
+index 84420bf..477f693 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -73,6 +73,8 @@
@@ -150,7 +150,7 @@ index 84420bf..a589438 100644
  	vmx_vcpu_pi_put(vcpu);
  
  	vmx_prepare_switch_to_host(to_vmx(vcpu));
-@@ -5924,9 +5997,360 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+@@ -5924,9 +5997,428 @@ static int handle_pause(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -199,15 +199,33 @@ index 84420bf..a589438 100644
 +	vmx->det.overflows++;
 +}
 +
-+static void vmx_det_set_stepping(struct vcpu_vmx *vmx, bool on)
++/* MTF exits while stepping to a target or tracing instructions. */
++static void vmx_det_mtf_update(struct vcpu_vmx *vmx)
 +{
 +	preempt_disable();
-+	if (on)
++	if (vmx->det.stepping || vmx->det.itracing)
 +		exec_controls_setbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
 +	else
 +		exec_controls_clearbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
 +	preempt_enable();
++}
++
++static void vmx_det_set_stepping(struct vcpu_vmx *vmx, bool on)
++{
 +	vmx->det.stepping = on;
++	vmx_det_mtf_update(vmx);
++}
++
++static void vmx_det_itrace_log(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u32 n = vmx->det.itrace_len;
++
++	if (n >= vmx->det.itrace_cap)
++		return;
++	vmx->det.itrace[2 * n] = vmx_det_branches(vmx);
++	vmx->det.itrace[2 * n + 1] = kvm_rip_read(vcpu);
++	vmx->det.itrace_len = n + 1;
 +}
 +
 +/* Disarms the target; returns 0 so the caller exits to userspace. */
@@ -304,8 +322,10 @@ index 84420bf..a589438 100644
 +{
 +	struct vcpu_vmx *vmx = to_vmx(vcpu);
 +
++	if (unlikely(vmx->det.itracing))
++		vmx_det_itrace_log(vcpu);
 +	if (!vmx->det.stepping || !vmx->det.target)
-+		return EXIT_FASTPATH_NONE;
++		return vmx->det.itracing ? EXIT_FASTPATH_REENTER_GUEST : EXIT_FASTPATH_NONE;
 +	if (vmx_det_branches(vmx) >= vmx->det.target)
 +		return EXIT_FASTPATH_NONE;
 +	vmx->det.mtf_steps++;
@@ -336,6 +356,16 @@ index 84420bf..a589438 100644
 +	if (!vmx->det.counter)
 +		return kvm_handle_invalid_op(vcpu);
 +	vmx->det.rdtsc_exits++;
++	if (unlikely(vmx->det.itrace)) {
++		/* The window: after the RDTSC exit numbered itrace_at, until the next one. */
++		if (vmx->det.itracing) {
++			vmx->det.itracing = false;
++			vmx_det_mtf_update(vmx);
++		} else if (vmx->det.rdtsc_exits == vmx->det.itrace_at) {
++			vmx->det.itracing = true;
++			vmx_det_mtf_update(vmx);
++		}
++	}
 +	tsc = vmx_det_branches(vmx);
 +	if (unlikely(vmx->det.log) && vmx->det.log_len < vmx->det.log_cap) {
 +		vmx->det.log[2 * vmx->det.log_len] = tsc;
@@ -477,6 +507,44 @@ index 84420bf..a589438 100644
 +		req.len = n;
 +		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 +	}
++	case KVM_DET_ITRACE_ENABLE: {
++		struct kvm_det_itrace req;
++
++		if (!vmx->det.counter)
++			return -EINVAL;
++		if (copy_from_user(&req, argp, sizeof(req)))
++			return -EFAULT;
++		kvfree(vmx->det.itrace);
++		vmx->det.itrace = NULL;
++		vmx->det.itrace_len = 0;
++		vmx->det.itrace_cap = 0;
++		vmx->det.itracing = false;
++		vmx_det_mtf_update(vmx);
++		if (!req.cap)
++			return 0;
++		if (req.cap > (1u << 24) || !req.at)
++			return -EINVAL;
++		vmx->det.itrace = kvcalloc(2 * req.cap, sizeof(u64), GFP_KERNEL_ACCOUNT);
++		if (!vmx->det.itrace)
++			return -ENOMEM;
++		vmx->det.itrace_cap = req.cap;
++		vmx->det.itrace_at = req.at;
++		return 0;
++	}
++	case KVM_DET_ITRACE_READ: {
++		struct kvm_det_log req;
++		u64 n;
++
++		if (!vmx->det.itrace)
++			return -EINVAL;
++		if (copy_from_user(&req, argp, sizeof(req)))
++			return -EFAULT;
++		n = min_t(u64, req.cap, vmx->det.itrace_len);
++		if (copy_to_user(u64_to_user_ptr(req.buf), vmx->det.itrace, n * 2 * sizeof(u64)))
++			return -EFAULT;
++		req.len = n;
++		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
++	}
 +	case KVM_DET_SET_XINUSE: {
 +		u64 xinuse;
 +
@@ -512,7 +580,7 @@ index 84420bf..a589438 100644
  }
  
  static int handle_invpcid(struct kvm_vcpu *vcpu)
-@@ -6109,6 +6533,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6109,6 +6601,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
@@ -520,7 +588,7 @@ index 84420bf..a589438 100644
  	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
-@@ -6620,6 +7045,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+@@ -6620,6 +7113,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
  
@@ -530,7 +598,7 @@ index 84420bf..a589438 100644
  	/*
  	 * Exit to user space when bus lock detected to inform that there is
  	 * a bus lock in guest.
-@@ -7273,6 +7701,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+@@ -7273,6 +7769,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
  		return handle_fastpath_preemption_timer(vcpu, force_immediate_exit);
  	case EXIT_REASON_HLT:
  		return handle_fastpath_hlt(vcpu);
@@ -539,7 +607,7 @@ index 84420bf..a589438 100644
  	default:
  		return EXIT_FASTPATH_NONE;
  	}
-@@ -7416,6 +7846,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7416,6 +7914,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  		vmx_set_interrupt_shadow(vcpu, 0);
  
  	kvm_load_guest_xsave_state(vcpu);
@@ -548,7 +616,7 @@ index 84420bf..a589438 100644
  
  	pt_guest_enter(vmx);
  
-@@ -7432,6 +7864,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7432,6 +7932,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  
  	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
  	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
@@ -557,7 +625,7 @@ index 84420bf..a589438 100644
  
  	/* All fields are clean at this point */
  	if (kvm_is_using_evmcs()) {
-@@ -7503,6 +7937,10 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -7503,6 +8005,11 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
  	nested_vmx_free_vcpu(vcpu);
  	free_loaded_vmcs(vmx->loaded_vmcs);
  	free_page((unsigned long)vmx->ve_info);
@@ -565,14 +633,15 @@ index 84420bf..a589438 100644
 +		perf_event_release_kernel(vmx->det.counter);
 +	kfree(vmx->det.xbuf);
 +	kvfree(vmx->det.log);
++	kvfree(vmx->det.itrace);
  }
  
  int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
-index a7e2de5..3103028 100644
+index a7e2de5..9215563 100644
 --- a/arch/x86/kvm/vmx/vmx.h
 +++ b/arch/x86/kvm/vmx/vmx.h
-@@ -363,6 +363,40 @@ struct vcpu_vmx {
+@@ -363,6 +363,49 @@ struct vcpu_vmx {
  
  	/* ve_info must be page aligned. */
  	struct vmx_ve_information *ve_info;
@@ -609,6 +678,15 @@ index a7e2de5..3103028 100644
 +		u64 *log;		/* debugging: (branches, rip) at each RDTSC exit */
 +		u32 log_len;
 +		u32 log_cap;		/* entries (pairs) */
++		/*
++		 * Debugging: (branches, rip) at each instruction, single-stepped, from the RDTSC exit
++		 * numbered itrace_at to the next RDTSC exit (where two runs part, which instruction).
++		 */
++		u64 *itrace;
++		u64 itrace_at;
++		u32 itrace_len;
++		u32 itrace_cap;
++		bool itracing;
 +	} det;
  };
  
@@ -626,10 +704,10 @@ index 5e4ce13..2732759 100644
  int vmx_skip_emulated_instruction(struct kvm_vcpu *vcpu);
  void vmx_update_emulated_instruction(struct kvm_vcpu *vcpu);
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 99549df..cdb6622 100644
+index 99549df..9ab5bc3 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
-@@ -5708,6 +5708,18 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+@@ -5708,6 +5708,20 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
  		r = kvm_vcpu_ioctl_x86_set_xcrs(vcpu, u.xcrs);
  		break;
  	}
@@ -641,6 +719,8 @@ index 99549df..cdb6622 100644
 +	case KVM_DET_SET_XINUSE:
 +	case KVM_DET_LOG_ENABLE:
 +	case KVM_DET_LOG_READ:
++	case KVM_DET_ITRACE_ENABLE:
++	case KVM_DET_ITRACE_READ:
 +		r = -ENOTTY;
 +		if (kvm_x86_ops.det_ioctl)
 +			r = kvm_x86_call(det_ioctl)(vcpu, ioctl, argp);
@@ -648,7 +728,7 @@ index 99549df..cdb6622 100644
  	case KVM_SET_TSC_KHZ: {
  		u32 user_tsc_khz;
  
-@@ -10944,10 +10956,14 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
+@@ -10944,10 +10958,14 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
  	 */
  	++vcpu->stat.halt_exits;
  	if (lapic_in_kernel(vcpu)) {
@@ -666,7 +746,7 @@ index 99549df..cdb6622 100644
  	} else {
  		vcpu->run->exit_reason = reason;
 diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
-index 9222f5e..d0eb044 100644
+index 9222f5e..ac3e612 100644
 --- a/include/uapi/linux/kvm.h
 +++ b/include/uapi/linux/kvm.h
 @@ -183,6 +183,8 @@ struct kvm_xen_exit {
@@ -678,7 +758,7 @@ index 9222f5e..d0eb044 100644
  
  /* For KVM_EXIT_INTERNAL_ERROR */
  /* Emulate instruction failed. */
-@@ -1575,6 +1577,58 @@ struct kvm_create_guest_memfd {
+@@ -1575,6 +1577,68 @@ struct kvm_create_guest_memfd {
  
  #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
  
@@ -733,6 +813,16 @@ index 9222f5e..d0eb044 100644
 +	__u64 len;	/* out: entries copied */
 +};
 +#define KVM_DET_LOG_READ	_IOWR(KVMIO, 0xf7, struct kvm_det_log)
++/*
++ * Debugging: single-step and log (branch count, RIP) at each instruction from the RDTSC exit
++ * numbered `at` (the first is 1) to the next RDTSC exit, up to cap entries; cap 0 frees.
++ */
++struct kvm_det_itrace {
++	__u64 at;
++	__u64 cap;
++};
++#define KVM_DET_ITRACE_ENABLE	_IOW(KVMIO, 0xf8, struct kvm_det_itrace)
++#define KVM_DET_ITRACE_READ	_IOWR(KVMIO, 0xf9, struct kvm_det_log)
 +
  struct kvm_pre_fault_memory {
  	__u64 gpa;

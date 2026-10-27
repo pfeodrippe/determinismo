@@ -115,6 +115,8 @@ stats: Stats,
 /// first divergence of two runs.
 trace_fd: ?linux.fd_t,
 rdtsc_log_fd: ?linux.fd_t,
+itrace_fd: ?linux.fd_t,
+itrace_at: u64,
 /// Exploration hooks, attached by the caller between init and run (null when not exploring):
 /// the plugin that may override decisions, the tape recording what it overrode, and a tape's
 /// overrides when replaying one.
@@ -150,6 +152,11 @@ pub const Options = struct {
     trace_fd: ?linux.fd_t = null,
     /// Debugging: where the (branch count, RIP) at each RDTSC exit goes when the VM ends.
     rdtsc_log_fd: ?linux.fd_t = null,
+    /// Debugging: every instruction's (branch count, RIP) from the RDTSC exit numbered
+    /// `itrace_at` to the next, single-stepped (where two runs part, which branch went another
+    /// way), written here when the VM ends.
+    itrace_fd: ?linux.fd_t = null,
+    itrace_at: u64 = 0,
     stop_at_setup_complete: bool = false,
     /// Stop at this virtual time, and optionally run a command in the guest there.
     moment_vtime_ns: ?u64 = null,
@@ -374,6 +381,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .stats = .{},
         .trace_fd = options.trace_fd,
         .rdtsc_log_fd = options.rdtsc_log_fd,
+        .itrace_fd = options.itrace_fd,
+        .itrace_at = options.itrace_at,
         .strategy = null,
         .tape_fd = null,
         .overrides = null,
@@ -1218,10 +1227,16 @@ fn trace(vm: *VM, comptime kind: []const u8, value: u64) !void {
 const rdtsc_log_cap = 1 << 22;
 
 fn rdtsc_log_enable(vm: *VM) !void {
+    if (vm.itrace_fd != null and vm.itrace_at > 0) {
+        var window: kvm.DetItrace = .{ .at = vm.itrace_at, .cap = itrace_cap };
+        _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ITRACE_ENABLE, @intFromPtr(&window));
+    }
     if (vm.rdtsc_log_fd == null) return;
     var cap: u64 = rdtsc_log_cap;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_ENABLE, @intFromPtr(&cap));
 }
+
+const itrace_cap = 1 << 22;
 
 fn rdtsc_log_write(vm: *VM) void {
     const fd = vm.rdtsc_log_fd orelse return;
@@ -1231,6 +1246,11 @@ fn rdtsc_log_write(vm: *VM) void {
     _ = kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_READ, @intFromPtr(&request)) catch return;
     const bytes = std.mem.sliceAsBytes(pairs[0 .. 2 * request.len]);
     _ = linux.write(fd, bytes.ptr, bytes.len);
+    const itrace = vm.itrace_fd orelse return;
+    var traced: kvm.DetLog = .{ .buf = @intFromPtr(pairs.ptr), .cap = itrace_cap, .len = 0 };
+    _ = kvm.ioctl(vm.vcpu_fd, kvm.DET_ITRACE_READ, @intFromPtr(&traced)) catch return;
+    const traced_bytes = std.mem.sliceAsBytes(pairs[0 .. 2 * traced.len]);
+    _ = linux.write(itrace, traced_bytes.ptr, traced_bytes.len);
 }
 
 fn irq_pulse(vm: *VM, irq: u32) !void {

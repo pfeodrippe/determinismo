@@ -28,6 +28,7 @@ const cpus = @import("cpus.zig");
 const checks = @import("checks.zig");
 const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
+const verify = @import("verify.zig");
 const changed = @import("changed.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
@@ -43,6 +44,10 @@ const usage =
     \\                            failing property's first failing timeline is saved to disk as
     \\                            soon as it is found) <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
+    \\       determinismo verify  <explore options> --record <run.jsonl> --tape-dir <dir>
+    \\                            [--sample <n>] [--jobs <n>]   (a sample of a run's timelines
+    \\                            replayed from their tapes, beside whatever else runs: each must
+    \\                            replay to its recorded history)
     \\       determinismo mutate  <explore options> --mutants <mutants.jsonl> [--out <dir>]
     \\                            (each mutant a patch to a node's build: caught, never ran, or
     \\                            unnoticed)
@@ -340,6 +345,8 @@ fn command_tool(
         causality.run(arena, io, argv[0], environ, rest)
     else if (eql(u8, name, "mutate"))
         mutate.run(arena, io, argv[0], rest)
+    else if (eql(u8, name, "verify"))
+        verify.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "extract"))
         extract.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "inject"))
@@ -433,6 +440,16 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
             try open_for_writing(arena, try std.fmt.allocPrint(arena, "{s}.rdtsc", .{path}))
         else
             null,
+        // Debugging (with --trace): DETERMINISMO_ITRACE_AT=<RDTSC exit> traces every
+        // instruction from there to the next RDTSC exit into <trace>.itrace.
+        .itrace_fd = if (arguments.trace_path != null and std.c.getenv("DETERMINISMO_ITRACE_AT") != null)
+            try open_for_writing(arena, try std.fmt.allocPrint(arena, "{s}.itrace", .{arguments.trace_path.?}))
+        else
+            null,
+        .itrace_at = if (std.c.getenv("DETERMINISMO_ITRACE_AT")) |text|
+            std.fmt.parseInt(u64, std.mem.span(text), 10) catch 0
+        else
+            0,
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
         .until = arguments.until,

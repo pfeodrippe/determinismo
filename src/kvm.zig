@@ -56,6 +56,11 @@ pub const DET_LOG_ENABLE = ioctl_number(.write, 0xf6, 8);
 pub const DET_LOG_READ = ioctl_number(.read_write, 0xf7, @sizeOf(DetLog));
 /// Debugging: the branch count and RIP at each RDTSC exit (KVM_DET_LOG_READ).
 pub const DetLog = extern struct { buf: u64, cap: u64, len: u64 };
+/// Debugging: single-stepped, the branch count and RIP at each instruction from the RDTSC exit
+/// numbered `at` to the next (read with KVM_DET_ITRACE_READ, a DetLog).
+pub const DET_ITRACE_ENABLE = ioctl_number(.write, 0xf8, @sizeOf(DetItrace));
+pub const DET_ITRACE_READ = ioctl_number(.read_write, 0xf9, @sizeOf(DetLog));
+pub const DetItrace = extern struct { at: u64, cap: u64 };
 
 pub const Exit = enum(u32) {
     unknown = 0,
