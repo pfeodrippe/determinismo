@@ -36,6 +36,28 @@ its disk; `start.sh` reformats it).
   query over them came back right on 0.16.13; it needs far more data than a timeline makes.
 - Found on the way: the repl panics ("reached unreachable code") on a command over about 8 KB
   (300 accounts in one `create_accounts`), 0.16.13.
+- **Found blind: the reformatted replica can also crash on rejoining** (srv1, seed 2, timeline 3;
+  a third symptom of #2767's procedure, beside the data loss and the version panics that issue
+  lists). tb-2 was wiped and reformatted while tb-0 and tb-1 were in a view change whose primary
+  was replica 2 (tb-0's queue to it full of `start_view_change` and `do_view_change`). The new
+  tb-2 started in view 0, the queued messages arrived, and 0.16 ms after the first one it
+  panicked (`reached unreachable code`, TigerBeetle's message for any failed assertion in a
+  release build). The assertion: `jump_view` (inlined in `on_message`), on a `prepare` or
+  `commit` of a view whose primary is replica 2 itself, asks that view's primary for its
+  `start_view`, and `send_message_to_replica_base` asserts a replica never sends
+  `request_start_view` to itself. Only `recovering_head` is checked for that case (still so on
+  main); the old replica 2 had been that view's primary, which a reformatted file forgets.
+  `tigerbeetle recover` (0.16.43) is the supported way back now.
+
+  How the stack was found: the replay stopped at the panic (140.162 s) and read the main
+  thread's stack from `/proc/<pid>/mem` (ptrace could not stop it there); the frame-pointer
+  chain gave ten return addresses. The release binary is stripped, but its build is
+  reproducible: TigerBeetle 0.16.13 built with its release flags is byte-identical (SHA-256
+  a4ad1a5b...), and the same build also emitting its assembly still is. `symbolize.py` names
+  each return address by finding the instructions before it in that assembly: `debug.panicImpl`
+  ← `send_message_to_replica_base` ← `send_header_to_replica` ← `on_message` (the header's
+  command byte, 13, is `request_start_view`; its destination, the view modulo three) ← the
+  message bus's receive ← `IO.Completion.complete` ← `IO.flush` ← `IO.run_for_ns` ← `main`.
 
 ## Status
 
