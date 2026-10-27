@@ -661,6 +661,29 @@ fn check_until_and_causality(context: *Context) !void {
     expect(context, points >= 4 and latest.probability == 1 and bounded, "causality: {d} " ++
         "moments (4, and refinements inside jumps), certain at the failure ({d:.2}), each " ++
         "within its 90% interval", .{ points, latest.probability });
+    // The bug as an event condition (a verdict) instead of a property: the same analysis.
+    var verdict_argv: std.ArrayList([]const u8) = .empty;
+    try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });
+    try verdict_argv.appendSlice(arena, context.machine);
+    try verdict_argv.appendSlice(arena, &system);
+    try verdict_argv.appendSlice(arena, &.{
+        "--branch", "4", "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
+    });
+    const verdict_result = try std.process.run(arena, context.io, .{ .argv = verdict_argv.items });
+    var verdict_points: u32 = 0;
+    var verdict_latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
+    var verdict_lines = std.mem.tokenizeScalar(u8, verdict_result.stdout, '\n');
+    while (verdict_lines.next()) |line| {
+        const point = std.json.parseFromSliceLeaky(Point, arena, line, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        verdict_points += 1;
+        if (point.vtime_ms >= verdict_latest.vtime_ms) verdict_latest = point;
+    }
+    expect(context, verdict_points == 5 and verdict_latest.probability == 1, "causality with a " ++
+        "verdict (an event condition, no property): {d} moments, certain at the failure ({d:.2})", .{
+        verdict_points, verdict_latest.probability,
+    });
     try check_files(context, &system, violation);
     try check_rewind(context, &system, violation);
 }

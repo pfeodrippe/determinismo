@@ -23,7 +23,7 @@
 //!   GET  /runs/<id>/output   its output, as text
 //!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec?} -> its output
 //!   POST /runs/<id>/causality {branch, property, points?, futures?, refine?, moments_max?,
-//!                            jump_min?, gap_min_ms?, planner?} -> {id} (in the background:
+//!                            jump_min?, gap_min_ms?, planner?, verdict?} -> {id} (in the background:
 //!                            causality.zig; its snapshots kept in the run's snapshots/)
 //!   GET  /runs/<id>/causality  every analysis: [{id, done, of: {branch, property, failure_ms,
 //!                            snapshot_ms, futures, planner}, points: [...]}]
@@ -961,7 +961,10 @@ fn run_extract(server: *Server, run: *const Run, body: []const u8, out: *std.Io.
 /// POST /runs/<id>/causality: causality.zig's parameters (its defaults when left out).
 const CausalityRequest = struct {
     branch: u32,
-    property: []const u8,
+    /// What the analysis is of (its label); the bug, unless `verdict` says otherwise.
+    property: []const u8 = "",
+    /// An event condition that is the bug (query.zig's language); null: the property failing.
+    verdict: ?[]const u8 = null,
     points: u32 = 8,
     futures: u32 = 16,
     refine: u32 = 6,
@@ -1086,6 +1089,7 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
+    if (asked.verdict) |verdict| try argv.appendSlice(server.arena, &.{ "--verdict", verdict });
     return argv.items;
 }
 

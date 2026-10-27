@@ -99,6 +99,7 @@ const usage =
     \\                            [--futures <m>] [--refine <rounds>] [--moments-max <n>]
     \\                            [--jump-min <0..1>] [--gap-min-ms <ms>] [--tape <tape>]
     \\                            [--planner <cmd> | tcp://host:port] [--run-url <url>]
+    \\                            [--verdict '<condition>']   (the bug, instead of the property)
     \\                            [--snapshots <dir>] [--json]   (see causality.zig)
     \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --to <local file>

@@ -754,13 +754,14 @@ async function causalityRefresh() {
 // The analysis's parameters (causality.zig), kept per browser: the planner (built in, a plugin's
 // command, tcp://host:port as the Clojure host's, or @name uploaded), the moments of its first
 // round, futures per moment, rounds after it, and the jump that is narrowed down.
-let causalityOptions = { planner: "", points: 8, futures: 16, refine: 6, jump_min: 0.2 };
+let causalityOptions = { planner: "", verdict: "", points: 8, futures: 16, refine: 6, jump_min: 0.2 };
 try { Object.assign(causalityOptions, JSON.parse(localStorage.getItem("causalityOptions") || "{}")); } catch { /* Defaults. */ }
 function causalityOptionsHtml() {
   const field = (name, label, width, tip, attributes = "") => `<label data-tip="${escape(tip)}">${label}
     <input data-option="${name}" value="${escape(String(causalityOptions[name]))}" style="width:${width}" ${attributes}></label>`;
   return `<div class="causality-options muted">Causality:
     ${field("planner", "planner", "190px", "Which moments to analyze: empty for the built-in one (evenly, then halfway inside each jump); a plugin: tcp://127.0.0.1:9102 (the Clojure host's planners: faults, bisect, dense), @name (uploaded), or a command", 'placeholder="built-in"')}
+    ${field("verdict", "verdict", "200px", "What counts as the bug in a future: empty for this property failing, or any event condition (as in Search), e.g. event=fault details.kind=partition", 'placeholder="the property failing"')}
     ${field("points", "moments", "40px", "Moments in the first round, evenly to the failure (and one just after the setup snapshot)", 'type="number" min="1" max="64"')}
     ${field("futures", "futures", "40px", "Futures forked from each moment: more, a narrower interval", 'type="number" min="1" max="256"')}
     ${field("refine", "rounds", "36px", "Rounds after the first, at most: the planner narrows the jumps", 'type="number" min="0" max="20"')}
@@ -774,6 +775,7 @@ async function causalityRun(property, branch) {
   const body = { branch, property, points: Number(options.points), futures: Number(options.futures),
     refine: Number(options.refine), jump_min: Number(options.jump_min) };
   if (String(options.planner).trim()) body.planner = String(options.planner).trim();
+  if (String(options.verdict || "").trim()) body.verdict = String(options.verdict).trim();
   try {
     await apiJson(`/runs/${run}/causality`, body);
   } catch (error) {

@@ -35,6 +35,11 @@
 //!   <- {"moments":[{"vtime_ms":t,"futures":m}],"note":"why these"}   (none: done)
 //! `run_url` (`--run-url`, serve passes it) is the run's HTTP API: a planner may query its events
 //! (the faults the timeline went through, its logs) to decide.
+//!
+//! What counts as the bug in a future is the verdict: the property failing by default, or any
+//! event condition (`--verdict '<condition>'`, query.zig's language: a fault followed by a log
+//! line, another property, ...): the timeline's replay stops at its first match (the failure's
+//! moment), and so does each future, which then counts.
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -59,6 +64,8 @@ const Request = struct {
     gap_min_ms: u64 = 20,
     /// A planner plugin's command, or `tcp://host:port`; null: the built-in one.
     planner: ?[]const u8 = null,
+    /// An event condition that is the bug (`--verdict`); null: the property failing.
+    verdict: ?[]const u8 = null,
     /// The run's HTTP API (serve's), told to planners.
     run_url: ?[]const u8 = null,
     /// Only save the first round's moments to disk (`--save-only`): serve snapshots a failure
@@ -115,6 +122,7 @@ pub fn run(
             .snapshot_ms = failure.snapshot_ms,
             .futures = request.futures,
             .planner = request.planner orelse "built-in",
+            .verdict = request.verdict,
         } }, .{})});
     } else {
         try out.print("'{s}' in branch {d}: first failure at {d}ms (snapshot at {d}ms); " ++
@@ -341,12 +349,17 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
                 "--branches",      try std.fmt.allocPrint(scratch, "{d}", .{moment.futures}),
                 "--record",        record,
             });
+            // A verdict: each future stops at its first match, which counts.
+            if (request.verdict) |verdict| try argv.appendSlice(scratch, &.{ "--until", verdict });
             _ = try std.process.run(scratch, io, .{ .argv = argv.items });
             const source = try std.Io.Dir.cwd().readFileAlloc(io, record, scratch, .limited(1 << 24));
             const point: Point = .{
                 .vtime_ms = moment.vtime_ms,
                 .futures = moment.futures,
-                .failing = try property_failing(scratch, source, request.property),
+                .failing = if (request.verdict != null)
+                    @intCast(std.mem.count(u8, source, "\"outcome\":\"moment_reached\""))
+                else
+                    try property_failing(scratch, source, request.property),
             };
             owner.out_mutex.lockUncancelable(io);
             defer owner.out_mutex.unlock(io);
@@ -518,7 +531,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             eql(u8, flag, "--refine") or eql(u8, flag, "--snapshots") or
             eql(u8, flag, "--planner") or eql(u8, flag, "--run-url") or
             eql(u8, flag, "--jump-min") or eql(u8, flag, "--gap-min-ms") or
-            eql(u8, flag, "--moments-max");
+            eql(u8, flag, "--moments-max") or eql(u8, flag, "--verdict");
         if (!ours) {
             try rest.append(arena, flag);
             continue;
@@ -540,6 +553,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             request.snapshots = value;
         } else if (eql(u8, flag, "--planner")) {
             request.planner = value;
+        } else if (eql(u8, flag, "--verdict")) {
+            request.verdict = value;
         } else if (eql(u8, flag, "--run-url")) {
             request.run_url = value;
         } else if (eql(u8, flag, "--jump-min")) {
@@ -553,7 +568,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
         }
     }
     request.branch = branch orelse return error.Usage;
-    if (request.property.len == 0) return error.Usage;
+    if (request.property.len == 0 and request.verdict == null) return error.Usage;
     if (request.points == 0 or request.points > points_max) return error.Usage;
     if (request.futures == 0 or request.futures > futures_max) return error.Usage;
     if (request.moments_max == 0 or request.moments_max > moments_limit) return error.Usage;
@@ -571,15 +586,7 @@ fn failure_find(
     self: []const u8,
     request: *const Request,
 ) !?Failure {
-    const message = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(request.property, .{})});
-    // A failing evaluation (declarations, `hit` false, are not): an always kind false, an
-    // unreachable reached.
-    const until = try std.fmt.allocPrint(arena, "assert.message={s} assert.condition=false or " ++
-        "assert.message={s} assert.type=unreachable assert.condition=true or " ++
-        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.condition=false or " ++
-        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.display_type=Unreachable", .{
-        message, message, message, message,
-    });
+    const until = request.verdict orelse try property_condition(arena, request.property);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ self, "explore" });
     try argv.appendSlice(arena, request.rest);
@@ -597,6 +604,18 @@ fn failure_find(
         .snapshot_ms = @trunc(snapshot_s * 1000),
         .failure_ms = @trunc(moment_ns / std.time.ns_per_ms),
     };
+}
+
+/// A failing evaluation of the property (declarations, `hit` false, are not): an always kind
+/// false, an unreachable reached.
+fn property_condition(arena: std.mem.Allocator, property: []const u8) ![]const u8 {
+    const message = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(property, .{})});
+    return std.fmt.allocPrint(arena, "assert.message={s} assert.condition=false or " ++
+        "assert.message={s} assert.type=unreachable assert.condition=true or " ++
+        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.condition=false or " ++
+        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.display_type=Unreachable", .{
+        message, message, message, message,
+    });
 }
 
 /// The tape of the timeline that was running at a moment: a tree's branch starts inside its
