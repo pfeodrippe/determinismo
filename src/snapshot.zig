@@ -100,10 +100,14 @@ fn state_save(snapshot: *Snapshot, vm: *VM, memory_fd: std.os.linux.fd_t) !void 
 
 /// A captured snapshot's memory: a copy of `memory` (this process's copy-on-write view of the
 /// VM's) in a memfd of its own.
-pub fn capture_memory(snapshot: *Snapshot, memory: []align(std.heap.page_size_min) u8) !void {
+pub fn capture_memory(
+    snapshot: *Snapshot,
+    memory: []align(std.heap.page_size_min) u8,
+    backing_fd: std.os.linux.fd_t,
+) !void {
     assert(snapshot.memory_fd == -1);
     assert(memory.len == snapshot.memory_size);
-    snapshot.memory_fd = try memory_copy(memory);
+    snapshot.memory_fd = try memory_copy(memory, backing_fd);
 }
 
 /// Freezes a branch: its memory is a private copy-on-write mapping, so it is first copied into a
@@ -111,7 +115,7 @@ pub fn capture_memory(snapshot: *Snapshot, memory: []align(std.heap.page_size_mi
 /// the guest never touched costs nothing.
 pub fn take_copy(snapshot: *Snapshot, vm: *VM) !void {
     assert(!vm.memory_fd_owned); // A branch: its memory belongs to the parent snapshot.
-    const fd = try memory_copy(vm.memory);
+    const fd = try memory_copy(vm.memory, vm.memory_fd);
     vm.memory_fd = fd;
     vm.memory_fd_owned = true;
     try snapshot.take(vm);
@@ -120,29 +124,97 @@ pub fn take_copy(snapshot: *Snapshot, vm: *VM) !void {
 
 const chunk_pages = 4096;
 
-fn memory_copy(memory: []align(std.heap.page_size_min) u8) !std.os.linux.fd_t {
+/// A copy of `memory` (mapped from the memfd `backing_fd`, shared or copy-on-write) in a memfd
+/// of its own: the pages that may hold data (Candidates), those not all zeros.
+fn memory_copy(memory: []align(std.heap.page_size_min) u8, backing_fd: std.os.linux.fd_t) !std.os.linux.fd_t {
     const linux = std.os.linux;
     const page = std.heap.page_size_min;
     assert(memory.len % page == 0);
     const fd = try memfd(memory.len);
-    var resident: [chunk_pages]u8 = undefined;
-    var offset: u64 = 0;
-    while (offset < memory.len) : (offset += chunk_pages * page) {
-        const size = @min(chunk_pages * page, memory.len - offset);
-        const chunk = memory[offset..][0..size];
-        const residency = linux.mincore(chunk.ptr, size, &resident);
-        if (linux.errno(residency) != .SUCCESS) return error.Mincore;
-        for (0..size / page) |index| {
-            if (resident[index] & 1 == 0) continue;
-            const bytes = chunk[index * page ..][0..page];
-            if (std.mem.allEqual(u8, bytes, 0)) continue; // A fresh memfd reads as zeros.
-            const position: i64 = @intCast(offset + index * page);
-            const written = linux.pwrite(fd, bytes.ptr, page, position);
-            if (linux.errno(written) != .SUCCESS or written != page) return error.Write;
-        }
+    var candidates = try Candidates.init(memory, backing_fd);
+    defer candidates.deinit();
+    for (0..memory.len / page) |index| {
+        if (!candidates.has(index)) continue;
+        const bytes = memory[index * page ..][0..page];
+        if (std.mem.allEqual(u8, bytes, 0)) continue; // A fresh memfd reads as zeros.
+        const position: i64 = @intCast(index * page);
+        const written = linux.pwrite(fd, bytes.ptr, page, position);
+        if (linux.errno(written) != .SUCCESS or written != page) return error.Write;
     }
     return fd;
 }
+
+/// The pages of `memory` (a VM's, or a copy-on-write view of one) that may hold data: those
+/// mapped in this process, resident or swapped out (/proc/self/pagemap), and those the memfd
+/// behind it holds (SEEK_DATA: a swapped-out page of a memfd counts as data). Residency alone
+/// (mincore) missed swapped-out pages, which copies then took for zeros: under the host's memory
+/// pressure, nodes unlike the ones a replay makes. Without pagemap, every page.
+pub const Candidates = struct {
+    bits: []u64,
+
+    const present: u64 = 1 << 63;
+    const swapped: u64 = 1 << 62;
+    const entries_per_read = 4096;
+    const seek_data = 3;
+    const seek_hole = 4;
+
+    pub fn init(memory: []align(page_size) const u8, backing_fd: std.os.linux.fd_t) !Candidates {
+        const linux = std.os.linux;
+        const pages = memory.len / page_size;
+        const bits = try std.heap.page_allocator.alloc(u64, @divCeil(pages, 64));
+        @memset(bits, 0);
+        var candidates: Candidates = .{ .bits = bits };
+        const opened = linux.open("/proc/self/pagemap", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) {
+            @memset(bits, std.math.maxInt(u64));
+            return candidates;
+        }
+        const pagemap: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(pagemap);
+        const first = @intFromPtr(memory.ptr) / page_size;
+        var entries: [entries_per_read]u64 = undefined;
+        var page: usize = 0;
+        while (page < pages) {
+            const count = @min(entries_per_read, pages - page);
+            const bytes = std.mem.sliceAsBytes(entries[0..count]);
+            const read = linux.pread(pagemap, bytes.ptr, bytes.len, @intCast((first + page) * @sizeOf(u64)));
+            if (linux.errno(read) != .SUCCESS or read != bytes.len) {
+                @memset(bits, std.math.maxInt(u64));
+                return candidates;
+            }
+            for (entries[0..count], page..) |entry, index| {
+                if (entry & (present | swapped) != 0) candidates.set(index);
+            }
+            page += count;
+        }
+        if (backing_fd >= 0) {
+            var offset: i64 = 0;
+            while (offset < memory.len) {
+                const data = linux.lseek(backing_fd, offset, seek_data);
+                if (linux.errno(data) != .SUCCESS) break; // ENXIO: no data past it.
+                const hole = linux.lseek(backing_fd, @intCast(data), seek_hole);
+                if (linux.errno(hole) != .SUCCESS) break;
+                const end = @min(hole, memory.len);
+                for (data / page_size..@divCeil(end, page_size)) |index| candidates.set(index);
+                offset = @intCast(hole);
+            }
+        }
+        return candidates;
+    }
+
+    pub fn deinit(candidates: *Candidates) void {
+        std.heap.page_allocator.free(candidates.bits);
+        candidates.* = undefined;
+    }
+
+    fn set(candidates: *Candidates, index: usize) void {
+        candidates.bits[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+    }
+
+    pub fn has(candidates: *const Candidates, index: usize) bool {
+        return candidates.bits[index / 64] & (@as(u64, 1) << @intCast(index % 64)) != 0;
+    }
+};
 
 fn memfd(size: u64) !std.os.linux.fd_t {
     const linux = std.os.linux;
@@ -221,6 +293,7 @@ fn page_hash(bytes: *const [page_size]u8) u64 {
 pub fn disk_save(
     snapshot: *const Snapshot,
     memory: []align(page_size) const u8,
+    backing_fd: std.os.linux.fd_t,
     hashes: []u64,
     directory: []const u8,
     name: []const u8,
@@ -242,20 +315,19 @@ pub fn disk_save(
     const bitmap = try std.heap.page_allocator.alloc(u64, @divCeil(hashes.len, 64));
     defer std.heap.page_allocator.free(bitmap);
     @memset(bitmap, 0);
-    var resident: [chunk_pages]u8 = undefined;
+    var candidates = try Candidates.init(memory, backing_fd);
+    defer candidates.deinit();
     var offset: u64 = 0;
     while (offset < memory.len) : (offset += chunk_pages * page_size) {
         const size = @min(chunk_pages * page_size, memory.len - offset);
         const chunk = memory[offset..][0..size];
-        const residency = linux.mincore(@constCast(chunk.ptr), size, &resident);
-        if (linux.errno(residency) != .SUCCESS) return error.Mincore;
         // Changed pages, written in runs.
         var run_start: ?usize = null;
         for (0..size / page_size + 1) |index| {
             const changed = index < size / page_size and changed: {
                 const at = offset / page_size + index;
                 const bytes = chunk[index * page_size ..][0..page_size];
-                const hash = if (resident[index] & 1 == 0) 0 else page_hash(bytes);
+                const hash = if (!candidates.has(at)) 0 else page_hash(bytes);
                 if (hash == hashes[at]) break :changed false;
                 hashes[at] = hash;
                 bitmap[at / 64] |= @as(u64, 1) << @intCast(at % 64);
@@ -303,20 +375,13 @@ pub fn disk_save(
 }
 
 /// The hashes of `memory`'s pages, into `hashes` (what disk_save compares with).
-pub fn pages_hash(memory: []align(page_size) const u8, hashes: []u64) !void {
-    const linux = std.os.linux;
+pub fn pages_hash(memory: []align(page_size) const u8, backing_fd: std.os.linux.fd_t, hashes: []u64) !void {
     assert(hashes.len == memory.len / page_size);
-    var resident: [chunk_pages]u8 = undefined;
-    var offset: u64 = 0;
-    while (offset < memory.len) : (offset += chunk_pages * page_size) {
-        const size = @min(chunk_pages * page_size, memory.len - offset);
-        const chunk = memory[offset..][0..size];
-        const residency = linux.mincore(@constCast(chunk.ptr), size, &resident);
-        if (linux.errno(residency) != .SUCCESS) return error.Mincore;
-        for (0..size / page_size) |index| {
-            const bytes = chunk[index * page_size ..][0..page_size];
-            hashes[offset / page_size + index] = if (resident[index] & 1 == 0) 0 else page_hash(bytes);
-        }
+    var candidates = try Candidates.init(memory, backing_fd);
+    defer candidates.deinit();
+    for (hashes, 0..) |*hash, index| {
+        const bytes = memory[index * page_size ..][0..page_size];
+        hash.* = if (candidates.has(index)) page_hash(bytes) else 0;
     }
 }
 

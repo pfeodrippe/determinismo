@@ -76,6 +76,15 @@ event hashing, the guest module.
   runner at 24.086 s, a durable crash of raft-node-1 at 24.223 s, the bug decided between them).
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
+- Holders: about 1 in 70 nodes from an in-run snapshot differs from the node a replay makes, by
+  one byte of guest memory (a counter, 2 in the held node and 3 in the replayed one: one device
+  or VMM action falls on the other side of the hold point); registers and devices equal. Seen
+  with builds from before 2026-10-27 too; the tree e2e's verification fails on it now and then.
+  A branch from such a node is not exactly what its tape's replay makes. Next: find which write
+  (the page's owner at that moment) and order it the same in both.
+- Snapshot copies took residency (mincore) for content: a page the host swapped out was copied
+  as zeros. Copies now take every page mapped in the process (present or swapped, pagemap) or held
+  by the memfd behind it (SEEK_DATA); srv1 and srv2 both swapped earlier (millions of pages).
 - Tailscale: your Mac's install (QUESTIONS.md 4).
 
 ## Now

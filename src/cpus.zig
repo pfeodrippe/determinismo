@@ -143,6 +143,17 @@ pub const Pool = struct {
                 _ = linux.nanosleep(&pause, null);
                 if (pool.priority_waiting()) continue;
             }
+            // The host's memory too: no VM starts while less than the reserve is available
+            // (runs share the host's memory as its CPUs, and waiting workers and holders keep
+            // theirs: srv2 once had 0 GB available), until timelines end or holders go.
+            const available = memory_available(); // 0: unknown, never a reason to wait.
+            if (available != 0 and available < memory_reserve_bytes) {
+                if (pool.priority) {
+                    const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
+                    _ = linux.nanosleep(&pause, null);
+                }
+                continue;
+            }
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
@@ -172,6 +183,24 @@ pub const Pool = struct {
 };
 
 pub const Held = struct { slot: u32 };
+
+/// Memory kept free on the host: no VM starts, and no holder is made, below it.
+pub const memory_reserve_bytes = 8 << 30;
+
+/// The host's available memory (MemAvailable), or 0 if unknown.
+pub fn memory_available() u64 {
+    const fd = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return 0;
+    const key = "MemAvailable:";
+    const at = std.mem.indexOf(u8, buffer[0..size], key) orelse return 0;
+    var words = std.mem.tokenizeScalar(u8, buffer[at + key.len .. size], ' ');
+    const kib = std.fmt.parseInt(u64, words.next() orelse return 0, 10) catch return 0;
+    return kib * 1024;
+}
 
 /// Whether the CPU is a core's second hyperthread (not the first of its siblings).
 fn sibling(cpu: u16) bool {

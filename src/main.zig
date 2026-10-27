@@ -2449,17 +2449,37 @@ fn segment_unusable(base: u64) kvm.Segment {
 fn memory_equal(a: linux.fd_t, b: linux.fd_t, size: u64) bool {
     var buffers: [2][1 << 20]u8 = undefined;
     var offset: u64 = 0;
+    var pages_differing: u64 = 0;
     while (offset < size) : (offset += buffers[0].len) {
         const length = @min(buffers[0].len, size - offset);
         const read_a = linux.pread(a, &buffers[0], length, @intCast(offset));
         const read_b = linux.pread(b, &buffers[1], length, @intCast(offset));
         if (read_a != length or read_b != length) return false;
-        if (!std.mem.eql(u8, buffers[0][0..length], buffers[1][0..length])) {
-            std.debug.print("[determinismo] verify: memory differs from {d}\n", .{offset});
-            return false;
+        if (std.mem.eql(u8, buffers[0][0..length], buffers[1][0..length])) continue;
+        // Each page that differs (the first few told): a page of zeros on one side is one a copy
+        // missed; contents on both, memory that changed.
+        const page = std.heap.page_size_min;
+        var at: usize = 0;
+        while (at < length) : (at += page) {
+            const x = buffers[0][at..][0..page];
+            const y = buffers[1][at..][0..page];
+            if (std.mem.eql(u8, x, y)) continue;
+            pages_differing += 1;
+            if (pages_differing > 8) continue;
+            const first = std.mem.indexOfDiff(u8, x, y).?;
+            std.debug.print("[determinismo] verify: page at {d} differs from byte {d}: {x} against " ++
+                "{x}{s}{s}\n", .{
+                offset + at,
+                first,
+                x[first..@min(page, first + 16)],
+                y[first..@min(page, first + 16)],
+                if (std.mem.allEqual(u8, x, 0)) " (held: all zeros)" else "",
+                if (std.mem.allEqual(u8, y, 0)) " (replayed: all zeros)" else "",
+            });
         }
     }
-    return true;
+    if (pages_differing > 0) std.debug.print("[determinismo] verify: {d} pages differ\n", .{pages_differing});
+    return pages_differing == 0;
 }
 
 /// Releases a tree node's memory (never the setup snapshot's), once its branches ran.

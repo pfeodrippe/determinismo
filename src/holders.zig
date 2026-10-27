@@ -25,7 +25,7 @@ pub const per_timeline_max = 8;
 const spacing_divisor = 64;
 const spacing_ns_min = 10 * std.time.ns_per_ms;
 /// No holder is made with less memory than this available (MemAvailable).
-const memory_reserve_bytes = 8 << 30;
+const memory_reserve_bytes = cpus.memory_reserve_bytes;
 
 /// What the explorer asks a holder: the moment of the node to make.
 const Request = extern struct { vtime_ns: u64 };
@@ -209,7 +209,11 @@ pub const Owner = struct {
         owner.armed_new = false;
         owner.last_ns = moment;
         try owner.arm(vm, moment + owner.period(), false); // The next, unless one is new first.
-        if (memory_available() < memory_reserve_bytes) return;
+        if (cpus.memory_available() < memory_reserve_bytes) return;
+        // Not once host checks' inputs arrived (the timeline's end): their bytes are in this
+        // worker's buffer, and a node goes to any worker with its state, not that buffer's
+        // content. A replay makes such a node right.
+        if (vm.events.check_used > 0) return;
         try owner.snapshot.capture(vm);
         owner.point = point;
         const id = owner.made;
@@ -287,7 +291,7 @@ pub const Owner = struct {
         var request: Request = undefined;
         if (!read_exact(socket, std.mem.asBytes(&request))) linux.exit_group(0); // Released.
         if (request.vtime_ns < moment_ns) linux.exit_group(1);
-        owner.snapshot.capture_memory(vm.memory) catch linux.exit_group(1);
+        owner.snapshot.capture_memory(vm.memory, vm.memory_fd) catch linux.exit_group(1);
         const node = if (request.vtime_ns == moment_ns)
             owner.snapshot
         else
@@ -355,20 +359,6 @@ fn oom_first() void {
 }
 
 /// MemAvailable from /proc/meminfo, in bytes (0 when unreadable: no holders then).
-fn memory_available() u64 {
-    const fd = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) != .SUCCESS) return 0;
-    defer _ = linux.close(@intCast(fd));
-    var buffer: [4096]u8 = undefined;
-    const size = linux.read(@intCast(fd), &buffer, buffer.len);
-    if (linux.errno(size) != .SUCCESS) return 0;
-    const key = "MemAvailable:";
-    const at = std.mem.indexOf(u8, buffer[0..size], key) orelse return 0;
-    var words = std.mem.tokenizeScalar(u8, buffer[at + key.len .. size], ' ');
-    const kib = std.fmt.parseInt(u64, words.next() orelse return 0, 10) catch return 0;
-    return kib * 1024;
-}
-
 fn read_exact(fd: linux.fd_t, target: []u8) bool {
     var done: u64 = 0;
     while (done < target.len) {

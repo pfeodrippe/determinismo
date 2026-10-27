@@ -60,9 +60,9 @@ pub const Saver = struct {
         defer _ = linux.munmap(@ptrFromInt(address), size);
         const memory = @as([*]align(std.heap.page_size_min) const u8, @ptrFromInt(address))[0..size];
         if (Snapshot.disk_exists(directory, setup_name)) {
-            try Snapshot.pages_hash(memory, saver.hashes.hashes);
+            try Snapshot.pages_hash(memory, setup.memory_fd, saver.hashes.hashes);
         } else {
-            try Snapshot.disk_save(setup, memory, saver.hashes.hashes, directory, setup_name, null, false);
+            try Snapshot.disk_save(setup, memory, setup.memory_fd, saver.hashes.hashes, directory, setup_name, null, false);
         }
         saver.base_set(setup_name);
         return saver;
@@ -107,9 +107,9 @@ pub const Saver = struct {
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
             // Saved before (another analysis): its pages are this memory's, for the next.
             const result = if (Snapshot.disk_exists(saver.directory, name))
-                Snapshot.pages_hash(memory, saver.hashes.hashes)
+                Snapshot.pages_hash(memory, vm.memory_fd, saver.hashes.hashes)
             else
-                Snapshot.disk_save(saver.capture, memory, saver.hashes.hashes, saver.directory, name, base, point.idle);
+                Snapshot.disk_save(saver.capture, memory, vm.memory_fd, saver.hashes.hashes, saver.directory, name, base, point.idle);
             result catch |err| {
                 std.debug.print("[determinismo] saving snapshot {s} failed: {s}\n", .{ name, @errorName(err) });
                 linux.exit_group(1);
