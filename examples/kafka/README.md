@@ -57,13 +57,27 @@ restarts, power losses and graceful stops of the brokers. The client node gets n
 - Readiness is the controller's port (9093): the broker's opens only once the quorum formed,
   which needs the nodes started after a node.
 - First timelines (srv1): producers could not start under the first faults (transaction state
-  being created), and **kafka-2 could not start again after power losses**: `No FeatureLevelRecord
-  for metadata.version was found in the bootstrap metadata from the binary bootstrap metadata
-  file: /data/kafka/bootstrap.checkpoint`, at every start. Kafka 3.8.0 writes that file at
-  `kafka-storage format` (BatchFileWriter: no `force()`, then a rename, no fsync either) and reads
-  it at every start: a power loss before the page cache reached the disk leaves it empty, the
-  rename kept. Close to KAFKA-16541 (a checkpoint corrupted by a crash, fixed in 3.8.0) and
-  KAFKA-4127 (directory fsyncs); trunk no longer has the file (KIP-1170). To confirm from a
-  replay of the timeline, once replays of Kafka's timelines are exact (they were not: two VMs on
-  sibling hyperthreads, and preemption while single-stepping, perturbed the guest's clock; both
-  fixed, see docs/PLAN.md).
+  being created), and kafka-2 could not start again after power losses.
+
+### Found: a power loss soon after `kafka-storage format` bricks the node
+
+The first hour on srv2 (`--seed 11`, exact replays) failed "nodes do not exit unexpectedly" in
+40 of its first 64 timelines, each a broker that could not start again:
+`No FeatureLevelRecord for metadata.version was found in the bootstrap metadata from the binary
+bootstrap metadata file: /data/kafka/bootstrap.checkpoint`. Timeline 63 replayed to the same
+events, and at moments of it:
+- kafka-1 was formatted at 2 s (`start.sh`, its first start), stopped gracefully at 18.96 s,
+  then lost power at sync points (24.75 s, 27.87 s, 28.49 s) and crashed at 30.31 s;
+- at 33.0 s, restarted, its `/data/kafka/bootstrap.checkpoint` is there, made at 00:00:02, and
+  empty (size 0); Kafka exits on it at 33.35 s, and at every start after.
+
+Kafka 3.8.0 writes the file at `kafka-storage format` (BootstrapDirectory.writeBinaryFile:
+BatchFileWriter into a temporary file, no force(), then an atomic rename, no directory fsync)
+and reads it at every start, even once the cluster's metadata log has its features. The rename
+is journaled; the data waits for writeback (about 30 s on Linux), so a power loss in that
+window leaves an empty file and a node that never starts again. `meta.properties`, written
+beside it, is fsynced.
+
+Not reported upstream as such (searched: KAFKA-19192 / KAFKA-19191, servers reading old
+bootstrap files once bootstrapped, resolved; KAFKA-16541, a checkpoint corrupted by a crash,
+another file; KAFKA-4127, directory fsyncs). Trunk no longer has the file (KIP-1170).
