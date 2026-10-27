@@ -178,11 +178,24 @@ pub fn main(init: std.process.Init) !void {
     disk_baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
     const names = try fault_names(arena, faults[0..count]);
+    const pacing = scenario.pacing;
+    // With bursts: when the stretch of faults under way ends (CLOCK_MONOTONIC).
+    var active_until_ns: u64 = if (pacing.active_ms_max > 0) monotonic_ns() + stretch_ns("fault.active_ms", pacing.active_ms_max) else std.math.maxInt(u64);
     var injections: u32 = 0;
     while (injections < injections_max) : (injections += 1) {
         const wait_ns = sdk.random_below_named("fault.wait_ns", delay_ns_max - delay_ns_min);
         sleep_ns(delay_ns_min + wait_ns);
         if (stopping.load(.acquire)) break;
+        if (monotonic_ns() >= active_until_ns) {
+            // A quiet stretch (healing what is under way), then the next stretch of faults.
+            if (pacing.quiet_ms_max > 0) {
+                quiet_request(stretch_ns("fault.quiet_ms", pacing.quiet_ms_max));
+                const now_ns = monotonic_ns();
+                if (quiet_until_ns > now_ns) sleep_ns(quiet_until_ns - now_ns);
+                if (stopping.load(.acquire)) break;
+            }
+            active_until_ns = @max(quiet_until_ns, monotonic_ns()) + stretch_ns("fault.active_ms", pacing.active_ms_max);
+        }
         // Labeled decisions: a strategy sees which faults it chooses among, by name.
         const applied = draw(&faults[sdk.decide("fault", names)]);
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
@@ -191,6 +204,13 @@ pub fn main(init: std.process.Init) !void {
     node_heal(&system);
     network_stop(&system);
     sdk.event("faults_stop", .{ .injections = injections });
+}
+
+/// A stretch of the pacing, drawn from a tenth of `max_ms` up to it.
+fn stretch_ns(comptime name: []const u8, max_ms: u32) u64 {
+    const floor_ms = max_ms / 10;
+    const drawn_ms = floor_ms + sdk.random_below_named(name, max_ms - floor_ms + 1);
+    return drawn_ms * std.time.ns_per_ms;
 }
 
 /// The stop: every network fault heals (what jammed links hold is delivered first).

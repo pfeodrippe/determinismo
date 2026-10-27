@@ -174,6 +174,19 @@ pub const Scenario = struct {
     /// Whether the fault injector runs during the driver phase.
     faults: bool = true,
     clock_skip: bool = false,
+    /// How the fault injector paces its faults.
+    pacing: Pacing = .{},
+};
+
+/// The fault injector's pace. By default a fault every 10 to 300 ms for the whole driver phase.
+/// With bursts (`active_ms_max` > 0), stretches of faults and quiet stretches alternate, each
+/// drawn up to its maximum (named decisions, "fault.active_ms" and "fault.quiet_ms": a strategy
+/// steers them), a quiet stretch healing what was under way: a system slow to recover (an
+/// election, a catalog loaded) gets windows to make progress in, and faults land on its work
+/// rather than on its recovery alone, as Jepsen's nemeses' intervals (10 s) left.
+pub const Pacing = struct {
+    active_ms_max: u32 = 0,
+    quiet_ms_max: u32 = 0,
 };
 
 pub const Command = struct {

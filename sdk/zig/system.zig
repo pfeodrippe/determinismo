@@ -141,6 +141,7 @@ pub fn System(comptime Nodes: type) type {
             count: u32 = 0,
             faults: bool = true,
             clock_skip: bool = false,
+            pacing: schema.Pacing = .{},
 
             const Entry = struct { command: schema.Command, handler: Handler };
 
@@ -193,7 +194,6 @@ pub fn System(comptime Nodes: type) type {
         pub const Describe = struct {
             profiles: [profiles_max]Profile = undefined,
             count: u32 = 0,
-
 
             pub fn profile(d: *Describe, name: []const u8) !*Profile {
                 if (d.count == profiles_max) return error.TooManyProfiles;
@@ -351,6 +351,7 @@ pub fn System(comptime Nodes: type) type {
                     .commands = commands,
                     .faults = scenario.faults,
                     .clock_skip = scenario.clock_skip,
+                    .pacing = scenario.pacing,
                 };
             }
             // The program's host checks, each with where its records are.
