@@ -84,9 +84,8 @@ event hashing, the guest module.
   determinismo, not natively), two model disagreements, the abort hook bypassed.
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
-- ScyllaDB 4.2.rc3 (examples/scylla): runs; open question, a pending_delete log that reads
-  back as zeros after a power loss (README). Next tool: extents (FIEMAP) of a node's files from
-  the runner at a moment, frozen node, to tell what reached its disk.
+- ScyllaDB 4.2.rc3 (examples/scylla): #7258 rediscovered blind; the zero pending_delete log
+  was determinismo's power loss (discards after the shutdown), fixed in 7c21695.
 - Resume for tree runs (serve's default): record each timeline's summary; on resume, judge the
   recorded generations again from them (no node making), and make nodes, by replay along the
   path, only for timelines still to run.

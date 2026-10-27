@@ -87,14 +87,11 @@ Elle's check in 1 of its first 99 timelines. Timeline 91 replayed to the same hi
 That is #7258 as Jepsen reported it: LWT writes failing with "Not enough replicas available"
 visible to later reads, under partitions and crashes; fixed in 4.1.9 and 4.2.1.
 
-## Open: power losses
+## Power losses (closed: determinismo's)
 
-Under power losses, a node could stay down for good: in timeline 0 of seed 1, n5 lost power
-0.18 s after a 4 s sync stall, while deleting compacted sstables, and its
-`pending_delete/sstables-23-24.log` came back as 36 zero bytes; every start after replays it,
-fails on a TOC name of zeros, and aborts in the failed startup's shutdown
-(``~sharded<gms::feature_service>: Assertion `_instances.empty()'``, a known class of Scylla
-4.x startup aborts). Scylla 4.2 writes that log with fdatasync before renaming it and syncing
-the directory (sstables.cc, Seastar's file sink flush), and determinismo's crash kept the same
-sequence's data in a direct test (8 rounds on a node; the node could not start again after the
-eighth crash, "fork failed", to look into). Not claimed until explained.
+Under power losses a node once stayed down for good, its `pending_delete` log read back as zero
+bytes. That was determinismo's power loss, not Scylla: after the crash's ext4 shutdown the
+guest's kernel ran on, and ext4's commit callback discarded blocks a lost transaction freed,
+punching holes in the disk's committed state (the same corruption Kafka's hunts showed as
+checksum failures). A power loss now cuts the node's disk off first (7c21695): 52 power losses
+over the power-loss profile's first timelines, no zero log, no checksum failure.
