@@ -173,6 +173,27 @@ working tree, not a commit. Its events, all of them, are in the run's database. 
 keeps the files it booted (serve), so that a finding replays after any deploy; meanwhile the
 hunts go on to find it again.
 
+### Found again, and explained by causality analysis: run 93 (srv2, 2026-10-27)
+
+Blind again, in run 93 (the tree explorer with CPU modulation and the durability-point faults,
+no long timelines): `[workload-commit-progress]` (the leadership-transfer deadlock, #696) in
+timeline 11 of the first generation, and `[log-matching]` (the divergence, #695) in timeline
+4862 at 24.496 s. Causality analysis (snapshots of the timeline saved to disk, 16 futures from
+each moment) says when each was decided:
+
+- The deadlock (timeline 734, reported at 134.1 s): 0% just after setup (2.55 s), 100% from
+  4.09 s on; narrowed to 3.830-4.087 s (19% to 100%), where one fault was injected: a degraded
+  link (delay and loss) between raft-node-0 and the runner at 3.879 s. The workload only notices
+  130 seconds later, when its retry budget runs out.
+- The divergence (timeline 4862): under 25% through the faults before it (a partition at
+  24.086 s, a power loss of raft-node-1 at 24.222 s: moments either side of each fault, the
+  `faults` planner, change it within noise), 6% at 24.478 s, then decided in the last 18 ms, with
+  no fault: node-1 was back from its power loss (`recovered log from disk: last-index=25
+  last-term=11`), and at 24.4962 s node-0 entered follower state under node-2
+  (`leader-id=node-2`) while rejecting node-2's vote because node-2's log was older (`our last
+  term is greater ... last-term=11 last-candidate-term=9`). A node following a leader whose log
+  is behind its own: the off-loop heartbeat of #695.
+
 So the window itself is now a fault: `sync_stall` (on by default, ARCHITECTURE.md §9) holds a
 node's fsyncs for a drawn time while its other goroutines run, and `durable_crash` (with
 `+crash`) crashes the node at one. bbolt syncs every transaction (each `SetUint64` of the term
