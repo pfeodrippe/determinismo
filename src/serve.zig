@@ -886,6 +886,20 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     const record = run_file(server, run.id, "record.jsonl") catch "";
     try out.print("{{\"id\":{d},\"state\":\"{s}\"", .{ run.id, state(run) });
     if (run.status) |status| try out.print(",\"status\":{d}", .{status});
+    // When (seconds since the epoch, from its files): asked (its request, written once), last
+    // started (its pid file, written by each explorer: a resume too), ended (its record's
+    // last write, once it is not running).
+    const directory = try run_directory(server, run.id);
+    const times = [_]struct { []const u8, []const u8, bool }{
+        .{ "created_s", "request.json", true },
+        .{ "started_s", "pid", true },
+        .{ "ended_s", "record.jsonl", run.status != null },
+    };
+    for (times) |time| {
+        if (!time[2]) continue;
+        const path = try std.fs.path.join(server.arena, &.{ directory, time[1] });
+        if (mtime_s(server.arena, path)) |seconds| try out.print(",\"{s}\":{d}", .{ time[0], seconds });
+    }
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
         for ([_][]const u8{ "run", "summary", "snapshot", "changed" }) |key| {
@@ -1657,6 +1671,14 @@ fn runs_insert(shared: *Shared, run: Run) void {
     }
     shared.runs[at] = run;
     shared.run_count += 1;
+}
+
+/// When the path last changed, in seconds since the epoch.
+fn mtime_s(arena: std.mem.Allocator, path: []const u8) ?i64 {
+    const path_z = arena.dupeSentinel(u8, path, 0) catch return null;
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path_z, 0, .{ .MTIME = true }, &stat)) != .SUCCESS) return null;
+    return stat.mtime.sec;
 }
 
 /// Seconds since the path changed (0 if it cannot tell).

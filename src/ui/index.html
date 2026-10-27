@@ -246,18 +246,22 @@ const query = async (request) => lines(await api(`/runs/${state.runId}/query`, r
 // ingested since (in the order they finished), and for the whole list again only if the page
 // has more than the run (another run under the same number).
 const timelinesKept = new Map(); // Run id -> its timelines, by index.
+// Everything a run's page shows, in one wave of requests side by side: each costs a round trip
+// (120 ms from a laptop to a server across an ocean), and in turn they added up to seconds.
 async function runFetch(id) {
   let kept = timelinesKept.get(id);
-  // The first time, all at once.
-  const all = kept ? null : apiJson(`/runs/${id}/timelines`);
-  const [info, properties] = await Promise.all([apiJson(`/runs/${id}`), apiJson(`/runs/${id}/properties`)]);
+  const [info, properties, fetched, discovery, failures] = await Promise.all([
+    apiJson(`/runs/${id}`), apiJson(`/runs/${id}/properties`),
+    apiJson(kept ? `/runs/${id}/timelines?offset=${kept.length}` : `/runs/${id}/timelines`),
+    apiJson(`/runs/${id}/discovery`).catch(() => null),
+    api(`/runs/${id}/failures`).then(lines).catch(() => null)]);
   const total = info.stats && info.stats.timelines;
-  if (kept && !(total != null && kept.length > total)) {
-    const more = await apiJson(`/runs/${id}/timelines?offset=${kept.length}`);
-    if (more.length) kept = kept.concat(more).sort((a, b) => a.index - b.index);
-  } else kept = await (all || apiJson(`/runs/${id}/timelines`));
+  if (!kept) kept = fetched;
+  // Fewer than kept: the run's database was made again; all of them anew.
+  else if (total != null && kept.length > total) kept = await apiJson(`/runs/${id}/timelines`);
+  else if (fetched.length) kept = kept.concat(fetched).sort((a, b) => a.index - b.index);
   timelinesKept.set(id, kept);
-  return { ...info, branches: kept, properties };
+  return { ...info, branches: kept, properties, discovery, failures };
 }
 // Runs forked from moments of others, kept once they ended: subtrees in the tree.
 const details = new Map();
@@ -298,10 +302,10 @@ async function runOpen(id) {
   state.logs = null;
   state.notebook = null;
   clearInterval(state.poll);
-  await runRefresh();
   runsRefresh();
-  state.poll = setInterval(async () => {
-    if (state.run && state.run.state === "running") { await runRefresh(); runsRefresh(); }
+  await runRefresh();
+  state.poll = setInterval(() => {
+    if (state.run && state.run.state === "running") { runRefresh(); runsRefresh(); }
   }, 2000);
 }
 
@@ -324,6 +328,8 @@ async function runRefresh() {
 
 function liveUpdate() {
   $("#stats-live").outerHTML = statsHtml();
+  const times = $("#run-times");
+  if (times) times.textContent = timesHtml();
   $("#charts-live").outerHTML = chartsHtml();
   discoveryDraw();
   const bar = $(".progress div");
@@ -354,6 +360,22 @@ function progress() {
   return info.branches ? run.branches.length / info.branches : 0;
 }
 const duration = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${(s / 60).toFixed(1)} min` : `${s.toFixed(1)} s`;
+// A moment in the viewer's time: its hour, and its day when not today.
+function clock(seconds) {
+  const date = new Date(seconds * 1000), today = new Date();
+  const hour = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toDateString() === today.toDateString() ? hour : `${date.toLocaleDateString([], { month: "short", day: "numeric" })} ${hour}`;
+}
+// When the run was asked for, last (re)started and ended (serve reads them from its files).
+function timesHtml() {
+  const run = state.run;
+  if (!run.created_s) return "";
+  const now = Date.now() / 1000;
+  const parts = [`started ${clock(run.created_s)} (${duration(Math.max(0, now - run.created_s))} ago)`];
+  if (run.started_s && run.started_s - run.created_s > 60) parts.push(`resumed ${clock(run.started_s)}`);
+  if (run.ended_s) parts.push(`ended ${clock(run.ended_s)}, after ${duration(Math.max(0, run.ended_s - run.created_s))}`);
+  return parts.join(" · ");
+}
 function statsHtml() {
   const run = state.run, info = run.run || {}, stats = run.stats || {};
   const done = stats.timelines ?? run.branches.length;
@@ -366,8 +388,11 @@ function statsHtml() {
   const stat = (title, value, note, color = "") =>
     `<div class="stat"><div class="title">${title}</div><div class="value" style="color:${color}">${value}</div><div class="note">${note}</div></div>`;
   const planned = info.time_budget_s ? `budget ${duration(info.time_budget_s)}` : `of ${info.branches || "?"}`;
+  // What bounds how many: workers at once, and how long a timeline takes each.
+  const each = run.branches.length ? run.branches.reduce((sum, b) => sum + b.wall_ns, 0) / run.branches.length / 1e9 : 0;
+  const pace = info.jobs ? `${info.jobs} workers${each ? `, ${duration(each)} each` : ""}` : `${duration(wall)} wall`;
   return `<div class="stats" id="stats-live">
-    ${stat("Timelines", done.toLocaleString(), `${planned} · ${duration(wall)} wall`)}
+    ${stat("Timelines", done.toLocaleString(), `${planned} · ${pace}`)}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
     ${stat("Properties", `${failed} / ${list.length}`, run.state === "running" ? "failing so far" : "failing", failed ? "var(--fail)" : "var(--pass)")}
     ${stat("Virtual time", duration(vtime), speed)}
@@ -404,6 +429,7 @@ function render() {
       ${info.strategy ? "· strategy " + escape(info.strategy) : ""}
       ${info.timeline_ms ? "· timelines of " + duration(info.timeline_ms / 1000) : ""}
       ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
+    <div class="muted" id="run-times" style="margin-top:2px">${timesHtml()}</div>
     ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>
       <div><button id="run-stop" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Stop this run: the timelines it explored so far stay">Stop run</button></div>` : ""}
     ${run.state === "stopped" || run.state === "interrupted" ? `
@@ -535,7 +561,7 @@ const discoveryKept = () => state.discovery && state.discovery.runId === state.r
 async function discoveryDraw() {
   const id = state.runId;
   let points;
-  try { points = (await apiJson(`/runs/${id}/discovery`)).points; } catch (error) {
+  try { points = (state.run && state.run.id === id && state.run.discovery || await apiJson(`/runs/${id}/discovery`)).points; } catch (error) {
     const box = $("#discovery");
     if (box && !discoveryKept()) box.textContent = `No events recorded (${error.message}).`;
     return;
@@ -1037,7 +1063,8 @@ async function mapDraw() {
   let { failures, decisions } = state.mapMarks && state.mapMarks.run === run.id &&
     state.mapMarks.timelines === branches.length ? state.mapMarks : { failures: [], faults: [], decisions: [] };
   if (!(state.mapMarks && state.mapMarks.run === run.id && state.mapMarks.timelines === branches.length)) try {
-    failures = lines(await api(`/runs/${state.runId}/failures`)); // Kept by serve (store's marks).
+    // Kept by serve (store's marks), and fetched with the run already.
+    failures = run.failures || lines(await api(`/runs/${state.runId}/failures`));
     // A strategy's reasons for its faults: only a run with a strategy has them.
     decisions = info.strategy ? await query({ condition: "event=decision", limit: 20000 }) : [];
     state.mapMarks = { run: run.id, timelines: branches.length, failures, decisions };
@@ -1119,7 +1146,8 @@ async function mapDraw() {
   const branched = rows.filter((r) => !r.child && r.parentRow != null).length;
   body.innerHTML = `<div class="muted" style="margin-bottom:6px">${model.depthMax
       ? `Branched up to ${model.depthMax} deep: ${branched} timelines continue another from a moment (◯), sharing everything before it.`
-      : "Every timeline starts from the setup snapshot (flat branching)."}</div>
+      : info.branching === "flat" ? "Every timeline starts from the setup snapshot (flat branching)."
+      : `A tree: its first generation (${info.generation || 16} timelines) starts from the setup snapshot; the next ones branch from the moments it finds.`}</div>
     <div class="legend"><span><i style="background:#9a9eab"></i>boot to snapshot</span>
       <span><i style="background:#3fbf7f"></i>passing timeline</span><span><i style="background:#f0506e"></i>failing timeline</span>
       <span><i style="background:#f0a650"></i>fault</span><span><i style="background:#f0506e;border-radius:50%"></i>failed assertion</span>
