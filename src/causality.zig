@@ -41,6 +41,7 @@
 //! line, another property, ...): the timeline's replay stops at its first match (the failure's
 //! moment), and so does each future, which then counts.
 const std = @import("std");
+const cpus = @import("cpus.zig");
 const assert = std.debug.assert;
 
 const Strategy = @import("strategy.zig");
@@ -372,8 +373,8 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
         name.* = try snapshot_name(analysis, place, moment.vtime_ms);
     }
     var futures: Futures = .{ .analysis = analysis, .names = names, .moments = moments };
-    const cpus = std.Thread.getCpuCount() catch 1;
-    const at_once = std.math.clamp(cpus / analysis.request.futures, 1, moments.len);
+    // The futures' explorers share the host's CPU pool: one VM per core (cpus.zig).
+    const at_once = std.math.clamp(cpus.usable_count() / analysis.request.futures, 1, moments.len);
     const threads = try arena.alloc(std.Thread, at_once);
     for (threads) |*thread| thread.* = try std.Thread.spawn(.{}, Futures.run, .{&futures});
     for (threads) |thread| thread.join();

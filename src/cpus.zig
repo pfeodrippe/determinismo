@@ -7,9 +7,12 @@
 //! the user's: every process agrees on the CPUs, and the kernel gives a CPU back when its holder
 //! dies. Locks belong to an open file, so each process opens the pool itself (never inherited).
 //!
-//! CPUs are taken physical cores first: a VM alone on a core runs faster than two on sibling
-//! hyperthreads (each about two thirds as fast), so a host with room gives each VM a core, and a
-//! busy one still uses every thread.
+//! One thread per physical core: two VMs on a core's sibling hyperthreads perturb each other's
+//! retired-branch counters, the guest's clock, and a timeline no longer replays (measured on
+//! srv1, 2026-10-27: Kafka timelines replayed exactly on separate cores, beside a busy loop or a
+//! memory-churning process on the sibling, and diverged within seconds with another VM there).
+//! The pool holds each core's first thread; a second thread only when the first is not this
+//! process's to run on (an affinity mask that leaves it out).
 //!
 //! A process with `DETERMINISMO_CPU_PRIORITY` set (checks, e.g. `zig build e2e`) goes first: while
 //! one waits it holds a shared lock on the pool's `priority` file, and the others leave the next
@@ -62,7 +65,7 @@ pub const Pool = struct {
         errdefer pool.close();
         const bits = @bitSizeOf(@TypeOf(available[0]));
         for (0..available.len * bits) |cpu| {
-            if (available[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) continue;
+            if (!usable(&available, cpu)) continue;
             if (pool.count == cpus_max) break;
             var path_buffer: [96]u8 = undefined;
             const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/cpu-{d}", .{ directory, cpu }, 0);
@@ -202,21 +205,60 @@ pub fn memory_available() u64 {
     return kib * 1024;
 }
 
+/// How many CPUs this process's pool holds: the CPUs it may run on, one thread per core.
+pub fn usable_count() u32 {
+    var available: linux.cpu_set_t = undefined;
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &available)) != .SUCCESS) {
+        return 1;
+    }
+    const bits = @bitSizeOf(@TypeOf(available[0]));
+    var count: u32 = 0;
+    for (0..available.len * bits) |cpu| {
+        if (usable(&available, cpu)) count += 1;
+    }
+    return @max(count, 1);
+}
+
+/// In the set, and not a second hyperthread whose core's first thread is in the set too.
+fn usable(available: *const linux.cpu_set_t, cpu: usize) bool {
+    const bits = @bitSizeOf(@TypeOf(available[0]));
+    if (available[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) return false;
+    const first = first_sibling(@intCast(cpu)) orelse return true;
+    if (first == cpu) return true;
+    return available[first / bits] >> @intCast(first % bits) & 1 == 0;
+}
+
 /// Whether the CPU is a core's second hyperthread (not the first of its siblings).
 fn sibling(cpu: u16) bool {
+    const first = first_sibling(cpu) orelse return false;
+    return cpu != first;
+}
+
+/// The first thread of the CPU's core (itself without SMT), if the kernel says.
+fn first_sibling(cpu: u16) ?u16 {
     var path_buffer: [96]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&path_buffer, "/sys/devices/system/cpu/cpu{d}/" ++
-        "topology/thread_siblings_list", .{cpu}, 0) catch return false;
+        "topology/thread_siblings_list", .{cpu}, 0) catch return null;
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) != .SUCCESS) return false;
+    if (linux.errno(fd) != .SUCCESS) return null;
     defer _ = linux.close(@intCast(fd));
     var text: [64]u8 = undefined;
     const size = linux.read(@intCast(fd), &text, text.len);
-    if (linux.errno(size) != .SUCCESS) return false;
-    // "0,18" or "0-1": the first is the core's first thread.
-    const end = std.mem.indexOfAny(u8, text[0..size], ",-\n") orelse size;
-    const first = std.fmt.parseInt(u16, text[0..end], 10) catch return false;
-    return cpu != first;
+    if (linux.errno(size) != .SUCCESS) return null;
+    return siblings_first(text[0..size]);
+}
+
+/// "0,18" or "0-1": the first is the core's first thread.
+fn siblings_first(text: []const u8) ?u16 {
+    const end = std.mem.indexOfAny(u8, text, ",-\n") orelse text.len;
+    return std.fmt.parseInt(u16, text[0..end], 10) catch null;
+}
+
+test siblings_first {
+    try std.testing.expectEqual(0, siblings_first("0,18\n"));
+    try std.testing.expectEqual(4, siblings_first("4-5\n"));
+    try std.testing.expectEqual(7, siblings_first("7\n"));
+    try std.testing.expectEqual(null, siblings_first(""));
 }
 
 fn monotonic_ns() u64 {

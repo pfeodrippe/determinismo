@@ -292,6 +292,13 @@ pub const Owner = struct {
         if (!read_exact(socket, std.mem.asBytes(&request))) linux.exit_group(0); // Released.
         if (request.vtime_ns < moment_ns) linux.exit_group(1);
         owner.snapshot.capture_memory(vm.memory, vm.memory_fd) catch linux.exit_group(1);
+        // Running on to a later moment is a VM run: on a CPU of the host's pool, alone on its
+        // core (cpus.zig: two VMs on sibling hyperthreads perturb each other's clocks).
+        var pool: cpus.Pool = undefined;
+        if (request.vtime_ns != moment_ns) {
+            pool.open() catch linux.exit_group(1);
+            _ = pool.take();
+        }
         const node = if (request.vtime_ns == moment_ns)
             owner.snapshot
         else

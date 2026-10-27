@@ -362,6 +362,35 @@ fn list_split(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
 
 /// Prepares the system (if any), then runs or explores its scenarios. Returns the number of
 /// scenarios with failing properties.
+/// The CPU this process runs its own VMs on (the boot and setup, branches run in-process): a
+/// CPU of the host's pool (cpus.zig), never shared with another VM's core. Given back, and the
+/// process unpinned, before forking processes that take CPUs of their own.
+const OwnCpu = struct {
+    pool: cpus.Pool = undefined,
+    opened: bool = false,
+    held: ?cpus.Held = null,
+
+    fn take(own: *OwnCpu) void {
+        if (own.held != null) return;
+        if (!own.opened) {
+            own.pool.open() catch |err| {
+                std.debug.print("[determinismo] the CPU pool: {s}\n", .{@errorName(err)});
+                linux.exit_group(1);
+            };
+            own.opened = true;
+        }
+        own.held = own.pool.take();
+    }
+
+    fn give(own: *OwnCpu) void {
+        const held = own.held orelse return;
+        own.pool.give(held);
+        own.held = null;
+        cpus.unpin();
+    }
+};
+var own_cpu: OwnCpu = .{};
+
 fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 {
     const arena = init.arena.allocator();
     var arguments = arguments_given;
@@ -668,6 +697,7 @@ fn cmdline_build(
 
 fn command_run(vm: *VM, options: *const VM.Options) !void {
     assert(!options.stop_at_setup_complete);
+    own_cpu.take();
     try vm.init(options);
     defer vm.deinit();
     const time_start_ns = monotonic_ns();
@@ -890,6 +920,7 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     options.moment_continue = false;
     defer options.moment_vtime_ns = null;
     defer options.moment_command = null;
+    own_cpu.take();
     try vm.init_from_snapshot(options, fork.from);
     const outcome = try vm.run_until_exit();
     const expected: VM.Outcome = if (fork.fork.exec != null) .command_done else .moment_reached;
@@ -1028,13 +1059,9 @@ test duration_parse {
     try std.testing.expectError(error.InvalidCharacter, duration_parse("ten"));
 }
 
+/// The CPUs VMs may run on here: one thread per core (cpus.zig).
 fn cpus_available() u32 {
-    var set: linux.cpu_set_t = undefined;
-    const result = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set);
-    if (linux.errno(result) != .SUCCESS) return 1;
-    var count: u32 = 0;
-    for (set) |word| count += @popCount(word);
-    return @max(count, 1);
+    return cpus.usable_count();
 }
 
 /// Forks `jobs` workers after the snapshot: each makes its own VMs from it (copy-on-write) and
@@ -1048,6 +1075,7 @@ fn explore_parallel(
     jobs: u32,
 ) !void {
     assert(jobs > 1 and jobs <= jobs_max);
+    own_cpu.give(); // The workers take their own.
     // The workers' shared counter of positions (branch_place).
     const protection: linux.PROT = .{ .READ = true, .WRITE = true };
     const shared_flags: linux.MAP = .{ .TYPE = .SHARED, .ANONYMOUS = true };
@@ -1187,6 +1215,7 @@ fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
     defer options.moment_vtime_ns = moment_vtime_ns;
     defer options.moment_command = moment_command;
     defer options.until = until;
+    own_cpu.take();
     try vm.init(options);
     const outcome = try vm.run_until_exit();
     if (outcome != .setup_complete) {
@@ -1277,6 +1306,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (branches.arguments.rewind_ms) |ms| {
             try rewind(vm, options, branches.snapshot, exploration, ms * std.time.ns_per_ms);
         }
+        if (branches.pool == null) own_cpu.take(); // In this process: its own CPU.
         try vm.init_from_snapshot(options, place.snapshot);
         defer vm.deinit();
         if (branches.arguments.events_directory) |directory| {
@@ -1504,6 +1534,7 @@ fn explore_tree(
     jobs: u32,
 ) !void {
     const arena = context.arena;
+    own_cpu.give(); // Its timelines and node makers take their own.
     const exploration = branches.exploration;
     const size = branches.arguments.generation_size;
     // In-run snapshots (holders.zig): not with a strategy that decides within timelines (its
@@ -2694,6 +2725,7 @@ fn rewind(
     var probe = options.*;
     probe.moment_command = null;
     probe.moment_continue = false;
+    own_cpu.take();
     try vm.init_from_snapshot(&probe, snapshot);
     defer vm.deinit();
     if (exploration.replay) |replay| vm.overrides = replay.overrides;
