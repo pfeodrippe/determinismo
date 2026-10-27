@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 
 HOME = os.path.expanduser("~")
-GUEST = os.environ.get("DETERMINISMO_GUEST", f"{HOME}/guest")
+GUEST = f"{HOME}/guest"  # The newest guest, always.
 MACHINE = ["--kernel", f"{GUEST}/vmlinuz", "--initrd", f"{GUEST}/base.cpio",
            "--append", "quiet", "--cache", f"{HOME}/cache"]
 DIGITS = ["first", "second", "third"]

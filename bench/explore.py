@@ -23,7 +23,7 @@ import tempfile
 import time
 
 HOME = os.path.expanduser("~")
-GUEST = os.environ.get("DETERMINISMO_GUEST", f"{HOME}/guest")
+GUEST = f"{HOME}/guest"  # The newest guest, always.
 MACHINE = ["--kernel", f"{GUEST}/vmlinuz", "--initrd", f"{GUEST}/base.cpio", "--append", "quiet",
            "--cache", f"{HOME}/cache", "--memory-mib", "4096"]
 RAFT = f"{HOME}/raft-poc/antithesis/config/docker-compose.yaml"
