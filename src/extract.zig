@@ -187,9 +187,17 @@ pub fn read(
     const text = std.mem.trim(u8, encoded, " \n");
     if (text.len == 0) return error.NoSuchFile;
     const decoder = std.base64.standard.Decoder;
-    const bytes = try arena.alloc(u8, try decoder.calcSizeForSlice(text));
-    try decoder.decode(bytes, text);
+    // Not base64: what the guest said instead (a missing file, a node that is gone: a node's
+    // files are read through its process, the guest's own as runner:<path>).
+    const size = decoder.calcSizeForSlice(text) catch return not_extracted(text);
+    const bytes = try arena.alloc(u8, size);
+    decoder.decode(bytes, text) catch return not_extracted(text);
     return bytes;
+}
+
+fn not_extracted(text: []const u8) error{NotExtracted} {
+    std.debug.print("[determinismo] extract: the guest answered: {s}\n", .{text[0..@min(text.len, 400)]});
+    return error.NotExtracted;
 }
 
 /// What `command` prints when run at the moment `explore_arguments` reach.
