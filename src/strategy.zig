@@ -314,6 +314,12 @@ pub fn branch_end(strategy: *Strategy, end: BranchEnd) !bool {
     return stop_value == .bool and stop_value.bool;
 }
 
+/// One request line and its reply, for other plugins on this transport (causality planners).
+/// The reply lives in parse_buffer until the next call.
+pub fn call_json(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {
+    return strategy.call_long(request);
+}
+
 /// Sends one request line and parses the one reply line. The reply lives in parse_buffer until
 /// the next call.
 fn call(strategy: *Strategy, request: []const u8) !std.json.ObjectMap {

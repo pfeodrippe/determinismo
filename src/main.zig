@@ -16,6 +16,7 @@ const Strategy = @import("strategy.zig");
 const tape = @import("tape.zig");
 const fd_pass = @import("fd_pass.zig");
 const holders = @import("holders.zig");
+const saver_zig = @import("saver.zig");
 const prepare = @import("prepare.zig");
 const serve = @import("serve.zig");
 const mcp = @import("mcp.zig");
@@ -34,8 +35,11 @@ const profiler = @import("profile.zig");
 
 const usage =
     \\usage: determinismo run     <machine options> [--trace <out.txt>] [--events <out.jsonl>]
-    \\       determinismo serve   [--listen <address:port>] [--data <dir>] [--archive "<cmd>"]
-    \\                            <machine options>
+    \\       determinismo serve   [--listen <address:port>[,<address:port>...]] [--data <dir>]
+    \\                            [--archive "<cmd>"]
+    \\                            [--snapshots-keep-hours <h>]   (runs' snapshots on disk, from
+    \\                            causality analyses: removed when none was saved for that long;
+    \\                            24 by default) <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo mutate  <explore options> --mutants <mutants.jsonl> [--out <dir>]
     \\                            (each mutant a patch to a node's build: caught, never ran, or
@@ -71,6 +75,10 @@ const usage =
     \\                            [--exec "<cmd>" | --exec-script <file>]
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
+    \\                            [--save-snapshots <dir> --save-at-ms <ms,ms,...>]   (with --tape
+    \\                            or --branch: the replay saved to disk at those moments, each
+    \\                            the pages changed since the one before)
+    \\                            [--from-snapshot <dir>/<name>]   (branches from one saved)
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
     \\                            [--cpu-modulation]   (branches run at varying speeds)
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
@@ -86,6 +94,10 @@ const usage =
     \\       determinismo query   <events-dir> '<condition>' [temporal conditions] (see query.zig)
     \\       determinismo events  <events-dir> '<pipeline>' (event sets, see event_sets.zig)
     \\       determinismo causality <options> --branch <n> --property '<message>' [--points <k>]
+    \\                            [--futures <m>] [--refine <rounds>] [--moments-max <n>]
+    \\                            [--jump-min <0..1>] [--gap-min-ms <ms>] [--tape <tape>]
+    \\                            [--planner <cmd> | tcp://host:port] [--run-url <url>]
+    \\                            [--snapshots <dir>] [--json]   (see causality.zig)
     \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --to <local file>
     \\       determinismo inject  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
@@ -202,6 +214,12 @@ const Arguments = struct {
     from_vtime_ms: ?u64 = null,
     /// A command to run at the fork point before exploring its futures.
     from_exec: ?[]const u8 = null,
+    /// Save the replayed branch (`--tape`, `--branch`) to disk at these moments
+    /// (`--save-snapshots <dir> --save-at-ms <a,b,...>`, saver.zig).
+    save_directory: ?[]const u8 = null,
+    save_at_ms: []const u64 = &.{},
+    /// Branch from a snapshot saved to disk (`<dir>/<name>`) instead of booting.
+    from_snapshot: ?[]const u8 = null,
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
     cpu_modulation: bool = false,
@@ -246,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "serve")) return command_serve(init, argv[2..]);
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "mcp")) return command_mcp(init, argv[2..]);
     if (argv.len >= 2) {
-        if (try command_tool(arena, init.io, argv)) |status| std.process.exit(status);
+        if (try command_tool(arena, init.io, init.minimal.environ.block.slice, argv)) |status| std.process.exit(status);
     }
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "script")) {
         return script.extract(arena, init.io, argv[2]);
@@ -295,12 +313,17 @@ pub fn main(init: std.process.Init) !void {
 
 /// The commands that read what explorations wrote (tla, query, causality): their exit status,
 /// or null for other commands. A usage error exits with 2.
-fn command_tool(arena: std.mem.Allocator, io: std.Io, argv: []const [:0]const u8) !?u8 {
+fn command_tool(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    environ: [:null]const ?[*:0]const u8,
+    argv: []const [:0]const u8,
+) !?u8 {
     const eql = std.mem.eql;
     const name = argv[1];
     const rest = argv[2..];
     const result = if (eql(u8, name, "causality"))
-        causality.run(arena, io, argv[0], rest)
+        causality.run(arena, io, argv[0], environ, rest)
     else if (eql(u8, name, "mutate"))
         mutate.run(arena, io, argv[0], rest)
     else if (eql(u8, name, "extract"))
@@ -486,6 +509,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var data: []const u8 = ".determinismo-data";
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
+    var snapshots_keep_hours: u64 = 24;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -500,6 +524,9 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             index += 1;
         } else if (std.mem.eql(u8, flag, "--archive")) {
             archive = value;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--snapshots-keep-hours")) {
+            snapshots_keep_hours = try std.fmt.parseInt(u64, value, 10);
             index += 1;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
@@ -521,6 +548,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .self = explorer orelse self_buffer[0..self_size],
         .archive = archive,
         .bb = bb,
+        .snapshots_keep_ns = snapshots_keep_hours * std.time.ns_per_hour,
     });
 }
 
@@ -745,7 +773,14 @@ fn command_explore(
         const timelines = try std.fs.path.join(context.arena, &.{ directory, "timelines.jsonl" });
         report.timelines_fd = try open_for_appending(context.arena, timelines);
     }
-    try explore_snapshot(vm, options, snapshot);
+    if (arguments.from_snapshot) |path| {
+        const directory = std.fs.path.dirname(path) orelse ".";
+        const name = std.fs.path.basename(path);
+        try snapshot.disk_load(context.arena, context.io, directory, name, options.check_buffer);
+        if (snapshot.memory_size != options.memory_size) return error.SnapshotMemoryDiffers;
+        exploration.exploration_seed = futures_seed(arguments.seed, snapshot);
+        options.seed = exploration.exploration_seed;
+    } else try explore_snapshot(vm, options, snapshot);
     report.snapshot_taken(snapshot, monotonic_ns() - time_start_ns);
     report.record(.{ .snapshot = .{
         .vtime_ns = snapshot.tsc / report.tsc_per_ns,
@@ -787,7 +822,7 @@ fn command_explore(
             const at = ms * std.time.ns_per_ms;
             start = try node_make(context.arena, vm, options, start, replay.header.branch_seed, at, overrides);
             exploration.replay = null;
-            exploration.exploration_seed ^= 0x9e3779b97f4a7c15; // Not the taped branch's seeds.
+            exploration.exploration_seed = futures_seed(exploration.exploration_seed, start);
         }
     }
     if (arguments.events_directory != null) {
@@ -798,6 +833,7 @@ fn command_explore(
     multiverse.* = .{};
     const branches = Branches{
         .snapshot = start,
+        .setup = snapshot,
         .multiverse = multiverse,
         .exploration = &exploration,
         .arguments = arguments,
@@ -869,6 +905,12 @@ fn explore_fork(context: Context, vm: *VM, options: *VM.Options, fork: Fork) !*c
     return snapshot;
 }
 
+/// The seed of futures from a moment of a timeline (causality's), replayed to it or saved there
+/// (`--from-snapshot`): the same either way, and neither the timeline's own nor another moment's.
+fn futures_seed(exploration_seed: u64, at: *const Snapshot) u64 {
+    return exploration_seed ^ 0x9e3779b97f4a7c15 ^ at.tsc;
+}
+
 /// Branches start at their snapshot: a moment before it would be in the past.
 fn moment_after_snapshot(snapshot: *const Snapshot, vtime_ns: u64) !void {
     const snapshot_ns = snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s);
@@ -914,7 +956,7 @@ fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     const strategy_planned = arguments.strategy_command != null and !arguments.branching_given;
     const planned = strategy_planned or arguments.branch_only != null or
         arguments.tape_path != null or arguments.from_branch != null or
-        arguments.shard_count > 1 or at_moment;
+        arguments.from_snapshot != null or arguments.shard_count > 1 or at_moment;
     if (planned and arguments.branching_given) return error.Usage;
     // A tree's first generation starts from the snapshot, as flat branches do; later ones start
     // inside others and replay from their tapes only.
@@ -1151,6 +1193,9 @@ fn explore_snapshot(vm: *VM, options: *VM.Options, snapshot: *Snapshot) !void {
 
 const Branches = struct {
     snapshot: *const Snapshot,
+    /// The setup snapshot (`snapshot` is a later one when branching from a moment): the base of
+    /// snapshots saved to disk (saver.zig).
+    setup: ?*const Snapshot = null,
     multiverse: *report.Multiverse,
     exploration: *const Exploration,
     arguments: *const Arguments,
@@ -1214,6 +1259,12 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.moment_command = branches.arguments.moment_command;
         options.moment_continue = branches.arguments.moment_continue;
         options.until = branches.arguments.until;
+        // Saving to disk: the replay goes just past the last moment saved.
+        const save_at_ms = branches.arguments.save_at_ms;
+        if (save_at_ms.len > 0) {
+            const last_ns = (std.mem.max(u64, save_at_ms) + 1) * std.time.ns_per_ms;
+            options.moment_vtime_ns = @min(options.moment_vtime_ns orelse last_ns, last_ns);
+        }
         if (branches.arguments.rewind_ms) |ms| {
             try rewind(vm, options, branches.snapshot, exploration, ms * std.time.ns_per_ms);
         }
@@ -1253,12 +1304,26 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             };
             try owner.attach(vm);
         }
+        var saver: saver_zig.Saver = undefined;
+        if (branches.arguments.save_directory) |directory| {
+            assert(branches.holders == null); // One hold owner: a replayed branch has none.
+            const setup = branches.setup.?;
+            var hasher = std.hash.Wyhash.init(0);
+            for ([_]u64{ exploration.inputs, exploration.exploration_seed, setup.tsc, setup.branches }) |value| {
+                hasher.update(std.mem.asBytes(&value));
+            }
+            const setup_name = try std.fmt.allocPrint(context.arena, "setup-{x:0>16}", .{hasher.final()});
+            try std.Io.Dir.cwd().createDirPath(context.io, directory);
+            saver = try saver_zig.Saver.init(context.arena, directory, index, save_at_ms, setup, setup_name);
+            try saver.attach(vm, place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s));
+        }
         vm.strategy = exploration.strategy;
         if (exploration.replay) |replay| vm.overrides = replay.overrides;
         try branch_announce(context, vm, exploration, place);
         defer if (vm.tape_fd) |fd| close(fd);
         const time_start_ns = monotonic_ns();
         const outcome = try vm.run_until_exit();
+        if (branches.arguments.save_directory != null) try saver.finish();
         try branches.multiverse.add(vm, .{
             .index = index,
             .seed = options.seed,
@@ -2573,6 +2638,19 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.from_vtime_ms != null and arguments.from_branch == null and arguments.tape_path == null) {
         return error.Usage;
     }
+    // Saving: one replayed branch, saved where it runs (not from a moment of it).
+    if ((arguments.save_directory == null) != (arguments.save_at_ms.len == 0)) return error.Usage;
+    if (arguments.save_directory != null) {
+        const single = arguments.tape_path != null or arguments.branch_only != null;
+        if (!single or arguments.from_vtime_ms != null) return error.Usage;
+    }
+    // From a saved snapshot: flat branches from it (their memory is a file's, which holders'
+    // copies cannot see in full), nothing replayed to it.
+    if (arguments.from_snapshot != null) {
+        const elsewhere = arguments.tape_path != null or arguments.from_branch != null or
+            arguments.save_directory != null or arguments.rewind_ms != null;
+        if (elsewhere or arguments.branching == .tree) return error.Usage;
+    }
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
         arguments.cmdline = try std.mem.join(arena, " ", &parts);
@@ -2677,6 +2755,16 @@ fn parse_option(
         arguments.from_exec = value;
     } else if (eql(u8, flag, "--from-vtime-ms")) {
         arguments.from_vtime_ms = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, flag, "--save-snapshots")) {
+        arguments.save_directory = value;
+    } else if (eql(u8, flag, "--save-at-ms")) {
+        var moments: std.ArrayList(u64) = .empty;
+        var parts = std.mem.tokenizeScalar(u8, value, ',');
+        while (parts.next()) |part| try moments.append(arena, try std.fmt.parseInt(u64, part, 10));
+        if (moments.items.len == 0 or moments.items.len > saver_zig.moments_max) return error.Usage;
+        arguments.save_at_ms = moments.items;
+    } else if (eql(u8, flag, "--from-snapshot")) {
+        arguments.from_snapshot = value;
     } else if (eql(u8, flag, "--shard")) {
         const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.Usage;
         arguments.shard_index = try std.fmt.parseInt(u32, value[0..slash], 10);

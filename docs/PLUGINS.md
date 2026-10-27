@@ -132,3 +132,31 @@ Both compose: an outer loop can run explorations whose branches are steered by a
 What strategies cannot do well yet (choose where to put a fault, where to branch) and how they
 will (labeled decisions, branching mid-timeline from a plugin, Go-Explore, fault scheduling, RL
 and LLM strategies, `sometimes` assertions as targets): [PLAN.md](PLAN.md), "Strategy guidance".
+
+## Causality planners
+
+A causality analysis (`determinismo causality`, the page's Causality button, `POST
+/runs/<id>/causality`) measures a failure's probability at moments of the timeline where it
+happened: snapshots of it saved to disk there, futures forked from each. Which moments, and how
+many futures each, is a planner's choice, on the same transport as strategies (a command's
+standard input and output, `tcp://host:port`, or `@<name>` uploaded to serve):
+
+```
+determinismo causality ... --planner tcp://127.0.0.1:9102            # the Clojure host's
+determinismo causality ... --planner "python3 my_planner.py"
+POST /runs/93/causality {"branch":4862,"property":"...","planner":"tcp://127.0.0.1:9102"}
+```
+
+| Request | When | Response |
+|---|---|---|
+| `{"method":"hello","protocol":1,"kind":"causality"}` | Once. | `{"name":"<planner>"}` |
+| `{"method":"plan","round":R,"branch":N,"property":"<message>","snapshot_ms":S,"failure_ms":F,"futures":M,"points_asked":K,"jump_min":J,"gap_min_ms":G,"moments_left":L,"run_url":"http://host:port/runs/<id>"\|null,"tape":"<path>"\|null,"points":[{"vtime_ms","futures","failing","probability","low","high"},...]}` | Before each round (at most `--refine` rounds after the first), with every moment analyzed so far: its futures, how many failed, the probability and its 90% interval. `run_url` is the run's HTTP API: a planner may query the timeline's events there (its faults, its logs: `POST <run_url>/query`). | `{"moments":[{"vtime_ms":T,"futures":M},...],"note":"<why>"}`; no moments ends the analysis. Moments outside (S, F], already analyzed, or past `L` are left out. |
+
+The built-in planner analyzes the moment just after the setup snapshot and K moments evenly to the
+failure, then, each round, halfway inside the jumps of J or more until they are G wide.
+plugins/clojure/strategies.clj serves planners on port 9102 (`--planner-port`), reloaded live
+over its nREPL: `bisect` (the built-in rule), `faults` (inside each jump, a moment just before
+and just after every fault injected there: whether that fault decided the bug) and `dense` (four
+times the moments, one round). `(use-planner! :faults)` switches; `@plans` keeps every round asked
+and answered. plugins/clojure/api.clj is the whole HTTP API from Clojure (runs, timelines,
+query, replays, causality, uploads), for planners, strategies and scripts alike.
