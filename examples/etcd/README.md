@@ -44,7 +44,9 @@ faults stopped the members never converged: etcd-3, the leader, at revision 66 w
 111, the others at 68 with the same applied index; their keyspace hashes differ. etcd-3 had
 silently lost two applied revisions, and every later write got a revision two lower there than
 on the others: a permanent divergence of the state machine, on the member serving linearizable
-reads. Replay and files: srv1:~/findings/etcd-revision-loss-2026-10-26 (REPLAY.md).
+reads. Its replay and files were on srv1 (~/findings/etcd-revision-loss-2026-10-26), gone with
+that host (cancelled 2026-10-27); the timeline comes back from the run's seed on a host of the
+same CPU model.
 
 What happened to etcd-3, every step from its own logs, its files (extracted at moments of the
 replay, read with bbolt and a WAL reader) and etcd's code:

@@ -58,7 +58,7 @@ event hashing, the guest module.
   analysis (built, not deployed); serve snapshotting a failure as soon as it is found.
 - Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check is
   written but not run yet; long-term archive later (QUESTIONS.md).
-- e2e: the whole suite on srv1 against the new binary; then `-Donly=saved`, `-Donly=ui`
+- e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
 - UI: a minimap for thousands of timelines; "1.8 h wall" is a sum of wall times.
 - srv2: deploy everything since d66b9ec once the benchmark ends (its initramfs too: det-core,
