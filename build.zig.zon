@@ -1,0 +1,16 @@
+.{
+    .name = .determinismo,
+    .version = "0.0.0",
+    .fingerprint = 0x887e61be47a23f5e,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Flecs master on 2026-10-26 (3988dee756aa047db1ca94e0fd61c9ad737926d8), for examples/flecs: fetched only to build
+        // flecs-stress.
+        .flecs = .{
+            .url = "https://github.com/SanderMertens/flecs/archive/3988dee756aa047db1ca94e0fd61c9ad737926d8.tar.gz",
+            .hash = "N-V-__8AAB9_cwOxaeJzs9aeCNQ9L3pMO5MZlsyAbe9QURtr",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "sdk", "guest", "tools", "examples", "tests", "workload" },
+}

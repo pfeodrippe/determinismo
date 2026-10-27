@@ -102,6 +102,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "galera-test", .path = "examples/galera/galera_test.zig" },
         .{ .name = "tidb-test", .path = "examples/tidb/tidb_test.zig" },
         .{ .name = "mongodb-test", .path = "examples/mongodb/mongodb_test.zig" },
+        .{ .name = "flecs-test", .path = "examples/flecs/flecs_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },
@@ -187,6 +188,25 @@ pub fn build(b: *std.Build) void {
     });
     c_node.root_module.addIncludePath(b.path("sdk/c"));
     b.installArtifact(c_node);
+
+    // Flecs (an in-memory entity component system) under a stress harness (examples/flecs): its
+    // amalgamated sources, fetched only for this program, built with Flecs's sanitize checks and
+    // edge coverage (strategies and the tree see which of Flecs's code a timeline reached).
+    if (b.lazyDependency("flecs", .{})) |flecs| {
+        const flecs_stress = b.addExecutable(.{
+            .name = "flecs-stress",
+            .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        });
+        const flags = [_][]const u8{ "-std=gnu11", "-DFLECS_SANITIZE", "-fsanitize-coverage=trace-pc-guard" };
+        flecs_stress.root_module.addCSourceFile(.{
+            .file = b.path("examples/flecs/stress.c"),
+            .flags = &(flags ++ [_][]const u8{ "-Wall", "-Wextra", "-DDETERMINISMO_COVERAGE" }),
+        });
+        flecs_stress.root_module.addCSourceFile(.{ .file = flecs.path("distr/flecs.c"), .flags = &flags });
+        flecs_stress.root_module.addIncludePath(flecs.path("distr"));
+        flecs_stress.root_module.addIncludePath(b.path("sdk/c"));
+        b.installArtifact(flecs_stress);
+    }
 
     // A maze for coverage-guided exploration, instrumented for edge coverage.
     const maze = b.addExecutable(.{
