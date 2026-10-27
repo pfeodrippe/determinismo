@@ -113,12 +113,56 @@
        (sort-by (comp - :vtime_ns))
        (take count)))
 
+;; Go-Explore's archive, with the cell pluggable: every cell any timeline of any generation
+;; reached, where (just after the first timeline reached it), how many timelines reached it and
+;; how often it was returned to. `cell-of` makes a behavior a cell: redefine it from the REPL
+;; (coarser: `(defn cell-of [b] (str/replace (:label b) #"\d+" "N"))`, or by what a domain
+;; cares about) and the next generation uses it. `(reset! archive {})` starts over.
+(defonce archive (atom {})) ; cell -> {:branch :vtime_ns :label :reached :returns}
+
+(defn cell-of
+  "A behavior's cell: its label (the explorer's own notion, each behavior a cell)."
+  [behavior]
+  (:label behavior))
+
+(defn- archive-note! [candidates]
+  (doseq [c candidates
+          b (:behaviors c)
+          :when (<= (:vtime_ns b) (room-end c))
+          :let [cell (cell-of b)]
+          :when cell]
+    (swap! archive update cell
+           (fn [known]
+             (if known
+               (update known :reached inc)
+               {:branch (:branch c) :vtime_ns (clamp-moment c (+ (:vtime_ns b) 1000))
+                :label (:label b) :reached 1 :returns 0})))))
+
+(defn archived
+  "Half the returns to the archive's least explored cells (score (1 + reached) * (1 + returns):
+  rare, seldom returned to), from any generation; the rest to this generation's rarest new
+  behaviors (rarity). All to the archive when nothing is new."
+  [generation candidates count]
+  (archive-note! candidates)
+  (let [fresh (vec (rarity generation candidates count))
+        wanted (if (seq fresh) (quot (inc count) 2) count)
+        cells (->> @archive
+                   (sort-by (fn [[_ {:keys [reached returns]}]] (* (inc reached) (inc returns))))
+                   (take wanted))
+        from-archive (for [[cell {:keys [branch vtime_ns label reached returns]}] cells]
+                       (do (swap! archive update-in [cell :returns] inc)
+                           {:branch branch :vtime_ns vtime_ns
+                            :reason (str "archive: " label " (cell " cell "), reached by " reached
+                                         " timelines, returned to " returns " times")}))]
+    (vec (take count (concat (doall from-archive) fresh)))))
+
 (defonce strategies
   (atom {:explorer {:returns (fn [& _] nil)} ; The explorer's built-in choice (a baseline).
          :rarity {:returns #'rarity}
          :rarest-ever {:returns #'rarest-ever}
          :uniform {:returns #'uniform}
-         :deepest {:returns #'deepest}}))
+         :deepest {:returns #'deepest}
+         :archive {:returns #'archived}}))
 
 (defonce current (atom :rarity))
 
@@ -261,7 +305,8 @@
                                  (catch Throwable e (str "error " (ex-message e))))
                       "planner" (try (use-planner! (keyword argument)) "ok"
                                      (catch Throwable e (str "error " (ex-message e))))
-                      "reset" (do (reset! generations []) (reset! ends {}) (reset! starts {}) "ok")
+                      "reset" (do (reset! generations []) (reset! ends {}) (reset! starts {})
+                                  (reset! archive {}) "ok")
                       "events-dir" (do (reset! events-dir argument) "ok")
                       (str "error unknown command " command))]
           (.write writer (str reply "\n"))
