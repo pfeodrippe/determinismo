@@ -1,0 +1,38 @@
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -163,9 +163,16 @@
+ 	       (pte_flags(pte) & (_PAGE_RW | _PAGE_DIRTY)) == _PAGE_DIRTY;
+ }
+ 
++/*
++ * determinismo: the processor may set the Accessed bit during a speculative page walk (Intel
++ * SDM), and speculation follows predictor and cache state, which the host perturbs: a page
++ * mapped old and never used read young in one run and old in another, and exit marked it
++ * accessed or not (about 150 branches: replays parted under host load). The guest never
++ * branches on it: LRU aging and khugepaged lose a hint; nothing depends on it for correctness.
++ */
+ static inline int pte_young(pte_t pte)
+ {
+-	return pte_flags(pte) & _PAGE_ACCESSED;
++	return 0;
+ }
+ 
+ static inline bool pte_decrypted(pte_t pte)
+@@ -189,7 +196,7 @@
+ #define pmd_young pmd_young
+ static inline int pmd_young(pmd_t pmd)
+ {
+-	return pmd_flags(pmd) & _PAGE_ACCESSED;
++	return 0;
+ }
+ 
+ static inline bool pud_dirty(pud_t pud)
+@@ -199,7 +206,7 @@
+ 
+ static inline int pud_young(pud_t pud)
+ {
+-	return pud_flags(pud) & _PAGE_ACCESSED;
++	return 0;
+ }
+ 
+ static inline bool pud_shstk(pud_t pud)
