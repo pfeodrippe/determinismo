@@ -86,6 +86,22 @@ event hashing, the guest module.
   (the buffer travels by pointer, not by content).
 - ScyllaDB 4.2.rc3 (examples/scylla): #7258 rediscovered blind; the zero pending_delete log
   was determinismo's power loss (discards after the shutdown), fixed in 7c21695.
+- Hunting harness, found by running real systems (2026-10-27): power losses discarded blocks
+  after the crash (writes now dropped once power is lost); a node start failed on a peer killed
+  but not reaped (ESRCH: now skipped); cores filled /run (now 512 MB in all and a quarter of free
+  space); process kills took supervising shells and start-script helpers, nodes down for good
+  (`process_kill_names`); a fault every 10-300 ms left systems that recover in seconds (Dgraph,
+  YugabyteDB) no window to work in (a scenario's `pacing`); the in-run verifier now finishes its
+  pending replays at a run's end (short runs are checked too) and replays a copy of the program
+  (a rebuild mid-hunt no longer reads as nondeterminism); serve shows its verdict.
+- Dgraph v1.1.1 (examples/dgraph): an alpha restarting panics on a tablet move, found blind in
+  the first run (README); hunting Jepsen's #4534/#4543 next.
+- YugabyteDB 1.3.1 (examples/yugabyte): YSQL backends crash on exit (libcds in
+  ThreadPool::Shutdown) and restart their node's backends; with paced faults and kills of
+  yb-master and yb-tserver only, transactions get through: hunting #2125.
+- Kafka 3.8.0: lost acknowledged writes under correlated power losses are its design (no fsync);
+  the default profile flushes every write, `unflushed` keeps Kafka's. KAFKA-17754 not found in
+  177 flushed timelines.
 - Resume for tree runs (serve's default): record each timeline's summary; on resume, judge the
   recorded generations again from them (no node making), and make nodes, by replay along the
   path, only for timelines still to run.
