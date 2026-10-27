@@ -68,7 +68,15 @@ fn describe(d: *System.Describe) !void {
                 .build = build,
                 .command = &.{name},
                 .ready = .{ .tcp = port },
-                .faults = .{ .restart = true, .crash = entry[1], .stop = true, .process_kill = true },
+                // Kills of Scylla only: a kill of start.sh's helpers (an address looked up,
+                // under set -e) as a node started ended its start.sh, the node down for good.
+                .faults = .{
+                    .restart = true,
+                    .crash = entry[1],
+                    .stop = true,
+                    .process_kill = true,
+                    .process_kill_names = &.{"scylla"},
+                },
             });
         }
     }
