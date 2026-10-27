@@ -95,7 +95,17 @@ event hashing, the guest module.
   pending replays at a run's end (short runs are checked too) and replays a copy of the program
   (a rebuild mid-hunt no longer reads as nondeterminism); serve shows its verdict.
 - Dgraph v1.1.1 (examples/dgraph): an alpha restarting panics on a tablet move, found blind in
-  the first run (README); hunting Jepsen's #4534/#4543 next.
+  the first run (README); hunting Jepsen's #4534/#4543 next. The tablet mover counted every
+  move a failure (zero answers a move in plain text, not JSON): fixed; moves did happen.
+- Runs (2026-10-27, evening): every exploration is a run of the host's store (~/.determinismo,
+  src/runs.zig), serve shows them all; a tree's live status (status.json: running, done,
+  failing, generation), progress lines every 30 s, the page's Output section; times and pace
+  on the run page; the page in one wave of requests. A run without --jobs used ONE core: the
+  explorer read its CPUs pinned to the one it booted on (cpus.zig keeps the given mask now;
+  e2e parallel checks the cores stay busy): also why causality's e2e failed all day.
+- srv2 hunts: one at a time, trees, no --jobs (the pool is elastic), infra/host/hunt-queue.sh
+  rotating when discovery plateaus (an hour in, nothing new over the last 100 timelines or the
+  last quarter). Dgraph (run 111) at ~4 timelines/min on 18 cores; then YugabyteDB, Kafka.
 - YugabyteDB 1.3.1 (examples/yugabyte): YSQL backends crash on exit (libcds in
   ThreadPool::Shutdown) and restart their node's backends; with paced faults and kills of
   yb-master and yb-tserver only, transactions get through: hunting #2125.
