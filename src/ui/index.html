@@ -1025,7 +1025,7 @@ async function mapDraw() {
   let { failures, decisions } = state.mapMarks && state.mapMarks.run === run.id &&
     state.mapMarks.timelines === branches.length ? state.mapMarks : { failures: [], faults: [], decisions: [] };
   if (!(state.mapMarks && state.mapMarks.run === run.id && state.mapMarks.timelines === branches.length)) try {
-    failures = await query({ condition: "assert.type=always assert.condition=false or assert.type=always_or_unreachable assert.condition=false or assert.type=unreachable assert.condition=true or antithesis_assert.hit=true antithesis_assert.display_type=Always antithesis_assert.condition=false or antithesis_assert.hit=true antithesis_assert.display_type=AlwaysOrUnreachable antithesis_assert.condition=false or antithesis_assert.hit=true antithesis_assert.display_type=Unreachable", output: "marks", limit: 200000 });
+    failures = lines(await api(`/runs/${state.runId}/failures`)); // Kept by serve (store's marks).
     // A strategy's reasons for its faults: only a run with a strategy has them.
     decisions = info.strategy ? await query({ condition: "event=decision", limit: 20000 }) : [];
     state.mapMarks = { run: run.id, timelines: branches.length, failures, decisions };

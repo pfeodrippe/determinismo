@@ -30,6 +30,7 @@
 //!   GET  /runs/<id>/causality/<n>  one: {id, done, of, points: [{vtime_ms, futures, failing,
 //!                            probability, low, high}]}
 //!   GET  /runs/<id>/timelines?offset=<n>  the timelines after the first n ingested
+//!   GET  /runs/<id>/failures  every failing evaluation, as map marks (JSON lines), kept
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
 //!   GET  /runs/<id>/notebook  {source}; PUT {source}: the run's notebook (JavaScript cells)
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
@@ -162,7 +163,7 @@ const Shared = struct {
 };
 
 /// What a run's database answers that changes only when timelines arrive.
-const Kept = enum { stats, timelines, properties, discovery };
+const Kept = enum { stats, timelines, properties, discovery, failures };
 const Answer = struct { generation: u64 = 0, bytes: ?[]u8 = null };
 
 /// A request being answered: what it shares, and what it allocates (gone with it).
@@ -437,6 +438,25 @@ fn properties_compute(_: *Server, connection: *duckdb.Connection, out: *std.Io.W
     try connection.json(out, store.properties_sql, .{});
 }
 
+/// Every failing evaluation of an assertion (Antithesis's declarations, `hit` false, are not),
+/// as map marks (query.zig's `marks`): GET /runs/<id>/failures, kept like the timelines (the map
+/// asked for them on every load: 1.8 s over run 93's 12,000 timelines).
+const failing_condition = "assert.type=always assert.condition=false or " ++
+    "assert.type=always_or_unreachable assert.condition=false or " ++
+    "assert.type=unreachable assert.condition=true or " ++
+    "antithesis_assert.hit=true antithesis_assert.display_type=Always antithesis_assert.condition=false or " ++
+    "antithesis_assert.hit=true antithesis_assert.display_type=AlwaysOrUnreachable antithesis_assert.condition=false or " ++
+    "antithesis_assert.hit=true antithesis_assert.display_type=Unreachable";
+
+fn failures_compute(server: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
+    const search = try query.query_of(server.arena, .{
+        .condition = failing_condition,
+        .output = .marks,
+        .limit = 200_000,
+    });
+    _ = try query.answer(connection, server.arena, &search, out, true);
+}
+
 fn discovery_compute(server: *Server, connection: *duckdb.Connection, out: *std.Io.Writer) !void {
     const Point = struct { timelines: u64, behaviors: u64 };
     const points = try connection.rows(Point, server.arena, store.discovery_sql, .{});
@@ -593,7 +613,7 @@ fn run_route(
         return causality_show(server, run, index, out);
     }
     // The rest is the run's events database's.
-    const reads = [_][]const u8{ "timelines", "properties", "discovery" };
+    const reads = [_][]const u8{ "timelines", "properties", "discovery", "failures" };
     const writes = [_][]const u8{ "query", "events", "sql" };
     const database_read = for (reads) |name| {
         if (eql(u8, action, name)) break eql(u8, request.method, "GET");
@@ -626,6 +646,7 @@ fn run_route(
             .timelines => &timelines_compute,
             .properties => &properties_compute,
             .discovery => &discovery_compute,
+            .failures => &failures_compute,
             .stats => unreachable, // Part of GET /runs/<id>.
         };
         try out.writeAll(try answer_kept(server, run.id, kind, compute));
