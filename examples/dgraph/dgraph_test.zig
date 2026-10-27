@@ -418,7 +418,7 @@ fn tablets_move(context: *System.Context) !void {
                 const target = group_ids[sdk.random_below(group_ids.len)];
                 if (std.mem.eql(u8, target, group.key_ptr.*)) continue;
                 const path = try std.fmt.allocPrint(arena, "/moveTablet?tablet={s}&group={s}", .{ predicate, target });
-                _ = request(arena, leader, zero_port, "GET", path, "", move_timeout_ms) catch |err| {
+                tablet_move(arena, leader, path) catch |err| {
                     sdk.sometimes(true, "a tablet move failed", .{ .err = @errorName(err) });
                     continue;
                 };
@@ -426,6 +426,21 @@ fn tablets_move(context: *System.Context) !void {
             }
         }
     }
+}
+
+/// One tablet moved through the zeros' leader. A move answers in plain text ("Predicate: [key_3]
+/// moved from group [1] to [2]"), a refusal in JSON (its errors): every move once read as a
+/// failure, as no JSON came back.
+fn tablet_move(arena: std.mem.Allocator, leader: [4]u8, path: []const u8) !void {
+    const response = try sdk.tcp.http_with(leader, zero_port, "GET", path, "", &reply_buffer, .{
+        .timeout_ms = move_timeout_ms,
+        .content_type = "application/json",
+    });
+    if (response.status == 200 and std.mem.startsWith(u8, response.body, "Predicate: [")) return;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, response.body, .{}) catch return error.BadAnswer;
+    const message = if (field(value, "errors")) |errors| error_message(errors) else "";
+    sdk.sometimes(true, "Dgraph refused a request", .{ .path = path, .message = message });
+    return error.Refused;
 }
 
 /// The zeros' leader's node ("addr": "dg3:5080").
