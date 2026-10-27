@@ -46,6 +46,9 @@ ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
   --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096
 # Restarts stop serve alone: its runs go on, adopted by the next.
 KillMode=process
+# A process the kernel's OOM killer takes (a holder, a worker) is not a reason to stop the unit
+# and every run in it: systemd's default (stop) did, 2026-10-27.
+OOMPolicy=continue
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

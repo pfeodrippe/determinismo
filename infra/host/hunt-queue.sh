@@ -7,10 +7,13 @@
 set -u
 current=$1
 shift
-running() { curl -s localhost:7878/runs/$1 | grep -q '"state":"running"'; }
+data=${DETERMINISMO_DATA:-$HOME/.determinismo}
+# Running while its explorer holds the run's pid file locked (src/runs.zig): whether serve is up
+# or not (the OOM killer once took serve, and the queue took that for the run's end).
+running() { [ -e "$data/runs/$1/pid" ] && ! flock -n -s "$data/runs/$1/pid" true; }
 plateaued() { # <run id>: exit 0 when its discovery is flat past the hour
   local started
-  started=$(stat -c %Y ${DETERMINISMO_DATA:-$HOME/.determinismo}/runs/$1/request.json)
+  started=$(stat -c %Y "$data/runs/$1/request.json")
   [ $(( $(date +%s) - started )) -ge 3600 ] || return 1
   curl -s localhost:7878/runs/$1/discovery | python3 -c '
 import sys, json

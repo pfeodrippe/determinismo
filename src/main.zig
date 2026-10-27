@@ -61,10 +61,12 @@ const usage =
     \\                            [--horizon <duration>]   (a tree's returns run that long past
     \\                            their moment, then stop: short branches, extended when they
     \\                            find something; default: to the timeline's end)
-    \\                            [--archive]   (Go-Explore's archive: the tree returns to the
-    \\                            least visited behaviors of any generation)
+    \\                            [--no-archive]   (Go-Explore's archive, on by default: half the
+    \\                            returns to the newest frontier, the rest to the least visited
+    \\                            behaviors of any generation; without it, the frontier only)
     \\                            [--pipeline <n>]   (a tree's generations in flight, 1 to 4: it
-    \\                            returns to moments from generation n on; default 3)
+    \\                            returns to moments from generation n on; default 2 up to 16
+    \\                            workers, else 3)
     \\                            [--generation <n>]   (a tree's timelines per generation: 16,
     \\                            or a multiple of it for machines with more CPUs)
     \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
@@ -210,11 +212,14 @@ const Arguments = struct {
     /// generation on; more keeps workers busy while long timelines finish.
     pipeline: u32 = pipeline_depth_default,
     pipeline_given: bool = false,
-    /// Go-Explore's archive (`--archive`): the tree keeps every behavior any timeline reached,
-    /// where (just after it), and how often it returned there, and returns to the least visited
-    /// ones, from any generation (a timeline of an earlier one is rebuilt by replaying its path),
-    /// instead of only to what the last generation found new.
-    archive: bool = false,
+    /// Go-Explore's archive (on unless `--no-archive`): the tree keeps every behavior any timeline
+    /// reached, where (just after it), and how often it returned there; each generation returns
+    /// to the newest frontier with up to half its nodes and to the least visited cells of any
+    /// generation with the rest (a timeline of an earlier one is rebuilt by replaying its path).
+    /// Off, only to what the last generation found new: a promising state found earlier is
+    /// forgotten once newer ones come, and a bug needing a second rare event after it is lost.
+    archive: bool = true,
+    archive_given: bool = false,
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
@@ -312,8 +317,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
-    // This process and everything it forks are one run sharing the host's CPUs (cpus.zig).
+    // This process and everything it forks are one run sharing the host's CPUs (cpus.zig), and
+    // its memory: each of its VMs claims its guest's size with the CPU it runs on.
     cpus.run_key = linux.getpid();
+    cpus.claim_bytes = @as(u64, arguments.memory_mib) << 20;
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
     const profile = arguments.profile orelse "";
     const all = std.mem.eql(u8, profile, "all");
@@ -425,6 +432,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const arena = init.arena.allocator();
     var arguments = arguments_given;
     if (exploration_is_run(&arguments)) try run_register(arena, init.io, &arguments);
+    if (arguments.resume_run) try resume_settings_adopt(arena, init.io, &arguments);
     const has_system = arguments.program_path != null or arguments.compose_path != null or
         arguments.pinned != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
@@ -886,6 +894,23 @@ const ReturnKey = struct { generation: u32, branch: u32, vtime_ns: u64 };
 
 /// What a run's record already has, for --resume: its run must be this one (the same inputs,
 /// seed, branching and, for a tree, how it plans), or there is nothing to continue.
+/// A resumed tree keeps the settings its record says it ran with (its archive, its pipeline),
+/// unless given again: a run started under other defaults still continues.
+fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !void {
+    const path = arguments.record_path orelse return;
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return;
+    const first = source[0 .. std.mem.indexOfScalar(u8, source, '\n') orelse source.len];
+    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null } = null };
+    const line = std.json.parseFromSliceLeaky(Line, arena, first, .{ .ignore_unknown_fields = true }) catch return;
+    const run = line.run orelse return;
+    if (!arguments.archive_given) if (run.archive) |archive| {
+        arguments.archive = archive;
+    };
+    if (!arguments.pipeline_given) if (run.pipeline) |pipeline| {
+        arguments.pipeline = pipeline;
+    };
+}
+
 fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*const Resumed {
     const path = arguments.record_path orelse {
         std.debug.print("[determinismo] --resume continues the run of a record: give --record\n", .{});
@@ -1044,6 +1069,35 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
     summary.behavior_count = header.behavior_count;
     @memcpy(std.mem.sliceAsBytes(summary.behaviors[0..header.behavior_count]), bytes[@sizeOf(SummaryHeader)..]);
+}
+
+test "a resumed run keeps the archive and pipeline its record says, unless given again" {
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const record = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/record.jsonl", .{&tmp.sub_path});
+    // Recorded under the old defaults: no archive, three generations in flight.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = record,
+        .data = "{\"run\":{\"seed\":\"0000000000000002\",\"pipeline\":3,\"archive\":false}}\n",
+    });
+    var kept: Arguments = .{ .command = .explore, .record_path = record, .pipeline = 2 };
+    try resume_settings_adopt(arena, io, &kept);
+    try std.testing.expect(!kept.archive);
+    try std.testing.expectEqual(3, kept.pipeline);
+    var given: Arguments = .{
+        .command = .explore,
+        .record_path = record,
+        .archive_given = true,
+        .pipeline = 2,
+        .pipeline_given = true,
+    };
+    try resume_settings_adopt(arena, io, &given);
+    try std.testing.expect(given.archive);
+    try std.testing.expectEqual(2, given.pipeline);
 }
 
 test "summaries round trip, a cut last one left" {
@@ -3376,8 +3430,9 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.verify_holders = true;
             continue;
         }
-        if (std.mem.eql(u8, argv[index], "--archive")) {
-            arguments.archive = true;
+        if (std.mem.eql(u8, argv[index], "--archive") or std.mem.eql(u8, argv[index], "--no-archive")) {
+            arguments.archive = std.mem.eql(u8, argv[index], "--archive");
+            arguments.archive_given = true;
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--resume")) {

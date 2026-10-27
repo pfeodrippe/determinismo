@@ -37,6 +37,10 @@ const wait_ns_max = 30 * std.time.ns_per_ms;
 /// (they inherit it); a process outside any run is a run of its own.
 pub var run_key: ?linux.pid_t = null;
 
+/// The memory this process's VMs may come to use (their guest's size), claimed with the CPU it
+/// takes: set once at its start, forks inherit it. 0: none claimed.
+pub var claim_bytes: u64 = 0;
+
 /// The CPUs this process was given: its affinity before a pin narrowed it to the one CPU it
 /// held. Its pool, its count of usable CPUs and a CPU given back go by it, never by the pinned
 /// affinity: an explorer pinned while it booted and set up once counted one usable CPU (every
@@ -161,9 +165,12 @@ pub const Pool = struct {
             }
             // The host's memory too: no VM starts while less than the reserve is available
             // (runs share the host's memory as its CPUs, and waiting workers and holders keep
-            // theirs: srv2 once had 0 GB available), until timelines end or holders go.
+            // theirs: srv2 once had 0 GB available), until timelines end or holders go; nor
+            // while the VMs running and this one could come to need more than the host has
+            // (a VM's memory grows after it starts, up to its guest's size: 18 YugabyteDB VMs
+            // admitted with memory free filled srv2 and the OOM killer took serve, 2026-10-27).
             const available = memory_available(); // 0: unknown, never a reason to wait.
-            if (available != 0 and available < memory_reserve_bytes) {
+            if ((available != 0 and available < memory_reserve_bytes) or !pool.claim_fits(claim_bytes)) {
                 if (pool.priority) {
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
@@ -174,6 +181,9 @@ pub const Pool = struct {
                 const slot: u32 = @intCast(index);
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
                 if (linux.errno(locked) != .SUCCESS) continue;
+                // The claim, where the others read it while this process holds the CPU.
+                const claim = std.mem.toBytes(claim_bytes);
+                _ = linux.pwrite(pool.fds[slot], &claim, claim.len, 0);
                 pin(pool.cpus[slot]);
                 return .{ .slot = slot };
             }
@@ -182,6 +192,25 @@ pub const Pool = struct {
                 _ = linux.nanosleep(&pause, null);
             }
         }
+    }
+
+    /// Whether `bytes` more fit beside what the held CPUs' processes claimed: within the host's
+    /// memory less the reserve. A CPU's claim counts while its lock is held.
+    fn claim_fits(pool: *Pool, bytes: u64) bool {
+        if (bytes == 0) return true;
+        const total = memory_total();
+        if (total == 0) return true; // Unknown: never a reason to wait.
+        var claimed: u64 = 0;
+        for (pool.fds[0..pool.count]) |fd| {
+            const probe = linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB);
+            if (linux.errno(probe) == .SUCCESS) {
+                _ = linux.flock(fd, std.posix.LOCK.UN);
+                continue; // Free.
+            }
+            var claim: [8]u8 = @splat(0);
+            if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
+        }
+        return claimed + bytes + memory_reserve_bytes <= total;
     }
 
     /// Whether a priority process waits for a CPU (it holds the `priority` file shared).
@@ -206,13 +235,21 @@ pub const memory_reserve_bytes = 8 << 30;
 
 /// The host's available memory (MemAvailable), or 0 if unknown.
 pub fn memory_available() u64 {
+    return meminfo("MemAvailable:");
+}
+
+/// The host's memory (MemTotal), 0 if unknown.
+pub fn memory_total() u64 {
+    return meminfo("MemTotal:");
+}
+
+fn meminfo(comptime key: []const u8) u64 {
     const fd = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return 0;
     defer _ = linux.close(@intCast(fd));
     var buffer: [4096]u8 = undefined;
     const size = linux.read(@intCast(fd), &buffer, buffer.len);
     if (linux.errno(size) != .SUCCESS) return 0;
-    const key = "MemAvailable:";
     const at = std.mem.indexOf(u8, buffer[0..size], key) orelse return 0;
     var words = std.mem.tokenizeScalar(u8, buffer[at + key.len .. size], ' ');
     const kib = std.fmt.parseInt(u64, words.next() orelse return 0, 10) catch return 0;
@@ -307,6 +344,25 @@ test "pinned, a process still counts and pools the CPUs it was given" {
     var mask: linux.cpu_set_t = undefined;
     _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mask);
     try std.testing.expectEqualSlices(usize, &given(), &mask); // Unpinned when given back.
+}
+
+test "a VM's memory claim counts while its CPU is held" {
+    var holder: Pool = undefined;
+    try holder.open();
+    defer holder.close();
+    var other: Pool = undefined;
+    try other.open();
+    defer other.close();
+    const total = memory_total();
+    if (total == 0) return error.SkipZigTest;
+    const saved = claim_bytes;
+    defer claim_bytes = saved;
+    claim_bytes = total / 2;
+    const held = holder.take(); // Claims half the host.
+    try std.testing.expect(!other.claim_fits(total / 2)); // Half more, and the reserve: no.
+    try std.testing.expect(other.claim_fits(1 << 20));
+    holder.give(held);
+    try std.testing.expect(other.claim_fits(total / 2)); // Given back: its claim no longer counts.
 }
 
 test "a CPU is held by one process at a time, and given back" {

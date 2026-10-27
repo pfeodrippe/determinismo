@@ -115,7 +115,7 @@ fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []
         "--from-vtime-ms", "--from-exec",   "--from-snapshot",  "--trace",          "--events",
         "--seed",
     };
-    const alone = [_][]const u8{ "--resume", "--archive", "--continue" };
+    const alone = [_][]const u8{ "--resume", "--archive", "--no-archive", "--continue" };
     var out: std.ArrayList([]const u8) = .empty;
     try out.appendSlice(arena, &.{ "/proc/self/exe", "explore" });
     assert(argv.len >= 2);
