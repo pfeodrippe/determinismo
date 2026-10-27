@@ -489,7 +489,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .process_pause,
         .thread_pause,
         => node_start(system, applied),
-        .process_kill => apply_process_kill(applied),
+        .process_kill => apply_process_kill(system, applied),
         .isolate, .partition, .degrade, .partition_groups, .clog => network_start(system, applied),
         .restore => network_restore(system, applied),
         .clock_skip => {
@@ -842,20 +842,38 @@ fn apply_custom(
 }
 
 /// A crash: one of the node's processes other than its main one (a worker, a pod's process)
-/// is killed, for whatever supervises it to notice. Nothing to undo.
-fn apply_process_kill(applied: *const Applied) void {
+/// is killed, for whatever supervises it to notice; one of the names the node allows, when it
+/// names some. Nothing to undo.
+fn apply_process_kill(system: *const schema.System, applied: *const Applied) void {
+    const names = if (system.node(applied.node)) |node| node.faults.process_kill_names else &.{};
     var pids: [processes_max]linux.pid_t = undefined;
     const count = nodes.processes(applied.node, &pids) catch return;
     const main_pid = nodes.pid_recorded(applied.node);
     var others: u32 = 0;
     for (pids[0..count]) |pid| {
         if (pid == main_pid) continue;
+        if (names.len > 0 and !command_named(pid, names)) continue;
         pids[others] = pid;
         others += 1;
     }
     if (others == 0) return;
     _ = linux.kill(pids[applied.process_index % others], .KILL);
     sdk.event("fault", applied.*);
+}
+
+/// Whether the process's command name (/proc/<pid>/comm) is one of `names`.
+fn command_named(pid: linux.pid_t, names: []const []const u8) bool {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/comm", .{pid}, 0) catch return false;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [64]u8 = undefined;
+    const read = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(read) != .SUCCESS) return false;
+    const command = std.mem.trimEnd(u8, buffer[0..read], "\n");
+    for (names) |name| if (std.mem.eql(u8, command, name)) return true;
+    return false;
 }
 
 /// The links (one direction each) a partition or clog disrupts.

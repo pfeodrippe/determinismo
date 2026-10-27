@@ -154,6 +154,11 @@ pub const Faults = struct {
     /// Kill one of its processes other than its main one (SIGKILL), as a crash its supervisor
     /// must recover from (a worker, a pod's process under kubelet).
     process_kill: bool = false,
+    /// When not empty, the processes process_kill may kill: those whose command name (comm,
+    /// 15 characters at most) is one of these. A system's own servers, not what they spawn and
+    /// handle the death of themselves: a PostgreSQL backend killed makes its postmaster restart
+    /// every backend, by design (YugabyteDB's YSQL), where its operators would kill the server.
+    process_kill_names: []const []const u8 = &.{},
     /// Commands in the node (an absolute path, then arguments, split at spaces: no shell) that
     /// the fault injector runs at random times, as Antithesis's custom faults: calling an admin
     /// API, forcing a compaction, a failover. They can draw from the SDK's randomness.
