@@ -271,6 +271,9 @@ pub fn build(b: *std.Build) void {
     e2e_run.setCwd(b.path(".")); // Its defaults (zig-out/bin) and the examples' paths.
     // Checks take the host's next free CPUs before exploration runs (src/cpus.zig).
     e2e_run.setEnvironmentVariable("DETERMINISMO_CPU_PRIORITY", "1");
+    // Its explorations are runs (src/runs.zig): in a store of its own, not the user's.
+    // Relative to its working directory, the repository's.
+    e2e_run.setEnvironmentVariable("DETERMINISMO_DATA", ".zig-cache/e2e-runs");
     const e2e_only = b.option([]const u8, "only", "e2e: the checks whose names contain this");
     if (e2e_only) |only| e2e_run.addArgs(&.{ "--only", only });
     const e2e_guest = b.option([]const u8, "guest", "e2e: the guest kernel and initramfs ($HOME/guest)");

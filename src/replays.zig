@@ -103,12 +103,13 @@ fn results_parse(arena: std.mem.Allocator, text: []const u8) !Results {
 /// what drives an exploration (its tape has the seeds and decisions).
 fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []const u8 {
     const with_value = [_][]const u8{
-        "--branches",   "--time-budget",   "--jobs",           "--record",         "--tape-dir",
-        "--events-dir", "--branching",     "--generation",     "--pipeline",       "--horizon",
-        "--strategy",   "--shard",         "--verify-replays", "--save-snapshots", "--save-at-ms",
-        "--serve",      "--branch",        "--tape",           "--at-vtime-ms",    "--until",
-        "--exec",       "--exec-script",   "--rewind-ms",      "--from-branch",    "--from-vtime-ms",
-        "--from-exec",  "--from-snapshot", "--trace",          "--events",         "--seed",
+        "--branches",      "--time-budget", "--jobs",           "--record",         "--tape-dir",
+        "--events-dir",    "--branching",   "--generation",     "--pipeline",       "--horizon",
+        "--strategy",      "--shard",       "--verify-replays", "--save-snapshots", "--save-at-ms",
+        "--data",          "--branch",      "--tape",           "--at-vtime-ms",    "--until",
+        "--run-directory", "--exec",        "--exec-script",    "--rewind-ms",      "--from-branch",
+        "--from-vtime-ms", "--from-exec",   "--from-snapshot",  "--trace",          "--events",
+        "--seed",
     };
     const alone = [_][]const u8{ "--resume", "--archive", "--continue" };
     var out: std.ArrayList([]const u8) = .empty;

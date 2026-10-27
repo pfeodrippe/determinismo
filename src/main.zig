@@ -30,6 +30,7 @@ const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
 const verify = @import("verify.zig");
 const replays = @import("replays.zig");
+const runs = @import("runs.zig");
 const changed = @import("changed.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
@@ -98,7 +99,8 @@ const usage =
     \\                            [--cpu-modulation]   (branches run at varying speeds)
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
     \\                            by a replay and compare them, to check holders; slower)
-    \\                            [--serve <host:port>]   (a run of that serve, in its web UI)
+    \\                            [--data <dir>]   (the host's runs, where this one goes:
+    \\                            $DETERMINISMO_DATA, else ~/.determinismo; serve shows them)
     \\                            [--events-dir <dir>]   (every branch's events, for query, and
     \\                            the system's pin)
     \\                            [--system <pin.json>]   (a pinned system and its node disks,
@@ -203,6 +205,7 @@ const Arguments = struct {
     /// decision points often; a branch is extended only when it found something). Null: to the
     /// timeline's end.
     horizon_ns: ?u64 = null,
+    horizon_text: ?[]const u8 = null,
     /// Generations in flight at once (`--pipeline`): the tree returns to moments from this
     /// generation on; more keeps workers busy while long timelines finish.
     pipeline: u32 = pipeline_depth_default,
@@ -244,9 +247,10 @@ const Arguments = struct {
     /// Remake every tree node an in-run snapshot made (holders.zig) by a replay, and print how
     /// the two differ in what the guest can see ("verify ... DIFFERENT"): a check of holders.
     verify_holders: bool = false,
-    /// Run the exploration in a `determinismo serve` at this address (host:port) instead of
-    /// here: it then shows in the web UI, with its record, events, tapes and notebook.
-    serve_address: ?[]const u8 = null,
+    /// The host's runs (runs.zig): an exploration is one of them, in its own directory there.
+    data_directory: ?[]const u8 = null,
+    /// The run's directory, claimed already (serve's runs); else the exploration claims one.
+    run_directory: ?[]const u8 = null,
     /// This host runs the branches whose index modulo `shard_count` is `shard_index`
     /// (`--shard k/n`); `determinismo merge` combines the shards' records.
     shard_index: u32 = 0,
@@ -307,7 +311,6 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     };
-    if (arguments.serve_address) |address| return submit(arena, arguments, address);
     // This process and everything it forks are one run sharing the host's CPUs (cpus.zig).
     cpus.run_key = linux.getpid();
     const vm = try arena.create(VM); // Large (port statistics): never on the stack.
@@ -420,6 +423,7 @@ var own_cpu: OwnCpu = .{};
 fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 {
     const arena = init.arena.allocator();
     var arguments = arguments_given;
+    if (exploration_is_run(&arguments)) try run_register(arena, init.io, &arguments);
     const has_system = arguments.program_path != null or arguments.compose_path != null or
         arguments.pinned != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
@@ -505,42 +509,58 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     return failing_scenarios;
 }
 
-/// `explore --serve <host:port>`: the exploration becomes a run of that `serve` (its machine
-/// options apply), so it shows in the web UI. Prints the run's address.
-fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const u8) !void {
-    if (arguments.command != .explore) return error.Usage;
-    const colon = std.mem.lastIndexOfScalar(u8, address_text, ':') orelse return error.Usage;
-    const port = try std.fmt.parseInt(u16, address_text[colon + 1 ..], 10);
-    const host = address_text[0..colon];
-    var address: [4]u8 = .{ 127, 0, 0, 1 };
-    if (!std.mem.eql(u8, host, "localhost")) {
-        var parts = std.mem.splitScalar(u8, host, '.');
-        for (&address) |*byte| byte.* = try std.fmt.parseInt(u8, parts.next() orelse "", 10);
-    }
-    const Request = struct {
-        program: ?[]const u8,
-        compose: ?[]const u8,
-        scenario: ?[]const u8,
-        profile: ?[]const u8,
-        seed: u64,
-        branches: ?u32,
-        time_budget: ?[]const u8,
-        branching: []const u8,
-        faults: ?[]const u8,
-        no_faults: ?[]const u8,
-        jobs: ?u32,
-        strategy: ?[]const u8,
-        from_branch: ?u32,
-        from_vtime_ms: ?u64,
-        cpu_modulation: bool,
-        timeline: ?[]const u8,
-        generation: u32,
-        changed: ?[]const u8,
-        retroactive: []const []const u8,
+/// Whether the command is an exploration, which is one of the host's runs (runs.zig): not a
+/// replay of one timeline (a tape, a branch), nor futures forked from a saved snapshot.
+fn exploration_is_run(arguments: *const Arguments) bool {
+    return arguments.command == .explore and arguments.tape_path == null and
+        arguments.branch_only == null and arguments.from_snapshot == null;
+}
+
+/// The exploration as one of the host's runs (runs.zig): its directory claimed, unless serve
+/// gave it one (`--run-directory`), its output kept there too, its request and machine written
+/// (what serve replays and continues it with); its pid held; its record, events and tapes there,
+/// or, asked elsewhere, named from there.
+fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !void {
+    const directory = arguments.run_directory orelse claimed: {
+        const data = try runs.data_directory(arena, arguments.data_directory);
+        const run = try runs.claim(arena, io, data);
+        try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
+        std.debug.print("[determinismo] run {d}: {s}\n", .{ run.id, run.directory });
+        try run_request_write(arena, io, data, run.directory, arguments);
+        break :claimed run.directory;
     };
-    const body = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(Request{
-        .program = arguments.program_path,
-        .compose = arguments.compose_path,
+    try runs.running_mark(arena, directory);
+    const Placed = struct { name: []const u8, path: *?[]const u8 };
+    for ([_]Placed{
+        .{ .name = "events", .path = &arguments.events_directory },
+        .{ .name = "record.jsonl", .path = &arguments.record_path },
+        .{ .name = "tapes", .path = &arguments.tape_directory },
+    }) |placed| {
+        const own = try std.fs.path.join(arena, &.{ directory, placed.name });
+        const elsewhere = placed.path.* orelse {
+            placed.path.* = own;
+            continue;
+        };
+        const target = try runs.absolute(arena, elsewhere);
+        if (std.mem.eql(u8, target, own)) continue;
+        const target_z = try arena.dupeSentinel(u8, target, 0);
+        _ = linux.symlinkat(target_z, linux.AT.FDCWD, try arena.dupeSentinel(u8, own, 0));
+    }
+}
+
+/// A run started here: what was asked (serve's request: the program kept by its content, as
+/// serve keeps it) and the machine it boots (its kernel and initramfs kept the same way).
+fn run_request_write(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    data: []const u8,
+    directory: []const u8,
+    arguments: *const Arguments,
+) !void {
+    const asked: serve.RunRequest = .{
+        .program = if (arguments.program_path) |path| try runs.artifact_keep(arena, io, data, path) else null,
+        .program_asked = if (arguments.program_path) |path| try runs.absolute(arena, path) else null,
+        .compose = if (arguments.compose_path) |path| try runs.absolute(arena, path) else null,
         .scenario = arguments.scenario,
         .profile = arguments.profile,
         .seed = arguments.seed,
@@ -549,29 +569,38 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
         .branching = @tagName(arguments.branching),
         .faults = arguments.faults_added,
         .no_faults = arguments.faults_none,
+        .timeline = arguments.timeline_text,
+        .generation = arguments.generation_size,
+        .horizon = arguments.horizon_text,
+        .pipeline = arguments.pipeline,
         .jobs = arguments.jobs,
         .strategy = arguments.strategy_command,
+        .changed = arguments.changed,
+        .retroactive = arguments.retroactive[0..arguments.retroactive_count],
         .from_branch = arguments.from_branch,
         .from_vtime_ms = arguments.from_vtime_ms,
         .cpu_modulation = arguments.cpu_modulation,
-        .timeline = arguments.timeline_text,
-        .generation = arguments.generation_size,
-        .changed = arguments.changed,
-        .retroactive = arguments.retroactive[0..arguments.retroactive_count],
-    }, .{})});
-    var buffer: [256]u8 = undefined;
-    const tcp = @import("determinismo").tcp;
-    const response = try tcp.http(address, port, "POST", "/runs", body, &buffer);
-    if (response.status != 201) {
-        std.debug.print("[determinismo] serve refused the run ({d}): {s}\n", .{
-            response.status, response.body,
-        });
-        return error.ServeRefused;
+        .memory_mib = arguments.memory_mib,
+    };
+    var machine: std.ArrayList([]const u8) = .empty;
+    try machine.appendSlice(arena, &.{ "--kernel", try runs.artifact_keep(arena, io, data, arguments.kernel_path) });
+    if (arguments.initrd_path) |path| try machine.appendSlice(arena, &.{ "--initrd", try runs.artifact_keep(arena, io, data, path) });
+    try machine.appendSlice(arena, &.{
+        "--cmdline",    arguments.cmdline,
+        "--cache",      try runs.absolute(arena, arguments.cache_directory),
+        "--memory-mib", try std.fmt.allocPrint(arena, "{d}", .{arguments.memory_mib}),
+    });
+    for (arguments.disk_paths[0..arguments.disk_count]) |path| {
+        try machine.appendSlice(arena, &.{ "--disk", try runs.absolute(arena, path) });
     }
-    const Created = struct { id: u32 };
-    const created = try std.json.parseFromSliceLeaky(Created, arena, response.body, .{});
-    std.debug.print("[determinismo] run {d}: http://{s}/#{d}\n", .{
-        created.id, address_text, created.id,
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ directory, "request.json" }),
+        .data = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(asked, .{})}),
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ directory, "machine.json" }),
+        .data = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(machine.items, .{})}),
     });
 }
 
@@ -580,7 +609,7 @@ fn submit(arena: std.mem.Allocator, arguments: Arguments, address_text: []const 
 fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
     var listen: []const u8 = "127.0.0.1:7878";
-    var data: []const u8 = ".determinismo-data";
+    var data: ?[]const u8 = null;
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
     var snapshots_keep_hours: u64 = 24;
@@ -620,7 +649,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     if (linux.errno(self_size) != .SUCCESS) return error.SelfPath;
     try serve.serve(arena, init.io, .{
         .listen = listen,
-        .data_directory = data,
+        .data_directory = try runs.data_directory(arena, data),
         .machine = machine.items,
         .self = explorer orelse self_buffer[0..self_size],
         .archive = archive,
@@ -3288,8 +3317,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         index += 1;
     }
     assert(index == argv.len);
-    // A run submitted to `serve` boots with serve's machine options.
-    if (arguments.kernel_path.len == 0 and arguments.serve_address == null) return error.Usage;
+    if (arguments.kernel_path.len == 0) return error.Usage;
     if (arguments.memory_mib < memory_mib_min) return error.Usage;
     if (arguments.memory_mib > memory_mib_max) return error.Usage;
     if (arguments.time_budget_ns != null and !arguments.branches_given) {
@@ -3414,6 +3442,7 @@ fn parse_option(
         arguments.changed = value;
     } else if (eql(u8, flag, "--horizon")) {
         arguments.horizon_ns = try duration_parse(value);
+        arguments.horizon_text = value;
     } else if (eql(u8, flag, "--pipeline")) {
         const depth = try std.fmt.parseInt(u32, value, 10);
         if (depth == 0 or depth > pipeline_depth_max) return error.Usage;
@@ -3466,8 +3495,10 @@ fn parse_option(
         arguments.tape_path = value;
     } else if (eql(u8, flag, "--at-vtime-ms")) {
         arguments.moment_vtime_ms = try std.fmt.parseInt(u64, value, 10);
-    } else if (eql(u8, flag, "--serve")) {
-        arguments.serve_address = value;
+    } else if (eql(u8, flag, "--data")) {
+        arguments.data_directory = value;
+    } else if (eql(u8, flag, "--run-directory")) {
+        arguments.run_directory = value;
     } else if (eql(u8, flag, "--rewind-ms")) {
         arguments.rewind_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec")) {
@@ -3592,6 +3623,7 @@ test {
     _ = @import("virtio_block.zig");
     _ = @import("prepare.zig");
     _ = @import("serve.zig");
+    _ = @import("runs.zig");
     _ = @import("mcp.zig");
     _ = @import("merge.zig");
     _ = @import("script.zig");

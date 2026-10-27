@@ -56,6 +56,7 @@ const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
 const duckdb = @import("duckdb.zig");
 const store = @import("store.zig");
+const host_runs = @import("runs.zig");
 
 pub const Options = struct {
     /// "address:port", e.g. 127.0.0.1:7878. Bind to loopback unless the network is trusted.
@@ -78,7 +79,7 @@ pub const Options = struct {
     failure_snapshots: bool = true,
 };
 
-const runs_max = 4096;
+const runs_max = host_runs.runs_max;
 const jobs_max = 256;
 // A notebook with its actions' results, an uploaded strategy.
 const request_size_max = 64 << 20;
@@ -197,7 +198,7 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
     const runs_directory = try std.fs.path.join(arena, &.{ options.data_directory, "runs" });
     try std.Io.Dir.cwd().createDirPath(io, runs_directory);
     var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
-    try runs_load(&server);
+    try runs_discover(&server);
     // The first address must be there; the others (a VPN's, as Tailscale's) may come up later.
     var addresses = std.mem.tokenizeScalar(u8, options.listen, ',');
     const first = addresses.next() orelse return error.BadListen;
@@ -281,6 +282,7 @@ fn watch(shared: *Shared) void {
         };
         assert(linux.errno(linux.nanosleep(&interval, null)) != .INVAL);
         shared.lock();
+        runs_discover_locked(shared);
         var ended: [16]u32 = undefined;
         const ended_count = runs_reap(shared, &ended);
         var count: usize = 0;
@@ -709,7 +711,7 @@ fn database_answer(
 }
 
 /// What a client may ask for; mirrors explore's flags.
-const RunRequest = struct {
+pub const RunRequest = struct {
     /// The system: a test program, or a Compose file (exactly one).
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
@@ -777,12 +779,12 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     const request_json = try std.fmt.allocPrint(server.arena, "{f}", .{std.json.fmt(asked, .{})});
     const shared = server.shared;
     shared.lock();
-    defer shared.unlock(); // Until the run is in the list: ids are given once.
+    defer shared.unlock(); // Until the run is in the list.
     if (shared.run_count == runs_max) return error.TooManyRuns;
-    const id = if (shared.run_count == 0) 1 else shared.runs[shared.run_count - 1].id + 1;
-    if (id >= runs_max) return error.TooManyRuns;
-    const directory = try run_directory(server, id);
-    try std.Io.Dir.cwd().createDirPath(server.io, directory);
+    // Claimed as every exploration claims its run (runs.zig): ids are given once, whoever asks.
+    const claimed = try host_runs.claim(server.arena, server.io, server.options.data_directory);
+    const id = claimed.id;
+    const directory = claimed.directory;
     try std.Io.Dir.cwd().writeFile(server.io, .{
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, "request.json" }),
         .data = request_json,
@@ -793,13 +795,9 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     });
     const argv = try explore_arguments(server, &asked, directory, machine);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
+    // Its explorer holds the run's pid file (runs.zig): how a restarted server finds it running.
     const pid = try spawn(server.arena, argv, output, &.{}, .fresh);
-    // For a restarted server to find it still running (runs_load).
-    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
-    const pid_text = try print(server, "{d}\n", .{pid});
-    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = pid_text });
-    shared.runs[shared.run_count] = .{ .id = id, .pid = pid };
-    shared.run_count += 1;
+    runs_insert(shared, .{ .id = id, .pid = pid });
     try out.print("{{\"id\":{d}}}\n", .{id});
     return 201;
 }
@@ -834,13 +832,8 @@ fn explore_arguments(
         const branches = try print(server, "{d}", .{asked.branches orelse 16});
         try argv.appendSlice(server.arena, &.{ "--branches", branches });
     }
-    try argv.appendSlice(server.arena, &.{
-        "--events-dir", try std.fs.path.join(server.arena, &.{ directory, "events" }),
-    });
-    try argv.appendSlice(server.arena, &.{
-        "--record",   try std.fs.path.join(server.arena, &.{ directory, "record.jsonl" }),
-        "--tape-dir", try std.fs.path.join(server.arena, &.{ directory, "tapes" }),
-    });
+    // Its record, events and tapes go there (runs.zig), its pid file too.
+    try argv.appendSlice(server.arena, &.{ "--run-directory", directory });
     if (asked.scenario) |scenario| try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     if (asked.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
     if (asked.strategy) |strategy| {
@@ -1534,8 +1527,8 @@ fn runs_copy(server: *Server) []const Run {
     return server.arena.dupe(Run, shared.runs[0..shared.run_count]) catch &.{};
 }
 
-/// Stops a running run: SIGTERM to its process group (the explorer and its workers; each run
-/// leads its own session). Marked stopped, on disk too.
+/// Stops a running run: SIGTERM to its explorer (its workers and verifier die with it), whoever
+/// started it. Marked stopped, on disk too.
 fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     const shared = server.shared;
     shared.lock();
@@ -1544,7 +1537,7 @@ fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
         if (run.id == id) break run;
     } else return error.NotFound;
     if (run.status != null) return error.NotRunning;
-    if (linux.errno(linux.kill(-run.pid, .TERM)) != .SUCCESS) return error.NotRunning;
+    if (linux.errno(linux.kill(run.pid, .TERM)) != .SUCCESS) return error.NotRunning;
     run.stopped = true;
     const directory = try run_directory(server, run.id);
     const path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
@@ -1594,8 +1587,6 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     try argv.append(server.arena, "--resume");
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     const pid = try spawn(server.arena, argv.items, output, &.{}, .appended);
-    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
-    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = try print(server, "{d}\n", .{pid}) });
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
     run.* = .{ .id = id, .pid = pid };
@@ -1603,43 +1594,83 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     return 200;
 }
 
-/// Runs of an earlier server (before a restart). One whose explorer still runs (its pid file
-/// names a live process that writes this run's events) is adopted: running, whatever its record
-/// says (`--scenario all` records a summary per scenario), or killed if it was stopped. Of the
+/// The runs in the data directory this server does not list yet: at its start every one, then
+/// those that appear (explorations started at a terminal or by a script: runs.zig). One whose
+/// explorer runs (it holds the run's pid file) is adopted: running, whatever its record says
+/// (`--scenario all` records a summary per scenario), or killed if it was stopped. Of the
 /// others, one whose record has its summary passed or failed by that summary; the rest were
-/// interrupted (an error), or stopped on request.
-fn runs_load(server: *Server) !void {
-    var id: u32 = 1;
-    while (id < runs_max) : (id += 1) {
+/// interrupted (an error), or stopped on request. A directory just claimed, with no pid file
+/// yet, waits for the next look (a minute at most: then its explorer ended before writing it).
+fn runs_discover(server: *Server) !void {
+    const shared = server.shared;
+    const runs_path = try std.fs.path.join(server.arena, &.{ server.options.data_directory, "runs" });
+    for (try host_runs.ids(server.arena, runs_path)) |id| {
+        const known = for (shared.runs[0..shared.run_count]) |run| {
+            if (run.id == id) break true;
+        } else false;
+        if (known) continue;
+        if (shared.run_count == runs_max) return;
         const directory = try run_directory(server, id);
-        std.Io.Dir.cwd().access(server.io, directory, .{}) catch break;
+        const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
+        const has_pid = if (std.Io.Dir.cwd().access(server.io, pid_path, .{})) |_| true else |_| false;
+        if (!has_pid and age_s(server.arena, directory) < claim_grace_s) continue;
         const record = run_file(server, id, "record.jsonl") catch "";
         const stopped = if (run_file(server, id, "stopped")) |_| true else |_| false;
         var run = Run{ .id = id, .pid = 0, .status = recorded_status(record), .stopped = stopped };
-        if (run_alive(server, id)) |pid| {
+        if (host_runs.running_pid(server.arena, directory)) |pid| {
             if (stopped) {
-                _ = linux.kill(-pid, .KILL); // Its process group: it leads its session.
+                _ = linux.kill(pid, .KILL);
             } else {
                 run.pid = pid;
                 run.status = null;
                 run.adopted = true;
             }
         }
-        server.shared.runs[server.shared.run_count] = run;
-        server.shared.run_count += 1;
+        runs_insert(shared, run);
     }
 }
 
-const status_interrupted = 255;
+/// How long a claimed run directory may go without its pid file.
+const claim_grace_s = 60;
 
-/// The run's explorer, if its pid file names a live process working for this run.
-fn run_alive(server: *Server, id: u32) ?linux.pid_t {
-    const text = run_file(server, id, "pid") catch return null;
-    const directory = run_directory(server, id) catch return null;
-    const events = print(server, "{s}/events", .{directory}) catch return null;
-    if (!process_alive(server, text, events)) return null;
-    return std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+/// runs_discover from the watcher, with the lock held.
+fn runs_discover_locked(shared: *Shared) void {
+    var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer request_arena.deinit();
+    var server: Server = .{
+        .shared = shared,
+        .options = shared.options,
+        .io = shared.io,
+        .arena = request_arena.allocator(),
+    };
+    runs_discover(&server) catch |err| {
+        std.debug.print("[determinismo] looking for new runs: {s}\n", .{@errorName(err)});
+    };
 }
+
+/// Into the list, which stays in id order.
+fn runs_insert(shared: *Shared, run: Run) void {
+    assert(shared.run_count < runs_max);
+    var at = shared.run_count;
+    while (at > 0 and shared.runs[at - 1].id > run.id) : (at -= 1) {
+        shared.runs[at] = shared.runs[at - 1];
+    }
+    shared.runs[at] = run;
+    shared.run_count += 1;
+}
+
+/// Seconds since the path changed (0 if it cannot tell).
+fn age_s(arena: std.mem.Allocator, path: []const u8) u64 {
+    const path_z = arena.dupeSentinel(u8, path, 0) catch return 0;
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path_z, 0, .{ .MTIME = true }, &stat)) != .SUCCESS) return 0;
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &now);
+    const changed: i64 = stat.mtime.sec;
+    return if (now.sec > changed) @intCast(now.sec - changed) else 0;
+}
+
+const status_interrupted = 255;
 
 /// Whether `pid_text` names a live process whose command line has `needle` (not another that
 /// took its number since).
@@ -1696,8 +1727,8 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
     for (shared.runs[0..shared.run_count]) |*run| {
         if (run.status != null) continue;
         if (run.adopted) {
-            if (linux.errno(linux.kill(run.pid, @fromBackingInt(0))) != .SRCH) continue;
-            _ = linux.kill(-run.pid, .KILL); // What it left in its process group.
+            const directory = run_directory(&server, run.id) catch continue;
+            if (host_runs.running_pid(server.arena, directory) != null) continue;
             const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
             if (run_ended_itself(run) and ended_count < ended.len) {
@@ -1881,11 +1912,9 @@ fn machine_kept(server: *Server, memory_mib: ?u32) ![]const []const u8 {
     return argv.items;
 }
 
-/// A copy of the file named by its content, under the data directory's `artifacts`, made once:
-/// runs of one build share it, and a deploy, which replaces the original, leaves it be.
+/// A copy of the file named by its content, under the data directory's `artifacts` (runs.zig).
 fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
-    const cwd = std.Io.Dir.cwd();
-    const bytes = cwd.readFileAlloc(server.io, path, server.arena, .unlimited) catch |err| switch (err) {
+    return host_runs.artifact_keep(server.arena, server.io, server.options.data_directory, path) catch |err| switch (err) {
         // The client named it: its mistake, said as such.
         error.FileNotFound => {
             server.detail = try std.fmt.allocPrint(server.arena, "no such file: {s}", .{path});
@@ -1893,21 +1922,6 @@ fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
         },
         else => return err,
     };
-    const directory = try std.fs.path.join(server.arena, &.{ server.options.data_directory, "artifacts" });
-    try cwd.createDirPath(server.io, directory);
-    const name = try std.fmt.allocPrint(server.arena, "{x:0>16}-{s}", .{
-        std.hash.Wyhash.hash(0, bytes), std.fs.path.basename(path),
-    });
-    const kept = try std.fs.path.join(server.arena, &.{ directory, name });
-    cwd.access(server.io, kept, .{}) catch {
-        const staging = try std.fmt.allocPrintSentinel(server.arena, "{s}.staging", .{kept}, 0);
-        try cwd.writeFile(server.io, .{ .sub_path = staging, .data = bytes });
-        // Executable: a test program is run from its kept copy.
-        const mode = linux.fchmodat(linux.AT.FDCWD, staging, 0o755);
-        if (linux.errno(mode) != .SUCCESS) return error.ChmodFailed;
-        try cwd.rename(staging, cwd, kept, server.io);
-    };
-    return kept;
 }
 
 /// A query string's value for `name` (`offset=12&x=1`), if there.

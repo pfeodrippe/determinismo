@@ -10,9 +10,11 @@ determinismo mcp --kernel <vmlinuz> --initrd <base.cpio> --memory-mib 2048 --cac
 ```
 
 Tools: `describe`, `explore`, `replay`, `fork`, `query`, `events`, `causality`, `mutate` (schemas in
-`src/mcp_tools.json`). `explore ... --serve <host:port>` runs the exploration in a `determinismo
-serve` instead, so people can follow it in the web UI (it prints the run's address). Without MCP, use `explore --record results.jsonl --events-dir events/`
-with `determinismo query` and `determinismo events`, or the HTTP API (`determinismo serve`).
+`src/mcp_tools.json`). Every exploration is a run of the host's, in its run store
+(`~/.determinismo`, src/runs.zig), with its record, events and tapes: people follow it in
+`determinismo serve`'s web UI however it was started (explore prints its run's number and
+directory). Without MCP, use `determinismo query` and `determinismo events` on a run's
+directory, or the HTTP API (`determinismo serve`).
 
 ## Skills
 

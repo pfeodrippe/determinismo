@@ -13,7 +13,7 @@ Raft at their commit 142e831, three nodes, a client with Go SDK assertions, a Py
 checking Raft's safety properties) runs unchanged: its images built with its own
 `antithesis/build.sh`, then
 
-    determinismo explore --serve 127.0.0.1:7878 \
+    determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --cache ~/cache \
       --compose ~/raft-poc/antithesis/config/docker-compose.yaml --scenario raft --seed 1 \
       --time-budget 8h --timeline 15m --retroactive "Applied block" \
       --no-faults raft-client,raft-monitor --faults +restart,+stop,+crash [--cpu-modulation]

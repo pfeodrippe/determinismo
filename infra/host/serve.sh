@@ -5,7 +5,8 @@
 # them (their pid files). `stop` takes the runs too (they live in its cgroup): before KVM is
 # reloaded. Idempotent. Run as root.
 # Usage: serve.sh <user> start|stop
-#   Then, as the user on the host: determinismo explore --serve 127.0.0.1:7878 ...
+#   Every exploration on the host is one of its runs (~/.determinismo, src/runs.zig): serve
+#   shows them however they were started.
 set -euo pipefail
 user=${1:?usage: $0 <user> start|stop}
 action=${2:?usage: $0 <user> start|stop}
@@ -41,7 +42,7 @@ User=$user
 Environment=XDG_RUNTIME_DIR=/run/user/$uid
 WorkingDirectory=$home/determinismo
 ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
-  --data $home/det-runs --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
+  --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
   --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096
 # Restarts stop serve alone: its runs go on, adopted by the next.
 KillMode=process
@@ -55,4 +56,4 @@ EOF
 systemctl daemon-reload
 systemctl enable "$unit" >/dev/null
 systemctl restart "$unit"
-echo "$unit running: $home/determinismo, data in $home/det-runs"
+echo "$unit running: $home/determinismo, runs in $home/.determinismo"

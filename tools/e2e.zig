@@ -109,7 +109,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
         .{ "pinned", check_pinned },                 .{ "saved", check_saved },
         .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
-        .{ "ui", check_ui },
+        .{ "ui", check_ui },                         .{ "runs", check_runs },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -602,6 +602,69 @@ fn check_ui(context: *Context) !void {
         "causality analysis from the page to its end, the map's failures, a running run's " ++
         "refreshes, a run stopped and resumed from its page", .{});
     if (!passed) std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
+}
+
+/// Every exploration is a run of the host's (src/runs.zig): one started at a terminal shows in
+/// serve as serve's own do, running, then judged; serve stops it.
+fn check_runs(context: *Context) !void {
+    const arena = context.arena;
+    const cwd = std.Io.Dir.cwd();
+    const address = "127.0.0.1:7893";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "runs-store" });
+    cwd.deleteTree(context.io, data) catch {};
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const listed = curl(context, &.{url ++ "/runs"}) catch "";
+        if (listed.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const system = [_][]const u8{ "--data", data, "--program", program, "--scenario", "bank", "--branching", "flat", "--jobs", "2" };
+    // One to its end, as at a terminal.
+    const output = try explore(context, &(system ++ [_][]const u8{ "--seed", "3", "--branches", "8" }));
+    const claimed = std.mem.indexOf(u8, output, "[determinismo] run 1: ") != null;
+    var listed: []const u8 = "";
+    for (0..100) |_| {
+        listed = curl(context, &.{url ++ "/runs/1"}) catch "";
+        if (std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null) break;
+        sleep_ms(200);
+    }
+    const timelines = curl(context, &.{url ++ "/runs/1/timelines"}) catch "";
+    const logged = cwd.readFileAlloc(context.io, try std.fs.path.join(arena, &.{ data, "runs", "1", "output.log" }), arena, .limited(1 << 24)) catch "";
+    expect(context, claimed and std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null and
+        std.mem.count(u8, timelines, "\"index\"") == 8 and std.mem.indexOf(u8, logged, "[branch") != null, "runs: an exploration at a terminal is run 1 of the host's, in serve with its 8 timelines " ++
+        "and its output, failed as it ended", .{});
+    // Another, long, which serve stops.
+    var command: std.ArrayList(u8) = .empty;
+    try command.print(arena, "exec '{s}' explore", .{context.determinismo});
+    for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
+    for (system) |part| try command.print(arena, " '{s}'", .{part});
+    try command.print(arena, " --seed 4 --branches 100000 --time-budget 30m > /dev/null 2>&1", .{});
+    var child = try std.process.spawn(context.io, .{ .argv = &.{ "sh", "-c", command.items }, .stdout = .ignore, .stderr = .ignore });
+    var running = false;
+    for (0..600) |_| {
+        const run = curl(context, &.{url ++ "/runs/2"}) catch "";
+        running = std.mem.indexOf(u8, run, "\"state\":\"running\"") != null;
+        if (running) break;
+        sleep_ms(100);
+    }
+    _ = curl(context, &.{ "-X", "POST", url ++ "/runs/2/stop" }) catch "";
+    const term = try child.wait(context.io);
+    var stopped = false;
+    for (0..100) |_| {
+        const run = curl(context, &.{url ++ "/runs/2"}) catch "";
+        stopped = std.mem.indexOf(u8, run, "\"state\":\"stopped\"") != null;
+        if (stopped) break;
+        sleep_ms(200);
+    }
+    _ = term;
+    expect(context, running and stopped, "runs: another, running at a terminal, shows " ++
+        "running in serve, and serve stops it", .{});
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {

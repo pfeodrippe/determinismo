@@ -208,7 +208,10 @@ sudo infra/host/serve.sh det start        # serve as a unit (stop: its runs stop
 To update a host's build without stopping its runs (the VMM, the guest runtime, the examples;
 not the KVM patch or the tools, which need `setup.sh`): `infra/host/update.sh <ip>`.
 
-Runs go to serve with `determinismo explore --serve 127.0.0.1:7878 ...`; its web UI through
+Every exploration is one of the host's runs, however it is started: `determinismo explore`
+claims a directory in the host's run store (`--data`, else `$DETERMINISMO_DATA`, else
+`~/.determinismo`), with its record, events, tapes and output, and `determinismo serve` shows
+every run there, its own and these, as they appear (src/runs.zig). Its web UI through
 `ssh -L 7878:127.0.0.1:7878 det@<ip>`.
 
 Then explore a system (images are pulled and cached under `--cache` on first use):
@@ -233,7 +236,7 @@ Results as JSON lines (`--record results.jsonl`). An HTTP API keeps runs, result
 replays branches; an MCP server gives agents the same powers:
 
 ```
-determinismo serve --listen 127.0.0.1:7878 --data ~/runs --kernel ... --initrd ... --cache ~/cache
+determinismo serve --listen 127.0.0.1:7878 --kernel ... --initrd ... --cache ~/cache
 curl -X POST localhost:7878/runs -d '{"program":"zig-out/bin/bank-test","scenario":"bank","branches":40}'
 curl localhost:7878/runs/1                       # state, record, stats
 curl localhost:7878/runs/1/properties            # every property's verdict so far (also /timelines, /discovery)
