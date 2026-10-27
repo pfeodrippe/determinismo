@@ -71,5 +71,5 @@ while true; do
   wait $child || status=$?
   [ $status -eq 0 ] && exit 0
   echo "start.sh: scylla exited with status $status; starting it again"
-  sleep 1
+  sleep 1 || true # A process kill may take the sleep too: the loop goes on (set -e would end it).
 done
