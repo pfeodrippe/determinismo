@@ -209,6 +209,7 @@ const Arguments = struct {
     /// Generations in flight at once (`--pipeline`): the tree returns to moments from this
     /// generation on; more keeps workers busy while long timelines finish.
     pipeline: u32 = pipeline_depth_default,
+    pipeline_given: bool = false,
     /// Go-Explore's archive (`--archive`): the tree keeps every behavior any timeline reached,
     /// where (just after it), and how often it returned there, and returns to the least visited
     /// ones, from any generation (a timeline of an earlier one is rebuilt by replaying its path),
@@ -2154,8 +2155,12 @@ const Cell = struct { branch: u32, vtime_ns: u64, label: []const u8, visits: u32
 /// planned, and meanwhile the generations between run. Timelines of very different lengths
 /// (Raft's: half a minute to six) no longer leave workers idle at each generation's tail (they
 /// were busy 13 to 23% of the time). The cost: the tree deepens from the generation
-/// pipeline depth on (the ones before all start from the setup snapshot).
+/// pipeline depth on (the ones before all start from the setup snapshot): with a generation's
+/// worth of workers or fewer (16), one generation ahead fills a tail, and the tree branches from
+/// timeline 32 instead of 48 (a system whose timelines take five minutes on six workers waited
+/// three quarters of an hour for its first branch).
 const pipeline_depth_default = 3;
+const pipeline_depth_few_workers = 2;
 const pipeline_depth_max = 4;
 
 /// A generation in flight: its plan, how many of its timelines started, and their summaries
@@ -3325,6 +3330,9 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     }
     if (arguments.branches == 0 or arguments.branches > branches_max) return error.Usage;
     if (arguments.command == .explore) arguments.deterministic = true;
+    if (!arguments.pipeline_given and jobs_count(&arguments) <= arguments.generation_size) {
+        arguments.pipeline = pipeline_depth_few_workers;
+    }
     // A command runs at a moment: a virtual time, or the first event matching --until.
     const moment = arguments.moment_vtime_ms != null or arguments.until != null;
     const commands = arguments.moment_command != null or arguments.moment_script_path != null;
@@ -3447,6 +3455,7 @@ fn parse_option(
         const depth = try std.fmt.parseInt(u32, value, 10);
         if (depth == 0 or depth > pipeline_depth_max) return error.Usage;
         arguments.pipeline = depth;
+        arguments.pipeline_given = true;
     } else if (eql(u8, flag, "--generation")) {
         const size = try std.fmt.parseInt(u32, value, 10);
         const multiple = size % tree.generation_base == 0;
