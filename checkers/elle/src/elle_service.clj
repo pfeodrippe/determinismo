@@ -13,6 +13,7 @@
   (:gen-class)
   (:require [clojure.data.json :as json]
             [clojure.string :as string]
+            [clojure.walk :as walk]
             [elle.list-append :as list-append]
             [elle.rw-register :as rw-register]
             [jepsen.history :as history])
@@ -39,6 +40,18 @@
                      (sorted-map) operations)]
     (into (vec operations) (map #(assoc % :type :info)) (vals open))))
 
+(defn- shortened
+  "Long lists of values (a read's) cut to their ends and a count: Elle prints an anomaly's reader
+  first, and a read of hundreds of values left no room for the writer and the element."
+  [x]
+  (walk/postwalk (fn [v]
+                   (if (and (vector? v) (> (count v) 8) (every? number? v))
+                     (vec (concat (take 3 v)
+                                  [(symbol (str "..." (- (count v) 6) "-more..."))]
+                                  (take-last 3 v)))
+                     v))
+                 x))
+
 (defn check [body model consistency]
   (let [operations (->> (string/split-lines body)
                         (remove string/blank?)
@@ -51,7 +64,7 @@
         result (checker {:consistency-models [(keyword consistency)]}
                         (history/history operations))
         valid (:valid? result)
-        anomalies (pr-str (:anomalies result))]
+        anomalies (pr-str (shortened (:anomalies result)))]
     {:valid (if (keyword? valid) (name valid) valid)
      :anomaly_types (map name (:anomaly-types result))
      :not (map name (:not result))
