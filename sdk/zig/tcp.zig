@@ -24,6 +24,8 @@ pub const Options = struct {
     /// A connect, write or read that waits longer fails (instead of waiting out TCP's
     /// retransmissions): under network faults, "unavailable" must be quick to observe.
     timeout_ms: u32 = 1000,
+    /// http_with's request body's type (Dgraph, for one, answers only application/json).
+    content_type: []const u8 = "application/octet-stream",
 };
 
 /// Whether `err` means the server could not be reached or went away (as opposed to a protocol
@@ -183,8 +185,8 @@ pub fn http_with(
     defer connection.close();
     var head_buffer: [512]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buffer, "{s} {s} HTTP/1.0\r\nHost: node\r\n" ++
-        "Content-Length: {d}\r\nContent-Type: application/octet-stream\r\n\r\n", .{
-        method, path, body.len,
+        "Content-Length: {d}\r\nContent-Type: {s}\r\n\r\n", .{
+        method, path, body.len, options.content_type,
     });
     try connection.write_all(head);
     try connection.write_all(body);

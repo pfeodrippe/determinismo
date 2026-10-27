@@ -103,6 +103,10 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
                 if (!sdk.tcp.unavailable(err) and err != error.ServerError) return err;
                 // Down, cut off or starting: a while later, without spending a transaction.
                 if (refused == 0) sdk.sometimes(true, "a node refused a connection", .{ .err = @errorName(err) });
+                if (err == error.ServerError) sdk.event("sql_connect_refused", .{
+                    .err = connection.last_error(),
+                    .sqlstate = connection.sqlstate(),
+                });
                 refused += 1;
                 if (refused == refused_max) return;
                 pause_ms(refused_pause_ms_min + sdk.random_below(refused_pause_ms_max - refused_pause_ms_min));
