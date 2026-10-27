@@ -107,6 +107,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mongodb-sharded-test", .path = "examples/mongodb/sharded_test.zig" },
         .{ .name = "kafka-test", .path = "examples/kafka/kafka_test.zig" },
         .{ .name = "scylla-test", .path = "examples/scylla/scylla_test.zig" },
+        .{ .name = "yugabyte-test", .path = "examples/yugabyte/yugabyte_test.zig" },
+        .{ .name = "dgraph-test", .path = "examples/dgraph/dgraph_test.zig" },
         .{ .name = "flecs-test", .path = "examples/flecs/flecs_test.zig" },
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
