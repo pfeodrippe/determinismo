@@ -281,7 +281,7 @@ async function runsRefresh() {
     item.addEventListener("click", () => runOpen(Number(item.dataset.id))));
 }
 function stateBadge(name) {
-  const kind = { passed: "pass", failed: "fail", running: "running", stopped: "stopped" }[name] || "error";
+  const kind = { passed: "pass", failed: "fail", running: "running", stopped: "stopped", interrupted: "stopped" }[name] || "error";
   return `<span class="badge ${kind}">${escape(name)}</span>`;
 }
 
@@ -406,6 +406,8 @@ function render() {
       ${info.from_branch != null ? `· forked from branch ${info.from_branch} at ${info.from_vtime_ms}ms` : ""}</div>
     ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>
       <button id="run-stop" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Stop this run: the timelines it explored so far stay">Stop run</button>` : ""}
+    ${(run.state === "stopped" || run.state === "interrupted") && info.branching === "flat" ? `
+      <button id="run-resume" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Continue this run where it ended: the timelines it has stay, the others run">Resume run</button>` : ""}
     <div class="tabs view-tabs"><button data-view="report" class="${state.view === "report" ? "on" : ""}">Report</button>
       <button data-view="notebook" class="${state.view === "notebook" ? "on" : ""}">Notebook</button></div>`;
   if (state.view === "notebook") {
@@ -450,6 +452,13 @@ function viewTabsWire() {
     state.view = button.dataset.view;
     render();
   }));
+  const resume = document.getElementById("run-resume");
+  if (resume) resume.addEventListener("click", async () => {
+    resume.disabled = true;
+    await api(`/runs/${state.runId}/resume`, {}).catch(() => {});
+    await runRefresh();
+    runsRefresh();
+  });
   const stop = document.getElementById("run-stop");
   if (stop) stop.addEventListener("click", async () => {
     stop.disabled = true;

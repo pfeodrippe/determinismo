@@ -27,7 +27,8 @@ fn create(context: *System.Context) !void {
     for (0..runs_per_driver) |_| {
         var body_buffer: [128]u8 = undefined;
         const branches = 1 + sdk.random_below(6);
-        const body_format = "{{\"program\":\"p\",\"branches\":{d}}}";
+        // A file of the node's (serve keeps a copy of the program a run boots).
+        const body_format = "{{\"program\":\"/det-selftest\",\"branches\":{d}}}";
         const body = try std.fmt.bufPrint(&body_buffer, body_format, .{branches});
         var reply: [4096]u8 = undefined;
         const response = http(address, "POST", "/runs", body, &reply) catch |err| {

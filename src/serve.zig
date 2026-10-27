@@ -592,6 +592,9 @@ fn run_route(
     if (eql(u8, action, "stop") and eql(u8, request.method, "POST")) {
         return run_stop(server, run.id, out);
     }
+    if (eql(u8, action, "resume") and eql(u8, request.method, "POST")) {
+        return run_resume(server, run.id, out);
+    }
     if (eql(u8, action, "extract") and eql(u8, request.method, "POST")) {
         return run_extract(server, run, request.body, out);
     }
@@ -774,7 +777,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     });
     const argv = try explore_arguments(server, &asked, directory, machine);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
-    const pid = try spawn(server.arena, argv, output, &.{});
+    const pid = try spawn(server.arena, argv, output, &.{}, .fresh);
     // For a restarted server to find it still running (runs_load).
     const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
     const pid_text = try print(server, "{d}\n", .{pid});
@@ -1051,7 +1054,7 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const directory = try run_directory(server, run.id);
     const output = try std.fs.path.join(server.arena, &.{ directory, name });
-    const pid = try spawn(server.arena, argv, output, &.{});
+    const pid = try spawn(server.arena, argv, output, &.{}, .fresh);
     // Its pid on disk: a server after a restart still knows it runs.
     const pid_name = try print(server, "causality-{d}.pid", .{index});
     try std.Io.Dir.cwd().writeFile(server.io, .{
@@ -1149,7 +1152,7 @@ fn failures_snapshot(server: *Server, id: u32) !void {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(server.arena, try causality_argv(server, &run, &asked));
         try argv.append(server.arena, "--save-only");
-        const pid = try spawn(server.arena, argv.items, log, &.{});
+        const pid = try spawn(server.arena, argv.items, log, &.{}, .fresh);
         shared.lock();
         defer shared.unlock();
         if (shared.job_count == jobs_max) return; // Reaped next time.
@@ -1534,6 +1537,48 @@ fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     return 200;
 }
 
+/// Continues a run that ended before its end (stopped, or its explorer interrupted): its
+/// explorer again, as it was asked and with the files it kept (a deploy since changes nothing
+/// of it), skipping the timelines its record has (explore --resume). Flat runs.
+fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    const run = for (shared.runs[0..shared.run_count]) |*run| {
+        if (run.id == id) break run;
+    } else return error.NotFound;
+    const interrupted = run.stopped or run.status == status_interrupted;
+    if (run.status == null and !run.stopped) {
+        server.detail = "the run is running";
+        return error.BadRequest;
+    }
+    if (!interrupted) {
+        server.detail = "the run finished: nothing to continue";
+        return error.BadRequest;
+    }
+    const asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, try run_file(server, id, "request.json"), .{
+        .ignore_unknown_fields = true,
+    });
+    if (!std.mem.eql(u8, asked.branching orelse "tree", "flat")) {
+        server.detail = "resume continues flat runs (a tree's archive of moments was its explorer's)";
+        return error.BadRequest;
+    }
+    const machine = try std.json.parseFromSliceLeaky([]const []const u8, server.arena, try run_file(server, id, "machine.json"), .{});
+    const directory = try run_directory(server, id);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(server.arena, try explore_arguments(server, &asked, directory, machine));
+    try argv.append(server.arena, "--resume");
+    const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
+    const pid = try spawn(server.arena, argv.items, output, &.{}, .appended);
+    const pid_path = try std.fs.path.join(server.arena, &.{ directory, "pid" });
+    try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = pid_path, .data = try print(server, "{d}\n", .{pid}) });
+    const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
+    std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
+    run.* = .{ .id = id, .pid = pid };
+    try out.print("{{\"id\":{d},\"state\":\"running\"}}\n", .{id});
+    return 200;
+}
+
 /// Runs of an earlier server (before a restart). One whose explorer still runs (its pid file
 /// names a live process that writes this run's events) is adopted: running, whatever its record
 /// says (`--scenario all` records a summary per scenario), or killed if it was stopped. Of the
@@ -1686,7 +1731,7 @@ fn archive(server: *Server, run: *const Run) !void {
     const with_dir = try std.mem.replaceOwned(u8, server.arena, template, "{dir}", directory);
     const command = try std.mem.replaceOwned(u8, server.arena, with_dir, "{id}", id);
     const log = try std.fs.path.join(server.arena, &.{ directory, "archive.log" });
-    _ = try spawn(server.arena, &.{ "/bin/sh", "-c", command }, log, &.{});
+    _ = try spawn(server.arena, &.{ "/bin/sh", "-c", command }, log, &.{}, .fresh);
 }
 
 fn state(run: *const Run) []const u8 {
@@ -1695,6 +1740,7 @@ fn state(run: *const Run) []const u8 {
     return switch (status) {
         0 => "passed",
         3 => "failed",
+        status_interrupted => "interrupted",
         else => "error",
     };
 }
@@ -1739,7 +1785,7 @@ fn nrepl_start(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
             try print(server, "DETERMINISMO_RUN={d}", .{run.id}),
         };
         const log = try std.fs.path.join(arena, &.{ directory, "nrepl.log" });
-        _ = try spawn(arena, &argv, log, &environment);
+        _ = try spawn(arena, &argv, log, &environment, .fresh);
         run.nrepl_port = port;
     }
     try out.print("{{\"port\":{d}}}\n", .{run.nrepl_port.?});
@@ -1815,7 +1861,14 @@ fn machine_kept(server: *Server, memory_mib: ?u32) ![]const []const u8 {
 /// runs of one build share it, and a deploy, which replaces the original, leaves it be.
 fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
-    const bytes = try cwd.readFileAlloc(server.io, path, server.arena, .unlimited);
+    const bytes = cwd.readFileAlloc(server.io, path, server.arena, .unlimited) catch |err| switch (err) {
+        // The client named it: its mistake, said as such.
+        error.FileNotFound => {
+            server.detail = try std.fmt.allocPrint(server.arena, "no such file: {s}", .{path});
+            return error.BadRequest;
+        },
+        else => return err,
+    };
     const directory = try std.fs.path.join(server.arena, &.{ server.options.data_directory, "artifacts" });
     try cwd.createDirPath(server.io, directory);
     const name = try std.fmt.allocPrint(server.arena, "{x:0>16}-{s}", .{
@@ -1866,6 +1919,7 @@ fn spawn(
     argv: []const []const u8,
     output_path: []const u8,
     extra: []const []const u8,
+    output: enum { fresh, appended },
 ) !linux.pid_t {
     assert(argv.len > 0 and argv.len < arguments_max);
     const argv_z = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
@@ -1877,7 +1931,12 @@ fn spawn(
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
-        const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+        const flags: linux.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = output == .fresh,
+            .APPEND = output == .appended,
+        };
         const fd = linux.open(output_z, flags, 0o644);
         if (linux.errno(fd) == .SUCCESS) {
             _ = linux.dup2(@intCast(fd), 1);
