@@ -275,6 +275,21 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
     defer file_write(paths.cgroup_freeze, "0") catch {}; // Its next start runs.
     if (frozen_begun) |call| call(name);
     try cgroup_frozen_wait(&paths);
+    // The power goes: from here nothing the node's kernel still issues reaches its disk (a
+    // journal commit, the discards of what a lost transaction freed: ext4's commit callback
+    // ran on and punched blocks the disk's committed state still used, directories read back
+    // as zeros). What reached it before stays.
+    const loop = loop_read(&paths) catch null;
+    var mapper_buffer: [mapper_name_size]u8 = undefined;
+    const mapper = try mapper_name(&mapper_buffer, name);
+    if (loop) |number| {
+        var parameters_buffer: [64]u8 = undefined;
+        try mapper_table(mapper, .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
+            &parameters_buffer,
+            "7:{d} 0 0 1 1 drop_writes",
+            .{number},
+        ) });
+    }
     const fd = linux.open(paths.layer, directory_flags, 0);
     if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
     var flags: u32 = ext4_going_flags_nologflush;
@@ -283,6 +298,12 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
     if (linux.errno(shutdown) != .SUCCESS) return error.NotADurableDisk; // Not ext4: no crash.
     try kill(name); // A frozen process dies of SIGKILL too.
     try layer_unmount(&paths);
+    // Power back: the disk through the table it had (a disk fault's, while one is on).
+    if (loop) |number| {
+        var record_buffer: [160]u8 = undefined;
+        var parameters_buffer: [64]u8 = undefined;
+        try mapper_table(mapper, try disk_table_now(&paths, number, &record_buffer, &parameters_buffer));
+    }
     sdk.event("node_crash", .{ .node = name });
 }
 
@@ -507,8 +528,11 @@ pub fn disk_fail(name: []const u8, fault: DiskFault) !void {
             .{ loop, fault.delay_ms },
         ) },
     };
+    // The fault's table, for a crash meanwhile to put back (disk_table_now).
     var flag_buffer: [path_size_max]u8 = undefined;
-    try file_write(try disk_failing_path(&flag_buffer, &paths), "1");
+    var record_buffer: [160]u8 = undefined;
+    const record = try std.fmt.bufPrint(&record_buffer, "{s} {s}", .{ target.kind, target.parameters });
+    try file_write(try disk_failing_path(&flag_buffer, &paths), record);
     var name_buffer: [mapper_name_size]u8 = undefined;
     try mapper_table(try mapper_name(&name_buffer, name), target);
     sdk.event("node_disk_fail", .{ .node = name, .failure = fault.failure });
@@ -536,6 +560,16 @@ pub fn disk_heal(name: []const u8) !bool {
 }
 
 /// Whether the node's disk is failing (a disk fault is under way): its exit is expected.
+/// The table the node's disk has when no crash is under way: a disk fault's, or its baseline.
+fn disk_table_now(paths: *const Paths, loop: u32, record: *[160]u8, parameters: *[64]u8) !MapperTarget {
+    var flag_buffer: [path_size_max]u8 = undefined;
+    if (read_small(try disk_failing_path(&flag_buffer, paths), record)) |text| {
+        const space = std.mem.indexOfScalar(u8, text, ' ') orelse return error.BadDiskFault;
+        return .{ .kind = text[0..space], .parameters = text[space + 1 ..] };
+    }
+    return disk_baseline_target(parameters, loop);
+}
+
 pub fn disk_failing(name: []const u8) bool {
     var paths: Paths = undefined;
     paths.init(name) catch return false;
