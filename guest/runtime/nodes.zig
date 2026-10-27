@@ -1166,11 +1166,17 @@ fn network_connect(
     for (system.nodes) |*peer| {
         if (std.mem.eql(u8, peer.name, node.name)) continue;
         const peer_pid = pid_read(peer.name) orelse continue;
-        try link_create(self, .{
+        link_create(self, .{
             .name = peer.name,
             .address = try address_now(peer),
             .pid = peer_pid,
-        });
+        }) catch |err| switch (err) {
+            // The peer died meanwhile (killed, not yet reaped: its pid answers, its namespace
+            // is gone): it links to this node when it starts again. Once, every start after a
+            // kill of a peer failed here and left its node down for good.
+            error.NoSuchNamespace => continue,
+            else => return err,
+        };
     }
 }
 

@@ -259,6 +259,8 @@ pub const Socket = struct {
         if (code == 0) return;
         const errno: linux.E = @fromBackingInt(@intCast(-code));
         if (errno == .EXIST) return error.Exists;
+        // A namespace named by a pid whose process exited (a zombie has none left).
+        if (errno == .SRCH) return error.NoSuchNamespace;
         std.debug.print("netlink request failed: {s}\n", .{@tagName(errno)});
         return error.NetlinkRequestFailed;
     }
