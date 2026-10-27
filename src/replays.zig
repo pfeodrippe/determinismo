@@ -38,7 +38,7 @@ pub const Verifier = struct {
         assert(every > 0);
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
         std.Io.Dir.cwd().deleteFile(io, results_path) catch {};
-        const base = try replay_argv(arena, argv);
+        const base = try program_kept(arena, io, try replay_argv(arena, argv), tapes);
         const explorer = linux.getpid();
         const pid = linux.fork();
         if (linux.errno(pid) != .SUCCESS) return error.Fork;
@@ -125,6 +125,27 @@ fn replay_argv(arena: std.mem.Allocator, argv: []const [:0]const u8) ![]const []
         try out.append(arena, flag);
     }
     return out.items; // /proc/self/exe: the explorer's binary, the build that ran.
+}
+
+/// The test program as the run started it, copied beside the tapes, for the replays: a program
+/// rebuilt meanwhile (another `zig build`) is other inputs, and its replays would not boot the
+/// timelines' system.
+fn program_kept(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: []const []const u8,
+    tapes: []const u8,
+) ![]const []const u8 {
+    const flag = for (base, 0..) |word, index| {
+        if (std.mem.eql(u8, word, "--program") and index + 1 < base.len) break index;
+    } else return base;
+    const kept = try std.fs.path.join(arena, &.{ tapes, "program" });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, tapes);
+    try cwd.copyFile(base[flag + 1], cwd, kept, io, .{});
+    const out = try arena.dupe([]const u8, base);
+    out[flag + 1] = kept;
+    return out;
 }
 
 fn contains(list: []const []const u8, word: []const u8) bool {
