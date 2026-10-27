@@ -22,8 +22,14 @@
 //!   GET  /runs/<id>/discovery  {points: [[timelines, behaviors], ...]}: new behavior discovery
 //!   GET  /runs/<id>/output   its output, as text
 //!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec?} -> its output
-//!   POST /runs/<id>/causality {branch, property, points?, futures?} -> {id} (in the background)
-//!   GET  /runs/<id>/causality/<n>  {done, points: [{vtime_ms, futures, failing, probability}]}
+//!   POST /runs/<id>/causality {branch, property, points?, futures?, refine?, moments_max?,
+//!                            jump_min?, gap_min_ms?, planner?} -> {id} (in the background:
+//!                            causality.zig; its snapshots kept in the run's snapshots/)
+//!   GET  /runs/<id>/causality  every analysis: [{id, done, of: {branch, property, failure_ms,
+//!                            snapshot_ms, futures, planner}, points: [...]}]
+//!   GET  /runs/<id>/causality/<n>  one: {id, done, of, points: [{vtime_ms, futures, failing,
+//!                            probability, low, high}]}
+//!   GET  /runs/<id>/timelines?offset=<n>  the timelines after the first n ingested
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
 //!   GET  /runs/<id>/notebook  {source}; PUT {source}: the run's notebook (JavaScript cells)
 //!   GET  /runs/<id>/findings {previous, findings: [{message, kind, finding, rare}]}: what changed
@@ -63,6 +69,9 @@ pub const Options = struct {
     archive: ?[]const u8 = null,
     /// Babashka, which evaluates notebooks (Clojure cells; notebook.clj).
     bb: []const u8 = "bb",
+    /// A run's snapshots on disk (causality analysis saves its timelines' moments there) go
+    /// when none was saved for this long.
+    snapshots_keep_ns: u64 = 24 * std.time.ns_per_hour,
 };
 
 const runs_max = 4096;
@@ -82,6 +91,8 @@ const database_threads = 4;
 const database_memory_mib = 4096;
 /// How often the watcher reaps runs and ingests their finished timelines.
 const watch_interval_ns = std.time.ns_per_s;
+/// How often it removes runs' snapshots past their time (Options.snapshots_keep_ns).
+const snapshots_sweep_interval = 600; // Watches.
 
 const Run = struct {
     id: u32,
@@ -153,6 +164,8 @@ const Server = struct {
     arena: std.mem.Allocator,
     /// What DuckDB said, when a request failed on the database.
     detail: ?[]const u8 = null,
+    /// The request's query string (after `?`), "" for none.
+    query_string: []const u8 = "",
 };
 
 pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
@@ -173,12 +186,41 @@ pub fn serve(arena: std.mem.Allocator, io: std.Io, options: Options) !void {
     try std.Io.Dir.cwd().createDirPath(io, runs_directory);
     var server: Server = .{ .shared = shared, .options = options, .io = io, .arena = arena };
     try runs_load(&server);
-    const listener = try listen(options.listen);
+    // The first address must be there; the others (a VPN's, as Tailscale's) may come up later.
+    var addresses = std.mem.tokenizeScalar(u8, options.listen, ',');
+    const first = addresses.next() orelse return error.BadListen;
+    const listener = try listen(first);
+    while (addresses.next()) |address| {
+        const later = try std.Thread.spawn(.{}, listen_later, .{ shared, address });
+        later.detach();
+    }
     const watcher = try std.Thread.spawn(.{}, watch, .{shared});
     watcher.detach();
     std.debug.print("[determinismo] serving on http://{s} (data in {s})\n", .{
-        options.listen, options.data_directory,
+        first, options.data_directory,
     });
+    accept_loop(shared, listener);
+}
+
+/// Listens on `address` once it can (retrying while the address is not up yet), then answers.
+fn listen_later(shared: *Shared, address: []const u8) void {
+    var told = false;
+    const listener = while (true) {
+        break listen(address) catch |err| {
+            if (!told) std.debug.print("[determinismo] not on http://{s} yet ({s}): retrying\n", .{
+                address, @errorName(err),
+            });
+            told = true;
+            const pause: linux.timespec = .{ .sec = 5, .nsec = 0 };
+            _ = linux.nanosleep(&pause, null);
+            continue;
+        };
+    };
+    std.debug.print("[determinismo] serving on http://{s} too\n", .{address});
+    accept_loop(shared, listener);
+}
+
+fn accept_loop(shared: *Shared, listener: linux.fd_t) noreturn {
     while (true) {
         const client = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(client) != .SUCCESS) continue;
@@ -218,7 +260,9 @@ fn answer(shared: *Shared, client: linux.fd_t) void {
 /// do; a finished run's last ones once).
 fn watch(shared: *Shared) void {
     var ids: [runs_max]u32 = undefined;
-    while (true) {
+    var watches: u64 = 0;
+    while (true) : (watches += 1) {
+        if (watches % snapshots_sweep_interval == 0) snapshots_sweep(shared);
         const interval: linux.timespec = .{
             .sec = @divFloor(watch_interval_ns, std.time.ns_per_s),
             .nsec = @mod(watch_interval_ns, std.time.ns_per_s),
@@ -413,7 +457,13 @@ fn listen(address_text: []const u8) !linux.fd_t {
     return fd;
 }
 
-const Request = struct { method: []const u8, path: []const u8, body: []const u8 };
+const Request = struct {
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    /// The client takes gzip (Accept-Encoding): large answers go compressed.
+    gzip: bool = false,
+};
 
 /// The web UI: one page, no build step, talking to this API.
 const ui_html = @embedFile("ui/index.html");
@@ -424,7 +474,7 @@ fn handle(server: *Server, client: linux.fd_t) void {
     };
     const page = std.mem.eql(u8, request.path, "/") or std.mem.eql(u8, request.path, "/index.html");
     if (page and std.mem.eql(u8, request.method, "GET")) {
-        return respond(client, 200, "text/html; charset=utf-8", ui_html);
+        return respond_to(server, request, client, 200, "text/html; charset=utf-8", ui_html);
     }
     var response: std.Io.Writer.Allocating = .init(server.arena);
     const writer = &response.writer;
@@ -443,12 +493,33 @@ fn handle(server: *Server, client: linux.fd_t) void {
     };
     const text = std.mem.startsWith(u8, writer.buffered(), "{") or
         std.mem.startsWith(u8, writer.buffered(), "[");
-    respond(client, status, if (text) "application/json" else "text/plain", writer.buffered());
+    respond_to(server, request, client, status, if (text) "application/json" else "text/plain", writer.buffered());
+}
+
+/// `respond`, gzipped when large and the client takes it.
+fn respond_to(
+    server: *Server,
+    request: Request,
+    client: linux.fd_t,
+    status: u16,
+    content_type: []const u8,
+    body: []const u8,
+) void {
+    if (request.gzip and body.len >= gzip_size_min) {
+        if (gzipped(server.arena, body)) |compressed| {
+            return respond_encoded(client, status, content_type, "Content-Encoding: gzip\r\n", compressed);
+        }
+    }
+    respond(client, status, content_type, body);
 }
 
 fn route(server: *Server, request: Request, out: *std.Io.Writer) !u16 {
     const eql = std.mem.eql;
-    var parts = std.mem.tokenizeScalar(u8, request.path, '/');
+    // A query string (`?after=N`) is the action's, apart.
+    const question = std.mem.indexOfScalar(u8, request.path, '?');
+    const path = request.path[0 .. question orelse request.path.len];
+    server.query_string = if (question) |at| request.path[at + 1 ..] else "";
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
     const first = parts.next() orelse return error.NotFound;
     if (eql(u8, first, "strategies")) return strategies_route(server, parts.next(), request, out);
     if (!eql(u8, first, "runs")) return error.NotFound;
@@ -502,7 +573,7 @@ fn run_route(
     }
     if (eql(u8, action, "causality")) {
         if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
-        const index_text = parts.next() orelse return error.NotFound;
+        const index_text = parts.next() orelse return causality_list(server, run, out);
         const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
         return causality_show(server, run, index, out);
     }
@@ -515,6 +586,25 @@ fn run_route(
         if (eql(u8, action, name)) break eql(u8, request.method, "POST");
     } else false;
     if (!database_read) return error.NotFound;
+    // The timelines after the first `offset` ingested (a page keeps those): a long run's whole
+    // list is megabytes, and a page polling it every few seconds fills a slow link. In the order
+    // they were ingested, the order they finished: a tree's do not finish in order.
+    if (eql(u8, action, "timelines")) if (query_value(server.query_string, "offset")) |offset_text| {
+        const offset = std.fmt.parseInt(u32, offset_text, 10) catch return error.BadRequest;
+        try run_update(server, run.id);
+        var connection = try run_connect(server, run.id);
+        defer connection.close();
+        const order = try print(server, "ORDER BY t.rowid OFFSET {d}", .{offset});
+        const sql = try std.mem.replaceOwned(u8, server.arena, store.timelines_sql, "ORDER BY t.branch", order);
+        const sql_z = try std.fmt.allocPrintSentinel(server.arena, "{s}", .{sql}, 0);
+        var rows: std.Io.Writer.Allocating = .init(server.arena);
+        connection.json(&rows.writer, sql_z, .{}) catch |err| {
+            if (err == error.DuckDB) server.detail = connection.failure.text();
+            return err;
+        };
+        try out.writeAll(if (rows.written().len == 0) "[]\n" else rows.written()); // None new.
+        return 200;
+    };
     const kept: ?Kept = std.meta.stringToEnum(Kept, action);
     if (kept) |kind| {
         const compute = switch (kind) {
@@ -853,12 +943,56 @@ fn run_extract(server: *Server, run: *const Run, body: []const u8, out: *std.Io.
     return 200;
 }
 
+/// POST /runs/<id>/causality: causality.zig's parameters (its defaults when left out).
 const CausalityRequest = struct {
     branch: u32,
     property: []const u8,
     points: u32 = 8,
     futures: u32 = 16,
+    refine: u32 = 6,
+    moments_max: u32 = 40,
+    jump_min: f64 = 0.2,
+    gap_min_ms: u64 = 20,
+    /// A planner plugin: a command, `tcp://host:port`, or `@<name>` (an uploaded strategy
+    /// executable, PUT /strategies/<name>). Null: the built-in one.
+    planner: ?[]const u8 = null,
 };
+
+/// Removes the snapshots of runs where none was saved for `snapshots_keep_ns` (the newest
+/// file's age: a directory's snapshots are chains, kept or removed together).
+fn snapshots_sweep(shared: *Shared) void {
+    var request_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer request_arena.deinit();
+    const arena = request_arena.allocator();
+    const io = shared.io;
+    const cwd = std.Io.Dir.cwd();
+    const now_s = std.Io.Timestamp.now(io, .real).toSeconds();
+    const keep_s: i64 = @intCast(shared.options.snapshots_keep_ns / std.time.ns_per_s);
+    shared.lock();
+    const count = shared.run_count;
+    shared.unlock();
+    for (1..count + 1) |id| {
+        const directory = std.fmt.allocPrint(arena, "{s}/runs/{d}/snapshots", .{
+            shared.options.data_directory, id,
+        }) catch return;
+        var dir = cwd.openDir(io, directory, .{ .iterate = true }) catch continue;
+        var newest_s: i64 = 0;
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            const stat = dir.statFile(io, entry.name, .{}) catch continue;
+            newest_s = @max(newest_s, stat.mtime.toSeconds());
+        }
+        dir.close(io);
+        if (now_s - newest_s < keep_s) continue;
+        cwd.deleteTree(io, directory) catch |err| {
+            std.debug.print("[determinismo] removing {s} failed: {s}\n", .{ directory, @errorName(err) });
+            continue;
+        };
+        std.debug.print("[determinismo] removed run {d}'s snapshots (none saved for {d}h)\n", .{
+            id, @divFloor(keep_s, 3600),
+        });
+    }
+}
 
 fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
     const asked = try std.json.parseFromSliceLeaky(CausalityRequest, server.arena, body, .{
@@ -887,18 +1021,33 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     if (std.Io.Dir.cwd().access(server.io, tape, .{})) |_| {
         try argv.appendSlice(server.arena, &.{ "--tape", tape });
     } else |_| {}
+    // Its moments saved with the run: a later analysis of the timeline starts from them.
+    const snapshots = try std.fs.path.join(server.arena, &.{ try run_directory(server, run.id), "snapshots" });
+    // The run's API for planners: this server, at its first address.
+    const listen_first = server.options.listen[0 .. std.mem.indexOfScalar(u8, server.options.listen, ',') orelse server.options.listen.len];
     try argv.appendSlice(server.arena, &.{
-        "--branch",   try print(server, "{d}", .{asked.branch}),
-        "--property", asked.property,
-        "--points",   try print(server, "{d}", .{asked.points}),
-        "--futures",  try print(server, "{d}", .{asked.futures}),
+        "--branch",      try print(server, "{d}", .{asked.branch}),
+        "--property",    asked.property,
+        "--points",      try print(server, "{d}", .{asked.points}),
+        "--futures",     try print(server, "{d}", .{asked.futures}),
+        "--refine",      try print(server, "{d}", .{asked.refine}),
+        "--moments-max", try print(server, "{d}", .{asked.moments_max}),
+        "--jump-min",    try print(server, "{d}", .{asked.jump_min}),
+        "--gap-min-ms",  try print(server, "{d}", .{asked.gap_min_ms}),
+        "--snapshots",   snapshots,
+        "--run-url",     try print(server, "http://{s}/runs/{d}", .{ listen_first, run.id }),
         "--json",
     });
+    if (asked.planner) |planner| {
+        try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
+    }
+    // After the analyses on disk (a server before a restart had its own jobs).
+    var index: u32 = 0;
+    for (try causality_indices(server, run.id)) |earlier| index = @max(index, earlier + 1);
     const shared = server.shared;
     shared.lock();
     defer shared.unlock();
     if (shared.job_count == jobs_max) return error.TooManyJobs;
-    var index: u32 = 0;
     for (shared.jobs[0..shared.job_count]) |job| {
         if (job.run == run.id) index = @max(index, job.index + 1);
     }
@@ -906,32 +1055,87 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const directory = try run_directory(server, run.id);
     const output = try std.fs.path.join(server.arena, &.{ directory, name });
     const pid = try spawn(server.arena, argv.items, output, &.{});
+    // Its pid on disk: a server after a restart still knows it runs.
+    const pid_name = try print(server, "causality-{d}.pid", .{index});
+    try std.Io.Dir.cwd().writeFile(server.io, .{
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, pid_name }),
+        .data = try print(server, "{d}\n", .{pid}),
+    });
     shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
     shared.job_count += 1;
     try out.print("{{\"id\":{d}}}\n", .{index});
     return 201;
 }
 
-fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
+/// The causality analyses on disk (causality-<n>.jsonl): their numbers.
+fn causality_indices(server: *Server, id: u32) ![]const u32 {
+    var indices: std.ArrayList(u32) = .empty;
+    var dir = std.Io.Dir.cwd().openDir(server.io, try run_directory(server, id), .{ .iterate = true }) catch
+        return indices.items;
+    defer dir.close(server.io);
+    var iterator = dir.iterate();
+    while (try iterator.next(server.io)) |entry| {
+        const prefix = "causality-";
+        const suffix = ".jsonl";
+        if (!std.mem.startsWith(u8, entry.name, prefix) or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const digits = entry.name[prefix.len .. entry.name.len - suffix.len];
+        try indices.append(server.arena, std.fmt.parseInt(u32, digits, 10) catch continue);
+    }
+    std.mem.sort(u32, indices.items, {}, std.sort.asc(u32));
+    return indices.items;
+}
+
+/// One analysis: what it analyzes (branch, property, the failure's moment), whether it is done
+/// (no job of this server runs it), and its points so far.
+fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !void {
     const shared = server.shared;
     shared.lock();
-    const found: ?Job = for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id and job.index == index) break job;
+    const ours = for (shared.jobs[0..shared.job_count]) |job| {
+        if (job.run == run.id and job.index == index) break !job.done;
     } else null;
     shared.unlock();
-    const job = found orelse return error.NotFound;
+    // One an earlier server started: running while its process is.
+    const running = ours orelse running: {
+        const pid_name = try print(server, "causality-{d}.pid", .{index});
+        const text = run_file(server, run.id, pid_name) catch break :running false;
+        break :running process_alive(server, text, "causality");
+    };
     const name = try print(server, "causality-{d}.jsonl", .{index});
-    const output = run_file(server, run.id, name) catch "";
-    try out.print("{{\"done\":{},\"points\":[", .{job.done});
-    var first = true;
+    const output = run_file(server, run.id, name) catch return error.NotFound;
+    try out.print("{{\"id\":{d},\"done\":{}", .{ index, !running });
     var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    const header_key = "{\"causality\":";
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, header_key) or line.len < header_key.len + 1) continue;
+        try out.print(",\"of\":{s}", .{line[header_key.len .. line.len - 1]});
+        break;
+    }
+    try out.writeAll(",\"points\":[");
+    var first = true;
+    lines.reset();
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "{\"vtime_ms\"")) continue;
         if (!first) try out.writeAll(",");
         first = false;
         try out.writeAll(line);
     }
-    try out.writeAll("]}\n");
+    try out.writeAll("]}");
+}
+
+fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
+    try causality_write(server, run, index, out);
+    try out.writeAll("\n");
+    return 200;
+}
+
+/// Every analysis of the run, oldest first.
+fn causality_list(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
+    try out.writeAll("[");
+    for (try causality_indices(server, run.id), 0..) |index, position| {
+        if (position > 0) try out.writeAll(",");
+        try causality_write(server, run, index, out);
+    }
+    try out.writeAll("]\n");
     return 200;
 }
 
@@ -1236,9 +1440,10 @@ fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     return 200;
 }
 
-/// Runs of an earlier server (before a restart). A run whose record has its summary finished:
-/// it passed or failed by that summary. One without whose explorer still runs (its pid file
-/// names a live process that writes this run's events) is adopted: running. Others were
+/// Runs of an earlier server (before a restart). One whose explorer still runs (its pid file
+/// names a live process that writes this run's events) is adopted: running, whatever its record
+/// says (`--scenario all` records a summary per scenario), or killed if it was stopped. Of the
+/// others, one whose record has its summary passed or failed by that summary; the rest were
 /// interrupted (an error), or stopped on request.
 fn runs_load(server: *Server) !void {
     var id: u32 = 1;
@@ -1248,8 +1453,10 @@ fn runs_load(server: *Server) !void {
         const record = run_file(server, id, "record.jsonl") catch "";
         const stopped = if (run_file(server, id, "stopped")) |_| true else |_| false;
         var run = Run{ .id = id, .pid = 0, .status = recorded_status(record), .stopped = stopped };
-        if (run.status == status_interrupted and !stopped) {
-            if (run_alive(server, id)) |pid| {
+        if (run_alive(server, id)) |pid| {
+            if (stopped) {
+                _ = linux.kill(-pid, .KILL); // Its process group: it leads its session.
+            } else {
                 run.pid = pid;
                 run.status = null;
                 run.adopted = true;
@@ -1265,13 +1472,22 @@ const status_interrupted = 255;
 /// The run's explorer, if its pid file names a live process working for this run.
 fn run_alive(server: *Server, id: u32) ?linux.pid_t {
     const text = run_file(server, id, "pid") catch return null;
-    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return null;
+    const directory = run_directory(server, id) catch return null;
+    const events = print(server, "{s}/events", .{directory}) catch return null;
+    if (!process_alive(server, text, events)) return null;
+    return std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+}
+
+/// Whether `pid_text` names a live process whose command line has `needle` (not another that
+/// took its number since).
+fn process_alive(server: *Server, pid_text: []const u8, needle: []const u8) bool {
+    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch return false;
     const arena = server.arena;
     const cmdline_path = std.fmt.allocPrintSentinel(arena, "/proc/{d}/cmdline", .{pid}, 0) catch
-        return null;
+        return false;
     // Read until the end: procfs files report no size.
     const fd = linux.open(cmdline_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) != .SUCCESS) return null;
+    if (linux.errno(fd) != .SUCCESS) return false;
     defer _ = linux.close(@intCast(fd));
     var cmdline_buffer: [1 << 16]u8 = undefined;
     var size: usize = 0;
@@ -1282,9 +1498,7 @@ fn run_alive(server: *Server, id: u32) ?linux.pid_t {
         size += result;
     }
     const cmdline = cmdline_buffer[0..size];
-    const directory = run_directory(server, id) catch return null;
-    const events = print(server, "{s}/events", .{directory}) catch return null;
-    return if (std.mem.indexOf(u8, cmdline, events) != null) pid else null;
+    return std.mem.indexOf(u8, cmdline, needle) != null;
 }
 
 fn recorded_status(record: []const u8) u32 {
@@ -1320,6 +1534,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         if (run.status != null) continue;
         if (run.adopted) {
             if (linux.errno(linux.kill(run.pid, @fromBackingInt(0))) != .SRCH) continue;
+            _ = linux.kill(-run.pid, .KILL); // What it left in its process group.
             const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
             if (run_ended_itself(run) and ended_count < ended.len) {
@@ -1333,6 +1548,9 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         const bits: u32 = @bitCast(status);
         run.status = if (bits & 0x7f == 0) (bits >> 8) & 0xff else 128 + (bits & 0x7f);
+        // What the explorer left in its process group (it leads its session): holders of
+        // timelines it stopped waiting for, workers of a killed explorer.
+        _ = linux.kill(-run.pid, .KILL);
         archive(&server, run) catch |err| {
             std.debug.print("[determinismo] archiving run {d} failed: {s}\n", .{
                 run.id, @errorName(err),
@@ -1521,6 +1739,21 @@ fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
     return kept;
 }
 
+/// A query string's value for `name` (`offset=12&x=1`), if there.
+fn query_value(query_string: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.tokenizeScalar(u8, query_string, '&');
+    while (pairs.next()) |pair| {
+        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..equals], name)) return pair[equals + 1 ..];
+    }
+    return null;
+}
+
+test query_value {
+    try std.testing.expectEqualStrings("12", query_value("offset=12&x=1", "offset").?);
+    try std.testing.expect(query_value("x=1", "offset") == null);
+}
+
 fn run_file(server: *Server, id: u32, name: []const u8) ![]const u8 {
     const path = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), name });
     const limit: std.Io.Limit = .limited(response_size_max);
@@ -1588,8 +1821,58 @@ fn request_read(server: *Server, client: linux.fd_t) !Request {
             .method = line.next() orelse return error.BadRequest,
             .path = line.next() orelse return error.BadRequest,
             .body = text[header_end + 4 .. total],
+            .gzip = accepts_gzip(text[0..header_end]),
         };
     }
+}
+
+fn accepts_gzip(headers: []const u8) bool {
+    var lines = std.mem.tokenizeSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "accept-encoding")) continue;
+        return std.mem.indexOf(u8, line[colon + 1 ..], "gzip") != null;
+    }
+    return false;
+}
+
+test accepts_gzip {
+    try std.testing.expect(accepts_gzip("GET / HTTP/1.1\r\nAccept-Encoding: gzip, deflate, br"));
+    try std.testing.expect(!accepts_gzip("GET / HTTP/1.1\r\nAccept: */*"));
+}
+
+/// Answers this large and up go gzipped to a client that takes it: a run's timelines, marks
+/// and events are megabytes of JSON (about a tenth compressed), and a page may be at the far
+/// end of a slow link.
+const gzip_size_min = 1024;
+
+/// `body` gzipped (std's deflate at its fastest), or null if compressing failed.
+fn gzipped(arena: std.mem.Allocator, body: []const u8) ?[]const u8 {
+    const flate = std.compress.flate;
+    var out = std.Io.Writer.Allocating.initCapacity(arena, body.len / 4 + 4096) catch return null;
+    const window = arena.alloc(u8, flate.max_window_len) catch return null;
+    var compress = flate.Compress.init(&out.writer, window, .gzip, .level_1) catch return null;
+    compress.writer.writeAll(body) catch return null;
+    compress.finish() catch return null;
+    return out.written();
+}
+
+test gzipped {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.append(arena, '[');
+    for (0..300) |index| try text.print(arena, "{{\"index\":{d},\"why\":\"A random moment of #7249\"}},", .{index});
+    try text.appendSlice(arena, "{}]");
+    const body = text.items;
+    const compressed = gzipped(arena, body).?;
+    try std.testing.expect(compressed.len < body.len / 10);
+    var input: std.Io.Reader = .fixed(compressed);
+    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, window);
+    const back = try decompress.reader.allocRemaining(arena, .unlimited);
+    try std.testing.expectEqualStrings(body, back);
 }
 
 fn content_length(headers: []const u8) u32 {
@@ -1603,7 +1886,17 @@ fn content_length(headers: []const u8) u32 {
 }
 
 fn respond(client: linux.fd_t, status: u16, content_type: []const u8, body: []const u8) void {
-    var header: [256]u8 = undefined;
+    respond_encoded(client, status, content_type, "", body);
+}
+
+fn respond_encoded(
+    client: linux.fd_t,
+    status: u16,
+    content_type: []const u8,
+    encoding: []const u8,
+    body: []const u8,
+) void {
+    var header: [320]u8 = undefined;
     const reason = switch (status) {
         200 => "OK",
         201 => "Created",
@@ -1612,9 +1905,9 @@ fn respond(client: linux.fd_t, status: u16, content_type: []const u8, body: []co
         503 => "Service Unavailable",
         else => "Internal Server Error",
     };
-    const head = std.fmt.bufPrint(&header, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n" ++
+    const head = std.fmt.bufPrint(&header, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n{s}" ++
         "Content-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{
-        status, reason, content_type, body.len,
+        status, reason, content_type, encoding, body.len,
     }) catch unreachable;
     write_all(client, head);
     write_all(client, body);
