@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: MIT# hunt-queue.sh <run id> <request JSON>...: srv2 runs one hunt at a time. Waits for the run to
+# SPDX-License-Identifier: MIT
+# hunt-queue.sh <run id> <request JSON>...: srv2 runs one hunt at a time. Waits for the run to
 # end, then starts each request in turn through serve, waiting for each to end. A run also ends
 # here once its discovery plateaus: after an hour, no new behavior over its last 100 timelines
 # (or its last quarter, if more); its time budget stays the bound.
