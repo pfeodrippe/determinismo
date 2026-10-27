@@ -34,9 +34,16 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 ## Profiles
 
 - `default`: as Kafka is deployed, except that start.sh forces `bootstrap.checkpoint` to disk
-  after formatting: the finding below would otherwise brick a broker in most timelines and hide
-  the rest.
-- `format-unsynced`: formatted as Kafka does it (that finding's profile).
+  after formatting (the finding below would otherwise brick a broker in most timelines and hide
+  the rest), and each write to disk before it counts (`log.flush.interval.messages=1`).
+- `format-unsynced`: formatted as Kafka does it (that finding's profile), writes flushed.
+- `unflushed`: Kafka's flushing as it comes. Kafka leaves its log to the kernel's writeback and
+  counts on its replicas: when every replica that took a write loses power before the kernel
+  writes it back (30 s), the write is gone, though acknowledged. That is Kafka's design, and
+  this profile shows it: hunt kf4 (seed 15, the default profile then unflushed) lost committed
+  writes in 2 of 139 timelines. In timeline 29, the run's one committed transaction committed at
+  21.5 s with kafka-3 stopped, and kafka-1 lost power at 21.9 s, kafka-3 (caught up meanwhile) at
+  28.7 s and kafka-2 at 49.9 s: the topic read back empty.
 
 ## The workload and its properties
 

@@ -60,21 +60,26 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// `default`: the format's bootstrap.checkpoint made durable (start.sh), so that a power loss
-/// soon after it does not brick a broker (found here, README) and hide the rest.
+/// soon after it does not brick a broker (found here, README) and hide the rest, and each write
+/// forced to disk before it counts (log.flush.interval.messages=1): Kafka's defaults lose what
+/// its replicas acknowledged when they all lose power within the kernel's writeback window, by
+/// design (README), which would hide the rest too.
 /// `format-unsynced`: formatted as Kafka does it, that finding's profile.
+/// `unflushed`: Kafka's flushing as it comes, the lost writes above expected.
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "format-unsynced" }) |profile_name| {
+    inline for (.{ "default", "format-unsynced", "unflushed" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
 
 fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/kafka/Dockerfile" };
-    const format = if (comptime std.mem.eql(u8, profile_name, "default")) "synced" else profile_name;
+    const format = if (comptime std.mem.eql(u8, profile_name, "format-unsynced")) profile_name else "synced";
+    const flush = if (comptime std.mem.eql(u8, profile_name, "unflushed")) profile_name else "flushed";
     inline for (.{ "kafka-1", "kafka-2", "kafka-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format },
+            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush },
             // The controller's port: open at once. The broker's opens once the quorum formed,
             // which needs the nodes started after this one.
             .ready = .{ .tcp = controller_port },

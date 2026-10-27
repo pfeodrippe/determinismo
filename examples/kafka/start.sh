@@ -1,8 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# start.sh broker <id> [format-unsynced]: one KRaft node (broker and controller), its log in
-# /data, formatted the first time (a fixed cluster id: every node the same cluster). start.sh client: the client
-# node on port 7000.
+# start.sh broker <id> [synced|format-unsynced] [flushed|unflushed]: one KRaft node (broker and
+# controller), its log in /data, formatted the first time (a fixed cluster id: every node the same
+# cluster); `flushed` forces each write to disk before it is acknowledged (README: Profiles).
+# start.sh client: the client node on port 7000.
 set -e
 case "$1" in
 broker)
@@ -26,6 +27,10 @@ transaction.state.log.min.isr=2
 auto.create.topics.enable=false
 group.initial.rebalance.delay.ms=0
 PROPERTIES
+  # Kafka leaves its log to the kernel's writeback (30 s) and counts on replicas: a power loss of
+  # every replica within that window loses what they acknowledged, by design. Flushed, each write
+  # is on disk before it counts.
+  [ "${4:-flushed}" = "unflushed" ] || echo "log.flush.interval.messages=1" >> /tmp/server.properties
   if [ ! -f /data/kafka/meta.properties ]; then
     /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /tmp/server.properties \
       --ignore-formatted > /dev/null
