@@ -198,11 +198,18 @@ pub const Behavior = struct {
 };
 
 /// A moment of a branch to return to, and why.
-pub const Return = struct { branch: u32, vtime_ns: u64, reason: []const u8 };
+pub const Return = struct {
+    branch: u32,
+    vtime_ns: u64,
+    reason: []const u8,
+    /// How long the returned branches run past the moment (null: `--horizon`, or to the end).
+    horizon_ns: ?u64 = null,
+};
 
 /// The tree explorer asks where to return after a generation: the plugin answers
-/// `{"returns": [{"branch": B, "vtime_ns": T, "reason": "..."}, ...]}` (at most `count`), or
-/// `{}` to leave it to the explorer. Reasons are copied into `arena`.
+/// `{"returns": [{"branch": B, "vtime_ns": T, "reason": "...", "horizon_ns": H}, ...]}` (at most
+/// `count`; `horizon_ns` optional), or `{}` to leave it to the explorer. Reasons are copied into
+/// `arena`.
 pub fn returns(
     strategy: *Strategy,
     arena: std.mem.Allocator,
@@ -228,10 +235,16 @@ pub fn returns(
             .string => |string| try arena.dupe(u8, string[0..@min(string.len, reason_size_max)]),
             else => "",
         } else "";
+        const horizon: ?u64 = if (item.object.get("horizon_ns")) |value| switch (value) {
+            .integer => |integer| std.math.cast(u64, integer) orelse return error.BadPluginReply,
+            .null => null,
+            else => return error.BadPluginReply,
+        } else null;
         try chosen.append(arena, .{
             .branch = std.math.cast(u32, index.integer) orelse return error.BadPluginReply,
             .vtime_ns = std.math.cast(u64, vtime.integer) orelse return error.BadPluginReply,
             .reason = reason,
+            .horizon_ns = horizon,
         });
     }
     return chosen.items;

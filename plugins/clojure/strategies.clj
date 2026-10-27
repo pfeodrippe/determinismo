@@ -156,13 +156,47 @@
                                          " timelines, returned to " returns " times")}))]
     (vec (take count (concat (doall from-archive) fresh)))))
 
+;; Fault schedules (nemeses): a strategy with `:decide` is asked for every named decision of the
+;; timeline and told its events (it then says "decides": true at hello: a round trip per
+;; decision). `leader-faults` follows the Raft leader in the logs and, when the fault injector
+;; draws a fault, picks one aimed at the leader most of the time, as Jepsen's nemeses partition or
+;; pause the leader: the moments a cluster is most fragile. Its state is per connection (each
+;; exploration worker runs its timelines one at a time).
+
+(defn- index-hex
+  "An option's index as the decision's bytes: little endian, `size` bytes."
+  [index size]
+  (apply str (for [i (range size)] (format "%02x" (bit-and (bit-shift-right index (* 8 i)) 0xff)))))
+
+(defn leader-faults-event [state {:keys [event]}]
+  (when-let [text (get-in event [:output :text])]
+    (when-let [[_ node] (re-find #"(node-\d+): entering leader state" text)]
+      (swap! state assoc :leader node))
+    (when (re-find #"entering (follower|candidate) state" text)
+      (when-let [[_ node] (re-find #"(node-\d+): entering" text)]
+        (when (= node (:leader @state)) (swap! state dissoc :leader))))))
+
+(defn leader-faults-decide
+  "A fault aimed at the leader (an option naming its container), seven times in ten; the
+  injector's own draw otherwise."
+  [state {:keys [decision size]}]
+  (let [leader (:leader @state)
+        options (:options decision)]
+    (when (and leader (= "fault" (:name decision)) (< (rand) 0.7))
+      (let [aimed (keep-indexed (fn [i option] (when (str/includes? option (str "raft-" leader)) i)) options)]
+        (when (seq aimed)
+          (let [index (rand-nth aimed)]
+            {:hex (index-hex index size)
+             :reason (str "nemesis: " (nth options index) ", at the leader (" leader ")")}))))))
+
 (defonce strategies
   (atom {:explorer {:returns (fn [& _] nil)} ; The explorer's built-in choice (a baseline).
          :rarity {:returns #'rarity}
          :rarest-ever {:returns #'rarest-ever}
          :uniform {:returns #'uniform}
          :deepest {:returns #'deepest}
-         :archive {:returns #'archived}}))
+         :archive {:returns #'archived}
+         :leader-faults {:returns (fn [& _] nil) :decide #'leader-faults-decide :event #'leader-faults-event}}))
 
 (defonce current (atom :rarity))
 
@@ -250,7 +284,7 @@
   (assert (contains? @planners name) (str "no planner " name))
   (reset! current-planner name))
 
-(defn plan-answer [{:keys [method] :as request}]
+(defn plan-answer [{:keys [method] :as request} _state]
   (case method
     "hello" {:name (str "clojure/" (name @current-planner))}
     "plan" (let [planner @current-planner
@@ -265,10 +299,21 @@
 
 ;; The protocol -----------------------------------------------------------------------------------
 
-(defn answer [{:keys [method] :as request}]
+(defn answer [{:keys [method] :as request} state]
   (case method
-    "hello" {:name (str "clojure/" (name @current)) :decides false :wants ["behaviors"]}
-    "branch" (do (swap! starts assoc (:index request) (select-keys request [:seed :from])) {})
+    "hello" (let [strategy (get @strategies @current)]
+              {:name (str "clojure/" (name @current)) :decides (boolean (:decide strategy))
+               :wants ["behaviors"]})
+    "branch" (do (swap! starts assoc (:index request) (select-keys request [:seed :from]))
+                 (reset! state {}) ; A timeline of its own.
+                 {})
+    "event" (do (when-let [f (:event (get @strategies @current))] (f state request)) {})
+    "random" (or (when-let [f (:decide (get @strategies @current))]
+                   (try (f state request)
+                        (catch Exception e
+                          (binding [*out* *err*] (println "decide failed:" (ex-message e)))
+                          nil)))
+                 {})
     "branch_end" (do (swap! ends assoc (:index request) (select-keys request [:outcome :events :failing])) {})
     "returns" (let [{:keys [generation candidates count]} request
                     strategy @current
@@ -279,19 +324,20 @@
                 (swap! generations conj {:generation generation :strategy strategy
                                          :candidates candidates :chosen chosen})
                 (if (seq chosen)
-                  {:returns (mapv #(select-keys % [:branch :vtime_ns :reason]) chosen)}
+                  {:returns (mapv #(select-keys % [:branch :vtime_ns :reason :horizon_ns]) chosen)}
                   {}))
     {}))
 
 (defn- serve-with [answer-fn]
   (fn [socket]
     (future
-      (with-open [socket socket
-                  reader (io/reader (.getInputStream socket))
-                  writer (io/writer (.getOutputStream socket))]
-        (doseq [line (line-seq reader)]
-          (.write writer (str (json/generate-string (answer-fn (json/parse-string line true))) "\n"))
-          (.flush writer))))))
+      (let [state (atom {})] ; The connection's: one exploration worker's timelines.
+        (with-open [socket socket
+                    reader (io/reader (.getInputStream socket))
+                    writer (io/writer (.getOutputStream socket))]
+          (doseq [line (line-seq reader)]
+            (.write writer (str (json/generate-string (answer-fn (json/parse-string line true) state)) "\n"))
+            (.flush writer)))))))
 
 (defn- serve-control [socket]
   (future

@@ -1930,7 +1930,7 @@ fn tree_judge(
                 .path = path,
                 .generation = generation + state.pipeline,
                 .why = back.why,
-                .horizon_ns = if (branches.arguments.horizon_ns) |horizon| at + horizon else null,
+                .horizon_ns = if (back.horizon_ns orelse branches.arguments.horizon_ns) |horizon| at + horizon else null,
             });
             state.next_index += 1;
         }
@@ -1972,7 +1972,13 @@ const Candidate = struct {
     changed_label: []const u8 = "",
 };
 
-const TreeReturn = struct { branch: u32, vtime_ns: u64, why: []const u8 };
+const TreeReturn = struct {
+    branch: u32,
+    vtime_ns: u64,
+    why: []const u8,
+    /// A strategy's horizon for this return (null: `--horizon`, or to the end).
+    horizon_ns: ?u64 = null,
+};
 
 /// A judged timeline, kept for returns from later generations (a strategy's archive, or ours);
 /// with `--archive`, every behavior it reached that the archive lacks becomes a cell just after
@@ -2100,6 +2106,7 @@ fn tree_returns(
             try list.append(arena, .{
                 .branch = back.branch,
                 .vtime_ns = back.vtime_ns,
+                .horizon_ns = back.horizon_ns,
                 .why = try std.fmt.allocPrint(arena, "The strategy returned to #{d} here: {s}", .{
                     back.branch, reason,
                 }),
