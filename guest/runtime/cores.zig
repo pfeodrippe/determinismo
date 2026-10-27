@@ -7,6 +7,10 @@
 //! its smallest memory segments, the largest left out (their headers kept, with no bytes): the
 //! stacks stay, which a plain cut would lose (they come last), so gdb still unwinds the threads
 //! of a process with gigabytes of heap.
+//!
+//! The cores together keep to cores_total_max and to a quarter of the free space where they
+//! are: /run is the nodes' disks' too, and a system whose processes crash over and over (a
+//! YugabyteDB's backends, each a 190 MB core) once filled it, every node's disk failing after.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -14,6 +18,8 @@ const sdk = @import("determinismo");
 
 const cores_directory = "/run/det/cores";
 const cores_size_max = 256 * 1024 * 1024;
+/// All of a timeline's cores.
+const cores_total_max = 512 * 1024 * 1024;
 const name_size_max = 64;
 const headers_size_max = 1024 * 1024;
 const page_size = 4096;
@@ -38,7 +44,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (linux.errno(fd) != .SUCCESS) return 1;
     defer _ = linux.close(@intCast(fd));
     var input: Input = .{ .fd = 0 };
-    const kept = core_copy(&input, @intCast(fd), init.arena.allocator(), cores_size_max);
+    const budget = budget_left(path);
+    const kept = core_copy(&input, @intCast(fd), init.arena.allocator(), budget);
     // The whole dump is read, so that the kernel finishes it.
     while (input.fill()) input.start = input.end;
     const size = kept.size;
@@ -53,6 +60,41 @@ pub fn main(init: std.process.Init) !u8 {
         .dropped = dropped,
     });
     return 0;
+}
+
+/// What this core may take: cores_size_max, less what the other cores took of
+/// cores_total_max, and at most a quarter of the free space.
+fn budget_left(own: [:0]const u8) u64 {
+    var used: u64 = 0;
+    const directory = linux.open(cores_directory, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(directory) == .SUCCESS) {
+        defer _ = linux.close(@intCast(directory));
+        var buffer: [8192]u8 align(8) = undefined;
+        while (true) {
+            const read = linux.getdents64(@intCast(directory), &buffer, buffer.len);
+            if (linux.errno(read) != .SUCCESS or read == 0) break;
+            var at: usize = 0;
+            while (at < read) {
+                const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[at]);
+                at += entry.reclen;
+                const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+                if (!std.mem.endsWith(u8, name, ".core")) continue;
+                if (std.mem.endsWith(u8, own, name)) continue; // This one, just created.
+                var stat: linux.Statx = undefined;
+                const name_z: [*:0]const u8 = @ptrCast(&entry.name);
+                const statted = linux.statx(@intCast(directory), name_z, 0, .{ .BLOCKS = true }, &stat);
+                if (linux.errno(statted) != .SUCCESS) continue;
+                used += stat.blocks * 512;
+            }
+        }
+    }
+    var budget: u64 = cores_size_max;
+    budget = @min(budget, cores_total_max -| used);
+    // struct statfs on x86_64: f_bsize its 2nd field, f_bavail its 5th.
+    var space: [15]u64 = undefined;
+    const result = linux.syscall2(.statfs, @intFromPtr(cores_directory.ptr), @intFromPtr(&space));
+    if (linux.errno(result) == .SUCCESS) budget = @min(budget, space[4] * space[1] / 4);
+    return budget;
 }
 
 /// The kernel's dump, read once, in order.
