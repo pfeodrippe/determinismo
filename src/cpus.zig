@@ -37,6 +37,23 @@ const wait_ns_max = 30 * std.time.ns_per_ms;
 /// (they inherit it); a process outside any run is a run of its own.
 pub var run_key: ?linux.pid_t = null;
 
+/// The CPUs this process was given: its affinity before a pin narrowed it to the one CPU it
+/// held. Its pool, its count of usable CPUs and a CPU given back go by it, never by the pinned
+/// affinity: an explorer pinned while it booted and set up once counted one usable CPU (every
+/// run without --jobs ran one timeline at a time, 2026-10-27), and the timelines it forked
+/// opened pools of that one CPU. Read before the first pin; forks inherit it.
+var given_mask: ?linux.cpu_set_t = null;
+
+fn given() linux.cpu_set_t {
+    if (given_mask) |mask| return mask;
+    var mask: linux.cpu_set_t = undefined;
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mask)) != .SUCCESS) {
+        mask = @splat(~@as(@TypeOf(mask[0]), 0));
+    }
+    given_mask = mask;
+    return mask;
+}
+
 pub const Pool = struct {
     /// The CPUs this process may run on, and their lock files.
     cpus: [cpus_max]u16 = undefined,
@@ -51,11 +68,7 @@ pub const Pool = struct {
     /// Opens the pool of the CPUs this process may run on.
     pub fn open(pool: *Pool) !void {
         pool.* = .{};
-        var available: linux.cpu_set_t = undefined;
-        const size = @sizeOf(linux.cpu_set_t);
-        if (linux.errno(linux.sched_getaffinity(0, size, &available)) != .SUCCESS) {
-            return error.Affinity;
-        }
+        const available = given();
         var directory_buffer: [64]u8 = undefined;
         const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-{d}", .{
             linux.getuid(),
@@ -182,6 +195,7 @@ pub const Pool = struct {
     pub fn give(pool: *Pool, held: Held) void {
         assert(held.slot < pool.count);
         _ = linux.flock(pool.fds[held.slot], std.posix.LOCK.UN);
+        unpin(); // Not pinned to a CPU it no longer holds (nor are what it forks or runs next).
     }
 };
 
@@ -205,12 +219,9 @@ pub fn memory_available() u64 {
     return kib * 1024;
 }
 
-/// How many CPUs this process's pool holds: the CPUs it may run on, one thread per core.
+/// How many CPUs this process's pool holds: the CPUs it was given, one thread per core.
 pub fn usable_count() u32 {
-    var available: linux.cpu_set_t = undefined;
-    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &available)) != .SUCCESS) {
-        return 1;
-    }
+    const available = given();
     const bits = @bitSizeOf(@TypeOf(available[0]));
     var count: u32 = 0;
     for (0..available.len * bits) |cpu| {
@@ -268,16 +279,34 @@ fn monotonic_ns() u64 {
 }
 
 fn pin(cpu: u16) void {
+    _ = given(); // Read before narrowing it.
     var set: linux.cpu_set_t = @splat(0);
     const bits = @bitSizeOf(@TypeOf(set[0]));
     set[cpu / bits] = @as(@TypeOf(set[0]), 1) << @intCast(cpu % bits);
     linux.sched_setaffinity(0, &set) catch {}; // Best effort: the lock is what counts.
 }
 
-/// Lets this process run on any CPU (a process that holds none, after a pinned parent).
+/// Lets this process run on the CPUs it was given again (one that holds none, after a pin).
 pub fn unpin() void {
-    var set: linux.cpu_set_t = @splat(~@as(@TypeOf(@as(linux.cpu_set_t, undefined)[0]), 0));
+    const set = given();
     linux.sched_setaffinity(0, &set) catch {};
+}
+
+test "pinned, a process still counts and pools the CPUs it was given" {
+    const before = usable_count();
+    var pool: Pool = undefined;
+    try pool.open();
+    defer pool.close();
+    const held = pool.take(); // Pins this process to one CPU.
+    try std.testing.expectEqual(before, usable_count());
+    var while_pinned: Pool = undefined;
+    try while_pinned.open();
+    defer while_pinned.close();
+    try std.testing.expectEqual(pool.count, while_pinned.count);
+    pool.give(held);
+    var mask: linux.cpu_set_t = undefined;
+    _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mask);
+    try std.testing.expectEqualSlices(usize, &given(), &mask); // Unpinned when given back.
 }
 
 test "a CPU is held by one process at a time, and given back" {

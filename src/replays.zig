@@ -14,6 +14,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const cpus = @import("cpus.zig");
 
 /// At most this many replays in a run (each as long as its timeline).
 pub const replays_max = 16;
@@ -46,6 +47,9 @@ pub const Verifier = struct {
             _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
             if (linux.getppid() != explorer) linux.exit_group(0);
             _ = linux.setpgid(0, 0); // Its replays with it: stopped as one.
+            // Forked while the explorer held its CPU for the setup: its replays (programs of
+            // their own, which read their affinity afresh) get every CPU the run was given.
+            cpus.unpin();
             const action: linux.Sigaction = .{
                 .handler = .{ .handler = finish_requested },
                 .mask = linux.sigemptyset(),
