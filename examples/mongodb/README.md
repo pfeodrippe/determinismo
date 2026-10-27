@@ -49,3 +49,30 @@ clear outcome retried on any router with the recovery token from the router's la
 majority write concern; the whole transaction run again (the same appends) when the server says
 it aborted (TransientTransactionError). A transaction that ran twice shows in Elle's check as a
 duplicated element.
+
+### Found: SERVER-48307, blind
+
+The first hunt (srv2, `--seed 7`, 12 at once) failed Elle's check in 2 of its first 89
+timelines, both replayed to the same history. Timeline 80, 221 s of virtual time: an aborted read
+(G1a). A read of key 17 saw an append whose transaction the client had recorded failed. From
+the nodes' logs, the transaction's session (all five runs of it under one session id):
+- runs 1-3 aborted (`not master` from shard 2, a snapshot too old, a chunk epoch mismatch);
+- run 4 read key 15 on shard 1, appended to key 17 on shard 2, and committed:
+  `commitType:singleWriteShard`, `terminationCause:committed` at r1, after 13 s. During that
+  commit, shard 1, which it only read from, failed over twice (s1c to s1b, then to s1a);
+- the client's commit gave up at its 10 s timeout and was retried on r1 with the recovery
+  token; the retry answered NoSuchTransaction ("transaction number 4 does not match any
+  in-progress transactions"), a TransientTransactionError: aborted, run it again;
+- run 5 aborted (epoch mismatch), the fifth and last attempt, so the transaction was recorded
+  failed. It had committed, and later reads saw its append.
+
+This is SERVER-48307 as its ticket states it: a transaction that writes to exactly one shard and
+reads from others, a failover of a shard it only read from during the commit, and a commit retry
+told it definitely aborted. Had run 5 committed, the append would have been there twice, as
+Jepsen saw.
+
+Timeline 61 (498 s) is that other outcome: Elle found an element of key 7 twice. Session
+c343fbc3's transaction 1 wrote to shard 2, read from shard 1, and committed at r3 after 14.7 s,
+shard 1 failing over (s1a to s1b) during the commit; the client's retry of the commit, through
+r3 to shard 2's new primary s2a, answered that transaction 1 was not in progress; the client ran
+it again: run 2 aborted, run 3 committed, and the append was there twice.
