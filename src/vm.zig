@@ -1111,6 +1111,15 @@ fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
     if (vm.overrides) |overrides| overrides.check(now) catch |err| {
         const message = "[determinismo] replay diverged from its tape at event {d}\n";
         std.debug.print(message, .{now.events});
+        // What could have perturbed the guest's clock on the way (the KVM patch's counts).
+        if (vm.det_state()) |state| {
+            std.debug.print("[determinismo] its clock's hazards: {d} counter throttles restarted, " ++
+                "{d} reached at another exit, {d} overshoots (largest skid {d}), {d} drifts, " ++
+                "XINUSE restored {d} times ({d} not)\n", .{
+                state.throttles, state.late_steps,   state.overshoots,     state.skid_max,
+                state.drifts,    state.xinuse_fixes, state.xinuse_unfixed,
+            });
+        } else |_| {}
         return err;
     };
 }

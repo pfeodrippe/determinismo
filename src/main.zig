@@ -280,6 +280,9 @@ pub fn main(init: std.process.Init) !void {
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "script")) {
         return script.extract(arena, init.io, argv[2]);
     }
+    if (argv.len == 6 and std.mem.eql(u8, argv[1], "snapshot-diff")) {
+        return snapshot_diff(init, argv[2..6]);
+    }
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "merge")) {
         const failing = try merge.merge(arena, init.io, argv[2..]);
         if (failing > 0) std.process.exit(3);
@@ -742,6 +745,74 @@ const Exploration = struct {
     /// A resumed run's (--resume): its timelines already recorded, skipped.
     done: ?*const Resumed = null,
 };
+
+/// `determinismo snapshot-diff <dir> <name> <dir> <name>`: how two saved moments' guest memory
+/// differs (two runs of one timeline, saved at the same moment, should not). Each differing
+/// 8-byte word is classed by its XOR: the bits a processor sets on its own in page-table
+/// entries (Accessed 0x20, Dirty 0x40), or other data; the first pages are listed.
+fn snapshot_diff(init: std.process.Init, names: []const []const u8) !void {
+    const arena = init.arena.allocator();
+    var snapshots: [2]Snapshot = undefined;
+    const check_buffer = try std.heap.page_allocator.alloc(u8, checks.input_size_max); // Touched as used.
+    for (&snapshots, 0..) |*snapshot, side| {
+        try snapshot.disk_load(arena, init.io, names[2 * side], names[2 * side + 1], check_buffer);
+    }
+    if (snapshots[0].memory_size != snapshots[1].memory_size) return error.SizesDiffer;
+    const size = snapshots[0].memory_size;
+    var memories: [2][]const u8 = undefined;
+    for (&memories, snapshots) |*memory, snapshot| {
+        const address = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, snapshot.memory_fd, 0);
+        if (linux.errno(address) != .SUCCESS) return error.OutOfMemory;
+        memory.* = @as([*]const u8, @ptrFromInt(address))[0..size];
+    }
+    const page = std.heap.page_size_min;
+    var pages_differing: u64 = 0;
+    var accessed_only: u64 = 0; // Words differing only in bit 5.
+    var dirty_only: u64 = 0; // Only in bit 6.
+    var both: u64 = 0;
+    var other: u64 = 0;
+    var listed: u32 = 0;
+    var offset: usize = 0;
+    while (offset < size) : (offset += page) {
+        const a = memories[0][offset..][0..page];
+        const b = memories[1][offset..][0..page];
+        if (std.mem.eql(u8, a, b)) continue;
+        pages_differing += 1;
+        var words_ad: u32 = 0;
+        var words_other: u32 = 0;
+        var first_other: ?usize = null;
+        var word: usize = 0;
+        while (word < page) : (word += 8) {
+            const x = std.mem.readInt(u64, a[word..][0..8], .little) ^ std.mem.readInt(u64, b[word..][0..8], .little);
+            if (x == 0) continue;
+            switch (x) {
+                0x20 => accessed_only += 1,
+                0x40 => dirty_only += 1,
+                0x60 => both += 1,
+                else => {
+                    other += 1;
+                    words_other += 1;
+                    first_other = first_other orelse word;
+                    continue;
+                },
+            }
+            words_ad += 1;
+        }
+        if (listed < 40) {
+            listed += 1;
+            std.debug.print("page 0x{x}: {d} words differ in Accessed/Dirty bits, {d} otherwise", .{ offset, words_ad, words_other });
+            if (first_other) |at| {
+                std.debug.print(" (first at +0x{x}: {x:0>16} vs {x:0>16})", .{
+                    at, std.mem.readInt(u64, a[at..][0..8], .little), std.mem.readInt(u64, b[at..][0..8], .little),
+                });
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+    std.debug.print("{d} pages differ; words: {d} only Accessed, {d} only Dirty, {d} both, {d} otherwise\n", .{
+        pages_differing, accessed_only, dirty_only, both, other,
+    });
+}
 
 /// What a resumed run (--resume) takes from its record: the timelines it has, and for a tree
 /// each one's summary (`<record>.summaries`) and how many recorded timelines each return (its
