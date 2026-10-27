@@ -82,6 +82,8 @@ const usage =
     \\                            the pages changed since the one before)
     \\                            [--from-snapshot <dir>/<name>]   (branches from one saved)
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
+    \\                            [--resume]   (with --record: continue that run, its recorded
+    \\                            timelines skipped; flat branching, the same inputs and seed)
     \\                            [--cpu-modulation]   (branches run at varying speeds)
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
     \\                            by a replay and compare them, to check holders; slower)
@@ -240,6 +242,9 @@ const Arguments = struct {
     shard_count: u32 = 1,
     /// Write results as JSON lines here (see report.record).
     record_path: ?[]const u8 = null,
+    /// Continue the run whose record is `record_path`: its timelines already recorded are
+    /// skipped (flat branching; the same inputs and seed).
+    resume_run: bool = false,
     /// Parallel workers for branches (default: one per available CPU).
     jobs: ?u32 = null,
     /// Multiverse debugging: stop the (single) branch at this virtual time, run this there.
@@ -733,7 +738,70 @@ const Exploration = struct {
     tape_directory: ?[]const u8 = null,
     /// Set when replaying one recorded branch.
     replay: ?struct { header: tape.Header, overrides: *tape.Overrides } = null,
+    /// A resumed run's timelines already recorded (--resume): skipped.
+    done: ?*const std.AutoHashMapUnmanaged(u32, void) = null,
 };
+
+/// The timelines a run's record already has, for --resume: its run must be this one (the same
+/// inputs, seed and branching), or there is nothing to continue.
+fn resume_read(
+    context: Context,
+    arguments: *const Arguments,
+    inputs: u64,
+) !*const std.AutoHashMapUnmanaged(u32, void) {
+    const path = arguments.record_path orelse {
+        std.debug.print("[determinismo] --resume continues the run of a record: give --record\n", .{});
+        return error.Usage;
+    };
+    if (arguments.branching != .flat) {
+        std.debug.print("[determinismo] --resume continues flat runs only (a tree's archive " ++
+            "of moments is the explorer's)\n", .{});
+        return error.Usage;
+    }
+    const Line = struct {
+        run: ?struct { inputs: ?[]const u8 = null, seed: ?[]const u8 = null, branching: ?[]const u8 = null } = null,
+        branch: ?struct { index: u32 } = null,
+    };
+    const source = try std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .unlimited);
+    const done = try context.arena.create(std.AutoHashMapUnmanaged(u32, void));
+    done.* = .empty;
+    var run_seen = false;
+    var lines = std.mem.tokenizeScalar(u8, source, '\n');
+    while (lines.next()) |text| {
+        // A line cut short by the interruption is not a timeline.
+        const line = std.json.parseFromSliceLeaky(Line, context.arena, text, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (line.run) |run| {
+            run_seen = true;
+            const same = std.mem.eql(u8, run.inputs orelse "", &hex16(inputs)) and
+                std.mem.eql(u8, run.seed orelse "", &hex16(arguments.seed)) and
+                std.mem.eql(u8, run.branching orelse "", "flat");
+            if (!same) {
+                std.debug.print("[determinismo] {s} is the record of another run (inputs {s}, " ++
+                    "seed {s}, {s} branching; these: {s}, {s}, flat): start a new run\n", .{
+                    path,                     run.inputs orelse "?", run.seed orelse "?",
+                    run.branching orelse "?", &hex16(inputs),        &hex16(arguments.seed),
+                });
+                return error.Usage;
+            }
+        }
+        if (line.branch) |branch| try done.put(context.arena, branch.index, {});
+    }
+    if (!run_seen) {
+        std.debug.print("[determinismo] {s} has no run to continue\n", .{path});
+        return error.Usage;
+    }
+    std.debug.print("[determinismo] resuming {s}: {d} timelines recorded, skipped\n", .{ path, done.count() });
+    const left = for (0..arguments.branches) |index| {
+        if (!done.contains(@intCast(index))) break true;
+    } else false;
+    if (!left) {
+        std.debug.print("[determinismo] the run is complete: all {d} timelines recorded\n", .{arguments.branches});
+        std.process.exit(0);
+    }
+    return done;
+}
 
 /// Boots once to setup_complete, snapshots, then runs every branch from the snapshot.
 /// Returns the multiverse: its verdict, and what the test program's catalog saw.
@@ -755,10 +823,15 @@ fn command_explore(
     const signature = host_cpu_signature()[3];
     std.debug.print("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature " ++
         "{x:0>8})\n", .{ exploration.inputs, VM.determinism_abi, signature });
+    if (arguments.resume_run) {
+        exploration.done = try resume_read(context, arguments, exploration.inputs);
+    }
     if (arguments.record_path) |path| {
         if (report.record_fd == null) {
-            report.record_fd = try open_for_appending(context.arena, path);
+            report.record_fd = try open_for_appending(context.arena, path, if (arguments.resume_run) .resumed else .fresh);
         }
+    }
+    if (arguments.record_path != null and !arguments.resume_run) {
         report.record(.{ .run = .{
             .scenario = scenario_of(options.cmdline),
             .profile = arguments.profile,
@@ -814,7 +887,7 @@ fn command_explore(
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
         options.events_fd = try events_file(context.arena, directory, "setup.jsonl");
         const timelines = try std.fs.path.join(context.arena, &.{ directory, "timelines.jsonl" });
-        report.timelines_fd = try open_for_appending(context.arena, timelines);
+        report.timelines_fd = try open_for_appending(context.arena, timelines, if (arguments.resume_run) .resumed else .fresh);
     }
     if (arguments.from_snapshot) |path| {
         const directory = std.fs.path.dirname(path) orelse ".";
@@ -1092,12 +1165,14 @@ fn explore_parallel(
     shared_branches.next = counter;
     var readers: [jobs_max]linux.fd_t = undefined;
     var pids: [jobs_max]linux.pid_t = undefined;
+    const explorer = linux.getpid();
     for (0..jobs) |worker| {
         var pipe: [2]linux.fd_t = undefined;
         if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
         const pid = linux.fork();
         if (linux.errno(pid) != .SUCCESS) return error.Fork;
         if (pid == 0) {
+            child_dies_with(explorer);
             _ = linux.close(pipe[0]);
             worker_run(context, vm, options, shared_branches, .{
                 .worker = @intCast(worker),
@@ -1290,6 +1365,9 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         if (position >= total) break;
         const place = branch_place(branches, first + position, single, position) orelse continue;
         const index = place.index;
+        if (exploration.done) |done| {
+            if (done.contains(index)) continue;
+        }
         if (branches.deadline_ns) |deadline| {
             if (monotonic_ns() >= deadline) break;
         }
@@ -1643,6 +1721,14 @@ fn deciding_strategy(exploration: *const Exploration) bool {
 /// A timeline running in a process of its own (explore_tree): where its summary comes back.
 const Running = struct { pid: linux.pid_t, results: linux.fd_t, slot: *InFlight };
 
+/// In a child just forked from the explorer: it dies with it. A worker left running after the
+/// explorer was interrupted keeps its VM, its CPU and its memory (an interrupted hunt on srv2
+/// left all twelve). The signal follows the forking thread: these forks are the main thread's.
+fn child_dies_with(explorer: linux.pid_t) void {
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
+    if (linux.getppid() != explorer) linux.exit_group(1); // It died before the prctl.
+}
+
 /// Starts the one timeline of `branches.plan` in a child process: a worker of one timeline, on a
 /// CPU of the host's (cpus.zig); its results come back through a pipe.
 fn timeline_start(
@@ -1655,9 +1741,11 @@ fn timeline_start(
     assert(branches.plan.?.len == 1);
     var pipe: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    const explorer = linux.getpid();
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
+        child_dies_with(explorer);
         _ = linux.close(pipe[0]);
         var one = Summaries{ .items = slot.items[slot.summaries.count..][0..1] };
         var mine = branches;
@@ -2324,9 +2412,11 @@ fn node_make_start(
     if (linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &pair)) != .SUCCESS) {
         return error.Socketpair;
     }
+    const explorer = linux.getpid();
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
+        child_dies_with(explorer);
         close(pair[0]);
         // A replay to the node's moment: on a CPU of the host's (cpus.zig), until it exits.
         var pool: cpus.Pool = undefined;
@@ -2877,6 +2967,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.archive = true;
             continue;
         }
+        if (std.mem.eql(u8, argv[index], "--resume")) {
+            arguments.resume_run = true;
+            continue;
+        }
         if (index + 1 == argv.len) return error.Usage;
         try parse_option(arena, &arguments, argv[index], argv[index + 1]);
         index += 1;
@@ -3095,19 +3189,28 @@ fn open_disks(arena: std.mem.Allocator, paths: []const []const u8) ![]const VM.D
 }
 
 /// A new results file (truncated once per process; scenarios of one run append to it).
-fn open_for_appending(arena: std.mem.Allocator, path: []const u8) !linux.fd_t {
+/// `resumed`: a resumed run's file, kept, its last line ended if the interruption cut it.
+fn open_for_appending(arena: std.mem.Allocator, path: []const u8, mode: enum { fresh, resumed }) !linux.fd_t {
     assert(path.len > 0);
     const path_z = try arena.dupeSentinel(u8, path, 0);
     const flags: linux.O = .{
-        .ACCMODE = .WRONLY,
+        .ACCMODE = .RDWR,
         .CREAT = true,
-        .TRUNC = true,
+        .TRUNC = mode == .fresh,
         .APPEND = true,
         .CLOEXEC = true,
     };
     const result = linux.open(path_z, flags, 0o644);
     if (linux.errno(result) != .SUCCESS) return error.OpenFailed;
-    return @intCast(result);
+    const fd: linux.fd_t = @intCast(result);
+    if (mode == .resumed) {
+        const size = linux.lseek(fd, 0, linux.SEEK.END);
+        if (linux.errno(size) != .SUCCESS) return error.SeekFailed;
+        var last: [1]u8 = .{'\n'};
+        if (size > 0) _ = linux.pread(fd, &last, 1, @intCast(size - 1));
+        if (last[0] != '\n') _ = linux.write(fd, "\n", 1);
+    }
+    return fd;
 }
 
 fn hex16(value: u64) [16]u8 {

@@ -1,6 +1,7 @@
 # Zig
 zig-out/
 .zig-cache/
+zig-pkg/
 # Kernel module build outputs
 guest/module/*.ko
 guest/module/*.o
