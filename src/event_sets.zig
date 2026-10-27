@@ -484,7 +484,7 @@ pub fn answer(
     const total_sql = try std.fmt.allocPrintSentinel(arena, counting, .{table}, 0);
     const total = (try connection.row(Count, arena, total_sql, .{})).?.count;
     switch (show.output) {
-        .events => {
+        .events, .marks => { // Event sets show whole events.
             const Row = struct { branch: u32, index: u64, vtime_ns: u64, event: []const u8 };
             const rows = try connection.rows(Row, arena, try std.fmt.allocPrintSentinel(arena,
                 \\SELECT timeline, idx, vtime_ns, event FROM {s}

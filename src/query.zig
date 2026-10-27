@@ -518,7 +518,9 @@ pub const Temporal = struct {
     window_ns: ?u64 = null,
 };
 
-pub const Output = enum { events, count, branches };
+/// `marks`: what a map draws, small: each match's timeline, time and a summary (a fault's kind
+/// and nodes, an assertion's type and message), at most one per `bucket_ns` of a timeline.
+pub const Output = enum { events, count, branches, marks };
 
 pub const Query = struct {
     condition: Condition,
@@ -527,6 +529,10 @@ pub const Query = struct {
     up_to_ns: ?u64 = null,
     limit: u64 = std.math.maxInt(u64),
     output: Output = .events,
+    /// `marks`: one per this much virtual time of a timeline (the first), null for all.
+    bucket_ns: ?u64 = null,
+    /// Only these timelines (a map draws the ones it shows); empty for all.
+    timelines: []const u32 = &.{},
 };
 
 /// A query as JSON, for the HTTP API and agents (MCP): the command's options as fields.
@@ -542,6 +548,8 @@ pub const Request = struct {
     up_to_vtime: ?f64 = null,
     limit: u64 = 100,
     output: Output = .events,
+    bucket_ns: ?u64 = null,
+    timelines: []const u32 = &.{},
 };
 
 pub fn query_of(arena: std.mem.Allocator, request: Request) !Query {
@@ -567,6 +575,8 @@ pub fn query_of(arena: std.mem.Allocator, request: Request) !Query {
         .up_to_ns = if (request.up_to_vtime) |seconds| try seconds_to_ns_float(seconds) else null,
         .limit = request.limit,
         .output = request.output,
+        .bucket_ns = request.bucket_ns,
+        .timelines = request.timelines,
     };
 }
 
@@ -595,7 +605,13 @@ pub fn matches_sql(arena: std.mem.Allocator, query: *const Query) ![]const u8 {
         });
     }
     try w.writeAll(" FROM timeline_events");
-    if (query.only_branch) |branch| try w.print(" WHERE timeline = {d}", .{branch});
+    if (query.only_branch) |branch| {
+        try w.print(" WHERE timeline = {d}", .{branch});
+    } else if (query.timelines.len > 0) {
+        try w.writeAll(" WHERE timeline IN (");
+        for (query.timelines, 0..) |timeline, index| try w.print("{s}{d}", .{ if (index == 0) "" else ",", timeline });
+        try w.writeAll(")");
+    }
     try w.writeAll(") SELECT timeline, seq, vtime_ns, event FROM flagged WHERE hit");
     if (query.up_to_ns) |end| try w.print(" AND vtime_ns <= {d}", .{end});
     for (query.temporals, 0..) |*temporal, index| {
@@ -667,6 +683,32 @@ pub fn answer(
                         "(--from-branch {d} " ++
                         "--from-vtime-ms {d})\n", .{ row.branch, row.matches, ms, row.branch, ms });
                 }
+            }
+            return rows.len;
+        },
+        .marks => {
+            const bucket = query.bucket_ns orelse 1;
+            const sql = try std.fmt.allocPrintSentinel(arena,
+                \\SELECT timeline, seq, vtime_ns, CASE WHEN json_extract_string(event, '$.event') = 'fault'
+                \\  THEN json_object('kind', json_extract_string(event, '$.details.kind'),
+                \\    'flavor', json_extract_string(event, '$.details.flavor'),
+                \\    'node', json_extract_string(event, '$.details.node'),
+                \\    'peer', json_extract_string(event, '$.details.peer'),
+                \\    'duration_ns', json_extract(event, '$.details.duration_ns'))::VARCHAR
+                \\  ELSE json_object('type', coalesce(json_extract_string(event, '$.assert.type'),
+                \\      json_extract_string(event, '$.antithesis_assert.display_type')),
+                \\    'message', coalesce(json_extract_string(event, '$.assert.message'),
+                \\      json_extract_string(event, '$.antithesis_assert.message')))::VARCHAR END
+                \\FROM ({s})
+                \\QUALIFY row_number() OVER (PARTITION BY timeline, vtime_ns // {d} ORDER BY vtime_ns, seq) = 1
+                \\ORDER BY timeline, vtime_ns, seq LIMIT {d}
+            , .{ matched, bucket, @min(query.limit, std.math.maxInt(i64)) }, 0);
+            const Row = struct { branch: u32, seq: u64, vtime_ns: u64, mark: []const u8 };
+            const rows = try connection.rows(Row, arena, sql, .{});
+            for (rows) |row| {
+                try out.print("{{\"branch\":{d},\"seq\":{d},\"vtime_ns\":{d},\"mark\":{s}}}\n", .{
+                    row.branch, row.seq, row.vtime_ns, row.mark,
+                });
             }
             return rows.len;
         },

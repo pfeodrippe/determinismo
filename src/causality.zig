@@ -3,7 +3,10 @@
 //! happened, as Antithesis's causality analysis (docs/ANTITHESIS.md).
 //!
 //!   determinismo causality <machine and system options> --seed <s> --branch <n>
-//!       --property '<message>' [--points <k>] [--futures <m>] [--json]
+//!       [--tape <branch n's tape>] --property '<message>' [--points <k>] [--futures <m>] [--json]
+//!
+//! With its tape, branch n is the one explored (a tree's branch starts inside its ancestors:
+//! the tape has its path); without, the n-th branch from the setup snapshot.
 //!
 //! First it finds when the property first failed in branch n (`--until`). Then, at k moments
 //! from the snapshot to that failure, it branches m futures from branch n (`--from-branch
@@ -22,6 +25,8 @@ const Request = struct {
     points: u32 = 8,
     futures: u32 = 16,
     json: bool = false,
+    /// Branch n's tape: the timeline replayed and branched from (a tree's branch).
+    tape: ?[]const u8 = null,
     /// Everything else: machine and system options, the seed; passed to every explore.
     rest: []const []const u8,
 };
@@ -88,7 +93,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             continue;
         }
         const ours = eql(u8, flag, "--branch") or eql(u8, flag, "--property") or
-            eql(u8, flag, "--points") or eql(u8, flag, "--futures");
+            eql(u8, flag, "--points") or eql(u8, flag, "--futures") or eql(u8, flag, "--tape");
         if (!ours) {
             try rest.append(arena, flag);
             continue;
@@ -100,6 +105,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             branch = try std.fmt.parseInt(u32, value, 10);
         } else if (eql(u8, flag, "--property")) {
             request.property = value;
+        } else if (eql(u8, flag, "--tape")) {
+            request.tape = value;
         } else if (eql(u8, flag, "--points")) {
             request.points = try std.fmt.parseInt(u32, value, 10);
         } else {
@@ -124,22 +131,47 @@ fn failure_find(
     request: *const Request,
 ) !?Failure {
     const message = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(request.property, .{})});
+    // A failing evaluation (declarations, `hit` false, are not): an always kind false, an
+    // unreachable reached.
     const until = try std.fmt.allocPrint(arena, "assert.message={s} assert.condition=false or " ++
-        "antithesis_assert.message={s} antithesis_assert.condition=false", .{ message, message });
+        "assert.message={s} assert.type=unreachable assert.condition=true or " ++
+        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.condition=false or " ++
+        "antithesis_assert.message={s} antithesis_assert.hit=true antithesis_assert.display_type=Unreachable", .{
+        message, message, message, message,
+    });
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ self, "explore" });
     try argv.appendSlice(arena, request.rest);
-    try argv.appendSlice(arena, &.{
+    if (request.tape) |path| {
+        try argv.appendSlice(arena, &.{ "--tape", path, "--until", until });
+    } else try argv.appendSlice(arena, &.{
         "--branch", try std.fmt.allocPrint(arena, "{d}", .{request.branch}), "--until", until,
     });
     const result = try std.process.run(arena, io, .{ .argv = argv.items });
     const snapshot_s = number_after(result.stderr, "snapshot at setup_complete: vtime=") orelse
         return error.NoSnapshot;
-    const moment_ns = number_after(result.stderr, "at moment vtime=") orelse return null;
+    // The last moment: a tree's branch replays along its path first (a moment per ancestor).
+    const moment_ns = number_after_last(result.stderr, "at moment vtime=") orelse return null;
     return .{
         .snapshot_ms = @trunc(snapshot_s * 1000),
         .failure_ms = @trunc(moment_ns / std.time.ns_per_ms),
     };
+}
+
+/// The tape of the timeline that was running at a moment: a tree's branch starts inside its
+/// ancestors (its tape's chain: each ancestor and where the next branched from it), so a moment
+/// before its start is an ancestor's, whose tape is beside it.
+fn tape_at(arena: std.mem.Allocator, io: std.Io, tape: []const u8, moment_ms: u64) ![]const u8 {
+    const Header = struct { chain: []const struct { branch: u32, vtime_ns: u64 } = &.{} };
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, tape, arena, .limited(1 << 24));
+    const first = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    const header = try std.json.parseFromSliceLeaky(Header, arena, first, .{ .ignore_unknown_fields = true });
+    for (header.chain) |segment| {
+        if (moment_ms * std.time.ns_per_ms >= segment.vtime_ns) continue;
+        const directory = std.fs.path.dirname(tape) orelse ".";
+        return std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ directory, segment.branch });
+    }
+    return tape;
 }
 
 /// How many of the futures from that moment fail the property.
@@ -157,8 +189,12 @@ fn futures_failing(
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ self, "explore" });
     try argv.appendSlice(arena, request.rest);
+    if (request.tape) |path| {
+        try argv.appendSlice(arena, &.{ "--tape", try tape_at(arena, io, path, moment_ms) });
+    } else try argv.appendSlice(arena, &.{
+        "--from-branch", try std.fmt.allocPrint(arena, "{d}", .{request.branch}),
+    });
     try argv.appendSlice(arena, &.{
-        "--from-branch",   try std.fmt.allocPrint(arena, "{d}", .{request.branch}),
         "--from-vtime-ms", try std.fmt.allocPrint(arena, "{d}", .{moment_ms}),
         "--branches",      try std.fmt.allocPrint(arena, "{d}", .{request.futures}),
         "--record",        record,
@@ -192,7 +228,16 @@ fn property_failing(arena: std.mem.Allocator, record: []const u8, property: []co
 /// The number right after `key` in `text` (as "1.017s" or "1053000000ns": digits and a dot).
 fn number_after(text: []const u8, key: []const u8) ?f64 {
     const at = std.mem.indexOf(u8, text, key) orelse return null;
-    const start = at + key.len;
+    return number_at(text, at + key.len);
+}
+
+/// The number right after the last `key` in `text`.
+fn number_after_last(text: []const u8, key: []const u8) ?f64 {
+    const at = std.mem.lastIndexOf(u8, text, key) orelse return null;
+    return number_at(text, at + key.len);
+}
+
+fn number_at(text: []const u8, start: usize) ?f64 {
     var end = start;
     while (end < text.len and (std.ascii.isDigit(text[end]) or text[end] == '.')) end += 1;
     return std.fmt.parseFloat(f64, text[start..end]) catch null;
@@ -203,4 +248,6 @@ test number_after {
         "[determinismo] at moment vtime=1053000000ns branches=4\n";
     try std.testing.expectEqual(@as(f64, 1.017), number_after(output, "setup_complete: vtime=").?);
     try std.testing.expectEqual(@as(f64, 1053000000), number_after(output, "at moment vtime=").?);
+    const chain = output ++ "[determinismo] at moment vtime=2053000000ns branches=5\n";
+    try std.testing.expectEqual(@as(f64, 2053000000), number_after_last(chain, "at moment vtime=").?);
 }

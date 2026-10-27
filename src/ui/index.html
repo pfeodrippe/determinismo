@@ -267,6 +267,12 @@ function stateBadge(name) {
 
 async function runOpen(id) {
   state.runId = id;
+  if (location.hash !== `#${id}`) history.replaceState(null, "", `#${id}`);
+  // Never the previous run's page under this run's name: a placeholder until it loads.
+  if (!state.run || state.run.id !== id) {
+    state.run = null;
+    $("#main").innerHTML = `<div class="empty"><h2>Run ${id}</h2><div class="muted">Loading…</div></div>`;
+  }
   state.examples = new Map();
   state.examplesOpen = new Set();
   state.logs = null;
@@ -577,7 +583,7 @@ function propertyHtml(property) {
   const badge = failed ? `<span class="badge fail">failed</span>`
     : property.status === "unreached" ? `<span class="badge error" title="Never reached in this run's scenario: judged across scenarios">unreached</span>`
     : `<span class="badge pass">passed</span>`;
-  return `<div class="property" data-message="${escape(property.message)}">
+  return `<div class="property" data-message="${escape(property.message)}" data-kind="${escape(property.kind)}">
     <div class="row">${badge}
       <span class="name">${escape(property.message)}${property.location ? ` <span class="muted mono" style="font-size:11px">${escape(property.location)}</span>` : ""}</span>
       <span class="counts">${escape(property.kind)} · hit in ${property.branches_hit}${property.kind === "sometimes" ? ` · true in ${property.branches_true ?? "?"}` : ""} · failing in ${property.branches_failing}</span></div>
@@ -613,15 +619,32 @@ async function examplesToggle(element) {
   state.examplesOpen.add(message);
   if (state.examples.has(message)) return examplesDraw(element);
   box.innerHTML = `<div class="muted">Loading examples…</div>`;
-  const field = `assert.message=${quote(message)}`;
+  const conditions = exampleConditions(message, element.dataset.kind);
   try {
-    const failing = await query({ condition: `${field} assert.condition=false or antithesis_assert.message=${quote(message)} antithesis_assert.condition=false`, output: "branches", limit: 1000000 });
-    const passing = await query({ condition: `${field} assert.condition=true or antithesis_assert.message=${quote(message)} antithesis_assert.condition=true`, output: "branches", limit: 1000000 });
-    state.examples.set(message, { failing, passing });
+    const failing = conditions.failing ? await query({ condition: conditions.failing, output: "branches", limit: 1000000 }) : [];
+    const passing = conditions.passing ? await query({ condition: conditions.passing, output: "branches", limit: 1000000 }) : [];
+    state.examples.set(message, { failing, passing, note: conditions.note });
   } catch (error) { state.examples.set(message, { error: error.message }); }
   // Drawn where the property is now (the list may have been drawn again meanwhile).
   const now = [...document.querySelectorAll(".property")].find((other) => other.dataset.message === message);
   if (now && state.examplesOpen.has(message)) examplesDraw(now);
+}
+// What makes one timeline fail a property, or pass it, by its kind. Only evaluations count:
+// declarations (the catalog: `hit` false, Antithesis's with a false condition) are left out.
+// A sometimes or reachable property fails as a whole (no timeline made it true), not in one.
+function exampleConditions(message, kind) {
+  const ours = (condition) => `assert.message=${quote(message)} assert.condition=${condition}`;
+  const theirs = (condition) => `antithesis_assert.message=${quote(message)} antithesis_assert.hit=true` +
+    (condition == null ? "" : ` antithesis_assert.condition=${condition}`);
+  switch (kind) {
+    case "always": case "always_or_unreachable":
+      return { failing: `${ours(false)} or ${theirs(false)}`, passing: `${ours(true)} or ${theirs(true)}` };
+    case "unreachable": // Reaching it is the failure.
+      return { failing: `${ours(true)} or ${theirs(null)}`, passing: null };
+    default:
+      return { failing: null, passing: `${ours(true)} or ${theirs(true)}`,
+        note: "A sometimes or reachable property fails only if no timeline makes it true: these timelines did." };
+  }
 }
 function examplesDraw(element) {
   const message = element.dataset.message;
@@ -640,7 +663,7 @@ function examplesDraw(element) {
       <td class="${row.failing ? "fail-text" : "pass-text"}">${row.failing ? "Failing" : "Passing"}</td>
       <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
       <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
-    </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.filter((example) => !failingBranches.has(example.branch)).length} passing. Click an example for its logs.</div>
+    </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.filter((example) => !failingBranches.has(example.branch)).length} passing. Click an example for its logs.${loaded.note ? ` ${escape(loaded.note)}` : ""}</div>
     <div class="causality-result"></div>`
     : `<div class="muted">No assertion events for this property (determinismo checks it when a timeline ends).</div>`;
   box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
@@ -761,7 +784,7 @@ function timelineTip(branch, run) {
 }
 // A fault in words: what it does, to what, for how long.
 function faultTip(event, decision) {
-  const d = (event.event && event.event.details) || {};
+  const d = event.mark || (event.event && event.event.details) || {};
   const kind = [d.kind, d.flavor].filter(Boolean).join(" · ");
   const between = d.node ? (d.peer ? `${d.node} ↔ ${d.peer}` : d.node) : "";
   const netem = d.netem || {};
@@ -783,7 +806,7 @@ function faultTip(event, decision) {
     <div class="t-foot">Click for the logs here</div>`;
 }
 function failureTip(event) {
-  const a = event.event.assert || event.event.antithesis_assert || {};
+  const a = event.mark || event.event.assert || event.event.antithesis_assert || {};
   const details = a.details && typeof a.details === "object" ? Object.entries(a.details).slice(0, 8).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)]) : [];
   const where = a.location ? `${(a.location.file || "").split("/").pop()}:${a.location.line} ${a.location.function || ""}` : undefined;
   return `<div class="t-title"><span class="t-dot" style="background:var(--fail)"></span>${escape(a.type || "assertion")} failed</div>
@@ -806,12 +829,19 @@ async function mapDraw() {
   const run = state.run, info = run.run || {};
   const branches = run.branches.slice().sort((a, b) => a.index - b.index);
   if (!branches.length) { body.textContent = "No timelines yet."; return; }
-  let failures = [], faults = [], decisions = [];
-  try {
-    failures = await query({ condition: "assert.condition=false or antithesis_assert.condition=false", limit: 20000 });
-    faults = await query({ condition: "event=fault", limit: 20000 });
-    decisions = await query({ condition: "event=decision", limit: 20000 });
+  // Failure marks (small summaries), fetched again only when timelines finished since.
+  let { failures, decisions } = state.mapMarks && state.mapMarks.run === run.id &&
+    state.mapMarks.timelines === branches.length ? state.mapMarks : { failures: [], faults: [], decisions: [] };
+  if (!(state.mapMarks && state.mapMarks.run === run.id && state.mapMarks.timelines === branches.length)) try {
+    failures = await query({ condition: "assert.type=always assert.condition=false or assert.type=always_or_unreachable assert.condition=false or assert.type=unreachable assert.condition=true or antithesis_assert.hit=true antithesis_assert.display_type=Always antithesis_assert.condition=false or antithesis_assert.hit=true antithesis_assert.display_type=AlwaysOrUnreachable antithesis_assert.condition=false or antithesis_assert.hit=true antithesis_assert.display_type=Unreachable", output: "marks", limit: 200000 });
+    // A strategy's reasons for its faults: only a run with a strategy has them.
+    decisions = info.strategy ? await query({ condition: "event=decision", limit: 20000 }) : [];
+    state.mapMarks = { run: run.id, timelines: branches.length, failures, decisions };
   } catch { /* The tree still shows the timelines. */ }
+  // Faults, a long run's hundreds of thousands: those of the timelines on screen, loaded as
+  // they come into view (kept for the run), thinned to about one mark per pixel.
+  if (!state.mapFaults || state.mapFaults.run !== run.id) state.mapFaults = { run: run.id, loaded: new Set(), faults: [] };
+  const faults = state.mapFaults.faults;
   // A strategy's reason for a fault: its last decision for the fault injector before it.
   const decisionsOf = new Map();
   for (const d of decisions) {
@@ -904,12 +934,33 @@ async function mapDraw() {
       logsOpen(Number(element.dataset.branch), Number(element.dataset.vtime));
     }));
   };
-  draw();
+  let loading = false;
+  const faultsLoad = async () => {
+    if (loading || state.mapFaults.run !== run.id) return;
+    const want = [];
+    for (let i = Math.max(0, Math.floor(view.r0)); i < Math.min(rows.length, Math.ceil(view.r1)) && want.length < 400; i++) {
+      const index = rows[i].branch.index;
+      if (!state.mapFaults.loaded.has(index)) want.push(index);
+    }
+    if (!want.length) return;
+    loading = true;
+    try {
+      const pixel_ns = Math.max(1, Math.floor((view.t1 - view.t0) / Math.max(720, body.clientWidth)));
+      const more = await query({ condition: "event=fault", output: "marks", bucket_ns: pixel_ns * 2, timelines: want, limit: 400000 });
+      faults.push(...more);
+      for (const index of want) state.mapFaults.loaded.add(index);
+    } catch { /* Drawn without them. */ }
+    loading = false;
+    redraw();
+  };
+  const drawAll = draw;
+  const drawThenLoad = () => { drawAll(); faultsLoad(); };
+  drawThenLoad();
   // Zoom and pan change the window of time and timelines shown; the tree is drawn again at
   // its size (not magnified). A drag past a few pixels is not a click.
   const layout = () => treeLayout(model, view, Math.max(720, body.clientWidth - 4));
   let frame = null;
-  const redraw = () => { if (!frame) frame = requestAnimationFrame(() => { frame = null; draw(); }); };
+  const redraw = () => { if (!frame) frame = requestAnimationFrame(() => { frame = null; drawThenLoad(); }); };
   container.addEventListener("wheel", (event) => {
     event.preventDefault();
     const { x0, x1, top, rowHeight } = layout();
@@ -1517,6 +1568,10 @@ runsRefresh();
 setInterval(runsRefresh, 5000);
 const fromHash = Number(location.hash.slice(1));
 if (fromHash) runOpen(fromHash);
+window.addEventListener("hashchange", () => {
+  const id = Number(location.hash.slice(1));
+  if (id && id !== state.runId) runOpen(id);
+});
 </script>
 </body>
 </html>

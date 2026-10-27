@@ -593,6 +593,10 @@ const RunRequest = struct {
     timeline: ?[]const u8 = null,
     /// Timelines per tree generation (explore's --generation).
     generation: ?u32 = null,
+    /// A tree's returns run this long past their moment, then stop (explore's --horizon), and
+    /// its generations in flight (--pipeline).
+    horizon: ?[]const u8 = null,
+    pipeline: ?u32 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
     /// A targeted run: a diff file or git range on the server (explore's --changed).
@@ -672,6 +676,10 @@ fn explore_arguments(
     }
     if (asked.branching) |branching| {
         try argv.appendSlice(server.arena, &.{ "--branching", branching });
+    }
+    if (asked.horizon) |horizon| try argv.appendSlice(server.arena, &.{ "--horizon", horizon });
+    if (asked.pipeline) |depth| {
+        try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });
     }
     if (asked.generation) |size| {
         try argv.appendSlice(server.arena, &.{ "--generation", try print(server, "{d}", .{size}) });
@@ -872,6 +880,13 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
         try argv.appendSlice(server.arena, &.{ "--scenario", scenario });
     }
     if (original.profile) |profile| try argv.appendSlice(server.arena, &.{ "--profile", profile });
+    // The branch's tape: a tree's branch starts inside its ancestors (the tape has its path).
+    const tape = try std.fmt.allocPrint(server.arena, "{s}/tapes/branch-{d}.jsonl", .{
+        try run_directory(server, run.id), asked.branch,
+    });
+    if (std.Io.Dir.cwd().access(server.io, tape, .{})) |_| {
+        try argv.appendSlice(server.arena, &.{ "--tape", tape });
+    } else |_| {}
     try argv.appendSlice(server.arena, &.{
         "--branch",   try print(server, "{d}", .{asked.branch}),
         "--property", asked.property,
