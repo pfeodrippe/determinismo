@@ -63,23 +63,17 @@ event hashing, the guest module.
 - UI: a minimap for thousands of timelines; "1.8 h wall" is a sum of wall times.
 - srv2: deploy everything since d66b9ec once the benchmark ends (its initramfs too: det-core,
   det-profile).
-- Determinism (2026-10-27). Kafka's timelines (JVMs) did not replay. Found and fixed: VMs on a
-  core's two hyperthreads perturb each other's branch counters (2d51a19: one VM per core, every
-  VM from the pool). Then, under host load (a busy process sharing the VM's CPU), about one
-  replay in three still parted. The KVM patch's RDTSC log (`--trace`, `<trace>.rdtsc`) pins it:
-  between two consecutive guest RDTSCs, at the same instructions, the guest runs about 150
-  branches more or fewer, in thread exit (before exit.c's add_device_randomness) and scheduler
-  paths: data-dependent work whose data differs. Ruled out, measured: throttling of the counter
-  (0), stops one instruction late after a dropped MTF exit (0), the count moving across context
-  switches (0), XINUSE cleared between exit and entry (0), AVX power gating (an AVX loop beside
-  it changes nothing); SCHED_FIFO for the VM (11 of 12) and XSAVE hidden from the guest (12 of
-  12) help. Found: Accessed bits, which the processor may set in speculative page walks
-  (fault-around maps pages old; exit's zap marks the young ones accessed, about 150 branches):
-  guest/kernel/patches/0001-accessed-bits.patch makes the guest never branch on them, and 24 of
-  24 contended replays were exact (one in three parted before).
-  Kept from the hunt: the patch's counters (throttles, late stops, drifts, XINUSE restorations)
-  and snapshots carrying the guest's XINUSE (KVM_GET_XSAVE's own save may clear it: the
-  holders' XSTATE_BV 2 against 3), an e2e check running one timeline concurrently.
+- Determinism (2026-10-27). Kafka's timelines (JVMs) did not replay. Found and fixed, in turn:
+  VMs on a core's two hyperthreads perturb each other's branch counters (one VM per core);
+  speculative page walks set Accessed bits the guest branched on (guest patch 0001); x86 Linux
+  upgrades a page's access without a TLB flush, so a later write took a spurious fault or not as
+  the host's activity left the TLB (guest patch 0002, found with the KVM instruction trace).
+  Under 8 busy processes beside six runs of a Kafka timeline: 12 of 12 the same through 30 s.
+  Tools: the KVM patch's RDTSC log (--trace: where two runs part, between which RDTSCs) and its
+  instruction trace (DETERMINISMO_ITRACE_AT: which instruction), the clock's hazard counters on
+  every divergence, snapshot-diff, `determinismo verify` (a run's sample replayed beside other
+  work), and every run with a record and tapes now replays every 16th timeline as it goes
+  ("timelines replay to their recorded history"): hunts are determinism tests on real loads.
 - Benchmarks (bench/explore.py on srv2, Raft POC, 40 minutes a seed, tree / archive / short
   branches): seed 1's safety bugs came from one fresh timeline (4653) in every variant; seed 2:
   the deadlock in all, and the log divergence only in the short-branch variant, from a moment
