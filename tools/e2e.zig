@@ -585,6 +585,11 @@ fn check_ui(context: *Context) !void {
         "\"seed\":5,\"branches\":100000,\"jobs\":1,\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});
     _ = try curl(context, &.{ "-X", "POST", "-d", running, url ++ "/runs" });
     defer _ = curl(context, &.{ "-X", "POST", url ++ "/runs/3/stop" }) catch "";
+    // The fourth, flat, for the page to stop and resume.
+    const resumable = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
+        "\"seed\":6,\"branches\":100000,\"jobs\":1,\"branching\":\"flat\",\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", resumable, url ++ "/runs" });
+    defer _ = curl(context, &.{ "-X", "POST", url ++ "/runs/4/stop" }) catch "";
     const command = try std.fmt.allocPrint(arena, "cd tests/ui && DETERMINISMO_URL={s} npx playwright test", .{url});
     const result = try std.process.run(arena, context.io, .{
         .argv = &.{ "/bin/sh", "-c", command },
@@ -594,7 +599,7 @@ fn check_ui(context: *Context) !void {
     const passed = result.term.success();
     expect(context, passed, "ui: the run page in a browser (Playwright): runs by URL, a " ++
         "causality analysis from the page to its end, the map's failures, a running run's " ++
-        "refreshes", .{});
+        "refreshes, a run stopped and resumed from its page", .{});
     if (!passed) std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
 }
 

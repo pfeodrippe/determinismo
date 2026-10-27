@@ -2,7 +2,8 @@
 // The web UI as a user drives it, against runs the e2e's ui check made (tools/e2e.zig):
 //   run 1: the bank example, seed 3, finished, failing "total balance is conserved";
 //   run 2: the bank example, seed 4, finished;
-//   run 3: the bank example, running while these run.
+//   run 3: the bank example, running while these run;
+//   run 4: the bank example, flat, running: stopped and resumed from its page.
 const { test, expect } = require("@playwright/test");
 
 const property = "total balance is conserved";
@@ -75,4 +76,24 @@ test("a running run's page asks only for the timelines it does not have", async 
   await page.waitForTimeout(8000); // A few refreshes (every 2 seconds while running).
   expect(asked.filter((search) => search === "").length).toBe(1);
   expect(asked.filter((search) => search.startsWith("?offset=")).length).toBeGreaterThanOrEqual(2);
+});
+
+
+test("a run stopped from its page resumes from it, and runs on", async ({ page, request }) => {
+  await page.goto("/#4");
+  const badge = page.locator("#main .badge").first();
+  await expect(badge).toHaveText("running");
+  await page.locator("#run-stop").click();
+  await expect(badge).toHaveText("stopped");
+  const stopped = await (await request.get("/runs/4")).json();
+  expect(stopped.state).toBe("stopped");
+  // A tree run would not offer it: this one is flat.
+  await page.locator("#run-resume").click();
+  await expect(badge).toHaveText("running");
+  await expect(page.locator("#run-stop")).toBeVisible();
+  const resumed = await (await request.get("/runs/4")).json();
+  expect(resumed.state).toBe("running");
+  // Its output says what it skipped.
+  await expect.poll(async () => (await request.get("/runs/4/output")).text(), { timeout: 120 * 1000 })
+    .toContain("timelines recorded, skipped");
 });
