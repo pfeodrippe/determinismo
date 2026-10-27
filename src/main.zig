@@ -45,6 +45,13 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--horizon <duration>]   (a tree's returns run that long past
+    \\                            their moment, then stop: short branches, extended when they
+    \\                            find something; default: to the timeline's end)
+    \\                            [--archive]   (Go-Explore's archive: the tree returns to the
+    \\                            least visited behaviors of any generation)
+    \\                            [--pipeline <n>]   (a tree's generations in flight, 1 to 4: it
+    \\                            returns to moments from generation n on; default 3)
     \\                            [--generation <n>]   (a tree's timelines per generation: 16,
     \\                            or a multiple of it for machines with more CPUs)
     \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
@@ -161,6 +168,19 @@ const Arguments = struct {
     /// Timelines per tree generation (`--generation`, a multiple of 16): more for machines with
     /// more CPUs (a generation's timelines run at once), with more moments returned to.
     generation_size: u32 = tree.generation_base,
+    /// A tree's branches returned to a moment run this long past it, then stop (`--horizon`):
+    /// short branches, many of them, around the moments that mattered (Antithesis returns to
+    /// decision points often; a branch is extended only when it found something). Null: to the
+    /// timeline's end.
+    horizon_ns: ?u64 = null,
+    /// Generations in flight at once (`--pipeline`): the tree returns to moments from this
+    /// generation on; more keeps workers busy while long timelines finish.
+    pipeline: u32 = pipeline_depth_default,
+    /// Go-Explore's archive (`--archive`): the tree keeps every behavior any timeline reached,
+    /// where (just after it), and how often it returned there, and returns to the least visited
+    /// ones, from any generation (a timeline of an earlier one is rebuilt by replaying its path),
+    /// instead of only to what the last generation found new.
+    archive: bool = false,
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
@@ -758,6 +778,17 @@ fn command_explore(
             const at = segment.vtime_ns;
             start = try node_make(arena, vm, options, start, segment.seed, at, overrides);
         }
+        // Futures from a moment of the taped branch (`--tape ... --from-vtime-ms`, causality
+        // analysis): the branch itself replayed to the moment, then new branches from there,
+        // with their own seeds.
+        if (arguments.from_vtime_ms) |ms| {
+            const own = try context.arena.create(tape.Overrides);
+            const overrides = try tape_overrides(context, directory, replay.header.branch, own);
+            const at = ms * std.time.ns_per_ms;
+            start = try node_make(context.arena, vm, options, start, replay.header.branch_seed, at, overrides);
+            exploration.replay = null;
+            exploration.exploration_seed ^= 0x9e3779b97f4a7c15; // Not the taped branch's seeds.
+        }
     }
     if (arguments.events_directory != null) {
         if (options.events_fd) |fd| close(fd);
@@ -1179,7 +1210,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         defer if (held) |cpu| branches.pool.?.give(cpu);
         options.seed = place.seed;
         const moment_ms = branches.arguments.moment_vtime_ms;
-        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else null;
+        options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else place.horizon_ns;
         options.moment_command = branches.arguments.moment_command;
         options.moment_continue = branches.arguments.moment_continue;
         options.until = branches.arguments.until;
@@ -1209,7 +1240,11 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .branch = index,
                 .seed = place.seed,
                 .start_ns = place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s),
-                .spacing_ns = holders.Owner.spacing(if (branches.arguments.timeline_ms) |ms|
+                // Spread over the branch: a short one keeps holders up to its horizon, where the
+                // tree extends it.
+                .spacing_ns = holders.Owner.spacing(if (place.horizon_ns) |horizon|
+                    horizon -| place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s)
+                else if (branches.arguments.timeline_ms) |ms|
                     ms * std.time.ns_per_ms
                 else
                     null),
@@ -1235,7 +1270,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .why = place.why,
         });
         if (branches.summaries) |summaries| {
-            summaries.note(vm, place, if (branches.holders != null) owner.holders() else &.{});
+            summaries.note(vm, place, outcome, if (branches.holders != null) owner.holders() else &.{});
         }
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };
@@ -1307,6 +1342,8 @@ const Planned = struct {
     generation: u32 = 0,
     /// Why it starts there, for people (the tree explorer's reason).
     why: []const u8 = "",
+    /// Where it stops (virtual time), a returned branch's horizon: null for the timeline's end.
+    horizon_ns: ?u64 = null,
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
@@ -1323,13 +1360,21 @@ const Summary = struct {
     trace_hash: u64,
     /// At or before its last randomness pull (VM.last_pull_ns): branches return before it.
     last_pull_ns: u64,
+    /// Stopped at its horizon: it can be extended (returned to at its end), its future unknown.
+    cut: bool,
 };
 
 const Summaries = struct {
     items: []Summary,
     count: u32 = 0,
 
-    fn note(summaries: *Summaries, vm: *VM, place: Planned, kept: []const holders.Held) void {
+    fn note(
+        summaries: *Summaries,
+        vm: *VM,
+        place: Planned,
+        outcome: VM.Outcome,
+        kept: []const holders.Held,
+    ) void {
         assert(summaries.count < summaries.items.len);
         const summary = &summaries.items[summaries.count];
         summaries.count += 1;
@@ -1339,6 +1384,7 @@ const Summaries = struct {
         summary.behavior_count = vm.events.behavior_count;
         summary.trace_hash = vm.events.hash.final();
         summary.last_pull_ns = vm.last_pull_ns;
+        summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.holder_count = @intCast(kept.len);
         @memcpy(summary.holders[0..kept.len], kept);
         @memcpy(
@@ -1386,10 +1432,12 @@ fn explore_tree(
     const arena = context.arena;
     const exploration = branches.exploration;
     const size = branches.arguments.generation_size;
-    // In-run snapshots (holders.zig): not with a strategy (its decisions replay from its tape, as
-    // holders do not).
+    // In-run snapshots (holders.zig): not with a strategy that decides within timelines (its
+    // decisions replay from its tape, as holders do not); one that only chooses where the tree
+    // returns ("decides":false) keeps them.
     var registry: holders.Registry = undefined;
-    const holding = exploration.strategy == null;
+    const deciding = if (exploration.strategy) |plugin| plugin.decides else false;
+    const holding = !deciding;
     if (holding) try registry.init();
     defer if (holding) registry.release();
     const change: ?changed.Change = if (branches.arguments.changed) |source|
@@ -1400,6 +1448,9 @@ fn explore_tree(
         .base = seed_base(exploration),
         .total = branches.arguments.branches,
         .size = size,
+        .pipeline = branches.arguments.pipeline,
+        .archive = branches.arguments.archive,
+        .setup = branches.snapshot,
         .jobs = jobs,
         .holding = holding,
         .registry = &registry,
@@ -1413,8 +1464,9 @@ fn explore_tree(
     };
     // Generations in flight (a ring): the first ones all start from the setup snapshot. Judged
     // in order, each once complete: a seed gives the same tree.
-    var flight: [pipeline_depth]InFlight = undefined;
-    for (&flight, 0..) |*slot, number| {
+    var flight_all: [pipeline_depth_max]InFlight = undefined;
+    const flight = flight_all[0..state.pipeline];
+    for (flight, 0..) |*slot, number| {
         slot.* = .{ .generation = @intCast(number), .items = try arena.alloc(Summary, size) };
         slot.summaries = .{ .items = slot.items };
         while (state.next_index < state.total and slot.plan.items.len < size) {
@@ -1434,8 +1486,8 @@ fn explore_tree(
         // Timelines start as CPUs free up, the oldest generation's first; none past the budget.
         const late = if (branches.deadline_ns) |deadline| monotonic_ns() >= deadline else false;
         while (!late and running_count < jobs) {
-            const slot = for (0..pipeline_depth) |offset| {
-                const candidate = &flight[(oldest + offset) % pipeline_depth];
+            const slot = for (0..flight.len) |offset| {
+                const candidate = &flight[(oldest + offset) % flight.len];
                 if (candidate.started < candidate.plan.items.len) break candidate;
             } else break;
             var mine = branches;
@@ -1453,25 +1505,30 @@ fn explore_tree(
         running[finished] = running[running_count - 1];
         running_count -= 1;
         // The oldest generation, once every timeline of it finished: judged, and its slot
-        // planned with the generation `pipeline_depth` after it.
+        // planned with the generation `state.pipeline` after it.
         while (!late) {
-            const slot = &flight[oldest % pipeline_depth];
+            const slot = &flight[oldest % flight.len];
             if (slot.plan.items.len == 0) break;
             if (slot.summaries.count < slot.plan.items.len) break;
             const judged = slot.generation;
             const next = try tree_judge(context, vm, options, branches, &state, judged, slot);
-            slot.* = .{ .generation = judged + pipeline_depth, .items = slot.items, .plan = next };
+            slot.* = .{ .generation = judged + state.pipeline, .items = slot.items, .plan = next };
             slot.summaries = .{ .items = slot.items };
             oldest += 1;
         }
     }
-    for (&flight) |*slot| {
+    for (flight) |*slot| {
         for (slot.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
     }
     if (state.change) |*target| {
         target.summarize(state.next_index);
         report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
     }
+}
+
+/// Whether the exploration's strategy decides within timelines (its answers are in tapes).
+fn deciding_strategy(exploration: *const Exploration) bool {
+    return if (exploration.strategy) |plugin| plugin.decides else false;
 }
 
 /// A timeline running in a process of its own (explore_tree): where its summary comes back.
@@ -1545,6 +1602,8 @@ const TreeState = struct {
     base: u64,
     total: u32,
     size: u32,
+    /// Generations in flight (`--pipeline`).
+    pipeline: u32,
     jobs: u32,
     holding: bool,
     registry: *holders.Registry,
@@ -1559,14 +1618,25 @@ const TreeState = struct {
     /// Parents' tapes are read into this (a strategy's overrides), one at a time.
     tape_buffer: *tape.Overrides,
     next_index: u32 = 0,
+    /// Go-Explore's archive (`--archive`): each behavior's cell, and every branch planned (its
+    /// seed and path: one of an earlier generation is rebuilt from the setup snapshot).
+    archive: bool,
+    cells: std.AutoHashMapUnmanaged(u64, Cell) = .empty,
+    planned: std.AutoHashMapUnmanaged(u32, Planned) = .empty,
+    setup: *const Snapshot,
 };
 
-/// Generations in flight at once: when one is judged, the one `pipeline_depth` after it is
+/// A cell of the archive: where a behavior was first reached (the moment just after it), and how
+/// often the tree returned there.
+const Cell = struct { branch: u32, vtime_ns: u64, label: []const u8, visits: u32 = 0 };
+
+/// Generations in flight at once by default (`--pipeline`): when one is judged, the one that many after it is
 /// planned, and meanwhile the generations between run. Timelines of very different lengths
 /// (Raft's: half a minute to six) no longer leave workers idle at each generation's tail (they
 /// were busy 13 to 23% of the time). The cost: the tree deepens from the generation
-/// `pipeline_depth` on (the ones before all start from the setup snapshot).
-const pipeline_depth = 3;
+/// pipeline depth on (the ones before all start from the setup snapshot).
+const pipeline_depth_default = 3;
+const pipeline_depth_max = 4;
 
 /// A generation in flight: its plan, how many of its timelines started, and their summaries
 /// (in `items`, kept for the slot's next generations).
@@ -1579,7 +1649,7 @@ const InFlight = struct {
 };
 
 /// A generation, every timeline of it finished: what each reached that none before it had,
-/// the moments returned to (nodes made), and the plan of the generation `pipeline_depth` after.
+/// the moments returned to (nodes made), and the plan of the generation `state.pipeline` after.
 fn tree_judge(
     context: Context,
     vm: *VM,
@@ -1612,6 +1682,7 @@ fn tree_judge(
         const entry = try reached.getOrPut(arena, behavior.hash);
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     };
+    for (done) |summary| try archive_add(arena, state, plan.items, summary);
     var candidate_count: u32 = 0;
     const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
     var random: std.Random.DefaultPrng = .init(generation_seed);
@@ -1628,7 +1699,10 @@ fn tree_judge(
         // fifths); the branches return just after it.
         var score: f64 = 0;
         var moment_reached: u32 = std.math.maxInt(u32);
-        const room_end = summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
+        const room_end = if (summary.cut)
+            summary.end_ns -| std.time.ns_per_ms
+        else
+            summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
         for (summary.behaviors[0..summary.behavior_count]) |behavior| {
             // A targeted run: which hunks it ran (counted once), and when it first ran
             // changed code itself (not in its parents' prefix). Any moment with a little
@@ -1648,8 +1722,9 @@ fn tree_judge(
             const timelines = reached.get(behavior.hash) orelse continue; // Known before.
             novel += 1;
             score += 1.0 / @as(f64, @floatFromInt(timelines));
-            // A moment past its last randomness pull returns to the same timeline.
-            const open = behavior.vtime_ns < summary.last_pull_ns;
+            // A moment past its last randomness pull returns to the same timeline (a cut
+            // branch's future was never drawn: open to its end).
+            const open = summary.cut or behavior.vtime_ns < summary.last_pull_ns;
             if (behavior.vtime_ns <= room_end and open and timelines <= moment_reached) {
                 moment = behavior.vtime_ns;
                 moment_reached = timelines;
@@ -1673,7 +1748,8 @@ fn tree_judge(
     std.sort.insertion(Candidate, chosen, {}, candidate_before);
     const counts = Counts{ .reached = &reached, .visits = &state.visits };
     const plugin = exploration.strategy;
-    const returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, state.size);
+    var returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, state.size, &state.planned);
+    if (state.archive and plugin == null) returns = try archive_returns(arena, state, returns, &random);
     for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
         const entry = try state.visits.getOrPut(arena, behavior.hash);
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
@@ -1685,16 +1761,20 @@ fn tree_judge(
     var finished: u32 = 0;
     var held: u32 = 0;
     for (returns) |back| {
+        var earlier = false;
         const parent = for (plan.items) |entry| {
             if (entry.index == back.branch) break entry;
-        } else continue;
+        } else state.planned.get(back.branch) orelse continue;
+        if (state.planned.get(back.branch) != null) earlier = for (plan.items) |entry| {
+            if (entry.index == back.branch) break false;
+        } else true;
         if (making_count - finished == state.jobs) {
             node_make_finish(arena, &makings[finished]);
             finished += 1;
         }
         // A holder of the parent at the moment, or a little before it: no replay from the
         // parent's start.
-        if (state.holding) if (state.registry.take(back.branch, back.vtime_ns)) |taken| {
+        if (state.holding and !earlier) if (state.registry.take(back.branch, back.vtime_ns)) |taken| {
             makings[making_count] = .{
                 .back = back,
                 .parent = parent,
@@ -1707,13 +1787,18 @@ fn tree_judge(
             continue;
         };
         // A strategy's decisions in the parent are in its tape: replayed to the moment.
-        const overrides = if (exploration.strategy != null) try tape_overrides(
+        const overrides = if (deciding_strategy(exploration)) try tape_overrides(
             context,
             branches.arguments.tape_directory.?,
             parent.index,
             state.tape_buffer,
         ) else null;
-        makings[making_count] = .{ .back = back, .parent = parent };
+        makings[making_count] = .{
+            .back = back,
+            .parent = parent,
+            // Its start snapshot is gone (an earlier generation's): replayed along its path.
+            .chain_from = if (earlier and parent.path.len > 0) state.setup else null,
+        };
         try node_make_start(arena, vm, options, &makings[making_count], overrides);
         making_count += 1;
     }
@@ -1763,8 +1848,9 @@ fn tree_judge(
                 .seed = branch_seed(state.base, state.next_index),
                 .snapshot = snapshot,
                 .path = path,
-                .generation = generation + pipeline_depth,
+                .generation = generation + state.pipeline,
                 .why = back.why,
+                .horizon_ns = if (branches.arguments.horizon_ns) |horizon| at + horizon else null,
             });
             state.next_index += 1;
         }
@@ -1778,7 +1864,7 @@ fn tree_judge(
             .index = state.next_index,
             .seed = branch_seed(state.base, state.next_index),
             .snapshot = branches.snapshot,
-            .generation = generation + pipeline_depth,
+            .generation = generation + state.pipeline,
             .why = "From the setup snapshot: some timelines of every generation start " ++
                 "over, so the tree does not only deepen.",
         });
@@ -1808,6 +1894,80 @@ const Candidate = struct {
 
 const TreeReturn = struct { branch: u32, vtime_ns: u64, why: []const u8 };
 
+/// A judged timeline, kept for returns from later generations (a strategy's archive, or ours);
+/// with `--archive`, every behavior it reached that the archive lacks becomes a cell just after
+/// it (a moment that leads elsewhere: before its last randomness pull, or anywhere in a cut
+/// branch).
+fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planned, summary: *const Summary) !void {
+    const planned = for (plan) |entry| {
+        if (entry.index == summary.index) break entry;
+    } else return;
+    try state.planned.put(arena, summary.index, planned);
+    if (!state.archive) return;
+    for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+        if (behavior.vtime_ns <= summary.start_ns) continue; // Its ancestors' (reached before).
+        const at = behavior.vtime_ns + std.time.ns_per_us;
+        const open = summary.cut or at < summary.last_pull_ns;
+        if (!open or at + std.time.ns_per_ms >= summary.end_ns) continue;
+        const entry = try state.cells.getOrPut(arena, behavior.hash);
+        if (entry.found_existing) continue;
+        entry.value_ptr.* = .{
+            .branch = summary.index,
+            .vtime_ns = at,
+            .label = try arena.dupe(u8, behavior.name()),
+        };
+    }
+}
+
+/// Go-Explore's selection: half the generation's moments (all of them when it found nothing
+/// new) go to the archive's most promising cells: rare (few timelines reached the behavior) and
+/// seldom returned to, scored (1 + timelines) * (1 + returns), ties at random; each return
+/// counts.
+fn archive_returns(
+    arena: std.mem.Allocator,
+    state: *TreeState,
+    frontier: []const TreeReturn,
+    random: *std.Random.DefaultPrng,
+) ![]const TreeReturn {
+    const nodes = tree.nodes(state.size);
+    const novel = frontier.len > 0 and !std.mem.startsWith(u8, frontier[0].why, "A random moment");
+    const keep: usize = if (novel) @min(frontier.len, (nodes + 1) / 2) else 0;
+    var list: std.ArrayList(TreeReturn) = .empty;
+    try list.appendSlice(arena, frontier[0..keep]);
+    if (state.cells.count() == 0) return list.items;
+    const Ranked = struct { hash: u64, score: u64, tie: u64 };
+    const ranked = try arena.alloc(Ranked, state.cells.count());
+    var iterator = state.cells.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        const timelines: u64 = state.visits.get(entry.key_ptr.*) orelse 0;
+        ranked[index] = .{
+            .hash = entry.key_ptr.*,
+            .score = (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)),
+            .tie = random.random().int(u64),
+        };
+    }
+    std.sort.pdq(Ranked, ranked, {}, struct {
+        fn before(_: void, a: Ranked, b: Ranked) bool {
+            return if (a.score != b.score) a.score < b.score else a.tie < b.tie;
+        }
+    }.before);
+    for (ranked) |cell_ranked| {
+        if (list.items.len == nodes) break;
+        const cell = state.cells.getPtr(cell_ranked.hash).?;
+        cell.visits += 1;
+        try list.append(arena, .{
+            .branch = cell.branch,
+            .vtime_ns = cell.vtime_ns,
+            .why = try std.fmt.allocPrint(arena, "Go-Explore's archive: back to just after {s}, " ++
+                "first reached by #{d} ({d} timelines reached it); returned there {d} times.", .{
+                cell.label, cell.branch, state.visits.get(cell_ranked.hash) orelse 0, cell.visits,
+            }),
+        });
+    }
+    return list.items;
+}
+
 /// Where the next generation returns: the strategy's choice when it makes one; else the
 /// branches with the most new behaviors, just after the last of them that leaves room (Go-
 /// Explore's frontier), or a random moment of a branch when nothing was new.
@@ -1826,6 +1986,8 @@ fn tree_returns(
     counts: Counts,
     random: *std.Random.DefaultPrng,
     size: u32,
+    /// Every branch planned before: a strategy may return to any of them (its own archive).
+    planned: *const std.AutoHashMapUnmanaged(u32, Planned),
 ) ![]const TreeReturn {
     var list: std.ArrayList(TreeReturn) = .empty;
     const nodes = tree.nodes(size);
@@ -1845,11 +2007,15 @@ fn tree_returns(
         };
         const answer = try plugin.returns(arena, generation, offered, nodes);
         for (answer) |back| {
+            // A timeline of this generation: within its span. Of an earlier one: the strategy's
+            // archive; a moment outside its span makes no node (the replay says why).
             const candidate = for (chosen) |candidate| {
                 if (candidate.summary.index == back.branch) break candidate;
-            } else continue;
-            const summary = candidate.summary;
-            if (back.vtime_ns <= summary.start_ns or back.vtime_ns >= summary.end_ns) continue;
+            } else null;
+            if (candidate) |known| {
+                const summary = known.summary;
+                if (back.vtime_ns <= summary.start_ns or back.vtime_ns >= summary.end_ns) continue;
+            } else if (!planned.contains(back.branch)) continue;
             const reason = if (back.reason.len > 0) back.reason else "(it gave no reason)";
             try list.append(arena, .{
                 .branch = back.branch,
@@ -1868,8 +2034,11 @@ fn tree_returns(
         const end_ns = @min(summary.end_ns, summary.last_pull_ns);
         const span = end_ns -| summary.start_ns;
         if (span < 2 * std.time.ns_per_ms) continue;
+        const extend = summary.cut and candidate.novel > 0 and candidate.changed_moment == null;
         const after = if (candidate.changed_moment) |moment|
             moment + std.time.ns_per_us
+        else if (extend)
+            summary.end_ns -| std.time.ns_per_ms
         else if (candidate.moment) |moment|
             moment + std.time.ns_per_us
         else
@@ -1879,7 +2048,12 @@ fn tree_returns(
             summary.start_ns + std.time.ns_per_ms,
             end_ns - std.time.ns_per_ms,
         );
-        const why = if (candidate.changed_moment != null)
+        const why = if (extend)
+            try std.fmt.allocPrint(arena, "Extended #{d} from where it stopped: it reached " ++
+                "{d} behaviors no timeline before it had (the rarest, {s}).", .{
+                summary.index, candidate.novel, candidate.label,
+            })
+        else if (candidate.changed_moment != null)
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first ran changed " ++
                 "code ({s}): a targeted run explores what follows it.", .{
                 summary.index, candidate.changed_label,
@@ -2005,6 +2179,9 @@ const HolderMaker = struct {
 const NodeMaking = struct {
     back: TreeReturn,
     parent: Planned,
+    /// Set for a parent of an earlier generation: replayed from this (the setup snapshot) along
+    /// its path, ancestor by ancestor, then to the moment.
+    chain_from: ?*const Snapshot = null,
     /// Made by a holder (else by a replay).
     held: bool = false,
     pid: linux.pid_t = 0,
@@ -2035,8 +2212,19 @@ fn node_make_start(
         _ = pool.take();
         const parent = making.parent;
         const at = making.back.vtime_ns;
-        const from = parent.snapshot;
+        var from = parent.snapshot;
         const seed = parent.seed;
+        if (making.chain_from) |setup| {
+            from = setup;
+            for (parent.path) |segment| {
+                from = node_make(arena, vm, options, from, segment.seed, segment.vtime_ns, null) catch |err| {
+                    std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}'s path: {s}\n", .{
+                        segment.vtime_ns, segment.branch, @errorName(err),
+                    });
+                    linux.exit_group(1);
+                };
+            }
+        }
         const snapshot = node_make(arena, vm, options, from, seed, at, overrides) catch |err| {
             std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
                 at, parent.index, @errorName(err),
@@ -2352,6 +2540,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.verify_holders = true;
             continue;
         }
+        if (std.mem.eql(u8, argv[index], "--archive")) {
+            arguments.archive = true;
+            continue;
+        }
         if (index + 1 == argv.len) return error.Usage;
         try parse_option(arena, &arguments, argv[index], argv[index + 1]);
         index += 1;
@@ -2376,7 +2568,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
     try branching_resolve(&arguments, moment or commands);
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
-    if ((arguments.from_branch == null) != (arguments.from_vtime_ms == null)) return error.Usage;
+    // From a moment: of a branch (`--from-branch`), or of the taped one (`--tape`).
+    if (arguments.from_branch != null and arguments.from_vtime_ms == null) return error.Usage;
+    if (arguments.from_vtime_ms != null and arguments.from_branch == null and arguments.tape_path == null) {
+        return error.Usage;
+    }
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
         arguments.cmdline = try std.mem.join(arena, " ", &parts);
@@ -2459,6 +2655,12 @@ fn parse_option(
         arguments.retroactive_count += 1;
     } else if (eql(u8, flag, "--changed")) {
         arguments.changed = value;
+    } else if (eql(u8, flag, "--horizon")) {
+        arguments.horizon_ns = try duration_parse(value);
+    } else if (eql(u8, flag, "--pipeline")) {
+        const depth = try std.fmt.parseInt(u32, value, 10);
+        if (depth == 0 or depth > pipeline_depth_max) return error.Usage;
+        arguments.pipeline = depth;
     } else if (eql(u8, flag, "--generation")) {
         const size = try std.fmt.parseInt(u32, value, 10);
         const multiple = size % tree.generation_base == 0;

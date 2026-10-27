@@ -18,15 +18,17 @@ import subprocess
 import tempfile
 
 HOME = os.path.expanduser("~")
-MACHINE = ["--kernel", f"{HOME}/guest/vmlinuz", "--initrd", f"{HOME}/guest/base.cpio",
+GUEST = os.environ.get("DETERMINISMO_GUEST", f"{HOME}/guest")
+MACHINE = ["--kernel", f"{GUEST}/vmlinuz", "--initrd", f"{GUEST}/base.cpio",
            "--append", "quiet", "--cache", f"{HOME}/cache"]
 DIGITS = ["first", "second", "third"]
 
 
-def run(seed, branches, strategy):
+def run(seed, branches, strategy, extra):
     command = ["zig-out/bin/determinismo", "explore", *MACHINE,
                "--program", "zig-out/bin/det-selftest", "--profile", "maze", "--scenario", "maze",
                "--seed", str(seed), "--branches", str(branches)]
+    command += extra
     if strategy:
         tapes = tempfile.mkdtemp(prefix="tree-bench-")
         command += ["--branching", "tree", "--tape-dir", tapes, "--strategy", strategy]
@@ -44,11 +46,12 @@ def main():
     parser.add_argument("--branches", type=int, default=400)
     parser.add_argument("--seeds", default="1,2,3,4,5,6,7,8")
     parser.add_argument("--strategy")
+    parser.add_argument("--explore", default="", help='more explore options: "--horizon 2s --pipeline 1"')
     arguments = parser.parse_args()
     seeds = [int(seed) for seed in arguments.seeds.split(",")]
     totals = dict.fromkeys(DIGITS, 0)
     for seed in seeds:
-        reached = run(seed, arguments.branches, arguments.strategy)
+        reached = run(seed, arguments.branches, arguments.strategy, arguments.explore.split())
         for digit in DIGITS:
             totals[digit] += reached[digit]
         solved = "  solved" if reached["solved"] else ""
