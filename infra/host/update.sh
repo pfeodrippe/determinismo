@@ -29,7 +29,8 @@ ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15)
 echo "== the repository"
 rsync -az -e "ssh ${ssh_opts[*]}" \
   --exclude .git --exclude .zig-cache --exclude zig-out --exclude .determinismo-cache \
-  --exclude todo.md --exclude 'guest/module/*.ko' --exclude 'guest/module/*.o' \
+  --exclude todo.md --exclude QUESTIONS.md --exclude node_modules \
+  --exclude 'guest/module/*.ko' --exclude 'guest/module/*.o' \
   --exclude 'guest/module/.*' --exclude 'guest/module/*.mod*' \
   --exclude guest/module/Module.symvers --exclude guest/module/modules.order \
   "$repo/" "$user@$ip:determinismo/"

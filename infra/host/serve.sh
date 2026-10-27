@@ -21,21 +21,26 @@ case $action in
   start) ;;
   *) echo "error: unknown action $action" >&2; exit 2 ;;
 esac
+# On the tailnet too (tailscale.sh): the web UI from your devices, without a tunnel.
+listen=127.0.0.1:7878
+if command -v tailscale >/dev/null && address=$(tailscale ip -4 2>/dev/null); then
+  listen="$listen,$address:7878"
+fi
 # Runs prepare images with rootless podman, which wants the user's runtime directory: the user's
 # manager runs without a login (lingering), and the unit starts after it.
 loginctl enable-linger "$user"
 cat > "/etc/systemd/system/$unit" <<EOF
 [Unit]
-Description=determinismo serve (runs, results and the web UI on 127.0.0.1:7878)
-# At boot, after our KVM is loaded (ordering only: setup.sh loads it itself).
-After=network.target determinismo-kvm.service user@$uid.service
+Description=determinismo serve (runs, results and the web UI on $listen)
+# At boot, after our KVM is loaded (ordering only: setup.sh loads it itself), and Tailscale.
+After=network.target determinismo-kvm.service user@$uid.service tailscaled.service
 Wants=user@$uid.service
 
 [Service]
 User=$user
 Environment=XDG_RUNTIME_DIR=/run/user/$uid
 WorkingDirectory=$home/determinismo
-ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen 127.0.0.1:7878 \\
+ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
   --data $home/det-runs --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\
   --initrd $home/guest/base.cpio --append quiet --cache $home/cache --memory-mib 4096
 # Restarts stop serve alone: its runs go on, adopted by the next.
