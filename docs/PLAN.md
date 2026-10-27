@@ -58,35 +58,28 @@ event hashing, the guest module.
   analysis (built, not deployed); serve snapshotting a failure as soon as it is found.
 - Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check is
   written but not run yet; long-term archive later (QUESTIONS.md).
-- e2e: the whole suite runs on srv1 against the new binary; then `-Donly=saved`, `-Donly=ui`
+- e2e: the whole suite on srv1 against the new binary; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
-- UI: first load 5.4 s on run 93 through the tunnel (27 s before gzip and incremental
-  timelines); timelines in parallel with the run's info (built); the chart larger; "1.8 h wall"
-  is a sum of wall times; a minimap for thousands of timelines.
-- srv2 leaks (fixed in serve and holders, deployed): holders now exit with their explorer, serve
-  kills what a finished run leaves, adopts a live explorer whatever its record says. Run 93's
-  explorer still runs the old binary.
-- Benchmarks (QUESTIONS.md 3: A): stop run 93, run bench/explore.py's variants on srv2.
+- UI: a minimap for thousands of timelines; "1.8 h wall" is a sum of wall times.
+- srv2: deploy everything since d66b9ec once the benchmark ends (its initramfs too: det-core,
+  det-profile).
+- Benchmarks (bench/explore.py on srv2, Raft POC, 40 minutes a seed): every safety bug so far
+  came from a fresh timeline (the same seed-derived one in every variant); returns found the
+  deadlock and, once, the log divergence after a fresh one had. bench/explore.py now counts
+  finds by origin. Next: more seeds, and why returns miss what fresh timelines find (their
+  moments come from behaviors the double vote's run does not have yet).
 - Clojure strategies: their own archive (returns to any earlier timeline), inspectability.
 - Flecs master: the readonly-table assert in flecs_table_ensure (30 of 32 timelines under
-  determinismo, not natively), two model disagreements, the abort hook bypassed, SIGABRT ending
-  in a GPF in nodes.
-- srv2 memory: admission by available memory, holders given up oldest first.
-- Findings: run 93's [log-matching] rediscovery, with its causality (a partition raft-node-2 ↔
-  runner at 24.086 s, a durable crash of raft-node-1 at 24.223 s, the bug decided between them).
+  determinismo, not natively), two model disagreements, the abort hook bypassed.
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
-- Holders: about 1 in 20 nodes from an in-run snapshot differed from the node a replay makes,
-  by one byte of guest memory, always at 192 mod 512 in its page, 2 against 3. Explained
-  (2026-10-27, from the page itself): a guest task's XSAVE header, its x87 state initial
-  (FCW 037f, MXCSR 1f80), XSTATE_BV 2 or 3. XSAVE writes XINUSE, which the host's own FPU saves
-  and restores of the guest (its thread preempted) may clear at host-chosen moments; the guest
-  restores the same registers either way and cannot read XINUSE (XGETBV 1 hidden). Verification
-  now accepts exactly that (xsave_bits_only, with a test); the tree e2e flaked on it.
-- Snapshot copies took residency (mincore) for content: a page the host swapped out was copied
-  as zeros. Copies now take every page mapped in the process (present or swapped, pagemap) or held
-  by the memfd behind it (SEEK_DATA); srv1 and srv2 both swapped earlier (millions of pages).
-- Tailscale: your Mac's install (QUESTIONS.md 4).
+- Jepsen, blind: Redis-Raft #52 (crashes alone: the `crashes` profile, 60 s timelines, running);
+  MongoDB 4.2.6 sharded (SERVER-48307, first timeline running); Redpanda next.
+- Done today: holders' one-byte difference explained (an XSAVE header's x87 in-use bit, which
+  host FPU saves flip; accepted exactly) and the tree e2e stable; snapshot copies of swapped-out
+  pages; memory admission; cores past 256 MiB keep their stacks; `stacks` reads threads ptrace
+  cannot stop; TigerBeetle's rejoin crash traced to the line through a reproducible build;
+  Tailscale on the Mac and srv2.
 
 ## Now
 
