@@ -10,7 +10,8 @@
 //! CLUSTERDOWN, ...: Jepsen's #23, aborted reads, came from refusals that took effect after all);
 //! `info` when no answer came.
 //!
-//! Faults: the default ones, restarts and power losses (each node's Raft log on its own disk).
+//! Faults: the default ones, restarts and power losses (each node's Raft log on its own disk);
+//! profile `crashes`: process kills and restarts alone.
 //!
 //!   determinismo explore ... --program zig-out/bin/redisraft-test --scenario append
 const std = @import("std");
@@ -45,15 +46,30 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
+/// `default`: every fault. `crashes`: process kills and restarts alone, as Jepsen found #52
+/// (history rewritten by crashes alone).
 fn describe(d: *System.Describe) !void {
-    const profile = try d.profile("default");
-    inline for (.{ "redis-1", "redis-2", "redis-3", "redis-4", "redis-5" }, 1..) |name, id| {
-        profile.node(@field(System.Name, name), .{
-            .build = .{ .context = ".", .dockerfile = "examples/redisraft/Dockerfile" },
-            .command = &.{std.fmt.comptimePrint("{d}", .{id})},
-            .ready = .{ .tcp = port },
-            .faults = .{ .restart = true, .crash = true },
-        });
+    const all: sdk.schema.Faults = .{ .restart = true, .crash = true };
+    const crashes: sdk.schema.Faults = .{
+        .restart = true,
+        .pause = false,
+        .isolate = false,
+        .partition = false,
+        .sync_stall = false,
+        .degrade = false,
+        .throttle = false,
+        .process_pause = false,
+    };
+    inline for (.{ .{ "default", all }, .{ "crashes", crashes } }) |entry| {
+        const profile = try d.profile(entry[0]);
+        inline for (.{ "redis-1", "redis-2", "redis-3", "redis-4", "redis-5" }, 1..) |name, id| {
+            profile.node(@field(System.Name, name), .{
+                .build = .{ .context = ".", .dockerfile = "examples/redisraft/Dockerfile" },
+                .command = &.{std.fmt.comptimePrint("{d}", .{id})},
+                .ready = .{ .tcp = port },
+                .faults = entry[1],
+            });
+        }
     }
 }
 

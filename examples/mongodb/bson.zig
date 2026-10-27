@@ -74,6 +74,13 @@ pub const Builder = struct {
         builder.bytes(value);
     }
 
+    /// An embedded document as it was read (a reply's element, sent back as is).
+    pub fn embedded(builder: *Builder, name: []const u8, value: []const u8) void {
+        assert(value.len >= 5);
+        builder.head(.document, name);
+        builder.bytes(value);
+    }
+
     /// Opens an embedded document; `close` ends it.
     pub fn document(builder: *Builder, name: []const u8) void {
         builder.head(.document, name);

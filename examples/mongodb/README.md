@@ -28,3 +28,24 @@ machine: a 256 MB WiredTiger cache each.
 
 Faults: Antithesis's set, restarts, graceful stops and power losses (each node's data on its own
 disk), and stalls and power losses at the nodes' syncs.
+
+## Sharded, as Jepsen tested 4.2.6
+
+Jepsen's anomalies in 4.2.6 came from a sharded cluster, which MongoDB traced to SERVER-48307
+(fixed in 4.2.8): a transaction that writes to one shard and reads from another, whose commit
+the driver retries after a failover of the shard it only read from, is reported aborted though
+it committed, and the driver's `withTransaction` runs it again. `sharded_test.zig` is that
+cluster, from jepsen-io/mongodb: a config server replica set (`cfg1`-`cfg3`), two shards
+(`s1a`-`s1c`, `s2a`-`s2c`), each a replica set with Jepsen's settings, and three routers
+(`r1`-`r3`, mongos); the collection sharded by hashed `_id` in seven initial chunks.
+
+```
+determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memory-mib 8192 \
+  --program zig-out/bin/mongodb-sharded-test --profile jepsen --scenario append --seed 1
+```
+
+Its client runs transactions as `withTransaction` does: on a random router; a commit with no
+clear outcome retried on any router with the recovery token from the router's last reply and
+majority write concern; the whole transaction run again (the same appends) when the server says
+it aborted (TransientTransactionError). A transaction that ran twice shows in Elle's check as a
+duplicated element.
