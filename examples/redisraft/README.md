@@ -34,6 +34,20 @@ Jepsen's split-brains needed (#17, #28, #44), are next, as custom faults.
   #51 (`EntryCacheAppend`), #53 (`AppendEntries` term mismatch), #54 (snapshot process
   segfault).
 
-## Status
+## Found blind (srv1, 2026-10-27)
 
-Image and program built; first exploration next.
+A 30-minute exploration (seed 1, six workers): of its first 179 timelines, 115 had a node crash,
+the first in timeline 2 (25 seconds of virtual time each; each replays from its tape, the same
+events):
+
+- `REDIS RAFT PANIC` / `Log refers to snapshot (term=0/index=1 which was not loaded, aborting`
+  in timelines 2, 5, 12, 13 and 15, a node that cannot start again: **Jepsen's #43** (startup
+  panic from a snapshot/log index mismatch).
+- `raft.c:784: callRaftPeriodic: Assertion 'ret == 0' failed` in timelines 2 and 12: **Jepsen's
+  #42**.
+- `src/raft_server.c:1252: raft_handle_append_cfg_change: Assertion 'node' failed` (the bundled
+  raft library) in timeline 13: not one of Jepsen's, known since 2019 (RedisLabs/redisraft#2:
+  a node rejoining under an id the cluster has seen).
+
+Elle found no anomaly in those timelines yet (#52, history rewritten, is the safety target): the
+crashes leave nodes down, and clusters unavailable, early.

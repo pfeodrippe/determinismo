@@ -85,7 +85,7 @@ Blind means blind to the results, not to the test: workloads follow Jepsen's pub
 | MongoDB | 4.2.6 | transactions with read skew, cyclic information flow, duplicated effects | next (examples/mongodb; 9.0.4 clean in 4 timelines on srv1) |
 | Raft (Antithesis's POC), again | hashicorp/raft 4c8f61ac | (as above) | the double vote again in 25 minutes (bench/explore.py's default tree, srv2, timeline 4653), and explained from the timeline (tests/antithesis-compat/README.md) |
 | TigerBeetle | 0.16.13 | #2767: a reformatted replica losing committed transfers; #2739: one replica down stalling requests for up to ~100 s; #2544: multi-filter queries missing results | first timelines (examples/tigerbeetle): a replica down for good stalled the cluster past 30 s once faults stopped (#2739's symptom, being measured); #2544 needs far more data than a timeline makes (natively, 60,000 accounts all correct) |
-| Redis-Raft | 2d1cf30 | #52 history rewritten by crashes; #44 split-brain from snapshot loading; crashes #48-#54 | first timelines (examples/redisraft, Jepsen's list-append with Elle) |
+| Redis-Raft | 2d1cf30 | #52 history rewritten by crashes; #44 split-brain from snapshot loading; crashes #42-#54 | ✅ crashes rediscovered in the first minutes (srv1, seed 1): #43's snapshot/log panic (a node that cannot restart) in 5 of the first 16 timelines, #42's callRaftPeriodic assertion in 2; and a `raft_handle_append_cfg_change` assertion (known: redisraft#2). Elle: no anomaly yet |
 
 ## Order
 
