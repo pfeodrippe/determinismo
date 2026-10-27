@@ -28,11 +28,18 @@ Jepsen's split-brains needed (#17, #28, #44), are next, as custom faults.
 
 ## Targets from Jepsen's analysis, in 2d1cf30
 
-- #52: history rewritten (acknowledged elements lost, duplicated, reordered) by crashes alone.
-- #44: split-brain and lost updates from loading snapshots.
-- Crashes: #48 (`raft_node_is_voting(me_)`), #49 (libuv `!uv__is_closing`), #50 (a segfault),
-  #51 (`EntryCacheAppend`), #53 (`AppendEntries` term mismatch), #54 (snapshot process
-  segfault).
+Jepsen found these in or before 2d1cf30, fixed only later (e0123a9) or never:
+
+- #52: history rewritten (acknowledged elements deleted, duplicated, flip-flopping) by process
+  crashes alone; perhaps related to #54.
+- Crashes: #42 (`callRaftPeriodic` assertion, unresolved), #43 (startup panic: a snapshot index
+  before the log's first entry), #48 (`raft_node_is_voting(me_)`), #49 (libuv
+  `!uv__is_closing`), #50 (a segfault), #51 (`EntryCacheAppend`), #53 (`AppendEntries` term
+  mismatch), #54 (the snapshot process's segfault in `RaftLogWriteEntry`).
+
+#44 (split-brain from snapshot loading) was fixed in 2d1cf30 itself. Jepsen compacted the log
+every 32 KB (about every 5 seconds); so does `start.sh` (at first it did not: 64 MB, no
+snapshots in a timeline).
 
 ## Found blind (srv1, 2026-10-27)
 

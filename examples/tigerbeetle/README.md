@@ -41,9 +41,12 @@ its disk; `start.sh` reformats it).
 
 - 6 GiB VMs ran out (three 1.1 GB data files and three replicas in guest memory): 12 GiB.
 - A power loss while `tigerbeetle format` wrote its 1.1 GB left a data file with no superblock,
-  which TigerBeetle cannot start from (`panic: superblock not found`, then a segfault in the panic
-  handler: the replica down for good). Expected of an unfinished format; `start.sh` now formats
-  aside and renames, as an operator would.
+  which TigerBeetle cannot start from (`panic: superblock not found`: the replica down for good).
+  Expected of an unfinished format; `start.sh` now formats aside and renames, as an operator
+  would.
+- Every panic ends in `segfault at 0`: the replica is its PID namespace's init (as in a
+  container), which ignores its own SIGABRT, so Zig's `abort()` falls back to writing address 0.
+  Not a second bug.
 - With that replica down for good, the cluster did not answer for over 30 seconds once faults
   stopped: Jepsen's #2739's symptom (ring replication stalls on one replica down). The check now
   waits up to five minutes and asserts an answer within one.

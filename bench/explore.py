@@ -103,12 +103,20 @@ def run(workload, seed, budget, options, bb):
         with open(record) as lines:
             rows = [json.loads(line)["branch"] for line in lines if '"branch"' in line]
     depths = [len(row.get("path") or []) for row in rows]
+    # A find from a fresh start is the seed's; one from a moment, the strategy's.
+    finds = {}
+    for row in rows:
+        for target in targets:
+            if any(message.startswith(target) for message in row.get("failing") or []):
+                kind = "from_moment" if row.get("path") else "fresh"
+                counts = finds.setdefault(target, {"fresh": 0, "from_moment": 0})
+                counts[kind] += 1
     return {
         "workload": workload, "seed": seed, "budget": budget, "options": " ".join(options),
         "timelines": len(rows), "from_moment": sum(1 for depth in depths if depth > 0),
         "depth_max": max(depths, default=0),
         "vtime_mean_s": round(sum(row["vtime_ns"] for row in rows) / max(1, len(rows)) / 1e9, 1),
-        "found": found,
+        "found": found, "finds": finds,
     }
 
 

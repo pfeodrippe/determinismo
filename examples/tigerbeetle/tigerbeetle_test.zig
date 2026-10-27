@@ -159,7 +159,7 @@ fn transfer_many(context: *System.Context) !void {
             continue;
         };
         if (failure(output)) |reason| {
-            sdk.always(false, "a transfer between existing accounts is accepted", .{ .reason = reason });
+            sdk.assert_unreachable("a transfer between existing accounts is refused", .{ .reason = reason });
             continue;
         }
         note("t {d} {d} {d} {d}\n", .{ id, debit, credit, amount });
