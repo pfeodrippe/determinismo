@@ -104,8 +104,11 @@ pub fn start(
         // gets the old, shut down filesystem back, or the disk is busy), and a fault may stop
         // or freeze it for seconds before it runs the node's program.
         launch.mounts_detach_other_nodes() catch |err| die("detach", err);
+        // The parent has set up cgroup and network: its "g", nothing else (it failed, and
+        // closed the pipe: a node running outside its cgroup, without a pidfile, would be out
+        // of reach of every fault).
         var byte: [1]u8 = undefined;
-        _ = linux.read(sync[0], &byte, 1); // The parent has set up cgroup and network.
+        if (linux.read(sync[0], &byte, 1) != 1 or byte[0] != 'g') linux.exit_group(1);
         // Its own cgroup namespace, rooted at its cgroup (as containers have): what it creates
         // there (kubelet's pods) stays under the node, within reach of its faults.
         if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
@@ -114,6 +117,11 @@ pub fn start(
         launch.exec(output_pipes.stdout[1], output_pipes.stderr[1]); // Never returns.
     }
     const pid: linux.pid_t = @intCast(result);
+    // A start that fails from here on leaves nothing running: the child is the first process
+    // of its PID namespace, so the namespace goes with it. (A pidfile that could not be
+    // written, with /run full, once left a node running that no fault could reach: a crash
+    // shut its disk down under it, and its program restarted against EIO for minutes.)
+    errdefer _ = linux.kill(pid, .KILL);
     _ = linux.close(running[1]); // Before the forwarder's fork: only the child holds it.
     defer _ = linux.close(running[0]);
     try output.forward(node.name, paths.output, output_pipes);
@@ -327,7 +335,11 @@ fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
     try device_wait(device);
     try device_free_wait(device);
     // noinit_itable: no background zeroing of inode tables (it would fill guest memory).
-    try mount(device, paths.layer, "ext4", 0, "data=ordered,noinit_itable");
+    // discard: blocks ext4 frees are punched out of the image (loop, then tmpfs), else the
+    // image keeps every block ever written: Scylla's rotating commit log grew five nodes'
+    // images to the whole of /run (4 GiB) while their filesystems held 160 MB each, and its
+    // writes failed with ENOSPC.
+    try mount(device, paths.layer, "ext4", 0, "data=ordered,noinit_itable,discard");
     // Not left mounted on a failure: the next start would mount the disk over it.
     errdefer _ = linux.umount2(paths.layer, 0);
     // The template is small; grown in place to the disk's size (nothing to do the next time).
