@@ -4,6 +4,80 @@ What is being built next, in order. Done work leaves this file (the parity map i
 [ANTITHESIS.md](ANTITHESIS.md) and the commit log keep the record). Each item is done when `zig
 build e2e` tests it.
 
+## Pluggable everything
+
+The rule: whatever decides *what to look at, where to go, or what it means* is a plugin (any
+binary on standard input and output, `tcp://` to a process anywhere, the Clojure host reloaded
+live over nREPL), and everything is inspectable and drivable over the HTTP API (a Clojure client,
+scripts, agents over MCP). Only what makes a timeline deterministic stays in the core: plugins
+choose, the core records their choices (tapes), and a replay needs no plugin.
+
+Pluggable now:
+- Exploration strategies: decisions inside timelines and where the tree returns (`returns`,
+  with reasons); `--strategy <cmd> | tcp://`, uploads (`@name`), plugins/clojure/strategies.clj.
+- Faults: which kinds each node allows (`--faults`, `--no-faults`), and when and which, through
+  the strategy's decisions.
+- Workloads and properties: test programs in any language (SDKs: Zig, C, Python, Java, Clojure,
+  Go via Antithesis's), host checks (`<program> check`, Elle).
+- Reading results: the HTTP API (query, event sets, SQL on DuckDB), notebooks (JavaScript, Clojure
+  over nREPL), MCP for agents; `serve --archive "<cmd>"` for long-term storage.
+
+To make pluggable (none changes what a timeline does, only what is looked at or chosen):
+1. **Causality planners** (in progress): which moments to analyze and how many futures each;
+   built in (even moments, then halfway inside jumps) or a plugin that sees every point, the
+   failure and the run's API. Clojure planners: bisect, faults (moments either side of each
+   fault inside a jump: which fault decided it), dense. Every parameter from the page too.
+2. **Causality's verdict**: what counts as "the bug happened" in a future (the property failing
+   by default; any query condition, or a plugin judging a future's events).
+3. **Behaviors and cells**: what counts as a new behavior (events.zig's keys) and the
+   Go-Explore archive's cell and score: today fixed in Zig; a plugin mapping a timeline's
+   summary to cells and weights, offline (between generations), so timelines pay nothing.
+4. **Fault schedules (nemeses)**: Jepsen-style schedules ("partition the leader after an
+   election, heal after 5 s") as a plugin over the decision hook, with reasons.
+5. **Horizons and timeline lengths per return**: the strategy's `returns` may say how long the
+   branch runs.
+6. **Run scheduling in serve**: which runs start, repeats, admission (memory), as API calls a
+   script makes (the benchmark harness in Clojure over the API, not only bench/explore.py).
+7. **Snapshot policy**: which failures get snapshotted, how densely, kept how long, archived
+   where: serve's defaults, a hook to override.
+8. **Triage**: findings (new / ongoing / resolved), rarity, grouping of failures by cause: a
+   plugin over the API producing the report the page shows.
+9. **A Clojure API client** (plugins/clojure/api.clj): runs, timelines, properties, query, event
+   sets, replays, causality, snapshots, stop and start, from any REPL or program.
+
+Stays in the core (determinism): the VMM (vCPU runs, virtual time and its TSC, timers, interrupt
+delivery, devices, CPUID and MSR filtering, branch counting), the decision stream's mechanics
+(seed and pulls; plugins only override values, which tapes record), fault mechanics (how a
+partition, pause or crash is applied in the guest), snapshots and their restore, tapes and
+event hashing, the guest module.
+
+## Open issues (2026-10-27)
+
+- Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
+  rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
+  analysis (built, not deployed); serve snapshotting a failure as soon as it is found.
+- Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check is
+  written but not run yet; long-term archive later (QUESTIONS.md).
+- e2e: the whole suite runs on srv1 against the new binary; then `-Donly=saved`, `-Donly=ui`
+  (Playwright, tests/ui) and `-Donly=until` (causality's new output).
+- UI: first load 5.4 s on run 93 through the tunnel (27 s before gzip and incremental
+  timelines); timelines in parallel with the run's info (built); the chart larger; "1.8 h wall"
+  is a sum of wall times; a minimap for thousands of timelines.
+- srv2 leaks (fixed in serve and holders, deployed): holders now exit with their explorer, serve
+  kills what a finished run leaves, adopts a live explorer whatever its record says. Run 93's
+  explorer still runs the old binary.
+- Benchmarks (QUESTIONS.md 3: A): stop run 93, run bench/explore.py's variants on srv2.
+- Clojure strategies: their own archive (returns to any earlier timeline), inspectability.
+- Flecs master: the readonly-table assert in flecs_table_ensure (30 of 32 timelines under
+  determinismo, not natively), two model disagreements, the abort hook bypassed, SIGABRT ending
+  in a GPF in nodes.
+- srv2 memory: admission by available memory, holders given up oldest first.
+- Findings: run 93's [log-matching] rediscovery, with its causality (a partition raft-node-2 ↔
+  runner at 24.086 s, a durable crash of raft-node-1 at 24.223 s, the bug decided between them).
+- Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
+  (the buffer travels by pointer, not by content).
+- Tailscale: your Mac's install (QUESTIONS.md 4).
+
 ## Now
 
 1. **e2e green on everything** (the tree check included: the same tree with one worker or four,
