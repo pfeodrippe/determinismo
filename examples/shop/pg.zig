@@ -175,12 +175,24 @@ fn server_error(connection: *Connection, body: []const u8) error{ServerError} {
 const Message = struct { kind: u8, body: []const u8 };
 
 fn message_read(connection: *Connection) !Message {
-    // The header is copied out: the body's read may move the buffered bytes.
-    const header = try connection.socket.read_exact(5);
-    const kind = header[0];
-    const size = std.mem.readInt(u32, header[1..5], .big);
-    if (size < 4 or size > tcp.buffer_size - 1) return error.ReplyTooLarge;
-    return .{ .kind = kind, .body = try connection.socket.read_exact(size - 4) };
+    while (true) {
+        // The header is copied out: the body's read may move the buffered bytes.
+        const header = try connection.socket.read_exact(5);
+        const kind = header[0];
+        const size = std.mem.readInt(u32, header[1..5], .big);
+        if (size < 4) return error.BadReply;
+        if (size <= tcp.buffer_size - 1) return .{ .kind = kind, .body = try connection.socket.read_exact(size - 4) };
+        // Too large to keep (YugabyteDB's notices and errors can be): a notice is passed over;
+        // an error stays one, an internal error with no message; anything else is a limit.
+        switch (kind) {
+            'N' => try connection.socket.skip(size - 4),
+            'E' => {
+                try connection.socket.skip(size - 4);
+                return .{ .kind = 'E', .body = "CXX000\x00Merror message too large to read\x00\x00" };
+            },
+            else => return error.ReplyTooLarge,
+        }
+    }
 }
 
 fn write_all(connection: *Connection, bytes: []const u8) !void {
@@ -196,4 +208,46 @@ test first_cell {
     try std.testing.expectEqualStrings("420", (try first_cell(&row, &cell)).?);
     const null_row = [_]u8{ 0, 1, 0xff, 0xff, 0xff, 0xff };
     try std.testing.expect(try first_cell(&null_row, &cell) == null);
+}
+
+test "message_read: a notice too large is passed over, an error too large stays an error" {
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(0, linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds));
+    defer _ = linux.close(fds[1]);
+    var connection: Connection = .{ .socket = .{ .fd = fds[0] } };
+    defer connection.socket.close();
+    // From a thread: the pair holds less than the notice.
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(fd: i32) void {
+            const big = tcp.buffer_size + 100;
+            var header: [5]u8 = undefined;
+            header[0] = 'N';
+            std.mem.writeInt(u32, header[1..5], big + 4, .big);
+            _ = linux.write(fd, &header, header.len);
+            var filler: [4096]u8 = @splat('x');
+            var left: usize = big;
+            while (left > 0) {
+                const size = @min(left, filler.len);
+                _ = linux.write(fd, &filler, size);
+                left -= size;
+            }
+            header[0] = 'E';
+            _ = linux.write(fd, &header, header.len);
+            left = big;
+            while (left > 0) {
+                const size = @min(left, filler.len);
+                _ = linux.write(fd, &filler, size);
+                left -= size;
+            }
+            const ready = [_]u8{ 'Z', 0, 0, 0, 5, 'I' };
+            _ = linux.write(fd, &ready, ready.len);
+        }
+    }.run, .{fds[1]});
+    defer writer.join();
+    const first = try message_read(&connection);
+    try std.testing.expectEqual('E', first.kind); // The notice passed over.
+    try std.testing.expect(std.mem.startsWith(u8, first.body, "CXX000"));
+    const second = try message_read(&connection);
+    try std.testing.expectEqual('Z', second.kind);
 }

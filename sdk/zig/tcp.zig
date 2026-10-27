@@ -102,6 +102,18 @@ pub const Connection = struct {
         return bytes;
     }
 
+    /// Reads past the next `size` bytes, however many: a message too large to keep, but whose
+    /// end the protocol says.
+    pub fn skip(connection: *Connection, size: u64) !void {
+        var left = size;
+        while (left > 0) {
+            if (connection.end == connection.start) try connection.fill();
+            const taken: u32 = @intCast(@min(left, connection.end - connection.start));
+            connection.start += taken;
+            left -= taken;
+        }
+    }
+
     /// The next byte, left unread.
     pub fn peek(connection: *Connection) !u8 {
         if (connection.end == connection.start) try connection.fill();
