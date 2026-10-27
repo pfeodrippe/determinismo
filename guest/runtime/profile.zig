@@ -130,7 +130,13 @@ const Profile = struct {
                     process_name(tid), pid, tid, state,
                 });
                 var frames: [frames_max]u64 = undefined;
-                const depth = stack_sample(pid, tid, &frames);
+                var depth = stack_sample(pid, tid, &frames);
+                if (depth == 0) {
+                    // Not stoppable (dumping core, or blocked where ptrace cannot reach it).
+                    depth = stack_scan(pid, tid, &maps, &frames);
+                    if (depth > 0) try out.writer.writeAll("  (not stoppable: its stack read " ++
+                        "from its last saved stack pointer, frames found by their links)\n");
+                }
                 var valid: usize = @min(depth, 1);
                 while (valid < depth and maps.find(frames[valid]) != null) valid += 1;
                 for (frames[0..valid], 0..) |frame, index| {
@@ -281,6 +287,103 @@ fn stack_sample(pid: linux.pid_t, tid: linux.pid_t, frames: *[frames_max]u64) us
         frame_pointer = pair[0];
     }
     return depth;
+}
+
+/// The stack of a thread ptrace cannot stop: its stack and instruction pointers from
+/// /proc/<pid>/task/<tid>/syscall (kept while it is in the kernel), then the longest chain of
+/// frame links (a saved frame pointer above it, then a return address into executable code)
+/// in the stack memory above the stack pointer.
+fn stack_scan(pid: linux.pid_t, tid: linux.pid_t, maps: *const Maps, frames: *[frames_max]u64) usize {
+    var path_buffer: [64]u8 = undefined;
+    const syscall_path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/task/{d}/syscall", .{
+        pid, tid,
+    }, 0) catch return 0;
+    var text_buffer: [256]u8 = undefined;
+    const text = read_file(syscall_path, &text_buffer) orelse return 0;
+    const pointers = syscall_pointers(text) orelse return 0;
+    frames[0] = pointers.pc;
+    const mem_path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/mem", .{pid}, 0) catch return 1;
+    const fd = linux.open(mem_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 1;
+    defer _ = linux.close(@intCast(fd));
+    var words: [stack_scan_size / 8]u64 = undefined;
+    const base = pointers.sp & ~@as(u64, 7);
+    var count: usize = 0;
+    while (count < words.len) { // Page by page: the stack's mapping may end before the buffer.
+        const chunk = std.mem.sliceAsBytes(words[count..@min(words.len, count + 512)]);
+        const read = linux.pread(@intCast(fd), chunk.ptr, chunk.len, @intCast(base + count * 8));
+        if (linux.errno(read) != .SUCCESS or read == 0) break;
+        count += read / 8;
+        if (read < chunk.len) break;
+    }
+    return frames_link(words[0..count], base, maps, frames);
+}
+
+const stack_scan_size = 64 * 1024;
+
+const Pointers = struct { sp: u64, pc: u64 };
+
+/// The last two fields of /proc/<pid>/task/<tid>/syscall: "<nr> <args...> <sp> <pc>", or
+/// "-1 <sp> <pc>" outside a system call; "running" has none.
+fn syscall_pointers(text: []const u8) ?Pointers {
+    var fields: [9][]const u8 = undefined;
+    var count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, text, " \n");
+    while (tokens.next()) |token| {
+        if (count == fields.len) return null;
+        fields[count] = token;
+        count += 1;
+    }
+    if (count < 3) return null;
+    const sp = std.fmt.parseInt(u64, fields[count - 2], 0) catch return null;
+    const pc = std.fmt.parseInt(u64, fields[count - 1], 0) catch return null;
+    return .{ .sp = sp, .pc = pc };
+}
+
+/// The longest chain of frame links in `words` (the stack from `base`): each a saved frame
+/// pointer to a higher link, then a return address into executable code. Fills frames[1..].
+fn frames_link(words: []const u64, base: u64, maps: *const Maps, frames: *[frames_max]u64) usize {
+    var best_start: ?usize = null;
+    var best_length: usize = 0;
+    var start: usize = 0;
+    while (start + 1 < words.len) : (start += 1) {
+        const length = chain_length(words, base, maps, start);
+        if (length > best_length) {
+            best_length = length;
+            best_start = start;
+        }
+    }
+    var depth: usize = 1;
+    var at = best_start orelse return depth;
+    while (depth < frames_max) {
+        frames[depth] = words[at + 1];
+        depth += 1;
+        const next = link_next(words, base, maps, at) orelse break;
+        at = next;
+    }
+    return depth;
+}
+
+fn chain_length(words: []const u64, base: u64, maps: *const Maps, start: usize) usize {
+    if (maps.find(words[start + 1]) == null) return 0;
+    var length: usize = 1;
+    var at = start;
+    while (length < frames_max) {
+        at = link_next(words, base, maps, at) orelse break;
+        length += 1;
+    }
+    return length;
+}
+
+/// The link a frame pointer at `at` points to, if it is a link higher in the stack.
+fn link_next(words: []const u64, base: u64, maps: *const Maps, at: usize) ?usize {
+    const pointer = words[at];
+    const here = base + at * 8;
+    if (pointer <= here or pointer % 8 != 0) return null;
+    const next = (pointer - base) / 8;
+    if (next + 1 >= words.len) return null;
+    if (maps.find(words[next + 1]) == null) return null;
+    return next;
 }
 
 fn process_name(pid: linux.pid_t) []const u8 {
@@ -491,6 +594,28 @@ fn sleep_ns(duration_ns: u64) void {
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
     _ = linux.nanosleep(&request, null);
+}
+
+test syscall_pointers {
+    const blocked = syscall_pointers("-1 0x7ffec13c2320 0x126e816\n").?;
+    try std.testing.expectEqual(0x7ffec13c2320, blocked.sp);
+    try std.testing.expectEqual(0x126e816, blocked.pc);
+    const waiting = syscall_pointers("7 0x1 0x2 0x3 0x0 0x0 0x0 0x7ffc00001000 0x401000\n").?;
+    try std.testing.expectEqual(0x401000, waiting.pc);
+    try std.testing.expectEqual(null, syscall_pointers("running\n"));
+}
+
+test frames_link {
+    // Code at 0x1000-0x2000; a stack from 0x8000 with noise, then links 0x8010 -> 0x8030 -> 0x8050.
+    var maps: Maps = .{};
+    maps.entries[0] = .{ .start = 0x1000, .end = 0x2000, .offset = 0, .path = "/bin/x" };
+    maps.count = 1;
+    const words = [_]u64{ 0x1234, 0x1500, 0x8030, 0x1100, 0, 0, 0x8050, 0x1200, 0, 0, 0, 0x1300 };
+    var frames: [frames_max]u64 = undefined;
+    frames[0] = 0x1001;
+    const depth = frames_link(&words, 0x8000, &maps, &frames);
+    try std.testing.expectEqual(4, depth);
+    try std.testing.expectEqualSlices(u64, &.{ 0x1001, 0x1100, 0x1200, 0x1300 }, frames[0..depth]);
 }
 
 test "options" {
