@@ -78,7 +78,9 @@ def run(workload, seed, budget, options, bb):
     if strategy:
         strategies_ready(bb)
         assert control(f"use {strategy[0]}") == "ok", strategy[0]
-        command += ["--strategy", f"tcp://127.0.0.1:{STRATEGY_PORT}",
+        # A tree (explore plans flat branches for a strategy unless told), its nodes replayed
+        # with their tapes.
+        command += ["--strategy", f"tcp://127.0.0.1:{STRATEGY_PORT}", "--branching", "tree",
                     "--tape-dir", tempfile.mkdtemp(prefix="explore-bench-tapes-")]
     start = time.monotonic()
     found = {}

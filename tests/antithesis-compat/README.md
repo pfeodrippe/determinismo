@@ -166,12 +166,39 @@ power losses that each brought it back at term 179 (`recovered log from disk: la
 kept campaigning in 180; at 445.49 s, partitioned from node-2, it won term 180 with node-0's vote
 again. So node-0 voted twice in term 180. In between, at 440.32 s, node-0's stale vote requests
 of terms 176 to 179 all completed at once as a partition healed. What made node-0 forget its vote
-(its term going back through the off-loop heartbeat, as below, or its stable store) is not
-known yet: the timeline cannot be replayed any more, since srv2 was redeployed and its guest
+was not known then (it is now: below, "The double vote, found again and explained"): the timeline cannot be replayed any more, since srv2 was redeployed and its guest
 image replaced (the tape says so: its inputs differ), and that run's image was built from a
 working tree, not a commit. Its events, all of them, are in the run's database. Next: each run
 keeps the files it booted (serve), so that a finding replays after any deploy; meanwhile the
 hunts go on to find it again.
+
+### The double vote, found again and explained (srv2, 2026-10-27)
+
+Blind again, in 25 minutes: the strategy benchmark's default tree (bench/explore.py, seed 1,
+generations of 48 on srv2's 36 threads) failed `[election-safety]` in timeline 4653, a fresh root
+of generation 96, with `[log-matching]`, `[leader-completeness]`, `[state-machine-safety]` and
+`[fsm-convergence]` after it: two leaders in term 22, node-1 and node-2. A root replays alone
+(`--branch 4653 --branching flat`, the same events hash), so this time its mechanism could be
+read off the timeline, at any moment of it:
+
+- The monitor's own log (`determinismo extract` of raft-monitor's /opt/monitor/raft-monitor.log,
+  which holds every node's DEBUG records): `node-2: vote granted: from="node-0" ... term=22`, then
+  `node-1: vote granted: from="node-0" ... term=22`. node-0 voted twice in term 22.
+- node-0's raft stable store (raft-boltdb's /var/lib/raft-node/raft.db, extracted at moments a
+  few milliseconds apart, CurrentTerm / LastVoteTerm / LastVoteCand by bbolt transaction):
+  28.650 s: 16 / 16 / node-0. 28.656 s: 22 / 22 (node-2's request for term 22, on the main loop).
+  28.663 s: 21 / 22 / node-2: the vote for node-2 is persisted, and the term goes back to 21:
+  the heartbeat handler (`processHeartbeat`, which calls `appendEntries` off the main loop, #695)
+  had compared node-1's term-21 heartbeat with the old term, and its `setCurrentTerm(21)` landed
+  after the main loop's 22 (node-0's DEBUG: `updated currentTerm: term=22`, then `term=21`).
+  28.668 s: 21 / 21 / node-2, then 28.700 s: 21 / 21 / node-1: with its term back at 21, node-0
+  took a late term-21 vote request from node-1 and voted, and raft keeps one vote record, so the
+  term-22 vote was gone. 28.735 s on: node-1 asked in term 22, the record said term 21, and node-0
+  voted again: 22 / 22 / node-1.
+
+So: an off-loop term regression, then a stale lower-term vote overwriting the single vote record.
+The evidence (events, tape, the stores at each moment, the monitor's log) is on srv2 in
+~/findings/double-vote-2026-10-27; the timeline replays from its tape.
 
 ### Found again, and explained by causality analysis: run 93 (srv2, 2026-10-27)
 
