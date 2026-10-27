@@ -2373,7 +2373,7 @@ fn snapshots_compare(back: TreeReturn, held: *const Snapshot, replayed: *const S
             });
         }
     }
-    const memory_same = memory_equal(held.memory_fd, replayed.memory_fd, held.memory_size);
+    const memory_same = memory_equal(held, replayed);
     if (!memory_same) differ += 1;
     std.debug.print("[determinismo] verify #{d} at {d}ns: {s}{s}\n", .{
         back.branch,
@@ -2446,10 +2446,14 @@ fn segment_unusable(base: u64) kvm.Segment {
     return segment;
 }
 
-fn memory_equal(a: linux.fd_t, b: linux.fd_t, size: u64) bool {
+fn memory_equal(held: *const Snapshot, replayed: *const Snapshot) bool {
+    const a = held.memory_fd;
+    const b = replayed.memory_fd;
+    const size = held.memory_size;
     var buffers: [2][1 << 20]u8 = undefined;
     var offset: u64 = 0;
     var pages_differing: u64 = 0;
+    var xsave_headers: u64 = 0;
     while (offset < size) : (offset += buffers[0].len) {
         const length = @min(buffers[0].len, size - offset);
         const read_a = linux.pread(a, &buffers[0], length, @intCast(offset));
@@ -2464,6 +2468,10 @@ fn memory_equal(a: linux.fd_t, b: linux.fd_t, size: u64) bool {
             const x = buffers[0][at..][0..page];
             const y = buffers[1][at..][0..page];
             if (std.mem.eql(u8, x, y)) continue;
+            if (xsave_bits_only(buffers[0][0..length], buffers[1][0..length], at)) {
+                xsave_headers += 1;
+                continue;
+            }
             pages_differing += 1;
             if (pages_differing > 8) continue;
             const first = std.mem.indexOfDiff(u8, x, y).?;
@@ -2476,10 +2484,192 @@ fn memory_equal(a: linux.fd_t, b: linux.fd_t, size: u64) bool {
                 if (std.mem.allEqual(u8, x, 0)) " (held: all zeros)" else "",
                 if (std.mem.allEqual(u8, y, 0)) " (replayed: all zeros)" else "",
             });
+            rings_name(held, offset + at + first);
+            page_dump(offset + at, x, y);
+            mappings_name(held, offset + at);
         }
     }
+    if (xsave_headers > 0) std.debug.print("[determinismo] verify: {d} pages differ only in an " ++
+        "XSAVE header's x87/SSE in-use bits (the same registers either way)\n", .{xsave_headers});
     if (pages_differing > 0) std.debug.print("[determinismo] verify: {d} pages differ\n", .{pages_differing});
     return pages_differing == 0;
+}
+
+/// Whether the page at `at` differs only in the in-use bits of XSAVE headers whose components
+/// are in their initial state. XSAVE writes XSTATE_BV from the processor's XINUSE tracking,
+/// which may clear a component's bit once it holds its initial values; the host's own FPU
+/// saves and restores of the guest (when its thread is preempted) do so at host-chosen moments,
+/// so a guest task's saved x87 state reads XSTATE_BV 2 in one run and 3 in another. XRSTOR
+/// gives back the same registers either way, and the guest cannot read XINUSE (XGETBV 1 is
+/// hidden: cpuid.zig), so the two machines are the same.
+fn xsave_bits_only(x: []const u8, y: []const u8, at: usize) bool {
+    const page = std.heap.page_size_min;
+    const header_size = 64;
+    const legacy_size = 512;
+    const in_use_bits: u64 = 0b11; // x87, SSE.
+    assert(at % page == 0 and at + page <= x.len and x.len == y.len);
+    var word = at;
+    while (word < at + page) : (word += 8) {
+        const a = std.mem.readInt(u64, x[word..][0..8], .little);
+        const b = std.mem.readInt(u64, y[word..][0..8], .little);
+        if (a == b) continue;
+        // XSTATE_BV: a 64-byte aligned header after the 512-byte legacy area, its reserved
+        // bytes zero (else XRSTOR faults), differing in in-use bits alone.
+        if (word % header_size != 0 or word + header_size > x.len or word < legacy_size) return false;
+        if ((a ^ b) & ~in_use_bits != 0) return false;
+        if (!std.mem.allEqual(u8, x[word + 8 ..][0 .. header_size - 8], 0)) return false;
+        if (!std.mem.allEqual(u8, y[word + 8 ..][0 .. header_size - 8], 0)) return false;
+        const legacy = x[word - legacy_size ..][0..legacy_size];
+        if (!std.mem.eql(u8, legacy, y[word - legacy_size ..][0..legacy_size])) return false;
+        // The components whose bit differs hold their initial values.
+        if ((a ^ b) & 0b01 != 0) {
+            const control = std.mem.readInt(u16, legacy[0..2], .little);
+            if (control != 0x037f or !std.mem.allEqual(u8, legacy[2..24], 0)) return false;
+            if (!std.mem.allEqual(u8, legacy[32..160], 0)) return false; // ST0-ST7.
+        }
+        if ((a ^ b) & 0b10 != 0) {
+            const mxcsr = std.mem.readInt(u32, legacy[24..28], .little);
+            if (mxcsr != 0x1f80 or !std.mem.allEqual(u8, legacy[160..416], 0)) return false; // XMM0-XMM15.
+        }
+        word += header_size - 8; // The header's other words are equal (zero) on both.
+    }
+    return true;
+}
+
+test "xsave_bits_only: an x87 in-use bit in an XSAVE header, nothing else" {
+    // As found on srv1: a task's XSAVE area at 704 in its page, x87 and SSE initial.
+    var held: [2 * std.heap.page_size_min]u8 = @splat(0);
+    std.mem.writeInt(u16, held[704..][0..2], 0x037f, .little);
+    std.mem.writeInt(u32, held[704 + 24 ..][0..4], 0x1f80, .little);
+    std.mem.writeInt(u32, held[704 + 28 ..][0..4], 0xffff, .little);
+    held[1216] = 2;
+    var replayed = held;
+    replayed[1216] = 3;
+    try std.testing.expect(xsave_bits_only(&held, &replayed, 0));
+    // Not when the x87 state is in use (a register holds a value).
+    var used_held = held;
+    var used_replayed = replayed;
+    used_held[704 + 32] = 1;
+    used_replayed[704 + 32] = 1;
+    try std.testing.expect(!xsave_bits_only(&used_held, &used_replayed, 0));
+    // Not for another bit, nor at an unaligned place, nor for any other byte.
+    replayed[1216] = 2 | 4;
+    try std.testing.expect(!xsave_bits_only(&held, &replayed, 0));
+    replayed[1216] = 2;
+    replayed[1217] = 1;
+    try std.testing.expect(!xsave_bits_only(&held, &replayed, 0));
+    replayed[1217] = 0;
+    replayed[1224] = 3;
+    try std.testing.expect(!xsave_bits_only(&held, &replayed, 0));
+}
+
+/// Says which virtual addresses of the running address space (CR3, 4-level paging) map a guest
+/// page, the kernel's direct map left out: a user address names a process's memory.
+fn mappings_name(snapshot: *const Snapshot, page_address: u64) void {
+    const fd = snapshot.memory_fd;
+    const mask: u64 = 0x000f_ffff_ffff_f000;
+    var told: u32 = 0;
+    const pml4 = snapshot.sregs.cr3 & mask;
+    for (0..512) |a| {
+        const e4 = entry_read(fd, pml4, a) orelse continue;
+        for (0..512) |b| {
+            const e3 = entry_read(fd, e4 & mask, b) orelse continue;
+            const va3 = canonical((a << 39) | (b << 30));
+            if (e3 & 0x80 != 0) { // 1 GiB page.
+                const base = e3 & 0x000f_ffff_c000_0000;
+                if (page_address >= base and page_address < base + (1 << 30)) {
+                    told += mapping_tell(va3 + (page_address - base), told);
+                }
+                continue;
+            }
+            for (0..512) |c| {
+                const e2 = entry_read(fd, e3 & mask, c) orelse continue;
+                const va2 = va3 | (c << 21);
+                if (e2 & 0x80 != 0) { // 2 MiB page.
+                    const base = e2 & 0x000f_ffff_ffe0_0000;
+                    if (page_address >= base and page_address < base + (1 << 21)) {
+                        told += mapping_tell(va2 + (page_address - base), told);
+                    }
+                    continue;
+                }
+                var table: [512]u64 = undefined;
+                const length = std.mem.sliceAsBytes(&table).len;
+                if (linux.pread(fd, std.mem.sliceAsBytes(&table).ptr, length, @intCast(e2 & mask)) != length) continue;
+                for (table, 0..) |e1, d| {
+                    if (e1 & 1 == 0 or e1 & mask != page_address) continue;
+                    told += mapping_tell(va2 | (d << 12), told);
+                }
+            }
+        }
+    }
+    if (told == 0) std.debug.print("[determinismo] verify: no mapping of it but the direct map (cr3 {x})\n", .{
+        snapshot.sregs.cr3,
+    });
+}
+
+fn entry_read(fd: linux.fd_t, table: u64, index: usize) ?u64 {
+    var entry: u64 = 0;
+    if (linux.pread(fd, std.mem.asBytes(&entry), 8, @intCast(table + index * 8)) != 8) return null;
+    if (entry & 1 == 0) return null;
+    return entry;
+}
+
+fn canonical(address: u64) u64 {
+    return if (address & (1 << 47) != 0) address | 0xffff_0000_0000_0000 else address;
+}
+
+/// Tells one mapping (up to eight), the kernel's direct map left out; returns how many it told.
+fn mapping_tell(address: u64, told: u32) u32 {
+    const direct_map_start: u64 = 0xffff_8880_0000_0000;
+    const direct_map_end: u64 = 0xffff_c880_0000_0000;
+    if (address >= direct_map_start and address < direct_map_end) return 0;
+    if (told >= 8) return 0;
+    std.debug.print("[determinismo] verify: mapped at {x}{s}\n", .{
+        address, if (address < (1 << 47)) " (user space)" else "",
+    });
+    return 1;
+}
+
+/// Writes both sides of a page that differs to /tmp/determinismo-verify-<pid>-<address>-{held,
+/// replayed}, to read what it holds.
+fn page_dump(address: u64, held: []const u8, replayed: []const u8) void {
+    const sides = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "held", .bytes = held },
+        .{ .name = "replayed", .bytes = replayed },
+    };
+    for (sides) |side| {
+        var path_buffer: [128]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-verify-{d}-{d}-{s}", .{
+            linux.getpid(), address, side.name,
+        }, 0) catch return;
+        const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+        if (linux.errno(fd) != .SUCCESS) return;
+        _ = linux.write(@intCast(fd), side.bytes.ptr, side.bytes.len);
+        _ = linux.close(@intCast(fd));
+    }
+    std.debug.print("[determinismo] verify: page written to /tmp/determinismo-verify-{d}-{d}-{{held,replayed}}\n", .{
+        linux.getpid(), address,
+    });
+}
+
+/// Says which disk's virtqueue part holds a guest address, if one does (the parts the VMM and
+/// the guest both write).
+fn rings_name(snapshot: *const Snapshot, address: u64) void {
+    for (snapshot.blocks[0..snapshot.block_count], 0..) |*block, disk| {
+        const size: u64 = block.queue_size;
+        const parts = [_]struct { name: []const u8, start: u64, length: u64 }{
+            .{ .name = "descriptors", .start = block.queue_descriptors, .length = 16 * size },
+            .{ .name = "available ring", .start = block.queue_available, .length = 6 + 2 * size },
+            .{ .name = "used ring", .start = block.queue_used, .length = 6 + 8 * size },
+        };
+        for (parts) |part| {
+            if (address < part.start or address >= part.start + part.length) continue;
+            std.debug.print("[determinismo] verify: that is disk {d}'s {s}, byte {d} (the VMM's " ++
+                "indices: available {d}, used {d})\n", .{
+                disk, part.name, address - part.start, block.available_index, block.used_index,
+            });
+        }
+    }
 }
 
 /// Releases a tree node's memory (never the setup snapshot's), once its branches ran.

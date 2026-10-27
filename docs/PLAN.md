@@ -76,12 +76,13 @@ event hashing, the guest module.
   runner at 24.086 s, a durable crash of raft-node-1 at 24.223 s, the bug decided between them).
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
-- Holders: about 1 in 70 nodes from an in-run snapshot differs from the node a replay makes, by
-  one byte of guest memory (a counter, 2 in the held node and 3 in the replayed one: one device
-  or VMM action falls on the other side of the hold point); registers and devices equal. Seen
-  with builds from before 2026-10-27 too; the tree e2e's verification fails on it now and then.
-  A branch from such a node is not exactly what its tape's replay makes. Next: find which write
-  (the page's owner at that moment) and order it the same in both.
+- Holders: about 1 in 20 nodes from an in-run snapshot differed from the node a replay makes,
+  by one byte of guest memory, always at 192 mod 512 in its page, 2 against 3. Explained
+  (2026-10-27, from the page itself): a guest task's XSAVE header, its x87 state initial
+  (FCW 037f, MXCSR 1f80), XSTATE_BV 2 or 3. XSAVE writes XINUSE, which the host's own FPU saves
+  and restores of the guest (its thread preempted) may clear at host-chosen moments; the guest
+  restores the same registers either way and cannot read XINUSE (XGETBV 1 hidden). Verification
+  now accepts exactly that (xsave_bits_only, with a test); the tree e2e flaked on it.
 - Snapshot copies took residency (mincore) for content: a page the host swapped out was copied
   as zeros. Copies now take every page mapped in the process (present or swapped, pagemap) or held
   by the memfd behind it (SEEK_DATA); srv1 and srv2 both swapped earlier (millions of pages).
@@ -127,7 +128,13 @@ event hashing, the guest module.
      strategy one (170 s); Clojure's rarity none. The Raft POC on srv2 (40 minutes a seed, 36
      threads, generations of 48), bench/explore.py: the default tree found the deadlock in both
      seeds (48 s, 66 s) and, in seed 1, the double vote with three others (1,481 s, timeline 4653);
-     the archive and short-branch variants are running.
+     the archive found the same in seed 1 (35 s; 1,768 s). But timeline 4653 is a fresh start
+     (no path), its seed drawn from its index, the same in both: the double vote was the seed's,
+     not the strategies'. Of 6,767 and 5,808 timelines, 1,799 and 1,560 started fresh; those from
+     moments found the deadlock (39 and 29 times) and, once, in the archive's, the log divergence
+     (timeline 5493, two moments deep, after the fresh one). So: count each variant's finds from
+     moments apart from fresh ones, and compare variants over more seeds; the double vote needs
+     returns that keep the off-loop heartbeat's timing (tests/antithesis-compat/README.md).
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
