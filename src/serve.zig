@@ -150,6 +150,8 @@ const Shared = struct {
     /// By run id: the size of timelines.jsonl at the last ingest (it only grows: the same size,
     /// nothing to bring in).
     ingested: [runs_max]u64 = @splat(0),
+    /// By run id: the size of its replays' results (record.jsonl.replays) at the last ingest.
+    replays_ingested: [runs_max]u64 = @splat(0),
     answers: [runs_max][@typeInfo(Kept).@"enum".field_names.len]Answer = @splat(@splat(.{})),
     requests: std.atomic.Value(u32) = .init(0),
 
@@ -353,19 +355,33 @@ fn run_update(server: *Server, id: u32) !void {
     const timelines = try std.fs.path.join(server.arena, &.{ events.directory, "timelines.jsonl" });
     const stat = std.Io.Dir.cwd().statFile(server.io, timelines, .{});
     const size = if (stat) |known| known.size else |_| 0;
-    if (size == shared.ingested[id]) return;
+    // The timelines replayed as the run went (replays.zig), which finish after their timelines.
+    const replays = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "record.jsonl.replays" });
+    const replays_stat = std.Io.Dir.cwd().statFile(server.io, replays, .{});
+    const replays_size = if (replays_stat) |known| known.size else |_| 0;
+    if (size == shared.ingested[id] and replays_size == shared.replays_ingested[id]) return;
     var connection = events.connect(&shared.database, server.arena, &failure) catch |err| {
         server.detail = try server.arena.dupe(u8, failure.text());
         return err;
     };
     defer connection.close();
-    const directory = events.directory;
-    const arrived = store.ingest(&connection, server.arena, server.io, directory) catch |err| {
-        server.detail = try server.arena.dupe(u8, connection.failure.text());
-        return err;
-    };
-    shared.ingested[id] = size;
-    if (arrived > 0) shared.generations[id] += 1;
+    if (size != shared.ingested[id]) {
+        const directory = events.directory;
+        const arrived = store.ingest(&connection, server.arena, server.io, directory) catch |err| {
+            server.detail = try server.arena.dupe(u8, connection.failure.text());
+            return err;
+        };
+        shared.ingested[id] = size;
+        if (arrived > 0) shared.generations[id] += 1;
+    }
+    if (replays_size != shared.replays_ingested[id]) {
+        store.replays_ingest(&connection, server.arena, server.io, replays) catch |err| {
+            server.detail = try server.arena.dupe(u8, connection.failure.text());
+            return err;
+        };
+        shared.replays_ingested[id] = replays_size;
+        shared.generations[id] += 1;
+    }
 }
 
 fn run_store(server: *Server, id: u32) !store.Store {

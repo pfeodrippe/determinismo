@@ -26,7 +26,7 @@ pub const duckdb = @import("duckdb.zig");
 
 pub const file_name = "events.duckdb";
 /// The tables' shape: a database of another version is rebuilt from the files.
-const schema_version = 2;
+const schema_version = 3;
 
 /// Paths of the events' JSON that searches read most (the UI's): kept as columns, their text
 /// (`->>`) and their JSON type, which a condition reads instead of parsing every event
@@ -164,13 +164,14 @@ fn schema_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
     try connection.exec(
         \\DROP VIEW IF EXISTS timeline_events;
         \\DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS timelines; DROP TABLE IF EXISTS steps;
+        \\DROP TABLE IF EXISTS replays;
         \\DROP TABLE IF EXISTS schema_version; DROP MACRO IF EXISTS categorical;
     );
     try connection.exec(schema_sql);
 }
 
 const schema_sql =
-    \\CREATE TABLE schema_version AS SELECT 2 AS version;
+    \\CREATE TABLE schema_version AS SELECT 3 AS version;
     \\CREATE MACRO categorical(j, path) AS
     \\    CASE WHEN json_type(j, path) IN ('VARCHAR', 'BOOLEAN') THEN j ->> path END;
     \\CREATE TABLE events (
@@ -210,6 +211,10 @@ const schema_sql =
     \\);
     \\CREATE TABLE steps (
     \\    branch UINTEGER, step UINTEGER, ancestor UINTEGER, from_ns UBIGINT, to_ns UBIGINT
+    \\);
+    \\CREATE TABLE replays (
+    \\    timeline UINTEGER PRIMARY KEY, same BOOLEAN, recorded VARCHAR, replayed VARCHAR,
+    \\    why VARCHAR
     \\);
     \\CREATE VIEW timeline_events AS
     \\    SELECT t.branch AS timeline, NULL::UINTEGER AS origin, e.* EXCLUDE (branch)
@@ -393,6 +398,45 @@ pub fn ingest(
     return @intCast(arrived.len);
 }
 
+/// The run's replays (replays.zig's results: "<timeline> same <hash>" or "<timeline> different
+/// <recorded> <replayed> <why>" lines), all of them again: there are at most replays_max.
+pub fn replays_ingest(
+    connection: *duckdb.Connection,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return;
+    var values: std.Io.Writer.Allocating = .init(arena);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |result| {
+        var words = std.mem.tokenizeScalar(u8, result, ' ');
+        const timeline = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
+        const verdict = words.next() orelse continue;
+        const same = std.mem.eql(u8, verdict, "same");
+        const recorded = words.next() orelse "";
+        const replayed = if (same) recorded else words.next() orelse "";
+        const why = std.mem.trim(u8, words.rest(), " ");
+        try values.writer.print("{s}({d}, {}, {s}, {s}, {s})", .{
+            if (values.written().len == 0) "" else ",",
+            timeline,
+            same,
+            try sql_string(arena, recorded),
+            try sql_string(arena, replayed),
+            try sql_string(arena, why),
+        });
+    }
+    try connection.exec("BEGIN TRANSACTION");
+    errdefer connection.exec("ROLLBACK") catch {};
+    try connection.exec("DELETE FROM replays");
+    if (values.written().len > 0) {
+        try connection.exec(try std.fmt.allocPrintSentinel(arena, "INSERT INTO replays VALUES {s}", .{
+            values.written(),
+        }, 0));
+    }
+    try connection.exec("COMMIT");
+}
+
 /// A string as a SQL literal.
 fn sql_string(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -434,7 +478,7 @@ pub const properties_sql =
     \\        min(timeline) FILTER (WHERE hits > 0) AS first_hit_timeline,
     \\        sum(hits) AS hits, sum(trues) AS trues, any_value(place) AS place
     \\    FROM per GROUP BY ALL
-    \\)
+    \\), listed AS (
     \\SELECT type, message,
     \\    CASE
     \\        WHEN timelines_failing > 0 THEN 'failing'
@@ -451,6 +495,16 @@ pub const properties_sql =
     \\        || coalesce(' ' || coalesce(place ->> '$.function', place ->> '$.function_name'), '')
     \\        AS location
     \\FROM judged
+    \\UNION ALL
+    \\-- The run's timelines replayed as it ran (replays.zig): determinismo's own property.
+    \\SELECT 'always', 'timelines replay to their recorded history', -- report.replays_property
+    \\    CASE WHEN bool_and(same) THEN 'passing' ELSE 'failing' END,
+    \\    count(*), count(*) FILTER (WHERE same), count(*) FILTER (WHERE NOT same),
+    \\    min(timeline) FILTER (WHERE NOT same), NULL, min(timeline), count(*),
+    \\    count(*) FILTER (WHERE same), 'replays.zig'
+    \\FROM replays HAVING count(*) > 0
+    \\)
+    \\SELECT * FROM listed
     \\ORDER BY status = 'failing' DESC, timelines_failing DESC, message
 ;
 
@@ -658,6 +712,29 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
     try testing.expectEqual(2, properties[1].first.?);
     try testing.expectEqualStrings("unreachable", properties[2].type);
     try testing.expectEqualStrings("failing", properties[2].status);
+
+    // The timelines replayed as the run went: one more property, determinismo's, failing in
+    // the one that did not replay (ingested twice: the second replaces the first).
+    const replays_path = try std.fs.path.join(arena, &.{ directory, "record.jsonl.replays" });
+    const replays_text = "1 same 2e30973b224051a4\n3 different 12 34 events 812 of 900\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = replays_path, .data = replays_text[0..24] });
+    try replays_ingest(&connection, arena, io, replays_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = replays_path, .data = replays_text });
+    try replays_ingest(&connection, arena, io, replays_path);
+    const with_replays = try connection.rows(Property, arena,
+        \\SELECT type, message, status, timelines_failing, first_failing_timeline
+        \\FROM (
+    ++ properties_sql ++
+        \\) WHERE message LIKE 'timelines replay%'
+    , .{});
+    try testing.expectEqual(1, with_replays.len);
+    try testing.expectEqualStrings("failing", with_replays[0].status);
+    try testing.expectEqual(1, with_replays[0].failing);
+    try testing.expectEqual(3, with_replays[0].first.?);
+    const Why = struct { why: []const u8, replayed: []const u8 };
+    const why = (try connection.row(Why, arena, "SELECT why, replayed FROM replays WHERE NOT same", .{})).?;
+    try testing.expectEqualStrings("events 812 of 900", why.why);
+    try testing.expectEqualStrings("34", why.replayed);
 
     const Timeline = struct { index: u32, failing: []const u8, parent: ?u32 };
     const timelines = try connection.rows(Timeline, arena,
