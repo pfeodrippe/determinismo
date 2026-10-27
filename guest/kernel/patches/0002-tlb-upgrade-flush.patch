@@ -1,0 +1,51 @@
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -505,8 +505,17 @@
+ {
+ 	int changed = !pte_same(*ptep, entry);
+ 
+-	if (changed && dirty)
++	if (changed && dirty) {
+ 		set_pte(ptep, entry);
++		/*
++		 * determinismo: flushed, though x86 does not need it. The upgrade may come without a
++		 * fault at this address (one the kernel takes for the task: a futex, GUP), so the TLB
++		 * can keep the old entry, and the task's next write takes a spurious fault, or does
++		 * not, as the TLB's state goes: host activity decides it (replays parted by the ~150
++		 * branches of a spurious fault).
++		 */
++		flush_tlb_page(vma, address);
++	}
+ 
+ 	return changed;
+ }
+@@ -522,12 +531,8 @@
+ 
+ 	if (changed && dirty) {
+ 		set_pmd(pmdp, entry);
+-		/*
+-		 * We had a write-protection fault here and changed the pmd
+-		 * to to more permissive. No need to flush the TLB for that,
+-		 * #PF is architecturally guaranteed to do that and in the
+-		 * worst-case we'll generate a spurious fault.
+-		 */
++		/* determinismo: flushed, as in ptep_set_access_flags (no spurious fault after). */
++		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+ 	}
+ 
+ 	return changed;
+@@ -542,12 +547,8 @@
+ 
+ 	if (changed && dirty) {
+ 		set_pud(pudp, entry);
+-		/*
+-		 * We had a write-protection fault here and changed the pud
+-		 * to to more permissive. No need to flush the TLB for that,
+-		 * #PF is architecturally guaranteed to do that and in the
+-		 * worst-case we'll generate a spurious fault.
+-		 */
++		/* determinismo: flushed, as in ptep_set_access_flags (no spurious fault after). */
++		flush_tlb_range(vma, address, address + HPAGE_PUD_SIZE);
+ 	}
+ 
+ 	return changed;
