@@ -6,6 +6,11 @@
 //! of determinismo's, "timelines replay to their recorded history": a timeline that does not
 //! is a determinism bug, found on a real workload as it ran (its replay's first difference is
 //! where to look: explore --trace, its .rdtsc log, DETERMINISMO_ITRACE_AT).
+//!
+//! When the run's timelines are done, the explorer asks the verifier to finish (SIGUSR1): it
+//! reads the record a last time and replays the sampled timelines still pending, side by side
+//! on the CPUs the workers left (so that a short run is checked too, and a long one waits about
+//! one timeline more), then exits.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -28,6 +33,7 @@ pub const Verifier = struct {
         record: []const u8,
         tapes: []const u8,
         every: u32,
+        jobs: u32,
     ) !Verifier {
         assert(every > 0);
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
@@ -40,17 +46,25 @@ pub const Verifier = struct {
             _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
             if (linux.getppid() != explorer) linux.exit_group(0);
             _ = linux.setpgid(0, 0); // Its replays with it: stopped as one.
-            verify_loop(io, base, record, tapes, every, results_path);
+            const action: linux.Sigaction = .{
+                .handler = .{ .handler = finish_requested },
+                .mask = linux.sigemptyset(),
+                .flags = 0,
+            };
+            _ = linux.sigaction(linux.SIG.USR1, &action, null);
+            verify_loop(io, base, record, tapes, every, jobs, results_path);
             linux.exit_group(0);
         }
         return .{ .pid = @intCast(pid), .results_path = results_path };
     }
 
-    /// Stops it (and the replay in flight) and reads what it found.
-    pub fn stop(verifier: *const Verifier, arena: std.mem.Allocator, io: std.Io) !Results {
-        _ = linux.kill(-verifier.pid, .KILL);
+    /// Lets it replay the sampled timelines still pending (the run's are all recorded), waits
+    /// for it, and reads what it found.
+    pub fn finish(verifier: *const Verifier, arena: std.mem.Allocator, io: std.Io) !Results {
+        _ = linux.kill(verifier.pid, .USR1);
         var status: i32 = 0;
         _ = linux.waitpid(verifier.pid, &status, 0);
+        _ = linux.kill(-verifier.pid, .KILL); // Anything of its group left.
         const text = std.Io.Dir.cwd().readFileAlloc(io, verifier.results_path, arena, .limited(1 << 20)) catch "";
         return results_parse(arena, text);
     }
@@ -118,12 +132,20 @@ fn contains(list: []const []const u8, word: []const u8) bool {
     return false;
 }
 
+/// Set by SIGUSR1: the run's timelines are all recorded.
+var finishing: std.atomic.Value(bool) = .init(false);
+
+fn finish_requested(_: linux.SIG) callconv(.c) void {
+    finishing.store(true, .release);
+}
+
 fn verify_loop(
     io: std.Io,
     base: []const []const u8,
     record: []const u8,
     tapes: []const u8,
     every: u32,
+    jobs: u32,
     results_path: []const u8,
 ) void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -132,7 +154,11 @@ fn verify_loop(
     var verified: std.AutoHashMapUnmanaged(u32, void) = .empty;
     var replays: u32 = 0;
     while (replays < replays_max) {
-        sleep_ns(scan_interval_ns);
+        if (!finishing.load(.acquire)) sleep_ns(scan_interval_ns); // A signal ends the sleep.
+        if (finishing.load(.acquire)) {
+            const text = std.Io.Dir.cwd().readFileAlloc(io, record, arena, .unlimited) catch "";
+            return finish_pending(arena, io, base, tapes, every, jobs, results_path, text, &verified, replays);
+        }
         const text = std.Io.Dir.cwd().readFileAlloc(io, record, arena, .unlimited) catch continue;
         // Timelines recorded at the read before: their tapes are closed.
         var ready: std.ArrayList(struct { index: u32, hash: []const u8 }) = .empty;
@@ -163,6 +189,67 @@ fn verify_loop(
             append(results_path, line);
         }
     }
+}
+
+/// The run is done, its tapes closed: every sampled timeline not replayed yet (within
+/// replays_max), up to `jobs` at once.
+fn finish_pending(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: []const []const u8,
+    tapes: []const u8,
+    every: u32,
+    jobs: u32,
+    results_path: []const u8,
+    text: []const u8,
+    verified: *const std.AutoHashMapUnmanaged(u32, void),
+    replays: u32,
+) void {
+    const Pending = struct { index: u32, hash: []const u8 };
+    var pending: std.ArrayList(Pending) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
+        const Line = struct { branch: struct { index: u32, events_hash: []const u8 } };
+        const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch continue;
+        if (parsed.branch.index % every != every - 1) continue;
+        if (verified.contains(parsed.branch.index)) continue;
+        if (replays + pending.items.len == replays_max) break;
+        pending.append(arena, .{ .index = parsed.branch.index, .hash = parsed.branch.events_hash }) catch return;
+    }
+    const Worker = struct {
+        fn run(
+            worker_io: std.Io,
+            worker_base: []const []const u8,
+            worker_tapes: []const u8,
+            worker_results: []const u8,
+            all: []const Pending,
+            next: *std.atomic.Value(u32),
+        ) void {
+            while (true) {
+                const at = next.fetchAdd(1, .monotonic);
+                if (at >= all.len) return;
+                const timeline = all[at];
+                // Each its own arena: the workers run at once.
+                var own: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+                defer own.deinit();
+                const line = replay_one(own.allocator(), worker_io, worker_base, worker_tapes, timeline.index, timeline.hash) catch |err|
+                    std.fmt.allocPrint(own.allocator(), "{d} different {s} none {s}\n", .{ timeline.index, timeline.hash, @errorName(err) }) catch return;
+                append(worker_results, line);
+            }
+        }
+    };
+    var next: std.atomic.Value(u32) = .init(0);
+    const workers = @min(@max(jobs, 1), pending.items.len);
+    var threads: [replays_max]std.Thread = undefined;
+    var started: usize = 0;
+    for (0..workers) |_| {
+        threads[started] = std.Thread.spawn(.{}, Worker.run, .{ io, base, tapes, results_path, pending.items, &next }) catch break;
+        started += 1;
+    }
+    // None started (no threads to be had): this one does them all.
+    if (started == 0) Worker.run(io, base, tapes, results_path, pending.items, &next);
+    for (threads[0..started]) |thread| thread.join();
 }
 
 fn replay_one(

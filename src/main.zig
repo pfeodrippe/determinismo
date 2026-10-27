@@ -1210,7 +1210,7 @@ fn command_explore(
     const verifier: ?replays.Verifier = if (arguments.record_path != null and
         arguments.tape_directory != null and arguments.verify_every > 0 and
         arguments.branch_only == null and arguments.tape_path == null and arguments.raw_argv.len >= 2)
-        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_every)
+        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_every, jobs)
     else
         null;
     if (arguments.branching == .tree) {
@@ -1236,7 +1236,7 @@ fn command_explore(
         try explore_parallel(context, vm, options, branches, jobs);
     }
     if (verifier) |*running| {
-        const found = try running.stop(context.arena, context.io);
+        const found = try running.finish(context.arena, context.io);
         try multiverse.replays_judge(found.replayed, found.same, found.first_different);
         for (found.different) |line| std.debug.print("[determinismo] did not replay: {s}\n", .{line});
     }
