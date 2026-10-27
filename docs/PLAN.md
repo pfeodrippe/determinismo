@@ -90,8 +90,11 @@ event hashing, the guest module.
   determinismo, not natively), two model disagreements, the abort hook bypassed.
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
-- Jepsen, blind: Redis-Raft #52 (crashes alone: the `crashes` profile, 60 s timelines, running);
-  MongoDB 4.2.6 sharded (SERVER-48307, first timeline running); Redpanda next.
+- Jepsen, blind: Redis-Raft #52 (crashes alone: the `crashes` profile, 60 s timelines, to rerun);
+  MongoDB 4.2.6 sharded: SERVER-48307 found (2 of the first 89 timelines, both its forms);
+  ScyllaDB 4.2.rc3 (examples/scylla: LWT list-append, Jepsen's configuration, own CQL client)
+  next, then Kafka's hunt again (bootstrap.checkpoint) on exact replays; Redpanda 21.10 is gone
+  (22.1.1 the oldest image).
 - Done today: holders' one-byte difference explained (an XSAVE header's x87 in-use bit, which
   host FPU saves flip; accepted exactly) and the tree e2e stable; snapshot copies of swapped-out
   pages; memory admission; cores past 256 MiB keep their stacks; `stacks` reads threads ptrace

@@ -76,3 +76,8 @@ c343fbc3's transaction 1 wrote to shard 2, read from shard 1, and committed at r
 shard 1 failing over (s1a to s1b) during the commit; the client's retry of the commit, through
 r3 to shard 2's new primary s2a, answered that transaction 1 was not in progress; the client ran
 it again: run 2 aborted, run 3 committed, and the append was there twice.
+
+By the hunt's 185th timeline, three more had failed: 147 (G1a, and a dirty update: a committed
+transaction appended after a write of one recorded failed), 167 (an element twice), and 174,
+whose replay parted from its tape (srv2 still ran the guest kernel without
+guest/kernel/patches/0001-accessed-bits.patch, under the load of 15 VMs).
