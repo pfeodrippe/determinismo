@@ -293,6 +293,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests (on x86-64 Linux)");
     const test_roots = [_][]const u8{
         "src/main.zig",
+        "src/replays.zig",
+        "src/verify.zig",
         "sdk/zig/determinismo.zig",
         "sdk/zig/tcp.zig",
         "guest/runtime/init.zig",

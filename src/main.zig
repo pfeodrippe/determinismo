@@ -29,6 +29,7 @@ const checks = @import("checks.zig");
 const causality = @import("causality.zig");
 const mutate = @import("mutate.zig");
 const verify = @import("verify.zig");
+const replays = @import("replays.zig");
 const changed = @import("changed.zig");
 const extract = @import("extract.zig");
 const event_sets = @import("event_sets.zig");
@@ -87,6 +88,10 @@ const usage =
     \\                            the pages changed since the one before)
     \\                            [--from-snapshot <dir>/<name>]   (branches from one saved)
     \\                            [--record <results.jsonl>] [--shard <k>/<n>]
+    \\                            [--verify-replays <n>]   (with --record and --tape-dir: every
+    \\                            n-th timeline replayed from its tape as the run goes, at most
+    \\                            16, beside its workers: "timelines replay to their recorded
+    \\                            history"; 16 by default, 0 for none)
     \\                            [--resume]   (with --record: continue that run, its recorded
     \\                            timelines skipped; the same inputs, seed and branching; a tree
     \\                            without a strategy, from its timelines' summaries)
@@ -248,6 +253,11 @@ const Arguments = struct {
     shard_count: u32 = 1,
     /// Write results as JSON lines here (see report.record).
     record_path: ?[]const u8 = null,
+    /// The command line as given (the replays' verifier boots the system the same way).
+    raw_argv: []const [:0]const u8 = &.{},
+    /// While exploring with a record and tapes, every this many timelines one is replayed from
+    /// its tape (replays.zig); 0: none.
+    verify_every: u32 = 16,
     /// Continue the run whose record is `record_path`: its timelines already recorded are
     /// skipped (flat branching; the same inputs and seed).
     resume_run: bool = false,
@@ -1196,6 +1206,13 @@ fn command_explore(
         .deadline_ns = if (arguments.time_budget_ns) |ns| time_start_ns + ns else null,
     };
     const jobs = jobs_count(arguments);
+    // Timelines replayed from their tapes as the run goes, beside its workers (replays.zig).
+    const verifier: ?replays.Verifier = if (arguments.record_path != null and
+        arguments.tape_directory != null and arguments.verify_every > 0 and
+        arguments.branch_only == null and arguments.tape_path == null and arguments.raw_argv.len >= 2)
+        try replays.Verifier.start(context.arena, context.io, arguments.raw_argv, arguments.record_path.?, arguments.tape_directory.?, arguments.verify_every)
+    else
+        null;
     if (arguments.branching == .tree) {
         // A strategy decides within its branches and chooses where the tree returns: an
         // instance here (and one per worker).
@@ -1217,6 +1234,11 @@ fn command_explore(
             });
         }
         try explore_parallel(context, vm, options, branches, jobs);
+    }
+    if (verifier) |*running| {
+        const found = try running.stop(context.arena, context.io);
+        try multiverse.replays_judge(found.replayed, found.same, found.first_different);
+        for (found.different) |line| std.debug.print("[determinismo] did not replay: {s}\n", .{line});
     }
     multiverse.summarize(monotonic_ns() - time_start_ns);
     return multiverse;
@@ -3234,7 +3256,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (argv.len > arguments_max) return error.Usage;
     var arguments = Arguments{ .command = std.meta.stringToEnum(Command, argv[1]) orelse {
         return error.Usage;
-    } };
+    }, .raw_argv = argv };
     var index: u32 = 2;
     while (index < argv.len) : (index += 1) {
         if (std.mem.eql(u8, argv[index], "--deterministic")) {
@@ -3432,6 +3454,8 @@ fn parse_option(
         }
     } else if (eql(u8, flag, "--record")) {
         arguments.record_path = value;
+    } else if (eql(u8, flag, "--verify-replays")) {
+        arguments.verify_every = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--jobs")) {
         arguments.jobs = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, flag, "--strategy")) {

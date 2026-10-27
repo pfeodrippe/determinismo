@@ -198,6 +198,7 @@ test property_failing {
 }
 
 const logging_property = "logging output stays under 200 MB per hour of virtual time";
+pub const replays_property = "timelines replay to their recorded history";
 const logging_bytes_per_hour_max = 200 * 1000 * 1000;
 
 /// Properties across all branches of an exploration.
@@ -419,6 +420,24 @@ pub const Multiverse = struct {
         aggregate.branches_true = if (over) 0 else multiverse.branches;
         aggregate.branches_failing = 0; // No timeline violates it alone.
         aggregate.run_failing = over;
+    }
+
+    /// determinismo's own property: the timelines replayed while the run explored
+    /// (replays.zig) had the histories the run recorded.
+    pub fn replays_judge(multiverse: *Multiverse, replayed: u32, same: u32, first_different: ?u32) !void {
+        if (replayed == 0) return;
+        var property = Events.Property{
+            .kind = .always,
+            .message = undefined,
+            .message_size = replays_property.len,
+        };
+        @memcpy(property.message[0..replays_property.len], replays_property);
+        const aggregate = try multiverse.aggregate_find(&property);
+        aggregate.branches_hit = replayed;
+        aggregate.branches_true = same;
+        aggregate.branches_failing = replayed - same;
+        aggregate.run_failing = same < replayed;
+        aggregate.first_failing_branch = first_different;
     }
 
     /// A property's location, from whichever branch or worker reported one.
