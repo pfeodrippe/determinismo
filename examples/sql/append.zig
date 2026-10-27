@@ -48,6 +48,10 @@ pub const Options = struct {
     keys: []const Key = &.{ .primary, .secondary },
     /// A pause before each micro-operation, drawn up to this (Jepsen's: 10 ms).
     pause_ms_max: u32 = 10,
+    /// An insert in a transaction under a savepoint, so that one losing a race to another's
+    /// leaves the transaction to update instead. Without (YugabyteDB 1.3: "SAVEPOINT not
+    /// supported yet"), a lost race fails the transaction, as Jepsen's YSQL append did.
+    savepoints: bool = true,
 };
 
 pub const Dialect = enum { postgres, mysql };
@@ -321,18 +325,20 @@ fn append(connection: *Client, mop: Mop, alone: bool, options: Options) Statemen
         },
         .update_insert_update => {
             if (try update(connection, mop, options)) return;
-            if (!alone) connection.exec("SAVEPOINT upsert") catch |err| return failure(connection, err);
+            const savepoint = !alone and options.savepoints;
+            if (savepoint) connection.exec("SAVEPOINT upsert") catch |err| return failure(connection, err);
             const sql = std.fmt.bufPrint(&statement, "INSERT INTO txn{d} (id, sk, val) " ++
                 "VALUES ({d}, {d}, '{d}')", .{ table, mop.key, mop.key, mop.value }) catch unreachable;
             if (connection.exec(sql)) |_| {
-                if (!alone) connection.exec("RELEASE SAVEPOINT upsert") catch |err| return failure(connection, err);
+                if (savepoint) connection.exec("RELEASE SAVEPOINT upsert") catch |err| return failure(connection, err);
                 return;
             } else |err| {
                 // A duplicate key (integrity class 23: PostgreSQL's 23505, MySQL's 23000).
                 const raced = err == error.ServerError and std.mem.startsWith(u8, connection.sqlstate(), "23");
-                if (!raced) return failure(connection, err);
+                // In a transaction with no savepoint, the race aborted it: a definite failure.
+                if (!raced or (!alone and !savepoint)) return failure(connection, err);
             }
-            if (!alone) connection.exec("ROLLBACK TO SAVEPOINT upsert") catch |err| return failure(connection, err);
+            if (savepoint) connection.exec("ROLLBACK TO SAVEPOINT upsert") catch |err| return failure(connection, err);
             if (try update(connection, mop, options)) return;
             sdk.event("sql_append_no_row", .{ .key = mop.key }); // Rare: not something a run must reach.
             return error.Definite; // Neither its insert nor its updates wrote.
