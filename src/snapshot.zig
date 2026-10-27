@@ -25,6 +25,9 @@ irqchips: [3]kvm.Irqchip,
 /// Virtual time and branch count at the snapshot; restored VMs continue from them.
 tsc: u64,
 branches: u64,
+/// The guest's XINUSE at the snapshot (KVM's record of it: XSAVE shows it to the guest, and
+/// the XSAVE state saved here may have lost bits of it to the host's own save).
+xinuse: u64,
 serial: @FieldType(VM, "serial"),
 rtc: @FieldType(VM, "rtc"),
 pit: @FieldType(VM, "pit"),
@@ -80,6 +83,7 @@ fn state_save(snapshot: *Snapshot, vm: *VM, memory_fd: std.os.linux.fd_t) !void 
         .irqchips = undefined,
         .tsc = state.tsc,
         .branches = vm.branches_offset + state.branches,
+        .xinuse = state.xinuse,
         .serial = vm.serial,
         .rtc = vm.rtc,
         .pit = vm.pit,

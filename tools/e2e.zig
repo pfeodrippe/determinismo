@@ -108,7 +108,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
         .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
         .{ "pinned", check_pinned },                 .{ "saved", check_saved },
-        .{ "ui", check_ui },
+        .{ "concurrent", check_concurrent },         .{ "ui", check_ui },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -995,6 +995,43 @@ fn check_builtin_properties(context: *Context) !void {
     const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
     expect(context, crash_caught, "built-in properties catch a crash (SIGSEGV) in a node", .{});
     try check_core_dump(context, program);
+}
+
+/// One timeline run at once by more processes than the host has cores (they queue for the CPU
+/// pool's cores): the same history in each. VMs on a core's sibling hyperthreads perturbed each
+/// other's retired-branch counters, and VMs outside the pool ran anywhere (2026-10-27).
+fn check_concurrent(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const runs = 8;
+    var children: [runs]std.process.Child = undefined;
+    var logs: [runs][]const u8 = undefined;
+    for (&children, &logs, 0..) |*child, *log, index| {
+        log.* = try std.fmt.allocPrint(arena, "{s}/concurrent-{d}.log", .{ context.scratch, index });
+        var command: std.ArrayList(u8) = .empty;
+        try command.print(arena, "exec '{s}' explore", .{context.determinismo});
+        for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
+        try command.print(arena, " --program '{s}' --scenario bank --seed 9 --branch 3 " ++
+            "--branching flat 2> '{s}'", .{ program, log.* });
+        child.* = try std.process.spawn(context.io, .{
+            .argv = &.{ "sh", "-c", command.items },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+    }
+    for (&children) |*child| _ = try child.wait(context.io);
+    var first: ?[]const u8 = null;
+    var same: u32 = 0;
+    for (logs) |path| {
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, arena, .limited(1 << 24)) catch "";
+        var branches: [1]Branch = undefined;
+        if (parse_branches(text, &branches) != 1) continue;
+        const hash = branches[0].events_hash;
+        if (first == null) first = hash;
+        if (std.mem.eql(u8, first.?, hash)) same += 1;
+    }
+    expect(context, same == runs, "concurrent: one timeline run by {d} processes at once, " ++
+        "the same history in {d}", .{ runs, same });
 }
 
 /// The crash leaves a core dump, which `extract` takes out of the runner at a later moment.

@@ -63,11 +63,26 @@ event hashing, the guest module.
 - UI: a minimap for thousands of timelines; "1.8 h wall" is a sum of wall times.
 - srv2: deploy everything since d66b9ec once the benchmark ends (its initramfs too: det-core,
   det-profile).
-- Benchmarks (bench/explore.py on srv2, Raft POC, 40 minutes a seed): every safety bug so far
-  came from a fresh timeline (the same seed-derived one in every variant); returns found the
-  deadlock and, once, the log divergence after a fresh one had. bench/explore.py now counts
-  finds by origin. Next: more seeds, and why returns miss what fresh timelines find (their
-  moments come from behaviors the double vote's run does not have yet).
+- Determinism (2026-10-27). Kafka's timelines (JVMs) did not replay. Found and fixed: VMs on a
+  core's two hyperthreads perturb each other's branch counters (2d51a19: one VM per core, every
+  VM from the pool). Left: under host load (a busy process sharing the VM's CPU) about one
+  replay in three still parts. The KVM patch's RDTSC log (`--trace`, `<trace>.rdtsc`) pins it:
+  between two consecutive guest RDTSCs, at the same instructions, the guest runs about 150
+  branches more or fewer, in thread exit (before exit.c's add_device_randomness) and scheduler
+  paths: data-dependent work whose data differs. Ruled out, measured: throttling of the counter
+  (0), stops one instruction late after a dropped MTF exit (0), the count moving across context
+  switches (0), XINUSE cleared between exit and entry (0), AVX power gating (an AVX loop beside
+  it changes nothing); SCHED_FIFO for the VM (11 of 12) and XSAVE hidden from the guest (12 of
+  12) help. Testing: Accessed bits set by speculative page walks (fault-around maps pages old;
+  exit's zap marks the young ones accessed): a guest kernel whose pte_young is always false.
+  Kept from the hunt: the patch's counters (throttles, late stops, drifts, XINUSE restorations)
+  and snapshots carrying the guest's XINUSE (KVM_GET_XSAVE's own save may clear it: the
+  holders' XSTATE_BV 2 against 3), an e2e check running one timeline concurrently.
+- Benchmarks (bench/explore.py on srv2, Raft POC, 40 minutes a seed, tree / archive / short
+  branches): seed 1's safety bugs came from one fresh timeline (4653) in every variant; seed 2:
+  the deadlock in all, and the log divergence only in the short-branch variant, from a moment
+  two deep (timeline 2508, 582 s): the first find of a strategy's own. bench/explore.py now
+  counts finds by origin. These runs used sibling threads (above): rerun after the fix.
 - Clojure strategies: their own archive (returns to any earlier timeline), inspectability.
 - Flecs master: the readonly-table assert in flecs_table_ensure (30 of 32 timelines under
   determinismo, not natively), two model disagreements, the abort hook bypassed.

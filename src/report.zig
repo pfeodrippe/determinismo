@@ -51,14 +51,15 @@ pub fn run(vm: *VM, result: struct { outcome: VM.Outcome, wall_ns: u64 }) !void 
         const state = try vm.det_state();
         print("[determinismo] vtime={d:.3}s branches={d} rdtsc_exits={d} timer_fires={d} " ++
             "idle_skips={d} idle_vtime={d:.3}s mtf_steps={d} overflows={d} overshoots={d} " ++
-            "skid_max={d} soft_exits={d} exit_timer_fires={d} fast_steps={d}\n", .{
+            "skid_max={d} soft_exits={d} exit_timer_fires={d} fast_steps={d} throttles={d} late_steps={d}\n", .{
             seconds(state.tsc / tsc_per_ns), state.branches,
             state.rdtsc_exits,               vm.stats.timer_fires,
             vm.stats.idle_skips,             seconds(vm.stats.idle_tsc / tsc_per_ns),
             state.mtf_steps,                 state.overflows,
             state.overshoots,                state.skid_max,
             state.soft_exits,                vm.stats.exit_timer_fires,
-            state.fast_steps,
+            state.fast_steps,                state.throttles,
+            state.late_steps,
         });
         overshoot_warn(state.overshoots);
     }
@@ -208,6 +209,14 @@ pub const Multiverse = struct {
     /// Exactness of the stops at branch-count targets, over all branches.
     skid_max: u64 = 0,
     overshoots: u64 = 0,
+    /// The branch counter's stops by perf throttling, restarted at their exit (kvm patch).
+    throttles: u64 = 0,
+    /// Exact stops reached at an exit that replaced the MTF exit (kvm patch).
+    late_steps: u64 = 0,
+    /// The guest's XINUSE restored at an entry after host work cleared some of it, and
+    /// restorations that left a bit clear (kvm patch).
+    xinuse_fixes: u64 = 0,
+    xinuse_unfixed: u64 = 0,
     /// Virtual time the branches simulated (from their snapshot on), and the wall time they
     /// took, each on one core: Antithesis's "virtual time per wall time".
     vtime_ns: u64 = 0,
@@ -283,6 +292,10 @@ pub const Multiverse = struct {
         const state = try vm.det_state();
         multiverse.skid_max = @max(multiverse.skid_max, state.skid_max);
         multiverse.overshoots += state.overshoots;
+        multiverse.throttles += state.throttles;
+        multiverse.late_steps += state.late_steps;
+        multiverse.xinuse_fixes += state.xinuse_fixes;
+        multiverse.xinuse_unfixed += state.xinuse_unfixed;
         multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
         multiverse.wall_ns += branch.wall_ns;
         multiverse.output_bytes += vm.events.output_bytes;
@@ -364,6 +377,10 @@ pub const Multiverse = struct {
         multiverse.failing_branches += other.failing_branches;
         multiverse.skid_max = @max(multiverse.skid_max, other.skid_max);
         multiverse.overshoots += other.overshoots;
+        multiverse.throttles += other.throttles;
+        multiverse.late_steps += other.late_steps;
+        multiverse.xinuse_fixes += other.xinuse_fixes;
+        multiverse.xinuse_unfixed += other.xinuse_unfixed;
         multiverse.vtime_ns += other.vtime_ns;
         multiverse.wall_ns += other.wall_ns;
         multiverse.output_bytes += other.output_bytes;
@@ -433,8 +450,11 @@ pub const Multiverse = struct {
             if (where.len > 0) print("  at {s}", .{where});
             print("\n", .{});
         }
-        print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots\n", .{
-            multiverse.skid_max, multiverse.overshoots,
+        print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots, {d} " ++
+            "counter throttles restarted, {d} reached at another exit; XINUSE restored {d} times " ++
+            "({d} not)\n", .{
+            multiverse.skid_max,   multiverse.overshoots,   multiverse.throttles,
+            multiverse.late_steps, multiverse.xinuse_fixes, multiverse.xinuse_unfixed,
         });
         print("[determinismo] virtual time per wall time: {d:.2} (one core; {d:.3}s virtual " ++
             "in {d:.3}s)\n", .{

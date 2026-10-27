@@ -51,6 +51,11 @@ pub const DET_SET_TARGET = ioctl_number(.write, 0xf1, 8);
 pub const DET_GET_STATE = ioctl_number(.read, 0xf2, @sizeOf(DetState));
 pub const DET_ADD_TSC = ioctl_number(.write, 0xf3, 8);
 pub const DET_SET_SOFT_TSC = ioctl_number(.write, 0xf4, 8);
+pub const DET_SET_XINUSE = ioctl_number(.write, 0xf5, 8);
+pub const DET_LOG_ENABLE = ioctl_number(.write, 0xf6, 8);
+pub const DET_LOG_READ = ioctl_number(.read_write, 0xf7, @sizeOf(DetLog));
+/// Debugging: the branch count and RIP at each RDTSC exit (KVM_DET_LOG_READ).
+pub const DetLog = extern struct { buf: u64, cap: u64, len: u64 };
 
 pub const Exit = enum(u32) {
     unknown = 0,
@@ -228,7 +233,22 @@ pub const DetState = extern struct {
     soft_exits: u64,
     /// Single-steps KVM handled in its exit fastpath.
     fast_steps: u64,
-    reserved: [5]u64,
+    /// Counter stops by perf throttling, undone at the exit (the guest would run uncounted).
+    throttles: u64,
+    /// Targets reached at an exit that took the place of the pending MTF exit (a host interrupt
+    /// while single-stepping): stopped there, not one instruction later.
+    late_steps: u64,
+    /// vCPU loads where the branch count had moved since the put (no guest runs in between: a
+    /// count of host work, or a lost one).
+    drifts: u64,
+    drift_last: i64,
+    /// The guest's XINUSE (XGETBV 1) at its last exit: XSAVE writes it as XSTATE_BV, and host
+    /// work may clear it (see the KVM patch), so KVM restores it at each entry; a snapshot keeps it.
+    xinuse: u64,
+    /// Entries where host work had cleared some of it, restored; and restorations that failed.
+    xinuse_fixes: u64,
+    xinuse_unfixed: u64,
+    reserved: [8]u64,
 };
 
 comptime {
@@ -246,7 +266,7 @@ comptime {
     assert(@sizeOf(Xsave) == 4096);
     assert(@sizeOf(Xcrs) == 392);
     assert(@sizeOf(MsrEntry) == 16);
-    assert(@sizeOf(DetState) == 128);
+    assert(@sizeOf(DetState) == 208);
 }
 
 pub const Error = error{ Interrupted, IoctlFailed };

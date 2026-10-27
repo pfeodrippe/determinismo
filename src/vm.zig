@@ -114,6 +114,7 @@ stats: Stats,
 /// idle skips and guest requests, each with branch count and RIP. Diffing two traces finds the
 /// first divergence of two runs.
 trace_fd: ?linux.fd_t,
+rdtsc_log_fd: ?linux.fd_t,
 /// Exploration hooks, attached by the caller between init and run (null when not exploring):
 /// the plugin that may override decisions, the tape recording what it overrode, and a tape's
 /// overrides when replaying one.
@@ -147,6 +148,8 @@ pub const Options = struct {
     /// Scratch memory for parsing guest events, reserved once by the caller (see events.zig).
     events_parse_buffer: []u8,
     trace_fd: ?linux.fd_t = null,
+    /// Debugging: where the (branch count, RIP) at each RDTSC exit goes when the VM ends.
+    rdtsc_log_fd: ?linux.fd_t = null,
     stop_at_setup_complete: bool = false,
     /// Stop at this virtual time, and optionally run a command in the guest there.
     moment_vtime_ns: ?u64 = null,
@@ -288,6 +291,8 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     try vm.init_vcpu();
     try snapshot.restore(vm);
     try vm.det_enable(options, .{ .tsc_base = snapshot.tsc });
+    var xinuse = snapshot.xinuse;
+    _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_SET_XINUSE, @intFromPtr(&xinuse));
     if (options.cpu_modulation) {
         vm.modulation = if (options.from_hold != null) snapshot.modulation.? else .{};
     }
@@ -301,6 +306,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
 
 pub fn deinit(vm: *VM) void {
     vm.serial.flush();
+    vm.rdtsc_log_write();
     _ = linux.munmap(@ptrCast(vm.run), vm.run_size);
     _ = linux.close(vm.vcpu_fd);
     _ = linux.munmap(vm.memory.ptr, vm.memory.len);
@@ -367,6 +373,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .events = undefined,
         .stats = .{},
         .trace_fd = options.trace_fd,
+        .rdtsc_log_fd = options.rdtsc_log_fd,
         .strategy = null,
         .tape_fd = null,
         .overrides = null,
@@ -413,6 +420,7 @@ fn det_enable(vm: *VM, options: *const Options, start: struct { tsc_base: u64 })
     };
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ENABLE, @intFromPtr(&config));
     assert((try vm.det_state()).tsc == start.tsc_base);
+    try vm.rdtsc_log_enable();
 }
 
 fn init_chipset(vm: *VM) !void {
@@ -1187,11 +1195,33 @@ fn trace(vm: *VM, comptime kind: []const u8, value: u64) !void {
     const state = try vm.det_state();
     var regs: kvm.Regs = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.GET_REGS, @intFromPtr(&regs));
-    var line_buffer: [128]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buffer, kind ++ " {d} branches={d} rip={x}\n", .{
-        value, state.branches, regs.rip,
+    var line_buffer: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, kind ++ " {d} branches={d} rip={x} rdtsc={d} " ++
+        "steps={d} overflows={d} soft={d} drifts={d} drift={d}\n", .{
+        value,            state.branches,  regs.rip,         state.rdtsc_exits,
+        state.mtf_steps,  state.overflows, state.soft_exits, state.drifts,
+        state.drift_last,
     }) catch unreachable;
     _ = linux.write(fd, line.ptr, line.len); // Best effort: a debugging aid.
+}
+
+/// Debugging: the log of RDTSC exits, (branch count, RIP) pairs, appended to rdtsc_log_fd.
+const rdtsc_log_cap = 1 << 22;
+
+fn rdtsc_log_enable(vm: *VM) !void {
+    if (vm.rdtsc_log_fd == null) return;
+    var cap: u64 = rdtsc_log_cap;
+    _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_ENABLE, @intFromPtr(&cap));
+}
+
+fn rdtsc_log_write(vm: *VM) void {
+    const fd = vm.rdtsc_log_fd orelse return;
+    const pairs = std.heap.page_allocator.alloc(u64, 2 * rdtsc_log_cap) catch return;
+    defer std.heap.page_allocator.free(pairs);
+    var request: kvm.DetLog = .{ .buf = @intFromPtr(pairs.ptr), .cap = rdtsc_log_cap, .len = 0 };
+    _ = kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_READ, @intFromPtr(&request)) catch return;
+    const bytes = std.mem.sliceAsBytes(pairs[0 .. 2 * request.len]);
+    _ = linux.write(fd, bytes.ptr, bytes.len);
 }
 
 fn irq_pulse(vm: *VM, irq: u32) !void {

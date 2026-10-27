@@ -420,6 +420,10 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .events_fd = if (arguments.events_path) |path| try open_for_writing(arena, path) else null,
         .events_parse_buffer = try arena.alloc(u8, Events.parse_buffer_size),
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
+        .rdtsc_log_fd = if (arguments.trace_path) |path|
+            try open_for_writing(arena, try std.fmt.allocPrint(arena, "{s}.rdtsc", .{path}))
+        else
+            null,
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
         .until = arguments.until,
