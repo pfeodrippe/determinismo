@@ -569,7 +569,10 @@ async function discoveryDraw() {
 const builtin = new Set(["test commands exit successfully", "nodes do not exit unexpectedly",
   "no process crashes (segfault, illegal instruction, ...)",
   "the kernel kills no process for lack of memory", "the kernel reports no warnings, BUGs or hung tasks",
-  "the guest finishes its scenario (no panic, hang or crash)"]);
+  "the guest finishes its scenario (no panic, hang or crash)",
+  "peak memory usage stays under 95% of the machine's memory",
+  "logging output stays under 200 MB per hour of virtual time", "host checks run to completion",
+  "the fault injector started", "timelines replay to their recorded history"]);
 function properties() {
   return (state.run.properties || []).map((p) => ({
     kind: p.type, message: p.message, location: p.location, status: p.status,

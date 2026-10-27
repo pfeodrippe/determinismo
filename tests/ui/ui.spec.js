@@ -79,6 +79,17 @@ test("a running run's page asks only for the timelines it does not have", async 
 });
 
 
+test("the run's timelines replayed as it ran show among determinismo's own properties", async ({ page }) => {
+  // Run 1's 16 timelines: the verifier replays timeline 15 as the run ends.
+  await page.goto("/#1");
+  const element = page.locator('.property[data-message="timelines replay to their recorded history"]');
+  await expect(element).toBeVisible();
+  await expect(element.locator(".badge")).toHaveText("passed");
+  await expect(element.locator(".counts")).toContainText("hit in 1");
+  const group = element.locator('xpath=preceding-sibling::div[contains(@class, "group-title")][1]');
+  await expect(group).toHaveText("determinismo");
+});
+
 test("a run stopped from its page resumes from it, and runs on", async ({ page, request }) => {
   await page.goto("/#4");
   const badge = page.locator("#main .badge").first();
