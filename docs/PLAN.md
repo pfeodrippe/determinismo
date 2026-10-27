@@ -60,9 +60,14 @@ event hashing, the guest module.
   written but not run yet; long-term archive later (QUESTIONS.md).
 - e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
-- UI: a minimap for thousands of timelines; "1.8 h wall" is a sum of wall times.
-- srv2: deploy everything since d66b9ec once the benchmark ends (its initramfs too: det-core,
-  det-profile).
+- UI: a minimap for thousands of timelines. Written, to check in a browser on the next host: the
+  progress bar and the Wall time of an elastic run (no --jobs) from the explorer's start, not
+  its timelines' wall times added up ("1.8 h wall").
+- Hosts (2026-10-27, night): srv2 was cancelled by mistake in Robot (its runs and ~/findings
+  gone with it), srv1 hung and is being cancelled; a W-2295 twin of srv2 from the auction is
+  next (infra/host/setup.sh builds its guest kernel itself). Waiting on it: the holders' memory
+  fix (a holder goes by itself under 8 GB available: 18 YugabyteDB timelines and their holders
+  filled srv2) and its tree e2e, then the hunt queue (YugabyteDB, Kafka, Dgraph).
 - Determinism (2026-10-27). Kafka's timelines (JVMs) did not replay. Found and fixed, in turn:
   VMs on a core's two hyperthreads perturb each other's branch counters (one VM per core);
   speculative page walks set Accessed bits the guest branched on (guest patch 0001); x86 Linux
