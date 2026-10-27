@@ -1539,7 +1539,8 @@ fn run_stop(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
 
 /// Continues a run that ended before its end (stopped, or its explorer interrupted): its
 /// explorer again, as it was asked and with the files it kept (a deploy since changes nothing
-/// of it), skipping the timelines its record has (explore --resume). Flat runs.
+/// of it), skipping the timelines its record has (explore --resume). Flat runs, and trees that
+/// recorded their timelines' summaries.
 fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     const shared = server.shared;
     shared.lock();
@@ -1560,8 +1561,15 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
         .ignore_unknown_fields = true,
     });
     if (!std.mem.eql(u8, asked.branching orelse "tree", "flat")) {
-        server.detail = "resume continues flat runs (a tree's archive of moments was its explorer's)";
-        return error.BadRequest;
+        // A tree continues from its timelines' summaries (recorded since resume came).
+        _ = run_file(server, id, "record.jsonl.summaries") catch {
+            server.detail = "this tree run has no timeline summaries to continue from (an older run)";
+            return error.BadRequest;
+        };
+        if (asked.strategy != null) {
+            server.detail = "a tree run with a strategy does not resume (its state was the strategy's)";
+            return error.BadRequest;
+        }
     }
     const machine = try std.json.parseFromSliceLeaky([]const []const u8, server.arena, try run_file(server, id, "machine.json"), .{});
     const directory = try run_directory(server, id);

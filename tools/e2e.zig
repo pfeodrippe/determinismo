@@ -108,7 +108,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
         .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
         .{ "pinned", check_pinned },                 .{ "saved", check_saved },
-        .{ "concurrent", check_concurrent },         .{ "ui", check_ui },
+        .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
+        .{ "ui", check_ui },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1037,6 +1038,69 @@ fn check_concurrent(context: *Context) !void {
     }
     expect(context, same == runs, "concurrent: one timeline run by {d} processes at once, " ++
         "the same history in {d}", .{ runs, same });
+}
+
+/// A run killed partway and resumed (--resume) explores what it would have whole: the same
+/// timelines (index, events hash), once each; flat, and a tree (from its recorded summaries).
+fn check_resume(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    for ([_][]const u8{ "flat", "tree" }) |branching| {
+        const system = [_][]const u8{
+            "--program",  program, "--scenario",   "bank", "--seed", "7", "--branching", branching,
+            "--branches", "48",    "--generation", "16",   "--jobs", "3",
+        };
+        const whole = try std.fmt.allocPrint(arena, "{s}/resume-{s}-whole.jsonl", .{ context.scratch, branching });
+        const parts = try std.fmt.allocPrint(arena, "{s}/resume-{s}-parts.jsonl", .{ context.scratch, branching });
+        _ = try explore(context, &(system ++ [_][]const u8{ "--record", whole }));
+        // Killed once a dozen timelines are recorded (its workers go with it).
+        var command: std.ArrayList(u8) = .empty;
+        try command.print(arena, "exec '{s}' explore", .{context.determinismo});
+        for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
+        for (system) |part| try command.print(arena, " '{s}'", .{part});
+        try command.print(arena, " --record '{s}' 2> /dev/null", .{parts});
+        var child = try std.process.spawn(context.io, .{
+            .argv = &.{ "sh", "-c", command.items },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        for (0..6000) |_| {
+            const text = std.Io.Dir.cwd().readFileAlloc(context.io, parts, arena, .limited(1 << 24)) catch "";
+            if (std.mem.count(u8, text, "{\"branch\":") >= 12) break;
+            sleep_ms(50);
+        }
+        _ = std.os.linux.kill(child.id.?, .TERM);
+        _ = try child.wait(context.io);
+        const interrupted = try record_timelines(context, parts);
+        _ = try explore(context, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
+        const expected = try record_timelines(context, whole);
+        const resumed = try record_timelines(context, parts);
+        const same = expected.len == 48 and expected.len == resumed.len and for (expected, resumed) |a, b| {
+            if (!std.mem.eql(u8, a, b)) break false;
+        } else true;
+        expect(context, same, "resume ({s}): killed at {d} timelines, resumed: the {d} timelines " ++
+            "of the whole run, once each ({d} recorded)", .{ branching, interrupted.len, expected.len, resumed.len });
+    }
+}
+
+/// A record's timelines as "index events_hash", sorted (duplicates kept: they would differ).
+fn record_timelines(context: *Context, path: []const u8) ![]const []const u8 {
+    const arena = context.arena;
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, arena, .limited(1 << 26)) catch "";
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"branch\":")) continue;
+        const index = field_json(line, "\"index\":") orelse continue;
+        const hash = field_json(line, "\"events_hash\":\"") orelse continue;
+        try out.append(arena, try std.fmt.allocPrint(arena, "{s:0>8} {s}", .{ index, hash }));
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    return out.items;
 }
 
 /// The crash leaves a core dump, which `extract` takes out of the runner at a later moment.
