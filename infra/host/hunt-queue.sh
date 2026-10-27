@@ -22,18 +22,33 @@ if timelines < window: sys.exit(1)
 before = [b for t, b in points if t <= timelines - window]
 sys.exit(0 if before and before[-1] == behaviors else 1)'
 }
-wait_run() { # <run id>
-  while running "$1"; do
-    if plateaued "$1"; then
-      echo "$(date +%H:%M) run $1: no new behavior lately, stopping it"
-      curl -s -X POST localhost:7878/runs/$1/stop > /dev/null
+wait_run() { # <run id>: until it has not run for 3 minutes running (a stop and a resume, or
+  # serve restarting, take seconds: not an end)
+  local idle=0
+  while [ $idle -lt 3 ]; do
+    if running "$1"; then
+      idle=0
+      if plateaued "$1"; then
+        echo "$(date +%H:%M) run $1: no new behavior lately, stopping it"
+        curl -s -X POST localhost:7878/runs/$1/stop > /dev/null
+      fi
+    else
+      idle=$((idle + 1))
     fi
     sleep 60
   done
 }
+start() { # <request JSON>: its run's id, once serve takes it (retried while serve is away)
+  local id=""
+  while [ -z "$id" ]; do
+    id=$(curl -s -X POST localhost:7878/runs -d "$1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' 2>/dev/null)
+    [ -n "$id" ] || sleep 30
+  done
+  echo "$id"
+}
 for request in "$@"; do
   wait_run "$current"
-  current=$(curl -s -X POST localhost:7878/runs -d "$request" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+  current=$(start "$request")
   echo "$(date +%H:%M) started run $current: $request"
 done
 wait_run "$current"
