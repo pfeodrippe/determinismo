@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# start.sh broker <id>: one KRaft node (broker and controller), its log in /data, formatted the
-# first time (a fixed cluster id: every node the same cluster). start.sh client: the client
+# start.sh broker <id> [format-unsynced]: one KRaft node (broker and controller), its log in
+# /data, formatted the first time (a fixed cluster id: every node the same cluster). start.sh client: the client
 # node on port 7000.
 set -e
 case "$1" in
@@ -29,6 +29,10 @@ PROPERTIES
   if [ ! -f /data/kafka/meta.properties ]; then
     /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /tmp/server.properties \
       --ignore-formatted > /dev/null
+    # Kafka writes bootstrap.checkpoint without forcing it to disk, and reads it at every start:
+    # a power loss before writeback leaves it empty and the node never starts (README). Made
+    # durable here, unless asked to format as Kafka does (the format-unsynced profile).
+    [ "${3:-}" = "format-unsynced" ] || sync /data/kafka/bootstrap.checkpoint /data/kafka
   fi
   export KAFKA_HEAP_OPTS="-Xms512m -Xmx512m"
   exec /opt/kafka/bin/kafka-server-start.sh /tmp/server.properties

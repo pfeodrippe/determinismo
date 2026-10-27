@@ -49,16 +49,32 @@ const timeout_ms = 30_000;
 const line_size_max = 512;
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .txn = txn_scenario } });
+    return System.main(init, .{
+        .describe = describe,
+        .scenarios = .{ .txn = txn_scenario },
+        // Each partition a list, each send an append to it, each partition read once faults stop
+        // (Jepsen's Kafka checker is Elle too): what the checks below cannot see, transactions
+        // ordered one way in a partition and the other way in another (G0, G1c).
+        .checks = .{ .elle = sdk.elle.check(.{ .consistency = "read-committed" }) },
+    });
 }
 
+/// `default`: the format's bootstrap.checkpoint made durable (start.sh), so that a power loss
+/// soon after it does not brick a broker (found here, README) and hide the rest.
+/// `format-unsynced`: formatted as Kafka does it, that finding's profile.
 fn describe(d: *System.Describe) !void {
-    const profile = try d.profile("default");
+    inline for (.{ "default", "format-unsynced" }) |profile_name| {
+        try describe_profile(try d.profile(profile_name), profile_name);
+    }
+}
+
+fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/kafka/Dockerfile" };
+    const format = if (comptime std.mem.eql(u8, profile_name, "default")) "synced" else profile_name;
     inline for (.{ "kafka-1", "kafka-2", "kafka-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}) },
+            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format },
             // The controller's port: open at once. The broker's opens once the quorum formed,
             // which needs the nodes started after this one.
             .ready = .{ .tcp = controller_port },
@@ -122,6 +138,9 @@ fn topic_create(context: *System.Context) !void {
 // The workload ----------------------------------------------------------------------------------
 
 fn transactions(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    const history: sdk.elle.History = .{};
+    var process = sdk.elle.process_new();
     var id: u64 = undefined;
     sdk.random_bytes(std.mem.asBytes(&id));
     id &= 0xff_ffff;
@@ -144,18 +163,23 @@ fn transactions(context: *System.Context) !void {
         const count = 1 + sdk.random_below(sends_max);
         const commit = sdk.random_below(abort_one_in) != 0;
         var values: [sends_max]u64 = undefined;
+        var mops: [sends_max]sdk.elle.Mop = undefined;
         var buffer: [256]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
         for (0..count) |position| {
             // Unique: the client, its transaction, the send.
             values[position] = (id << 12) | (sequence << 3) | position;
-            try writer.print(" {d}:{d}", .{ sdk.random_below(partitions), values[position] });
+            const partition = sdk.random_below(partitions);
+            mops[position] = .{ .append = .{ .key = partition, .value = values[position] } };
+            try writer.print(" {d}:{d}", .{ partition, values[position] });
         }
+        try history.invoke(arena, process, mops[0..count]);
         const reply = client.request("txn {s} {s}{s}", .{
             if (commit) "commit" else "abort", topic, writer.buffered(),
         }) catch {
             // No answer: the transaction may have committed, and the connection is done.
             note("u", values[0..count]);
+            try history.info(arena, process, mops[0..count]);
             sdk.sometimes(true, "a transaction got no answer", .{});
             return;
         };
@@ -168,6 +192,14 @@ fn transactions(context: *System.Context) !void {
         else
             "u";
         note(kind, values[0..count]);
+        switch (kind[0]) {
+            'c' => try history.ok(arena, process, mops[0..count]),
+            'a', 'f' => try history.fail(arena, process, mops[0..count]),
+            else => {
+                try history.info(arena, process, mops[0..count]);
+                process = sdk.elle.process_new(); // Elle's rule: one operation at a time.
+            },
+        }
         if (kind[0] == 'c') sdk.sometimes(true, "a transaction committed", .{});
         if (kind[0] == 'a') sdk.sometimes(true, "a transaction was aborted on purpose", .{});
         if (kind[0] == 'u') sdk.sometimes(true, "a transaction's outcome is unknown", .{ .reply = reply });
@@ -203,11 +235,17 @@ fn everything_read(context: *System.Context) !void {
     const noted = try transactions_parse(arena, log);
     // Every value read, and how often.
     var read: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    const history: sdk.elle.History = .{};
+    const process = sdk.elle.process_new();
     for (0..partitions) |partition| {
+        const unread = [_]sdk.elle.Mop{.{ .read = .{ .key = partition, .list = null } }};
+        try history.invoke(arena, process, &unread);
         const values = sdk.retry(read_attempts_max, 500, partition_read, .{ context, arena, partition }) catch |err| {
+            try history.fail(arena, process, &unread);
             sdk.assert_unreachable("every partition can be read once faults stop", .{ .err = @errorName(err) });
             return err;
         };
+        try history.ok(arena, process, &.{.{ .read = .{ .key = partition, .list = values } }});
         for (values) |value| {
             const entry = try read.getOrPut(arena, value);
             entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;

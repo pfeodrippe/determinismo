@@ -31,6 +31,13 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   Jepsen's: `acks=all`, idempotence, 1,000 retries, short timeouts. Errors are handled as the
   Java client's documentation says: on a `KafkaException`, abort, even after a commit timed out.
 
+## Profiles
+
+- `default`: as Kafka is deployed, except that start.sh forces `bootstrap.checkpoint` to disk
+  after formatting: the finding below would otherwise brick a broker in most timelines and hide
+  the rest.
+- `format-unsynced`: formatted as Kafka does it (that finding's profile).
+
 ## The workload and its properties
 
 Each driver is a client process: twenty transactions of one to four sends to random partitions,
@@ -48,6 +55,10 @@ Once faults stop, every partition is read from the beginning, `read_committed`:
 | every write of a committed transaction is read | lost write |
 | a transaction's writes are read all or none | torn transaction |
 | no write is read twice | duplicate |
+
+Elle checks the same history for read committed: each partition a list, each send an append,
+each partition's read once faults stop (as Jepsen's Kafka checker, Elle-based): transactions
+ordered one way in a partition and the other way in another (G0, G1c), aborted reads (G1a).
 
 Faults: the default ones (pauses, partitions, degraded links, sync stalls, throttling), plus
 restarts, power losses and graceful stops of the brokers. The client node gets none.
