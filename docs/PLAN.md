@@ -90,6 +90,12 @@ event hashing, the guest module.
   determinismo, not natively), two model disagreements, the abort hook bypassed.
 - Check: host checks' inputs (Events.check_buffer) in a tree's branches from in-run snapshots
   (the buffer travels by pointer, not by content).
+- ScyllaDB 4.2.rc3 (examples/scylla): runs; open question, a pending_delete log that reads
+  back as zeros after a power loss (README). Next tool: extents (FIEMAP) of a node's files from
+  the runner at a moment, frozen node, to tell what reached its disk.
+- Resume for tree runs (serve's default): record each timeline's summary; on resume, judge the
+  recorded generations again from them (no node making), and make nodes, by replay along the
+  path, only for timelines still to run.
 - Jepsen, blind: Redis-Raft #52 (crashes alone: the `crashes` profile, 60 s timelines, to rerun);
   MongoDB 4.2.6 sharded: SERVER-48307 found (2 of the first 89 timelines, both its forms);
   ScyllaDB 4.2.rc3 (examples/scylla: LWT list-append, Jepsen's configuration, own CQL client)

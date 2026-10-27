@@ -46,7 +46,7 @@ bugs are. Status: ✅ running, 🟡 next, blank later.
 | TiDB | 2.1.7 (2019) | auto-retry re-applying conflicting updates: read skew, lost updates | bank, long fork, register, sequential, set, append | ✅ examples/tidb (v8.5.8, Jepsen's configurations from jepsen-io/tidb) |
 | YugabyteDB | 1.1.9, 1.3.1 (2019) | read skew, lost inserts with partitions, DDL races (defaults as NULL), undercounting | append, bank, counter, long fork, set, rw | |
 | CockroachDB | beta 2016 | serializability violations | bank, register, sequential, sets, monotonic, adya | 🟡 examples/cockroachdb (v26.3.3) |
-| ScyllaDB | 4.2-rc3 (2020) | LWT split-brain (healthy clusters, then with membership changes), aborted LWT reads, non-isolated writes | cas-register, list-append, counter, batch | |
+| ScyllaDB | 4.2-rc3 (2020) | LWT split-brain (healthy clusters, then with membership changes), aborted LWT reads, non-isolated writes | cas-register, list-append, counter, batch | 🟡 examples/scylla (4.2.rc3, Jepsen's configuration and LWT list-append, our own CQL client): first timelines; an open question under power losses (README) |
 | Redis (Raft, Sentinel, Valkey) | Redis-Raft (2020), 2013/2014 posts | Redis-Raft: data loss on failover, split-brain, stale and aborted reads; Sentinel/WAIT lose writes by design | append, raft, cluster | Valkey cluster, Redis 8 |
 | TigerBeetle | 0.16.11 (2025) | crashes, latencies under single faults, a query predicate bug; strong against disk corruption | transfer, idempotence, lifecycle | interesting: Zig, deterministic itself |
 | RabbitMQ | 2014 post | lost messages with mirrored queues under partitions | queue | quorum queues today |
