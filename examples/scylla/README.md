@@ -73,6 +73,20 @@ supervision starts a killed Scylla again); `power-loss`, power losses too.
   discard), so Scylla's rotating commit log filled the guest's /run; and a node whose start
   failed partway ran without a pidfile, out of reach of every fault.
 
+## Found: #7258, blind
+
+The first hunt with the default profile (srv2, `--seed 3`, an hour, six at a time) failed
+Elle's check in 1 of its first 99 timelines. Timeline 91 replayed to the same history; Elle
+(run again on the history taken out of the guest at its end) found G1a and dirty updates:
+- a conditional BATCH of four appends (keys 6, 5, 5, 4) was answered Unavailable ("Cannot
+  achieve consistency level for cl SERIAL", as Scylla words it), which Jepsen's client and
+  this one take as definite: it did not happen;
+- three of its appends were then read, and later acknowledged appends to the same keys followed
+  them (the dirty update).
+
+That is #7258 as Jepsen reported it: LWT writes failing with "Not enough replicas available"
+visible to later reads, under partitions and crashes; fixed in 4.1.9 and 4.2.1.
+
 ## Open: power losses
 
 Under power losses, a node could stay down for good: in timeline 0 of seed 1, n5 lost power
