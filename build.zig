@@ -197,7 +197,11 @@ pub fn build(b: *std.Build) void {
             .name = "flecs-stress",
             .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
         });
-        const flags = [_][]const u8{ "-std=gnu11", "-DFLECS_SANITIZE", "-fsanitize-coverage=trace-pc-guard" };
+        // Frame pointers: determinismo's stacks and profiles unwind by them.
+        const flags = [_][]const u8{
+            "-std=gnu11",               "-DFLECS_SANITIZE", "-fsanitize-coverage=trace-pc-guard",
+            "-fno-omit-frame-pointer",
+        };
         flecs_stress.root_module.addCSourceFile(.{
             .file = b.path("examples/flecs/stress.c"),
             .flags = &(flags ++ [_][]const u8{ "-Wall", "-Wextra", "-DDETERMINISMO_COVERAGE" }),

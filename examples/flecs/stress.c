@@ -166,9 +166,20 @@ static void hooked_abort(void) {
     char details[details_max + 32];
     char escaped[details_max];
     size_t used = 0;
+    /* JSON: quotes and backslashes escaped, Flecs's terminal colors (ESC [ ... m) and other
+     * control characters left out. */
     for (const char *c = last_error; *c && used + 2 < sizeof escaped; c++) {
+        if (*c == 0x1b) {
+            while (c[1] && c[1] != 'm') c++;
+            if (c[1]) c++;
+            continue;
+        }
+        if ((unsigned char)*c < 0x20) {
+            escaped[used++] = ' ';
+            continue;
+        }
         if (*c == '"' || *c == '\\') escaped[used++] = '\\';
-        escaped[used++] = (*c == '\n' || *c == '\t') ? ' ' : *c;
+        escaped[used++] = *c;
     }
     escaped[used] = 0;
     snprintf(details, sizeof details, "{\"error\":\"%s\"}", escaped);
@@ -199,7 +210,7 @@ static void Move(ecs_iter_t *it) {
     Position *p = ecs_field(it, Position, 0);
     const Velocity *v = ecs_field(it, Velocity, 1);
     const Slot *s = ecs_field(it, Slot, 2);
-    atomic_fetch_or(&frame_stages, 1u << (ecs_stage_get_id(it->world) & 31));
+    atomic_fetch_or(&frame_stages, 1u << (ecs_stage_get_id(it->stage) & 31));
     for (int i = 0; i < it->count; i++) {
         p[i].x += v[i].x;
         p[i].y += v[i].y;
@@ -211,14 +222,16 @@ static void Move(ecs_iter_t *it) {
 static void Decay(ecs_iter_t *it) {
     Health *h = ecs_field(it, Health, 0);
     const Slot *s = ecs_field(it, Slot, 2);
-    atomic_fetch_or(&frame_stages, 1u << (ecs_stage_get_id(it->world) & 31));
+    atomic_fetch_or(&frame_stages, 1u << (ecs_stage_get_id(it->stage) & 31));
     for (int i = 0; i < it->count; i++) {
         uint32_t before = atomic_exchange(&model[s[i].index].decayed, frame);
         DET_ALWAYS(before != frame, "a multi-threaded system visits each entity once a frame", NULL);
         h[i].value -= 1;
         if (h[i].value > 0) continue;
-        ecs_delete(it->world, it->entities[i]); /* Deferred: in the system's stage. */
-        DET_SOMETIMES(ecs_stage_get_id(it->world) > 0, "a system deletes an entity from a worker thread", NULL);
+        /* Queued in the system's stage (it->world is the world itself, since Flecs master's
+         * 2c517a7: deleting there runs at once, in a table being iterated). */
+        ecs_delete(it->stage, it->entities[i]);
+        DET_SOMETIMES(ecs_stage_get_id(it->stage) > 0, "a system deletes an entity from a worker thread", NULL);
     }
 }
 
@@ -433,7 +446,7 @@ static int operate(void) {
         int parent = op == 1 ? slot : -1;
         if (op == 1 && parent < 0) return -1;
         int prefab = op == 2 ? (int)det_random_below(prefabs_max) : -1;
-        ecs_entity_t e = prefab >= 0 ? ecs_new_w_pair(writer, EcsIsA, prefabs[prefab].entity) : ecs_new(world);
+        ecs_entity_t e = prefab >= 0 ? ecs_new_w_pair(writer, EcsIsA, prefabs[prefab].entity) : ecs_new(writer);
         entity_ready(free, e);
         if (prefab >= 0) {
             model[free].prefab = (int16_t)prefab;

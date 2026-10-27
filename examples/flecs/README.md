@@ -31,8 +31,30 @@ its memory): pauses of the process or of one of its threads, CPU throttling, clo
 
 ## Status
 
-v4.1.6 passes everything (8 timelines). Master (3988dee) aborts in 30 of 32 timelines on Flecs's
-own check `assert(!(world->flags & EcsWorldReadonly))` in `flecs_table_ensure` (a table created
-while readonly), with two model disagreements (a component's value, a deleted entity alive):
-under investigation (the harness's readonly batches are new with master, where defer_begin/end
-are gone).
+v4.1.6 passes everything. So does master (3988dee) since the harness uses master's API: 32
+timelines, every property, every "sometimes" reached (worker-thread deletes, observers during
+merges, frames on several threads).
+
+### Found: master's old-idiom hazard (2c517a7, "Remove implicit defer mode from core")
+
+Under determinismo, master first aborted in 30 of 32 timelines on Flecs's own check
+`assert(!(world->flags & EcsWorldReadonly))` in `flecs_table_ensure`. `determinismo stacks` at the
+moment (frame pointers on) showed where: `ecs_progress` > worker pipeline > the `Decay` system >
+`ecs_delete(it->world, e)` > `flecs_on_delete` > `flecs_table_ensure`. Bisected natively (a
+16-line repro, outside determinismo) to 2c517a7 (2026-09-08), which made it the rule: systems and
+observers get `it->stage` to queue operations, and `it->world` is the world itself, whose
+operations run at once. So the idiom every Flecs program used until then, `ecs_delete(it->world,
+e)` in a system, now deletes at once, inside the table the system is iterating, and nothing says
+so, `FLECS_SANITIZE` included:
+
+- Single-threaded, other entities' writes are lost: six entities with health 1, 2, 3, 1, 2, 3, a
+  system that decrements each and deletes at 0; after the first frame e4 and e5 still have their
+  starting values (the delete moved the table's last row while the system wrote on), and e4 is
+  alive a frame after it reached 0. v4.1.6: every value right.
+- With worker threads, `double free or corruption (fasttop)`, or the readonly assert above when a
+  delete needs a new table (an entity that is a parent or a relationship target).
+
+Locking a table while a system iterates it, as Flecs did (the LOCKED_STORAGE errors), would turn
+the silent corruption into an error; master's open PR #2338 locks tables for OnAdd/OnRemove
+hooks and observers only. Not reported upstream (findings stay here); nothing in Flecs's tracker
+mentions it as of 2026-10-27.
