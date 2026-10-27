@@ -265,6 +265,21 @@ pub const Owner = struct {
         _ = linux.close(vm.kvm_fd);
         if (vm.events.log_fd) |fd| _ = linux.close(fd);
         oom_first();
+        // Until the explorer asks, or is gone: a holder outlives its worker, never its explorer
+        // (killed, or ended with timelines in flight whose holders it never heard of).
+        const explorer = linux.pidfd_open(owner.explorer, 0);
+        if (linux.errno(explorer) != .SUCCESS) linux.exit_group(0);
+        var polled = [_]linux.pollfd{
+            .{ .fd = listener, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = @intCast(explorer), .events = linux.POLL.IN, .revents = 0 },
+        };
+        while (true) {
+            const ready = linux.poll(&polled, polled.len, -1);
+            if (linux.errno(ready) == .INTR) continue;
+            if (linux.errno(ready) != .SUCCESS or polled[1].revents != 0) linux.exit_group(0);
+            if (polled[0].revents != 0) break;
+        }
+        _ = linux.close(@intCast(explorer));
         const accepted = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(accepted) != .SUCCESS) linux.exit_group(1);
         _ = linux.close(listener);
