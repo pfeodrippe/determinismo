@@ -1,4 +1,5 @@
-- [ ] test TLC ( https://github.com/tlaplus/tlaplus )
+- [x] test TLC ( https://github.com/tlaplus/tlaplus )
+- [ ] speed and exploration quality
 - [ ] test determinismo itself (nested kvm)
 - [ ] can we do load/perf test with it ?
 - [ ] writing tests in clojure (using zig or some abstraction that communicates using something else?)
@@ -12,3 +13,4 @@
   - [ ] make memory readable/modifiable (via instrumentation as well) so then we can rewind, start a new timeline and modify it in a atomic way (e.g. before calling a function so some value from a struct/map/whatever changes) or that we can modify a request
   - [ ] for all cases above, how to make it so that the timelike "likely" follows the path that it was following? maybe we could have some way to define which points we want to be called and that (because the service is instrumented), then we are able to confirm it, backtracking again a little bit and restarting with another seed if not the case ?
 - [ ] does the elle append_many needs to be this complex or it's because the API for a custom check is not yet good enough ?
+- [ ] modified clojure compiler so properties are automatic for clojure projects
