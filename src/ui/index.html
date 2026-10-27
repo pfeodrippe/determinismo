@@ -53,6 +53,12 @@ section.closed > .body { display: none; }
 .tabs button { border: 0; border-radius: 0; background: transparent; padding: 4px 12px; }
 .tabs button.on { background: var(--panel-2); }
 .group-title { margin: 14px 0 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+.causality-legend { margin: 4px 0; font-size: 12px; }
+.causality-options { margin: 8px 0 2px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.causality-options input { font-size: 12px; padding: 2px 4px; margin-left: 4px; }
+.causality-legend span { margin-left: 10px; }
+.causality-jumps { margin: 6px 0; font-size: 13px; }
+.causality-jumps > div { padding: 3px 0; }
 .property { border-top: 1px solid var(--line); }
 .property > .row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; cursor: pointer; }
 .property > .row .name { flex: 1; }
@@ -207,6 +213,8 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
 "use strict";
 const state = {
   runs: [], runId: null, run: null, poll: null, tab: "all", filter: "", logs: null,
+  causality: new Map(), // Property message -> its latest causality analysis (causalityRefresh).
+  causalityLoaded: null, causalityTimer: null,
   view: "report", notebook: null, // The run's notebook: cells, their outputs, action results.
   open: new Set(["findings", "properties", "map"]), // Sections shown expanded.
   discovery: null, // The last discovery chart drawn ({runId, html}): kept until the next one.
@@ -234,10 +242,22 @@ const query = async (request) => lines(await api(`/runs/${state.runId}/query`, r
 
 // Runs ------------------------------------------------------------------------------------
 // A run, from its events database: its record and stats, its timelines, its properties.
+// A run's timelines are kept (a long run's list is megabytes): each refresh asks only for those
+// ingested since (in the order they finished), and for the whole list again only if the page
+// has more than the run (another run under the same number).
+const timelinesKept = new Map(); // Run id -> its timelines, by index.
 async function runFetch(id) {
-  const [info, branches, properties] = await Promise.all([
-    apiJson(`/runs/${id}`), apiJson(`/runs/${id}/timelines`), apiJson(`/runs/${id}/properties`)]);
-  return { ...info, branches, properties };
+  let kept = timelinesKept.get(id);
+  // The first time, all at once.
+  const all = kept ? null : apiJson(`/runs/${id}/timelines`);
+  const [info, properties] = await Promise.all([apiJson(`/runs/${id}`), apiJson(`/runs/${id}/properties`)]);
+  const total = info.stats && info.stats.timelines;
+  if (kept && !(total != null && kept.length > total)) {
+    const more = await apiJson(`/runs/${id}/timelines?offset=${kept.length}`);
+    if (more.length) kept = kept.concat(more).sort((a, b) => a.index - b.index);
+  } else kept = await (all || apiJson(`/runs/${id}/timelines`));
+  timelinesKept.set(id, kept);
+  return { ...info, branches: kept, properties };
 }
 // Runs forked from moments of others, kept once they ended: subtrees in the tree.
 const details = new Map();
@@ -617,6 +637,7 @@ async function examplesToggle(element) {
   box.hidden = !box.hidden;
   if (box.hidden) { state.examplesOpen.delete(message); return; }
   state.examplesOpen.add(message);
+  if (state.causalityLoaded !== state.runId) { state.causalityLoaded = state.runId; causalityRefresh(); }
   if (state.examples.has(message)) return examplesDraw(element);
   box.innerHTML = `<div class="muted">Loading examples…</div>`;
   const conditions = exampleConditions(message, element.dataset.kind);
@@ -664,14 +685,20 @@ function examplesDraw(element) {
       <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
       <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
     </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.filter((example) => !failingBranches.has(example.branch)).length} passing. Click an example for its logs.${loaded.note ? ` ${escape(loaded.note)}` : ""}</div>
+    ${failing.length ? causalityOptionsHtml() : ""}
     <div class="causality-result"></div>`
     : `<div class="muted">No assertion events for this property (determinismo checks it when a timeline ends).</div>`;
   box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
     logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
   box.querySelectorAll("button.causality").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
-    causalityRun($(".causality-result", box), Number(button.dataset.branch), message);
+    causalityRun(message, Number(button.dataset.branch));
   }));
+  box.querySelectorAll(".causality-options [data-option]").forEach((input) => input.addEventListener("change", () => {
+    causalityOptions[input.dataset.option] = input.value;
+    try { localStorage.setItem("causalityOptions", JSON.stringify(causalityOptions)); } catch { /* Kept for this page only. */ }
+  }));
+  causalityDraw(message);
 }
 
 // Findings: what changed since the previous run of the same system and scenario.
@@ -704,36 +731,199 @@ async function findingsLoad() {
 }
 
 // Causality analysis (causality.zig): the failure's probability at moments of the timeline,
-// from futures forked there. Jumps mark where the timeline made the bug likely.
-async function causalityRun(box, branch, property) {
-  box.innerHTML = `<div class="muted">Causality of branch ${branch}: forking futures…</div>`;
-  let job;
-  try { job = await apiJson(`/runs/${state.runId}/causality`, { branch, property, points: 10, futures: 16 }); }
-  catch (error) { box.innerHTML = `<div class="fail-text">${escape(error.message)}</div>`; return; }
-  for (;;) {
-    const result = await apiJson(`/runs/${state.runId}/causality/${job.id}`);
-    box.innerHTML = causalityChart(branch, result.points, result.done);
-    box.querySelectorAll("[data-vtime]").forEach((bar) => bar.addEventListener("click", () =>
-      logsOpen(branch, Number(bar.dataset.vtime))));
-    if (result.done) return;
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+// from futures forked there (from snapshots of it saved to disk). A jump marks where the timeline
+// made the bug likely: the faults injected in that window are named on it. Analyses are the
+// run's (GET /runs/<id>/causality): a property shows its latest one, running or done.
+async function causalityRefresh() {
+  const run = state.runId;
+  let analyses;
+  try { analyses = await apiJson(`/runs/${run}/causality`); } catch { return; }
+  if (state.runId !== run) return;
+  for (const analysis of analyses) {
+    const property = analysis.of && analysis.of.property;
+    if (!property) continue;
+    const known = state.causality.get(property);
+    if (known && known.run === run && known.id > analysis.id) continue;
+    const faults = known && known.run === run && known.id === analysis.id ? known.faults : null;
+    state.causality.set(property, { ...analysis, run, branch: analysis.of.branch, faults });
   }
+  for (const property of state.causality.keys()) causalityDraw(property);
+  clearTimeout(state.causalityTimer);
+  if (analyses.some((analysis) => !analysis.done)) state.causalityTimer = setTimeout(causalityRefresh, 3000);
 }
-function causalityChart(branch, points, done) {
-  if (!points.length) return `<div class="muted">Causality of branch ${branch}: ${done ? "the property did not fail again" : "forking futures…"}</div>`;
-  const width = 520, height = 140, left = 36, bottom = 22, step = (width - left) / points.length;
-  const bars = points.map((point, i) => {
-    const h = (height - bottom - 8) * point.probability;
-    const html = `<div class="t-title">${point.vtime_ms} ms: ${(point.probability * 100).toFixed(0)}% likely to fail</div>
-      ${point.failing} of ${point.futures} futures forked here fail.<div class="t-foot">Click for the logs up to here</div>`;
-    return `<g data-vtime="${point.vtime_ms * 1e6}" style="cursor:pointer" ${tipAttr(html)}><rect x="${left + i * step + 2}" y="${height - bottom - h}"
-      width="${step - 4}" height="${Math.max(h, 1)}" fill="${point.probability >= 0.99 ? "#f0506e" : "#8f7cf7"}"></rect>
-      <text x="${left + i * step + step / 2}" y="${height - 6}" fill="#9a9eab" font-size="9" text-anchor="middle">${point.vtime_ms}</text></g>`;
+// The analysis's parameters (causality.zig), kept per browser: the planner (built in, a plugin's
+// command, tcp://host:port as the Clojure host's, or @name uploaded), the moments of its first
+// round, futures per moment, rounds after it, and the jump that is narrowed down.
+let causalityOptions = { planner: "", points: 8, futures: 16, refine: 6, jump_min: 0.2 };
+try { Object.assign(causalityOptions, JSON.parse(localStorage.getItem("causalityOptions") || "{}")); } catch { /* Defaults. */ }
+function causalityOptionsHtml() {
+  const field = (name, label, width, tip, attributes = "") => `<label data-tip="${escape(tip)}">${label}
+    <input data-option="${name}" value="${escape(String(causalityOptions[name]))}" style="width:${width}" ${attributes}></label>`;
+  return `<div class="causality-options muted">Causality:
+    ${field("planner", "planner", "190px", "Which moments to analyze: empty for the built-in one (evenly, then halfway inside each jump); a plugin: tcp://127.0.0.1:9102 (the Clojure host's planners: faults, bisect, dense), @name (uploaded), or a command", 'placeholder="built-in"')}
+    ${field("points", "moments", "40px", "Moments in the first round, evenly to the failure (and one just after the setup snapshot)", 'type="number" min="1" max="64"')}
+    ${field("futures", "futures", "40px", "Futures forked from each moment: more, a narrower interval", 'type="number" min="1" max="256"')}
+    ${field("refine", "rounds", "36px", "Rounds after the first, at most: the planner narrows the jumps", 'type="number" min="0" max="20"')}
+    ${field("jump_min", "jump", "44px", "A change in probability this large between two moments is narrowed down", 'type="number" min="0.01" max="1" step="0.05"')}</div>`;
+}
+async function causalityRun(property, branch) {
+  const run = state.runId;
+  state.causality.set(property, { run, id: Infinity, branch, of: { branch, property }, points: [], done: false, starting: true });
+  causalityDraw(property);
+  const options = causalityOptions;
+  const body = { branch, property, points: Number(options.points), futures: Number(options.futures),
+    refine: Number(options.refine), jump_min: Number(options.jump_min) };
+  if (String(options.planner).trim()) body.planner = String(options.planner).trim();
+  try {
+    await apiJson(`/runs/${run}/causality`, body);
+  } catch (error) {
+    state.causality.set(property, { run, id: Infinity, branch, points: [], done: true, error: error.message });
+    causalityDraw(property);
+    return;
+  }
+  state.causality.delete(property); // The listing has it now.
+  await causalityRefresh();
+}
+// The faults the timeline went through up to the failure (its ancestors' included): what the
+// jumps are named after.
+async function causalityFaults(property, analysis) {
+  if (analysis.faults || analysis.faultsLoading || !analysis.of || analysis.of.failure_ms == null) return;
+  analysis.faultsLoading = true;
+  try {
+    analysis.faults = await query({ condition: "event=fault", branch: analysis.branch,
+      up_to_vtime: analysis.of.failure_ms / 1000 + 1, limit: 5000 });
+  } catch { analysis.faults = []; }
+  causalityDraw(property);
+}
+function causalityDraw(property) {
+  const analysis = state.causality.get(property);
+  if (!analysis || analysis.run !== state.runId) return;
+  const element = [...document.querySelectorAll(".property")].find((other) => other.dataset.message === property);
+  const box = element && $(".causality-result", element);
+  if (!box) return;
+  if (analysis.error) { box.innerHTML = `<div class="fail-text">${escape(analysis.error)}</div>`; return; }
+  if (analysis.points.length) causalityFaults(property, analysis);
+  box.innerHTML = causalityChart(analysis);
+  box.querySelectorAll("[data-vtime]").forEach((target) => target.addEventListener("click", () =>
+    logsOpen(analysis.branch, Number(target.dataset.vtime))));
+  // Zoom: drag across the chart for a range, a jump's "zoom" for its window, double click or
+  // "whole timeline" back.
+  const zoom = (view) => { analysis.view = view; causalityDraw(property); };
+  box.querySelectorAll("[data-zoom-from]").forEach((link) => link.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const from = Number(link.dataset.zoomFrom), to = Number(link.dataset.zoomTo), pad = Math.max((to - from) * 0.5, 5);
+    zoom({ x0: from - pad, x1: to + pad });
+  }));
+  const whole = box.querySelector("[data-zoom-reset]");
+  if (whole) whole.addEventListener("click", () => zoom(null));
+  const svg = box.querySelector("svg.causality-chart");
+  if (!svg) return;
+  const at = (event) => {
+    const rect = svg.getBoundingClientRect(), d = svg.dataset;
+    const x = (event.clientX - rect.left) / rect.width * Number(d.width);
+    return Number(d.x0) + (x - Number(d.left)) / (Number(d.right) - Number(d.left)) * (Number(d.x1) - Number(d.x0));
+  };
+  let from = null;
+  svg.addEventListener("mousedown", (event) => { if (event.button === 0) from = { ms: at(event), x: event.clientX }; });
+  svg.addEventListener("mouseup", (event) => {
+    if (!from) return;
+    const moved = Math.abs(event.clientX - from.x) > 6, to = at(event);
+    if (moved) zoom({ x0: Math.min(from.ms, to), x1: Math.max(from.ms, to) });
+    from = null;
+  });
+  svg.addEventListener("dblclick", () => zoom(null));
+}
+// Neighbors whose probabilities differ by a fifth or more (causality.zig refines those).
+function causalityJumps(points) {
+  const jumps = [];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i];
+    if (Math.abs(b.probability - a.probability) >= 0.2) jumps.push({ a, b });
+  }
+  return jumps;
+}
+function faultName(event) {
+  const d = (event.event && event.event.details) || {};
+  const kind = [d.kind, d.flavor].filter(Boolean).join(" ");
+  return `${kind || "fault"}${d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}`;
+}
+function causalityChart(analysis) {
+  const of = analysis.of || {};
+  const planner = of.planner && of.planner !== "built-in" ? ` · planner ${escape(of.planner)}` : "";
+  const number = Number.isFinite(analysis.id) ? ` · analysis ${analysis.id}` : "";
+  const title = `<div class="group-title">Bug probability · branch ${analysis.branch}${planner}${number}${analysis.done ? "" : " (running)"}</div>`;
+  const points = [...analysis.points].sort((x, y) => x.vtime_ms - y.vtime_ms);
+  if (!points.length) return title + `<div class="muted">${analysis.done ? "The property did not fail again in this timeline's replay."
+    : "Saving the timeline's moments to disk, then forking futures from each…"}</div>`;
+  const W = 900, H = 300, L = 46, R = 18, T = 18, B = 40;
+  const x0 = analysis.view ? analysis.view.x0 : of.snapshot_ms != null ? of.snapshot_ms : points[0].vtime_ms;
+  const x1 = analysis.view ? Math.max(analysis.view.x1, x0 + 1)
+    : Math.max(of.failure_ms != null ? of.failure_ms : points[points.length - 1].vtime_ms, x0 + 1);
+  const xs = (ms) => L + (ms - x0) / (x1 - x0) * (W - L - R);
+  const ys = (p) => T + (1 - p) * (H - T - B);
+  const muted = "#9a9eab", grid = "rgba(154,158,171,0.18)";
+  let svg = "";
+  for (const p of [0, 0.25, 0.5, 0.75, 1]) {
+    svg += `<line x1="${L}" x2="${W - R}" y1="${ys(p)}" y2="${ys(p)}" stroke="${grid}"/>
+      <text x="${L - 6}" y="${ys(p) + 3}" fill="${muted}" font-size="10" text-anchor="end">${p * 100}%</text>`;
+  }
+  const span_s = (x1 - x0) / 1000;
+  const step = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300]
+    .find((candidate) => span_s / candidate <= 12) || 600;
+  const digits = step < 0.01 ? 3 : step < 0.1 ? 2 : 1;
+  for (let i = Math.ceil(x0 / 1000 / step); i * step * 1000 <= x1; i++) {
+    const t = i * step, x = xs(t * 1000);
+    svg += `<line x1="${x}" x2="${x}" y1="${T}" y2="${H - B}" stroke="${grid}"/>
+      <text x="${x}" y="${H - B + 14}" fill="${muted}" font-size="10" text-anchor="middle">${+t.toFixed(digits)}s</text>`;
+  }
+  svg += `<text x="${(L + W - R) / 2}" y="${H - 6}" fill="${muted}" font-size="10" text-anchor="middle">virtual time of branch ${analysis.branch}</text>`;
+  // Jumps: the window, a line where it ends, the faults injected in it.
+  const jumps = causalityJumps(points);
+  const faults = analysis.faults || [];
+  const named = jumps.map((jump) => ({ ...jump, faults: faults.filter((event) =>
+    event.vtime_ns > jump.a.vtime_ms * 1e6 && event.vtime_ns <= jump.b.vtime_ms * 1e6) }));
+  named.forEach((jump, i) => {
+    const xa = xs(jump.a.vtime_ms), xb = xs(jump.b.vtime_ms);
+    const label = jump.faults.length ? jump.faults.slice(0, 2).map(faultName).join(", ") + (jump.faults.length > 2 ? ` +${jump.faults.length - 2}` : "")
+      : analysis.faults ? "no fault: the program's own course" : "";
+    const tip = `<div class="t-title">${seconds(jump.a.vtime_ms * 1e6)} → ${seconds(jump.b.vtime_ms * 1e6)}: ${(jump.a.probability * 100).toFixed(0)}% → ${(jump.b.probability * 100).toFixed(0)}%</div>
+      ${jump.faults.length ? jump.faults.map((event) => `${seconds(event.vtime_ns)} ${escape(faultName(event))}`).join("<br>") : "No fault injected in this window."}
+      <div class="t-foot">Click for the logs up to ${seconds(jump.b.vtime_ms * 1e6)}</div>`;
+    svg += `<g data-clip data-vtime="${jump.b.vtime_ms * 1e6}" style="cursor:pointer" ${tipAttr(tip)}>
+      <rect x="${xa}" y="${T}" width="${Math.max(xb - xa, 2)}" height="${H - T - B}" fill="rgba(45,212,191,0.10)"/>
+      <line x1="${xb}" x2="${xb}" y1="${T}" y2="${H - B}" stroke="#2dd4bf" stroke-width="1.5"/>
+      ${label ? `<text x="${Math.min(xb + 4, W - R - 4)}" y="${T + 12 + (i % 3) * 13}" fill="#2dd4bf" font-size="11" text-anchor="${xb > W - 200 ? "end" : "start"}">${escape(label)}</text>` : ""}</g>`;
+  });
+  // The 90% interval, the probability, the failure.
+  const band = points.map((point) => `${xs(point.vtime_ms)},${ys(point.high != null ? point.high : point.probability)}`)
+    .concat([...points].reverse().map((point) => `${xs(point.vtime_ms)},${ys(point.low != null ? point.low : point.probability)}`)).join(" ");
+  svg += `<polygon data-clip points="${band}" fill="rgba(143,124,247,0.35)" stroke="none"/>
+    <polyline data-clip points="${points.map((point) => `${xs(point.vtime_ms)},${ys(point.probability)}`).join(" ")}" fill="none" stroke="#7cc4ff" stroke-width="1.5"/>`;
+  if (of.failure_ms != null) svg += `<line data-clip x1="${xs(of.failure_ms)}" x2="${xs(of.failure_ms)}" y1="${T}" y2="${H - B}" stroke="#f0506e" stroke-dasharray="4 3"/>
+    <text data-clip x="${xs(of.failure_ms) - 4}" y="${H - B - 6}" fill="#f0506e" font-size="10" text-anchor="end">failure</text>`;
+  svg += points.map((point) => {
+    const tip = `<div class="t-title">${seconds(point.vtime_ms * 1e6)}: ${(point.probability * 100).toFixed(0)}% likely to fail</div>
+      ${point.failing} of ${point.futures} futures forked here fail${point.low != null ? ` (90%: ${(point.low * 100).toFixed(0)}–${(point.high * 100).toFixed(0)}%)` : ""}.
+      <div class="t-foot">Click for the logs up to here</div>`;
+    return `<circle data-clip data-vtime="${point.vtime_ms * 1e6}" cx="${xs(point.vtime_ms)}" cy="${ys(point.probability)}" r="4" fill="#7cc4ff" stroke="#1d1f27" style="cursor:pointer" ${tipAttr(tip)}/>`;
   }).join("");
-  const axis = [0, 0.5, 1].map((p) => `<text x="${left - 6}" y="${height - bottom - (height - bottom - 8) * p + 3}" fill="#9a9eab" font-size="9" text-anchor="end">${p * 100}%</text>`).join("");
-  return `<div class="group-title">Causality of branch ${branch}${done ? "" : " (running)"}: probability of the failure, by moment (ms)</div>
-    <svg width="${width}" height="${height}">${axis}${bars}</svg>
-    <div class="muted">A jump means the timeline made the bug likely just before: click the bar after it for the logs up to there.</div>`;
+  const legend = `<div class="muted causality-legend"><span style="color:#7cc4ff">●</span> bug probability
+    <span style="color:#8f7cf7">■</span> 90% interval <span style="color:#2dd4bf">|</span> changepoints (and the faults in them)
+    <span style="color:#f0506e">┆</span> the failure</div>`;
+  const list = named.length ? `<div class="causality-jumps">${named.map((jump) => `<div class="clickable" data-vtime="${jump.b.vtime_ms * 1e6}">
+      <a class="clickable" data-zoom-from="${jump.a.vtime_ms}" data-zoom-to="${jump.b.vtime_ms}">zoom</a>
+      <span class="mono">${seconds(jump.a.vtime_ms * 1e6)} → ${seconds(jump.b.vtime_ms * 1e6)}</span>
+      ${(jump.a.probability * 100).toFixed(0)}% → ${(jump.b.probability * 100).toFixed(0)}%:
+      ${jump.faults.length ? jump.faults.map((event) => `${escape(faultName(event))} <span class="muted">at ${seconds(event.vtime_ns)}</span>`).join(", ")
+        : analysis.faults ? `<span class="muted">no fault injected: look at the logs</span>` : `<span class="muted">…</span>`}</div>`).join("")}</div>`
+    : analysis.done ? `<div class="muted">No jump: the bug was ${points[0].probability >= 0.5 ? "already likely" : "unlikely until the very end"} at every moment analyzed.</div>` : "";
+  const zoomed = analysis.view ? ` <a class="clickable" data-zoom-reset>whole timeline</a>` : "";
+  // Everything drawn inside the axes only (a zoom leaves points outside).
+  const clip = `<clipPath id="causality-clip"><rect x="${L}" y="${T - 6}" width="${W - L - R}" height="${H - T - B + 12}"/></clipPath>`;
+  const plotted = svg.replaceAll("data-clip", 'clip-path="url(#causality-clip)"');
+  return title + `<svg class="causality-chart" viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;user-select:none"
+    data-width="${W}" data-left="${L}" data-right="${W - R}" data-x0="${x0}" data-x1="${x1}">${clip}${plotted}</svg>` + legend + zoomed + list +
+    `<div class="muted">Each point: its futures forked from a snapshot of the timeline saved there. A jump means the timeline made the bug likely inside it: click it for the logs up to there. Drag across the chart to zoom, double click to see it all.</div>`;
 }
 
 // Tooltips: any element with data-tip (HTML) shows it in one styled tooltip near the pointer.

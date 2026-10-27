@@ -107,7 +107,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
         .{ "changed", check_changed },               .{ "readdress", check_readdress },
         .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
-        .{ "pinned", check_pinned },
+        .{ "pinned", check_pinned },                 .{ "saved", check_saved },
+        .{ "ui", check_ui },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -516,6 +517,66 @@ fn check_serve(context: *Context) !void {
     });
 }
 
+/// The web UI in a browser (tests/ui, Playwright), against a serve with three runs of the bank
+/// example: one finished with a failing property (its causality analysis, run from the page to
+/// its end), another finished, and one running while the tests look at it.
+fn check_ui(context: *Context) !void {
+    const arena = context.arena;
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(context.io, "tests/ui/node_modules/@playwright/test", .{}) catch {
+        std.debug.print("SKIP ui: tests/ui has no Playwright (npm ci && npx playwright install " ++
+            "--with-deps chromium there)\n", .{});
+        return;
+    };
+    const address = "127.0.0.1:7892";
+    const url = "http://" ++ address;
+    const data = try std.fs.path.join(arena, &.{ context.scratch, "ui-serve" });
+    cwd.deleteTree(context.io, data) catch {};
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ context.determinismo, "serve", "--listen", address, "--data", data });
+    try argv.appendSlice(arena, context.machine);
+    var server = try std.process.spawn(context.io, .{ .argv = argv.items, .stdout = .ignore, .stderr = .ignore });
+    defer server.kill(context.io);
+    for (0..50) |_| {
+        const listed = curl(context, &.{url ++ "/runs"}) catch "";
+        if (listed.len > 0) break;
+        sleep_ms(100);
+    }
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    for ([_][]const u8{
+        "\"seed\":3,\"branches\":16",
+        "\"seed\":4,\"branches\":8",
+    }) |runs| {
+        const body = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\",{s}}}", .{
+            std.json.fmt(program, .{}), runs,
+        });
+        _ = try curl(context, &.{ "-X", "POST", "-d", body, url ++ "/runs" });
+    }
+    for ([_][]const u8{ url ++ "/runs/1", url ++ "/runs/2" }) |run_url| {
+        for (0..3000) |_| {
+            const run = try curl(context, &.{run_url});
+            if (std.mem.indexOf(u8, run, "\"state\":\"running\"") == null) break;
+            sleep_ms(200);
+        }
+    }
+    // The third runs while the tests look at it (on one CPU: the analysis needs the rest).
+    const running = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
+        "\"seed\":5,\"branches\":100000,\"jobs\":1,\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});
+    _ = try curl(context, &.{ "-X", "POST", "-d", running, url ++ "/runs" });
+    defer _ = curl(context, &.{ "-X", "POST", url ++ "/runs/3/stop" }) catch "";
+    const command = try std.fmt.allocPrint(arena, "cd tests/ui && DETERMINISMO_URL={s} npx playwright test", .{url});
+    const result = try std.process.run(arena, context.io, .{
+        .argv = &.{ "/bin/sh", "-c", command },
+        .stdout_limit = .limited(16 << 20),
+        .stderr_limit = .limited(16 << 20),
+    });
+    const passed = result.term.success();
+    expect(context, passed, "ui: the run page in a browser (Playwright): runs by URL, a " ++
+        "causality analysis from the page to its end, the map's failures, a running run's " ++
+        "refreshes", .{});
+    if (!passed) std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
+}
+
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     const json = "Content-Type: application/json";
@@ -562,20 +623,23 @@ fn check_until_and_causality(context: *Context) !void {
         "--futures", "8", "--json",
     });
     const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
-    const Point = struct { vtime_ms: u64, probability: f64 };
+    // Points come as their futures finish, and refinement adds moments inside jumps.
+    const Point = struct { vtime_ms: u64, probability: f64, low: f64, high: f64 };
     var points: u32 = 0;
-    var last: f64 = 0;
+    var latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
+    var bounded = true;
     var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
         const point = std.json.parseFromSliceLeaky(Point, arena, line, .{
             .ignore_unknown_fields = true,
         }) catch continue;
-        if (point.probability < 0 or point.probability > 1) break;
+        bounded = bounded and point.low <= point.probability and point.probability <= point.high;
         points += 1;
-        last = point.probability;
+        if (point.vtime_ms >= latest.vtime_ms) latest = point;
     }
-    expect(context, points == 4 and last == 1, "causality: {d} moments, certain at the " ++
-        "failure ({d:.2})", .{ points, last });
+    expect(context, points >= 4 and latest.probability == 1 and bounded, "causality: {d} " ++
+        "moments (4, and refinements inside jumps), certain at the failure ({d:.2}), each " ++
+        "within its 90% interval", .{ points, latest.probability });
     try check_files(context, &system, violation);
     try check_rewind(context, &system, violation);
 }
@@ -1848,6 +1912,55 @@ fn same_timelines(a: []const Branch, b: []const Branch) bool {
 }
 
 /// Runs `determinismo explore` with the machine options; returns its whole output.
+/// Snapshots saved to disk along a replay (saver.zig), each the pages changed since the one
+/// before: the futures from each, loaded instead of booted to and replayed, are the futures a
+/// replay to that moment forks.
+fn check_saved(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const tapes = try std.fmt.allocPrint(arena, "{s}/saved-tapes", .{context.scratch});
+    const snapshots = try std.fmt.allocPrint(arena, "{s}/saved-snapshots", .{context.scratch});
+    const common = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "11" };
+    const ran = try explore(context, &(common ++ [_][]const u8{
+        "--branches", "2", "--branching", "flat", "--tape-dir", tapes,
+    }));
+    var lines = std.mem.tokenizeScalar(u8, ran, '\n');
+    const vtime_s = while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch ") or std.mem.indexOf(u8, line, " 1]") == null) continue;
+        const text = field(line, "vtime=") orelse continue;
+        break std.fmt.parseFloat(f64, std.mem.trimEnd(u8, text, "s")) catch continue;
+    } else 0;
+    const moments = [_]u64{ @trunc(vtime_s * 400), @trunc(vtime_s * 700) };
+    const tape = try std.fmt.allocPrint(arena, "{s}/branch-1.jsonl", .{tapes});
+    const saved = try explore(context, &(common ++ [_][]const u8{
+        "--tape",           tape,
+        "--save-snapshots", snapshots,
+        "--save-at-ms",     try std.fmt.allocPrint(arena, "{d},{d}", .{ moments[0], moments[1] }),
+    }));
+    const saved_count = std.mem.count(u8, saved, "saved snapshot ");
+    var same = vtime_s > 0;
+    for (moments) |ms| {
+        const at = try std.fmt.allocPrint(arena, "{d}", .{ms});
+        const replayed = try explore(context, &(common ++ [_][]const u8{
+            "--tape", tape, "--from-vtime-ms", at, "--branches", "4", "--jobs", "2",
+        }));
+        const name = try std.fmt.allocPrint(arena, "{s}/b1-{d}", .{ snapshots, ms });
+        const loaded = try explore(context, &(common ++ [_][]const u8{
+            "--from-snapshot", name, "--branches", "4", "--jobs", "2",
+        }));
+        var from_replay: [branches_max]Branch = undefined;
+        var from_disk: [branches_max]Branch = undefined;
+        const count = parse_branches(replayed, &from_replay);
+        same = same and count == 4 and parse_branches(loaded, &from_disk) == count and
+            same_timelines(from_replay[0..count], from_disk[0..count]);
+    }
+    expect(context, saved_count == 2 and same, "saved: {d} snapshots on disk along branch 1 " ++
+        "(at {d} and {d} ms); the futures from each, loaded, are the ones a replay forks there", .{
+        saved_count, moments[0], moments[1],
+    });
+    if (saved_count != 2) std.debug.print("{s}\n", .{saved});
+}
+
 fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(context.arena, &.{ context.determinismo, "explore" });

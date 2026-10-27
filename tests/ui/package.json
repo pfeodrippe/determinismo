@@ -1,0 +1,11 @@
+{
+  "name": "determinismo-ui-tests",
+  "private": true,
+  "description": "The web UI in a browser, against a real determinismo serve: tools/e2e.zig's ui check starts one, makes runs, and runs these.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}
