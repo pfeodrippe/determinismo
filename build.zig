@@ -96,6 +96,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "raft-test", .path = "examples/raft/raft_test.zig" },
         .{ .name = "etcd-test", .path = "examples/etcd/etcd_test.zig" },
         .{ .name = "nats-test", .path = "examples/nats/nats_test.zig" },
+        .{ .name = "tigerbeetle-test", .path = "examples/tigerbeetle/tigerbeetle_test.zig" },
+        .{ .name = "redisraft-test", .path = "examples/redisraft/redisraft_test.zig" },
         .{ .name = "postgres-test", .path = "examples/postgres/postgres_test.zig" },
         .{ .name = "cockroachdb-test", .path = "examples/cockroachdb/cockroachdb_test.zig" },
         .{ .name = "mysql-test", .path = "examples/mysql/mysql_test.zig" },
