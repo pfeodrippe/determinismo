@@ -25,13 +25,15 @@ import time
 HOME = os.path.expanduser("~")
 GUEST = os.environ.get("DETERMINISMO_GUEST", f"{HOME}/guest")
 MACHINE = ["--kernel", f"{GUEST}/vmlinuz", "--initrd", f"{GUEST}/base.cpio", "--append", "quiet",
-           "--cache", f"{HOME}/cache"]
+           "--cache", f"{HOME}/cache", "--memory-mib", "4096"]
 RAFT = f"{HOME}/raft-poc/antithesis/config/docker-compose.yaml"
 
 # (system arguments, target properties: the known bugs, by a prefix of their message)
 WORKLOADS = {
+    # As serve's runs of it (run 93): CPU modulation with the faults, as Antithesis does.
     "raft": (["--compose", RAFT, "--scenario", "raft", "--faults", "+restart,+stop,+crash",
-              "--no-faults", "raft-client,raft-monitor", "--retroactive", "Applied block"],
+              "--no-faults", "raft-client,raft-monitor", "--retroactive", "Applied block",
+              "--cpu-modulation"],
              ["[workload-commit-progress]", "[log-matching]", "[fsm-convergence] cluster failed",
               "[election-safety]", "[leader-completeness]"]),
     "maze": (["--program", "zig-out/bin/det-selftest", "--profile", "maze", "--scenario", "maze"],
@@ -70,7 +72,7 @@ def run(workload, seed, budget, options, bb):
     system, targets = WORKLOADS[workload]
     record = tempfile.mktemp(suffix=".jsonl", prefix="explore-bench-")
     command = ["zig-out/bin/determinismo", "explore", *MACHINE, *system, "--seed", str(seed),
-               "--time-budget", budget, "--branches", "1000000", "--record", record]
+               "--time-budget", budget, "--record", record]  # As many as fit in the budget.
     strategy = [option[1:] for option in options if option.startswith("@")]
     command += [option for option in options if not option.startswith("@")]
     if strategy:
@@ -92,6 +94,8 @@ def run(workload, seed, budget, options, bb):
                 found[target] = {"wall_s": round(time.monotonic() - start, 1), "timelines": timelines,
                                  "branch": int(match.group(1))}
     process.wait()
+    if process.returncode not in (0, 3):  # 3: properties failed, as expected.
+        print(f"explore exited with {process.returncode}: {' '.join(command)}", flush=True)
     rows = []
     if os.path.exists(record):
         with open(record) as lines:

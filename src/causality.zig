@@ -61,6 +61,9 @@ const Request = struct {
     planner: ?[]const u8 = null,
     /// The run's HTTP API (serve's), told to planners.
     run_url: ?[]const u8 = null,
+    /// Only save the first round's moments to disk (`--save-only`): serve snapshots a failure
+    /// as soon as it is found, and a later analysis forks its futures right away.
+    save_only: bool = false,
     json: bool = false,
     /// Branch n's tape: the timeline replayed and branched from (a tree's branch).
     tape: ?[]const u8 = null,
@@ -146,6 +149,13 @@ pub fn run(
         if (name == .string) std.debug.print("[determinismo] causality planner: {s}\n", .{name.string});
     }
     defer if (analysis.planner) |planner| planner.stop();
+    if (request.save_only) {
+        const moments = try plan(&analysis, 0);
+        try moments_analyze(&analysis, moments);
+        try out.print("{{\"saved\":{d},\"snapshots\":{f}}}\n", .{ moments.len, std.json.fmt(directory, .{}) });
+        try out.flush();
+        return 0;
+    }
     for (0..request.refine + 1) |round| {
         const moments = try plan(&analysis, @intCast(round));
         if (moments.len == 0) break;
@@ -289,6 +299,7 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
     }
     for (save_threads) |thread| thread.join();
     for (saves) |save| if (save.failed) return error.NotSaved;
+    if (analysis.request.save_only) return;
     // Their futures.
     const Futures = struct {
         analysis: *Analysis,
@@ -496,6 +507,10 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
         const eql = std.mem.eql;
         if (eql(u8, flag, "--json")) {
             request.json = true;
+            continue;
+        }
+        if (eql(u8, flag, "--save-only")) {
+            request.save_only = true;
             continue;
         }
         const ours = eql(u8, flag, "--branch") or eql(u8, flag, "--property") or

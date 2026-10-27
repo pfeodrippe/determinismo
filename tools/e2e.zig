@@ -559,6 +559,27 @@ fn check_ui(context: *Context) !void {
             sleep_ms(200);
         }
     }
+    // serve saved run 1's first failure to disk on its own, as soon as it found it.
+    const snapshots = try std.fs.path.join(arena, &.{ data, "runs", "1", "snapshots" });
+    var saved_log: []const u8 = "";
+    for (0..600) |_| {
+        var dir = cwd.openDir(context.io, snapshots, .{ .iterate = true }) catch {
+            sleep_ms(500);
+            continue;
+        };
+        defer dir.close(context.io);
+        var iterator = dir.iterate();
+        while (try iterator.next(context.io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "failure-")) continue;
+            const path = try std.fs.path.join(arena, &.{ snapshots, entry.name });
+            const text = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 20)) catch "";
+            if (std.mem.indexOf(u8, text, "{\"saved\":") != null) saved_log = text;
+        }
+        if (saved_log.len > 0) break;
+        sleep_ms(500);
+    }
+    expect(context, saved_log.len > 0, "ui: serve saved run 1's first failure to disk as soon " ++
+        "as it found it", .{});
     // The third runs while the tests look at it (on one CPU: the analysis needs the rest).
     const running = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
         "\"seed\":5,\"branches\":100000,\"jobs\":1,\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});
@@ -1520,10 +1541,13 @@ fn check_readdress(context: *Context) !void {
 fn check_changed(context: *Context) !void {
     const arena = context.arena;
     const record = try std.fmt.allocPrint(arena, "{s}/changed.jsonl", .{context.scratch});
+    // One generation in flight: the tree returns from the second one on (with the default three,
+    // 48 timelines would all be roots).
     const report = try explore(context, &.{
-        "--compose", "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
-        "--seed",    "1",                                           "--branches", "48",
-        "--changed", "tests/changed/maze.diff",                     "--record",   record,
+        "--compose",  "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
+        "--seed",     "1",                                           "--branches", "48",
+        "--changed",  "tests/changed/maze.diff",                     "--record",   record,
+        "--pipeline", "1",
     });
     const file = "tests/antithesis-compat/python/client/maze/singleton_driver_maze.py";
     const every = try std.fmt.allocPrint(arena, "ran in   48/48 timelines  {s}:24-24", .{file});

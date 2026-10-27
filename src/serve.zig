@@ -72,6 +72,9 @@ pub const Options = struct {
     /// A run's snapshots on disk (causality analysis saves its timelines' moments there) go
     /// when none was saved for this long.
     snapshots_keep_ns: u64 = 24 * std.time.ns_per_hour,
+    /// Each failing property's first failing timeline is saved to disk as soon as it is found
+    /// (`--no-failure-snapshots`: not).
+    failure_snapshots: bool = true,
 };
 
 const runs_max = 4096;
@@ -93,6 +96,8 @@ const database_memory_mib = 4096;
 const watch_interval_ns = std.time.ns_per_s;
 /// How often it removes runs' snapshots past their time (Options.snapshots_keep_ns).
 const snapshots_sweep_interval = 600; // Watches.
+/// How often it looks for new failures to save to disk (failures_snapshot).
+const failures_watch_interval = 15; // Watches.
 
 const Run = struct {
     id: u32,
@@ -115,9 +120,13 @@ const nrepl_port_base = 17000;
 /// A causality analysis (causality.zig) of a run's branch, in the background.
 const Job = struct {
     run: u32,
+    /// A causality analysis's number; a snapshot job's timeline.
     index: u32,
     pid: linux.pid_t,
     done: bool = false,
+    /// An analysis (POST /runs/<id>/causality), or a failure's snapshots saved as soon as it
+    /// was found (failures_snapshot).
+    kind: enum { causality, snapshot } = .causality,
 };
 
 /// What the threads share: runs and jobs (under `mutex`), and the runs' databases.
@@ -306,6 +315,12 @@ fn watch(shared: *Shared) void {
             };
             run_update(&server, id) catch |err| {
                 std.debug.print("[determinismo] run {d}'s events: {s} {s}\n", .{
+                    id, @errorName(err), server.detail orelse "",
+                });
+                continue;
+            };
+            if (watches % failures_watch_interval == 0) failures_snapshot(&server, id) catch |err| {
+                std.debug.print("[determinismo] run {d}'s failures not saved: {s} {s}\n", .{
                     id, @errorName(err), server.detail orelse "",
                 });
             };
@@ -998,6 +1013,36 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const asked = try std.json.parseFromSliceLeaky(CausalityRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     });
+    const argv = try causality_argv(server, run, &asked);
+    // After the analyses on disk (a server before a restart had its own jobs).
+    var index: u32 = 0;
+    for (try causality_indices(server, run.id)) |earlier| index = @max(index, earlier + 1);
+    const shared = server.shared;
+    shared.lock();
+    defer shared.unlock();
+    if (shared.job_count == jobs_max) return error.TooManyJobs;
+    for (shared.jobs[0..shared.job_count]) |job| {
+        if (job.run == run.id and job.kind == .causality) index = @max(index, job.index + 1);
+    }
+    const name = try print(server, "causality-{d}.jsonl", .{index});
+    const directory = try run_directory(server, run.id);
+    const output = try std.fs.path.join(server.arena, &.{ directory, name });
+    const pid = try spawn(server.arena, argv, output, &.{});
+    // Its pid on disk: a server after a restart still knows it runs.
+    const pid_name = try print(server, "causality-{d}.pid", .{index});
+    try std.Io.Dir.cwd().writeFile(server.io, .{
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, pid_name }),
+        .data = try print(server, "{d}\n", .{pid}),
+    });
+    shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
+    shared.job_count += 1;
+    try out.print("{{\"id\":{d}}}\n", .{index});
+    return 201;
+}
+
+/// `determinismo causality` for a run's timeline: the run's machine, system and seed, the
+/// branch's tape, the run's snapshots directory and API.
+fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityRequest) ![]const []const u8 {
     const original = try std.json.parseFromSliceLeaky(
         RunRequest,
         server.arena,
@@ -1041,30 +1086,54 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
-    // After the analyses on disk (a server before a restart had its own jobs).
-    var index: u32 = 0;
-    for (try causality_indices(server, run.id)) |earlier| index = @max(index, earlier + 1);
+    return argv.items;
+}
+
+/// Saves each failing property's first failing timeline to disk as soon as it is found
+/// (`causality --save-only`: the moment after setup and the first round's moments, a replay
+/// each), so that an analysis of it forks its futures right away and the failure is kept for
+/// `snapshots_keep_ns`. One at a time per run; `snapshots/failure-<timeline>.log` says it was
+/// started (and what it said).
+fn failures_snapshot(server: *Server, id: u32) !void {
+    if (!server.options.failure_snapshots) return;
     const shared = server.shared;
     shared.lock();
-    defer shared.unlock();
-    if (shared.job_count == jobs_max) return error.TooManyJobs;
-    for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id) index = @max(index, job.index + 1);
+    const busy = for (shared.jobs[0..shared.job_count]) |job| {
+        if (job.run == id and job.kind == .snapshot and !job.done) break true;
+    } else false;
+    const found: ?Run = for (shared.runs[0..shared.run_count]) |known| {
+        if (known.id == id) break known;
+    } else null;
+    const room = shared.job_count < jobs_max;
+    shared.unlock();
+    const run = found orelse return;
+    if (busy or !room) return;
+    var connection = try run_connect(server, id);
+    defer connection.close();
+    const Row = struct { property: []const u8, branch: u32 };
+    const rows = connection.rows(Row, server.arena, store.first_failures_sql, .{}) catch |err| {
+        if (err == error.DuckDB) server.detail = connection.failure.text();
+        return err;
+    };
+    const directory = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "snapshots" });
+    for (rows) |row| {
+        const log = try print(server, "{s}/failure-{d}.log", .{ directory, row.branch });
+        if (std.Io.Dir.cwd().access(server.io, log, .{})) |_| continue else |_| {}
+        try std.Io.Dir.cwd().createDirPath(server.io, directory);
+        const asked: CausalityRequest = .{ .branch = row.branch, .property = row.property };
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(server.arena, try causality_argv(server, &run, &asked));
+        try argv.append(server.arena, "--save-only");
+        const pid = try spawn(server.arena, argv.items, log, &.{});
+        shared.lock();
+        defer shared.unlock();
+        if (shared.job_count == jobs_max) return; // Reaped next time.
+        shared.jobs[shared.job_count] = .{ .run = id, .index = row.branch, .pid = pid, .kind = .snapshot };
+        shared.job_count += 1;
+        std.debug.print("[determinismo] run {d}: saving timeline {d} to disk (its first failure " ++
+            "of '{s}')\n", .{ id, row.branch, row.property });
+        return;
     }
-    const name = try print(server, "causality-{d}.jsonl", .{index});
-    const directory = try run_directory(server, run.id);
-    const output = try std.fs.path.join(server.arena, &.{ directory, name });
-    const pid = try spawn(server.arena, argv.items, output, &.{});
-    // Its pid on disk: a server after a restart still knows it runs.
-    const pid_name = try print(server, "causality-{d}.pid", .{index});
-    try std.Io.Dir.cwd().writeFile(server.io, .{
-        .sub_path = try std.fs.path.join(server.arena, &.{ directory, pid_name }),
-        .data = try print(server, "{d}\n", .{pid}),
-    });
-    shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
-    shared.job_count += 1;
-    try out.print("{{\"id\":{d}}}\n", .{index});
-    return 201;
 }
 
 /// The causality analyses on disk (causality-<n>.jsonl): their numbers.
@@ -1091,7 +1160,7 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
     const shared = server.shared;
     shared.lock();
     const ours = for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id and job.index == index) break !job.done;
+        if (job.run == run.id and job.kind == .causality and job.index == index) break !job.done;
     } else null;
     shared.unlock();
     // One an earlier server started: running while its process is.

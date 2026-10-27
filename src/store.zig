@@ -456,6 +456,18 @@ pub const properties_sql =
 
 /// The timelines, each with the properties it violates (Events.Property.passing): an `always`
 /// made false, an `unreachable` reached.
+/// Each failing property's first failing timeline (the lowest index; the failing evaluations
+/// of timelines_sql): what serve snapshots as soon as it is found.
+pub const first_failures_sql =
+    \\SELECT name AS property, min(timeline) AS branch
+    \\FROM timeline_events
+    \\WHERE kind IN ('assert', 'antithesis_assert')
+    \\    AND ((type IN ('always', 'always_or_unreachable') AND NOT condition)
+    \\        OR (type = 'unreachable' AND condition IS NOT NULL))
+    \\GROUP BY name
+    \\ORDER BY branch
+;
+
 pub const timelines_sql =
     \\WITH failing AS (
     \\    SELECT timeline, list(DISTINCT name ORDER BY name) AS failing

@@ -39,7 +39,9 @@ const usage =
     \\                            [--archive "<cmd>"]
     \\                            [--snapshots-keep-hours <h>]   (runs' snapshots on disk, from
     \\                            causality analyses: removed when none was saved for that long;
-    \\                            24 by default) <machine options>
+    \\                            24 by default) [--no-failure-snapshots]   (by default each
+    \\                            failing property's first failing timeline is saved to disk as
+    \\                            soon as it is found) <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo mutate  <explore options> --mutants <mutants.jsonl> [--out <dir>]
     \\                            (each mutant a patch to a node's build: caught, never ran, or
@@ -177,9 +179,11 @@ const Arguments = struct {
     /// How long (virtual time) each timeline's drivers run: commands keep starting until then
     /// (Antithesis's long timelines). Without it, a drawn number of starts (4 to 64).
     timeline_ms: ?u64 = null,
-    /// Timelines per tree generation (`--generation`, a multiple of 16): more for machines with
-    /// more CPUs (a generation's timelines run at once), with more moments returned to.
+    /// Timelines per tree generation (`--generation`, a multiple of 16): by default the workers,
+    /// rounded up (a generation is judged once its slowest timeline ends: with 16 on a 36-thread
+    /// host, about 10 timelines ran at once), with more moments returned to.
     generation_size: u32 = tree.generation_base,
+    generation_given: bool = false,
     /// A tree's branches returned to a moment run this long past it, then stop (`--horizon`):
     /// short branches, many of them, around the moments that mattered (Antithesis returns to
     /// decision points often; a branch is extended only when it found something). Null: to the
@@ -510,6 +514,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
     var snapshots_keep_hours: u64 = 24;
+    var failure_snapshots = true;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -528,6 +533,8 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, flag, "--snapshots-keep-hours")) {
             snapshots_keep_hours = try std.fmt.parseInt(u64, value, 10);
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--no-failure-snapshots")) {
+            failure_snapshots = false;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
@@ -549,6 +556,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .archive = archive,
         .bb = bb,
         .snapshots_keep_ns = snapshots_keep_hours * std.time.ns_per_hour,
+        .failure_snapshots = failure_snapshots,
     });
 }
 
@@ -1752,13 +1760,22 @@ fn tree_judge(
     const generation_seed = state.base ^ (@as(u64, generation) *% 0x9e3779b97f4a7c15);
     var random: std.Random.DefaultPrng = .init(generation_seed);
     for (done) |summary| {
+        // A targeted run: which hunks each timeline ran (once each; its parents' prefix too),
+        // whatever its trace (a timeline the same as an earlier one still ran them).
+        if (state.change) |*target| {
+            @memset(state.hunks_reached, false);
+            for (summary.behaviors[0..summary.behavior_count]) |behavior| {
+                const hunk = target.hunk_of(arena, behavior.name()) orelse continue;
+                if (!state.hunks_reached[hunk]) target.timelines[hunk] += 1;
+                state.hunks_reached[hunk] = true;
+            }
+        }
         if ((try state.traces.getOrPut(arena, summary.trace_hash)).found_existing) continue;
         var novel: u32 = 0;
         var moment: ?u64 = null;
         var label: []const u8 = "";
         var changed_moment: ?u64 = null;
         var changed_label: []const u8 = "";
-        @memset(state.hunks_reached, false);
         // The frontier (Go-Explore): its rarest new behavior (the fewest of its generation
         // reached it; latest among equals) that leaves room to go on (in its first four
         // fifths); the branches return just after it.
@@ -1769,13 +1786,10 @@ fn tree_judge(
         else
             summary.start_ns + (summary.end_ns -| summary.start_ns) / 5 * 4;
         for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-            // A targeted run: which hunks it ran (counted once), and when it first ran
-            // changed code itself (not in its parents' prefix). Any moment with a little
-            // room after it: what follows changed code is what a targeted run explores,
-            // however late it ran.
-            if (state.change) |*target| if (target.hunk_of(arena, behavior.name())) |hunk| {
-                if (!state.hunks_reached[hunk]) target.timelines[hunk] += 1;
-                state.hunks_reached[hunk] = true;
+            // A targeted run: when it first ran changed code itself (not in its parents'
+            // prefix). Any moment with a little room after it: what follows changed code is
+            // what a targeted run explores, however late it ran.
+            if (state.change) |*target| if (target.hunk_of(arena, behavior.name())) |_| {
                 const own = behavior.vtime_ns > summary.start_ns;
                 const room = behavior.vtime_ns + changed_room_ns < summary.end_ns and
                     behavior.vtime_ns < summary.last_pull_ns;
@@ -2633,6 +2647,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
     try branching_resolve(&arguments, moment or commands);
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
+    if (!arguments.generation_given) {
+        const base = tree.generation_base;
+        const workers = std.mem.alignForward(u32, jobs_count(&arguments), base);
+        arguments.generation_size = std.math.clamp(workers, base, tree.generation_max);
+    }
     // From a moment: of a branch (`--from-branch`), or of the taped one (`--tape`).
     if (arguments.from_branch != null and arguments.from_vtime_ms == null) return error.Usage;
     if (arguments.from_vtime_ms != null and arguments.from_branch == null and arguments.tape_path == null) {
@@ -2744,6 +2763,7 @@ fn parse_option(
         const multiple = size % tree.generation_base == 0;
         if (!multiple or size == 0 or size > tree.generation_max) return error.Usage;
         arguments.generation_size = size;
+        arguments.generation_given = true;
     } else if (eql(u8, flag, "--timeline")) {
         arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
         arguments.timeline_text = value;
