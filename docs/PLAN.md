@@ -113,6 +113,12 @@ event hashing, the guest module.
      with the numbering kept (the same tree, no clear wall-time gain: forking twice a generation
      costs what the overlap saves). Left: a budget split between depth and fresh starts learned
      from what found new behaviors.
+   - Measured 2026-10-27, the maze (4 minutes, seeds 1 and 2, srv1, beside other runs): the
+     built-in archive (`--archive --pipeline 1`) solved both (65 s, 5 s); the Clojure archive
+     strategy one (170 s); Clojure's rarity none. The Raft POC on srv2 (40 minutes a seed, 36
+     threads, generations of 48), bench/explore.py: the default tree found the deadlock in both
+     seeds (48 s, 66 s) and, in seed 1, the double vote with three others (1,481 s, timeline 4653);
+     the archive and short-branch variants are running.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons

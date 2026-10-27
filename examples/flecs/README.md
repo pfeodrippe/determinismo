@@ -33,7 +33,8 @@ its memory): pauses of the process or of one of its threads, CPU throttling, clo
 
 v4.1.6 passes everything. So does master (3988dee) since the harness uses master's API: 32
 timelines, every property, every "sometimes" reached (worker-thread deletes, observers during
-merges, frames on several threads).
+merges, frames on several threads); then a 45-minute tree exploration on srv1 (seed 2): 4,528
+timelines, none failing.
 
 ### Found: master's old-idiom hazard (2c517a7, "Remove implicit defer mode from core")
 
