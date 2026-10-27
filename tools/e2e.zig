@@ -1844,6 +1844,35 @@ fn check_parallel(context: *Context) !void {
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
     const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
     expect(context, same, "parallel workers give the timelines of one worker", .{});
+    // Without --jobs a run takes every core: an explorer pinned to the CPU it booted on once
+    // counted one, and ran one timeline at a time (srv2, 2026-10-27). Timelines at once, on
+    // average: their wall times over the run's.
+    for ([_][]const u8{ "flat", "tree" }) |branching| {
+        const output = try explore(context, &[_][]const u8{
+            "--program", program, "--scenario", "bank", "--seed", "22", "--branches", "48", "--branching", branching,
+        });
+        const at_once = concurrency(output);
+        expect(context, at_once >= 1.8, "parallel: without --jobs, a {s} run keeps the cores busy " ++
+            "({d:.1} timelines at once on average)", .{ branching, at_once });
+    }
+}
+
+/// The timelines' wall times over the run's (its multiverse line's).
+fn concurrency(output: []const u8) f64 {
+    var timelines_s: f64 = 0;
+    var run_s: f64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "[branch ")) {
+            const wall = field(line, "wall=") orelse continue;
+            timelines_s += std.fmt.parseFloat(f64, std.mem.trimEnd(u8, wall, "s")) catch 0;
+        } else if (std.mem.indexOf(u8, line, "] multiverse: ")) |_| {
+            const end = std.mem.lastIndexOf(u8, line, "s wall") orelse continue;
+            const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ' ') orelse continue) + 1;
+            run_s = std.fmt.parseFloat(f64, line[start..end]) catch 0;
+        }
+    }
+    return if (run_s > 0) timelines_s / run_s else 0;
 }
 
 /// TLA+ trace validation: the buggy service's trace is not a behavior of the spec; once its

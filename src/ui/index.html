@@ -216,7 +216,7 @@ const state = {
   causality: new Map(), // Property message -> its latest causality analysis (causalityRefresh).
   causalityLoaded: null, causalityTimer: null,
   view: "report", notebook: null, // The run's notebook: cells, their outputs, action results.
-  open: new Set(["findings", "properties", "map"]), // Sections shown expanded.
+  open: new Set(["findings", "properties", "map", "output"]), // Sections shown expanded.
   discovery: null, // The last discovery chart drawn ({runId, html}): kept until the next one.
   refreshing: false, // A refresh in flight: polls do not pile up behind a slow one.
   examples: new Map(), // A property's examples once loaded (by message), and those shown open.
@@ -328,6 +328,7 @@ async function runRefresh() {
 
 function liveUpdate() {
   $("#stats-live").outerHTML = statsHtml();
+  outputDraw();
   const times = $("#run-times");
   if (times) times.textContent = timesHtml();
   $("#charts-live").outerHTML = chartsHtml();
@@ -391,8 +392,10 @@ function statsHtml() {
   // What bounds how many: workers at once, and how long a timeline takes each.
   const each = run.branches.length ? run.branches.reduce((sum, b) => sum + b.wall_ns, 0) / run.branches.length / 1e9 : 0;
   const pace = info.jobs ? `${info.jobs} workers${each ? `, ${duration(each)} each` : ""}` : `${duration(wall)} wall`;
+  // Running now, from the explorer's own status (a tree's).
+  const now = run.state === "running" && run.progress ? ` · <b>${run.progress.running.length} running</b>` : "";
   return `<div class="stats" id="stats-live">
-    ${stat("Timelines", done.toLocaleString(), `${planned} · ${pace}`)}
+    ${stat("Timelines", done.toLocaleString(), `${planned} · ${pace}${now}`)}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
     ${stat("Properties", `${failed} / ${list.length}`, run.state === "running" ? "failing so far" : "failing", failed ? "var(--fail)" : "var(--pass)")}
     ${stat("Virtual time", duration(vtime), speed)}
@@ -448,6 +451,7 @@ function render() {
     ${sectionHtml("utilization", "Utilization", utilizationSummary(), utilizationBody(), isOpen("utilization"))}
     ${sectionHtml("properties", "Properties", propertiesSummary(), propertiesBody(), isOpen("properties"))}
     ${run.changed ? sectionHtml("changed", "Changed code", changedSummary(run.changed), changedBody(run.changed), isOpen("changed")) : ""}
+    ${sectionHtml("output", "Output", "what the explorer says, as it goes", `<pre id="output-body" class="mono muted" style="max-height:320px;overflow:auto;margin:0;font-size:12px;white-space:pre-wrap">Loading…</pre>`, isOpen("output"))}
     ${sectionHtml("map", "Multiverse tree", `${done} timelines from the setup snapshot`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
     ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
     ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}
@@ -458,6 +462,7 @@ function render() {
     section.classList.toggle("closed");
     if (section.classList.contains("closed")) state.open.delete(section.id); else state.open.add(section.id);
     if (section.id === "map" && !section.classList.contains("closed")) mapDraw();
+    if (section.id === "output" && !section.classList.contains("closed")) outputDraw();
   }));
   document.querySelectorAll(".bars .bar").forEach((bar) => bar.addEventListener("click", () => {
     state.open.add("properties");
@@ -468,6 +473,7 @@ function render() {
   propertiesWire();
   searchWire();
   mapDraw();
+  outputDraw();
   findingsLoad();
   discoveryDraw();
   logsWire();
@@ -510,6 +516,21 @@ function changedBody(changed) {
     return `<li style="display:flex;gap:10px;align-items:baseline">${badge}<code>${where}</code></li>`;
   }).join("");
   return `<ul style="list-style:none;padding:0;margin:0;display:grid;gap:6px">${rows}</ul>`;
+}
+
+// The explorer's own lines (its progress every half minute, its timelines, its verdicts), the
+// last 300, kept at the bottom while the reader is there.
+async function outputDraw() {
+  const box = $("#output-body");
+  if (!box || $("#output").classList.contains("closed")) return;
+  const id = state.runId;
+  let text;
+  try { text = await api(`/runs/${id}/output?lines=300&explorer=1`); } catch { return; }
+  if (id !== state.runId || !$("#output-body")) return;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.textContent = text.trim() || "Nothing yet: the system is being built and booted.";
+  box.classList.toggle("muted", !text.trim());
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
 function sectionHtml(id, title, summary, body, open) {

@@ -601,7 +601,25 @@ fn run_route(
 ) !u16 {
     const eql = std.mem.eql;
     if (eql(u8, action, "output") and eql(u8, request.method, "GET")) {
-        try out.writeAll(try run_file(server, run.id, "output.log"));
+        const text = try run_file(server, run.id, "output.log");
+        // `?lines=<n>`: its last n lines; `&explorer=1`: the explorer's own (its progress, its
+        // timelines, its verdicts), not the guests' consoles.
+        const lines_text = query_value(server.query_string, "lines") orelse {
+            try out.writeAll(text);
+            return 200;
+        };
+        const wanted = std.fmt.parseInt(usize, lines_text, 10) catch return error.BadRequest;
+        const explorer_only = query_value(server.query_string, "explorer") != null;
+        var kept: std.ArrayList([]const u8) = .empty;
+        var lines = std.mem.splitBackwardsScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (kept.items.len == wanted) break;
+            if (line.len == 0) continue;
+            if (explorer_only and !explorer_line(line)) continue;
+            try kept.append(server.arena, line);
+        }
+        var at = kept.items.len;
+        while (at > 0) : (at -= 1) try out.print("{s}\n", .{kept.items[at - 1]});
         return 200;
     }
     if (eql(u8, action, "replay") and eql(u8, request.method, "POST")) {
@@ -900,6 +918,11 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const path = try std.fs.path.join(server.arena, &.{ directory, time[1] });
         if (mtime_s(server.arena, path)) |seconds| try out.print(",\"{s}\":{d}", .{ time[0], seconds });
     }
+    // What its explorer says it is doing (a tree's status.json), while it runs.
+    if (run.status == null) if (run_file(server, run.id, "status.json")) |status| {
+        const trimmed = std.mem.trim(u8, status, " \n");
+        if (trimmed.len > 0 and trimmed[0] == '{') try out.print(",\"progress\":{s}", .{trimmed});
+    } else |_| {};
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
         for ([_][]const u8{ "run", "summary", "snapshot", "changed" }) |key| {
@@ -1944,6 +1967,16 @@ fn artifact_keep(server: *Server, path: []const u8) ![]const u8 {
         },
         else => return err,
     };
+}
+
+/// A line of the explorer's own (`[determinismo] ...`, `[branch n] ...`, a property's verdict),
+/// not of a guest's console.
+fn explorer_line(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, "\x00");
+    for ([_][]const u8{ "[determinismo]", "[branch ", "  PASS ", "  FAIL " }) |prefix| {
+        if (std.mem.startsWith(u8, trimmed, prefix)) return true;
+    }
+    return false;
 }
 
 /// A query string's value for `name` (`offset=12&x=1`), if there.

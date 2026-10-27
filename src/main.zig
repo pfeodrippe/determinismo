@@ -531,6 +531,7 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
         break :claimed run.directory;
     };
     try runs.running_mark(arena, directory);
+    arguments.run_directory = directory;
     const Placed = struct { name: []const u8, path: *?[]const u8 };
     for ([_]Placed{
         .{ .name = "events", .path = &arguments.events_directory },
@@ -2006,7 +2007,14 @@ fn explore_tree(
             slot.started += 1;
         }
         if (running_count > 0) {
-            const finished = try timeline_wait(running[0..running_count], branches.multiverse);
+            // Every half minute without a timeline finishing, what the run is doing: a long
+            // timeline (minutes) otherwise leaves its output silent.
+            const generation = flight[oldest % flight.len].generation;
+            status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, generation);
+            const finished = try timeline_wait(running[0..running_count], branches.multiverse, progress_interval_ms) orelse {
+                progress_print(running[0..running_count], branches.multiverse, generation);
+                continue;
+            };
             running[finished] = running[running_count - 1];
             running_count -= 1;
             progressed = true;
@@ -2041,7 +2049,7 @@ fn deciding_strategy(exploration: *const Exploration) bool {
 }
 
 /// A timeline running in a process of its own (explore_tree): where its summary comes back.
-const Running = struct { pid: linux.pid_t, results: linux.fd_t, slot: *InFlight };
+const Running = struct { pid: linux.pid_t, results: linux.fd_t, slot: *InFlight, index: u32, start_ns: u64 };
 
 /// In a child just forked from the explorer: it dies with it. A worker left running after the
 /// explorer was interrupted keeps its VM, its CPU and its memory (an interrupted hunt on srv2
@@ -2076,21 +2084,80 @@ fn timeline_start(
         worker_run(context, vm, options, mine, .{ .worker = 0, .jobs = 1, .results_fd = pipe[1] });
     }
     _ = linux.close(pipe[1]);
-    return .{ .pid = @intCast(pid), .results = pipe[0], .slot = slot };
+    return .{
+        .pid = @intCast(pid),
+        .results = pipe[0],
+        .slot = slot,
+        .index = branches.plan.?[0].index,
+        .start_ns = monotonic_ns(),
+    };
+}
+
+/// How often a tree run says what it is doing while no timeline finishes.
+const progress_interval_ms = 30 * std.time.ms_per_s;
+
+/// The run's state for whoever shows it (serve): `status.json` in its directory, written whole
+/// (renamed into place) as timelines start and finish: those running (each since when, in
+/// seconds since the epoch), those done and failing, the generation judged next.
+fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *const report.Multiverse, generation: u32) void {
+    const known = directory orelse return;
+    var buffer: [8192]u8 = undefined;
+    var text: std.Io.Writer = .fixed(&buffer);
+    var wall: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &wall);
+    const now_ns = monotonic_ns();
+    text.print("{{\"running\":[", .{}) catch return;
+    for (running, 0..) |timeline, at| {
+        const since_s = wall.sec - @as(i64, @intCast((now_ns - timeline.start_ns) / std.time.ns_per_s));
+        text.print("{s}{{\"index\":{d},\"since_s\":{d}}}", .{ if (at == 0) "" else ",", timeline.index, since_s }) catch return;
+    }
+    text.print("],\"done\":{d},\"failing\":{d},\"generation\":{d},\"at_s\":{d}}}\n", .{
+        multiverse.branches, multiverse.failing_branches, generation, wall.sec,
+    }) catch return;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const staging = std.fmt.bufPrintSentinel(&path_buffer, "{s}/status.json.next", .{known}, 0) catch return;
+    var final_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const final = std.fmt.bufPrintSentinel(&final_buffer, "{s}/status.json", .{known}, 0) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
+    const fd = linux.open(staging, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    _ = linux.write(@intCast(fd), text.buffered().ptr, text.buffered().len);
+    _ = linux.close(@intCast(fd));
+    _ = linux.renameat(linux.AT.FDCWD, staging, linux.AT.FDCWD, final);
+}
+
+/// One line: the timelines running (each with its wall time so far), those done and failing.
+fn progress_print(running: []const Running, multiverse: *const report.Multiverse, generation: u32) void {
+    var line_buffer: [1024]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buffer);
+    const now = monotonic_ns();
+    line.print("[determinismo] {d} timelines running (", .{running.len}) catch {};
+    for (running, 0..) |timeline, at| {
+        if (at == 12) {
+            line.print(" ...", .{}) catch {};
+            break;
+        }
+        line.print("{s}#{d} {d}s", .{ if (at == 0) "" else ", ", timeline.index, (now - timeline.start_ns) / std.time.ns_per_s }) catch {};
+    }
+    line.print("), {d} done, {d} failing, generation {d}\n", .{
+        multiverse.branches, multiverse.failing_branches, generation,
+    }) catch {};
+    std.debug.print("{s}", .{line.buffered()});
 }
 
 /// Waits for one of the running timelines to finish: its results in the run's multiverse, its
-/// summary in its generation's. Returns which.
-fn timeline_wait(running: []const Running, multiverse: *report.Multiverse) !usize {
+/// summary in its generation's. Returns which, or null when none finished within `timeout_ms`.
+fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, timeout_ms: i32) !?usize {
     assert(running.len > 0);
     var polled: [jobs_max]linux.pollfd = undefined;
     for (running, polled[0..running.len]) |timeline, *entry| {
         entry.* = .{ .fd = timeline.results, .events = linux.POLL.IN | linux.POLL.HUP, .revents = 0 };
     }
     while (true) {
-        const ready = linux.poll(&polled, @intCast(running.len), -1);
+        const ready = linux.poll(&polled, @intCast(running.len), timeout_ms);
         if (linux.errno(ready) == .INTR) continue;
         if (linux.errno(ready) != .SUCCESS) return error.Poll;
+        if (ready == 0) return null; // None finished in time.
         break;
     }
     const at = for (polled[0..running.len], 0..) |entry, index| {
