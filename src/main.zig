@@ -165,7 +165,7 @@ const Arguments = struct {
     deterministic: bool = false,
     seed: u64 = 0,
     margin_branches: u32 = 128,
-    timer_slack_us: u64 = 100,
+    timer_slack_us: u64 = 1000,
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = 0x01c4,
     events_path: ?[]const u8 = null,

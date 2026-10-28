@@ -142,12 +142,16 @@ pub const Options = struct {
     branch_event: u64 = 0x01c4,
     /// 8 TSC ticks per branch at 4 GHz: one branch is 2 ns of virtual time.
     tsc_per_branch: u32 = 8,
-    /// Branches before a stop target where KVM starts single-stepping (must exceed PMI skid).
+    /// Branches before a stop target where KVM starts single-stepping (must exceed PMI skid:
+    /// up to 65 branches on srv3's W-2295 under YugabyteDB; at 64, one stop overshot, and its
+    /// timeline was another).
     margin_branches: u32 = 128,
     /// How late a timer interrupt may be: it is delivered at the first RDTSC at or past its
     /// deadline (free), or exactly this much later (single-stepping) if the guest reads no
-    /// clock meanwhile. Part of a timeline's inputs.
-    timer_slack_ns: u64 = 100 * std.time.ns_per_us,
+    /// clock meanwhile. Part of a timeline's inputs. A millisecond, as a loaded host delays
+    /// timers: a busy YugabyteDB guest ran at 0.99x virtual time with it, 0.62x with 100 us
+    /// (fewer interrupts, timers due together firing at once, fewer exact stops; srv3).
+    timer_slack_ns: u64 = std.time.ns_per_ms,
     /// Root of all guest randomness: seeds the guest kernel's RNG at boot and answers every
     /// randomness pull from /dev/determinismo.
     seed: u64,

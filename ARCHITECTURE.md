@@ -142,9 +142,13 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
   stood still and timelines no longer replayed.
 - **Two kinds of stops.** Moments (multiverse debugging) stop at their exact branch count. Timer
   interrupts are **soft**: KVM exits at the first RDTSC at or past the deadline (a free, exact
-  point), with a hard stop at the deadline plus `--timer-slack-us` (100 µs) as a backstop for
+  point), with a hard stop at the deadline plus `--timer-slack-us` (1 ms) as a backstop for
   code that reads no clock. Interrupts are at most that late in virtual time; the slack is part of
-  a timeline's inputs. This halved wall time on the examples (bank: 40 branches 15.9 s → 9.3 s).
+  a timeline's inputs. This halved wall time on the examples (bank: 40 branches 15.9 s → 9.3 s);
+  1 ms rather than 100 µs took a busy YugabyteDB guest from 0.62x to 0.99x virtual time (timers
+  due within a millisecond fire together, and a clock read nearly always comes first). A hard
+  stop single-steps from 128 branches before its target: the PMU interrupt's skid reached 65
+  branches on srv3's W-2295, and a stop that overshoots its target is another timeline.
 - `vtime = f(instruction count, per-event charges, modulation parameters)`. The parameters are
   inputs too, which gives **CPU modulation** as a fault (clock-speed strobing, per-operation cost
   changes) for free.

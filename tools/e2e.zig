@@ -216,7 +216,7 @@ fn check_tapes(context: *Context) !void {
         last.index,
     });
     const elsewhere = try explore(context, &.{
-        "--program", program, "--scenario", "bank", "--tape", tape, "--timer-slack-us", "101",
+        "--program", program, "--scenario", "bank", "--tape", tape, "--timer-slack-us", "1001",
     });
     const refused = std.mem.indexOf(u8, elsewhere, "the tape was recorded with inputs") != null;
     expect(context, refused, "tapes: a replay on different inputs is refused", .{});
