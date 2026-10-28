@@ -214,6 +214,9 @@ pub const Multiverse = struct {
     throttles: u64 = 0,
     /// Exact stops reached at an exit that replaced the MTF exit (kvm patch).
     late_steps: u64 = 0,
+    /// The guests' clock reads (RDTSC exits), and those KVM answered in its exit fastpath.
+    rdtsc_exits: u64 = 0,
+    fast_rdtscs: u64 = 0,
     /// The guest's XINUSE restored at an entry after host work cleared some of it, and
     /// restorations that left a bit clear (kvm patch).
     xinuse_fixes: u64 = 0,
@@ -295,6 +298,8 @@ pub const Multiverse = struct {
         multiverse.overshoots += state.overshoots;
         multiverse.throttles += state.throttles;
         multiverse.late_steps += state.late_steps;
+        multiverse.rdtsc_exits += state.rdtsc_exits;
+        multiverse.fast_rdtscs += state.fast_rdtscs;
         multiverse.xinuse_fixes += state.xinuse_fixes;
         multiverse.xinuse_unfixed += state.xinuse_unfixed;
         multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
@@ -380,6 +385,8 @@ pub const Multiverse = struct {
         multiverse.overshoots += other.overshoots;
         multiverse.throttles += other.throttles;
         multiverse.late_steps += other.late_steps;
+        multiverse.rdtsc_exits += other.rdtsc_exits;
+        multiverse.fast_rdtscs += other.fast_rdtscs;
         multiverse.xinuse_fixes += other.xinuse_fixes;
         multiverse.xinuse_unfixed += other.xinuse_unfixed;
         multiverse.vtime_ns += other.vtime_ns;
@@ -471,9 +478,10 @@ pub const Multiverse = struct {
         }
         print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots, {d} " ++
             "counter throttles restarted, {d} reached at another exit; XINUSE restored {d} times " ++
-            "({d} not)\n", .{
-            multiverse.skid_max,   multiverse.overshoots,   multiverse.throttles,
-            multiverse.late_steps, multiverse.xinuse_fixes, multiverse.xinuse_unfixed,
+            "({d} not); clock reads {d}, {d} answered in KVM's fastpath\n", .{
+            multiverse.skid_max,    multiverse.overshoots,   multiverse.throttles,
+            multiverse.late_steps,  multiverse.xinuse_fixes, multiverse.xinuse_unfixed,
+            multiverse.rdtsc_exits, multiverse.fast_rdtscs,
         });
         print("[determinismo] virtual time per wall time: {d:.2} (one core; {d:.3}s virtual " ++
             "in {d:.3}s)\n", .{
