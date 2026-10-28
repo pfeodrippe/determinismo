@@ -163,7 +163,7 @@ fn system_finish(
     const pin_name = try std.fmt.allocPrint(context.arena, "{x:0>16}.pin.json", .{hash});
     const pin_path = try path_join(context, &.{ context.cache, "systems", pin_name });
     if (!exists(context, pin_path)) {
-        const staging = try std.fmt.allocPrint(context.arena, "{s}.partial", .{pin_path});
+        const staging = try own_path(context, pin_path, "partial");
         try cwd.writeFile(context.io, .{ .sub_path = staging, .data = writer.written() });
         try cwd.rename(staging, cwd, pin_path, context.io);
     }
@@ -325,7 +325,7 @@ fn image_disk(
         "podman", "create", "--quiet", reference,
     }), " \n");
     defer _ = tool(context, &.{ "podman", "rm", "--force", container }) catch {};
-    const tar = try std.fmt.allocPrint(context.arena, "{s}.tar", .{disk});
+    const tar = try own_path(context, disk, "tar");
     _ = try tool(context, &.{ "podman", "export", "--output", tar, container });
     defer std.Io.Dir.cwd().deleteFile(context.io, tar) catch {};
     // Its executables, for test templates (written before the disk: a disk implies them).
@@ -362,8 +362,7 @@ fn symbol_lines(context: Context, tar: []const u8, listing: []const u8, disk: []
     }
     if (members.items.len == 0) return 0;
     const cwd = std.Io.Dir.cwd();
-    const staging = try std.fmt.allocPrint(context.arena, "{s}.symbols", .{disk});
-    cwd.deleteTree(context.io, staging) catch {};
+    const staging = try own_path(context, disk, "symbols");
     defer cwd.deleteTree(context.io, staging) catch {};
     const tables = try path_join(context, &.{ staging, source_lines.tables_directory });
     try cwd.createDirPath(context.io, tables);
@@ -505,8 +504,8 @@ fn kubernetes_context(
 ) !void {
     const arena = context.arena;
     const cwd = std.Io.Dir.cwd();
-    const staging = try std.fmt.allocPrint(arena, "{s}.partial", .{build});
-    cwd.deleteTree(context.io, staging) catch {};
+    const staging = try own_path(context, build, "partial");
+    errdefer cwd.deleteTree(context.io, staging) catch {};
     const tools = try path_join(context, &.{ staging, "determinismo-kubernetes" });
     try cwd.createDirPath(context.io, try path_join(context, &.{ tools, "manifests" }));
     for (files, contents) |path, text| {
@@ -535,8 +534,15 @@ fn kubernetes_context(
     }
     const text = try kubernetes.dockerfile(arena, images.len > 0, seen.count() > 0);
     try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ staging, "Dockerfile" }), .data = text });
-    cwd.deleteTree(context.io, build) catch {};
-    try cwd.rename(staging, cwd, build, context.io);
+    cwd.rename(staging, cwd, build, context.io) catch |err| switch (err) {
+        error.DirNotEmpty => if (exists(context, try path_join(context, &.{ build, "Dockerfile" }))) {
+            cwd.deleteTree(context.io, staging) catch {}; // Another process made it meanwhile.
+        } else {
+            cwd.deleteTree(context.io, build) catch {}; // Left unfinished, from before.
+            try cwd.rename(staging, cwd, build, context.io);
+        },
+        else => return err,
+    };
 }
 
 fn executable_write(context: Context, path: []const u8, data: []const u8) !void {
@@ -805,9 +811,9 @@ fn binary_disk(
     digest: *[]const u8,
 ) ![]const u8 {
     const io = context.io;
-    const staging = try path_join(context, &.{ context.cache, "staging", name });
+    const staging = try own_path(context, try path_join(context, &.{ context.cache, "staging", name }), "binary");
     const cwd = std.Io.Dir.cwd();
-    cwd.deleteTree(io, staging) catch {};
+    defer cwd.deleteTree(io, staging) catch {};
     for ([_][]const u8{ "bin", "etc", "tmp", "proc", "sys", "dev" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ staging, directory }));
     }
@@ -822,11 +828,14 @@ fn binary_disk(
         "/bin/{s}",
         .{basename},
     )});
+    // By content: by name alone, another build of the binary replaced the disk under runs
+    // still to replay from it (and two at once raced on it).
     const disk = try path_join(context, &.{ context.cache, "images", try std.fmt.allocPrint(
         context.arena,
-        "binary-{s}.erofs",
-        .{name},
+        "binary-{s}-{x:0>16}.erofs",
+        .{ name, content_hash },
     ) });
+    if (exists(context, disk)) return disk;
     try erofs_build(context, disk, &.{ "--all-root", "--ignore-mtime", staging });
     return disk;
 }
@@ -848,8 +857,8 @@ fn system_disk(context: Context, files: SystemFiles) ![]const u8 {
     const name = try std.fmt.allocPrint(context.arena, "{x:0>16}.erofs", .{hash});
     const disk = try path_join(context, &.{ context.cache, "systems", name });
     if (exists(context, disk)) return disk;
-    const staging = try path_join(context, &.{ context.cache, "staging", "system" });
-    cwd.deleteTree(io, staging) catch {};
+    const staging = try own_path(context, try path_join(context, &.{ context.cache, "staging", "system" }), "system");
+    defer cwd.deleteTree(io, staging) catch {};
     try cwd.createDirPath(io, staging);
     if (program) |path| {
         try cwd.copyFile(path, cwd, try path_join(context, &.{ staging, "program" }), io, .{});
@@ -870,8 +879,18 @@ fn system_disk(context: Context, files: SystemFiles) ![]const u8 {
 
 /// Builds `disk` atomically (via a temporary name), reproducibly (fixed time and UUID): disks are
 /// read by the guest, so their exact bytes are part of every timeline.
+/// A path of this process's own beside `path` (`<path>.<what>-<pid>`): explores preparing the
+/// same system at once (a hunt and a check, six replays of one script) shared the staging names,
+/// and one renamed or deleted another's half-made files: 5 of 6 failed (srv3, 2026-10-28), and
+/// a disk could have been made of another's partial file. Each makes its own, and renames it in
+/// whole (the same content, by the same hash: whichever lands last).
+fn own_path(context: Context, path: []const u8, what: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(context.arena, "{s}.{s}-{d}", .{ path, what, std.os.linux.getpid() });
+}
+
 fn erofs_build(context: Context, disk: []const u8, source: []const []const u8) !void {
-    const temporary = try std.fmt.allocPrint(context.arena, "{s}.partial", .{disk});
+    const temporary = try own_path(context, disk, "partial");
+    errdefer std.Io.Dir.cwd().deleteFile(context.io, temporary) catch {};
     var argv: std.ArrayList([]const u8) = .empty;
     const fixed = [_][]const u8{ "mkfs.erofs", "--quiet", "-T0", "-U" ++ filesystem_uuid };
     try argv.appendSlice(context.arena, &fixed);
