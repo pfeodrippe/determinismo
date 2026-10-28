@@ -4,21 +4,25 @@
 # KVM, restarted if it fails. A restart (a new build) leaves its runs running: the new serve adopts
 # them (their pid files). `stop` takes the runs too (they live in its cgroup): before KVM is
 # reloaded. Idempotent. Run as root.
-# Usage: serve.sh <user> start|stop [--reserved-cores N]
+# Usage: serve.sh <user> start|stop [--reserved-cores N] [--siblings on|off]
 #   Every exploration on the host is one of its runs (~/.determinismo, src/runs.zig): serve
 #   shows them however they were started.
 #   --reserved-cores N: N physical cores (with their hyperthreads) for the user's own sessions
 #   (ssh: builds, checks, benchmarks), the rest for serve and every run it starts (hunts), each
 #   confined to its share by the kernel (cgroup cpusets: systemd's AllowedCPUs). Kept in
 #   /etc/determinismo/reserved-cores for the next start. Default 0: runs may take every core.
+#   --siblings on|off: VMs on a core's second hyperthread too, once every core's first is busy
+#   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default off.
 set -euo pipefail
 user=${1:?usage: $0 <user> start|stop [--reserved-cores N]}
 action=${2:?usage: $0 <user> start|stop [--reserved-cores N]}
 shift 2
 reserved_given=
+siblings_given=
 while [ $# -gt 0 ]; do
   case $1 in
     --reserved-cores) reserved_given=${2:?--reserved-cores needs a number}; shift 2 ;;
+    --siblings) siblings_given=${2:?--siblings needs on or off}; shift 2 ;;
     *) echo "error: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -42,6 +46,14 @@ if [ -n "$reserved_given" ]; then
   echo "$reserved_given" > "$config"
 fi
 reserved=$(cat "$config" 2>/dev/null || echo 0)
+siblings_config=/etc/determinismo/siblings
+case $siblings_given in
+  on|off) mkdir -p "$(dirname "$siblings_config")"; echo "$siblings_given" > "$siblings_config" ;;
+  "") ;;
+  *) echo "error: --siblings takes on or off" >&2; exit 2 ;;
+esac
+smt=0
+[ "$(cat "$siblings_config" 2>/dev/null || echo off)" = on ] && smt=1
 read -r own_cpus run_cpus < <(python3 - "$reserved" <<'PY'
 import sys
 
@@ -101,6 +113,7 @@ Wants=user@$uid.service
 [Service]
 User=$user
 Environment=XDG_RUNTIME_DIR=/run/user/$uid
+Environment=DETERMINISMO_SMT=$smt
 WorkingDirectory=$home/determinismo
 ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
   --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\

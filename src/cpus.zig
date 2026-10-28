@@ -7,11 +7,14 @@
 //! the user's: every process agrees on the CPUs, and the kernel gives a CPU back when its holder
 //! dies. Locks belong to an open file, so each process opens the pool itself (never inherited).
 //!
-//! One thread per physical core: two VMs on a core's sibling hyperthreads perturb each other's
-//! retired-branch counters, the guest's clock, and a timeline no longer replays (measured on
-//! srv1, 2026-10-27: Kafka timelines replayed exactly on separate cores, beside a busy loop or a
-//! memory-churning process on the sibling, and diverged within seconds with another VM there).
-//! The pool holds each core's first thread; a second thread only when the first is not this
+//! One thread per physical core by default, a host's choice (`DETERMINISMO_SMT=1`, serve.sh's
+//! `--siblings on`) adds the second hyperthreads, taken once every core's first is busy. Siblings
+//! were left out when Kafka timelines diverged within seconds with two VMs on one core (srv1,
+//! 2026-10-27), and were thought to perturb each other's branch counters; the divergences were
+//! the guest kernel's, which branched on TLB state that a sibling's VM perturbs most (guest
+//! patches 0001, 0002 and 0004: 150-branch spurious faults). With them, four VMs on two cores'
+//! hyperthreads replayed a 382-second YugabyteDB timeline exactly (srv3, 2026-10-28). Without
+//! siblings, the pool holds each core's first thread; a second only when the first is not this
 //! process's to run on (an affinity mask that leaves it out).
 //!
 //! A process with `DETERMINISMO_CPU_PRIORITY` set (checks, e.g. `zig build e2e`) goes first: while
@@ -339,13 +342,21 @@ pub fn usable_count() u32 {
     return @max(count, 1);
 }
 
-/// In the set, and not a second hyperthread whose core's first thread is in the set too.
+/// In the set, and not a second hyperthread whose core's first thread is in the set too (unless
+/// siblings are allowed: `DETERMINISMO_SMT=1`, a host's choice; the pool still takes every
+/// core's first thread before any sibling).
 fn usable(available: *const linux.cpu_set_t, cpu: usize) bool {
     const bits = @bitSizeOf(@TypeOf(available[0]));
     if (available[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) return false;
+    if (siblings_allowed()) return true;
     const first = first_sibling(@intCast(cpu)) orelse return true;
     if (first == cpu) return true;
     return available[first / bits] >> @intCast(first % bits) & 1 == 0;
+}
+
+fn siblings_allowed() bool {
+    const value = std.c.getenv("DETERMINISMO_SMT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 /// Whether the CPU is a core's second hyperthread (not the first of its siblings).
