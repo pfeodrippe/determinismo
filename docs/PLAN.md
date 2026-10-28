@@ -266,7 +266,13 @@ event hashing, the guest module.
      55, srv3, 2026-10-28, once serve passed the variable on: it never had): 2 of 9 sampled
      replays diverged (no clock hazard), against 33 of 33 exact without them: off again. Next:
      find what a sibling VM still perturbs (the guest kernel's TLB-dependent paths, patches
-     0001, 0002, 0004, were the last), with replays of a timeline beside a busy sibling.
+     0001, 0002, 0004, were the last), with replays of a timeline beside a busy sibling. So far:
+     run 55's timeline 15 is the original that parted (a lone replay and the in-run one agree,
+     diverging from its tape at the same event: seq 19819, 326 more branches in the 75 ms after
+     the broker's restart began); four replays on two cores' four hyperthreads all matched the
+     lone one. The original ran beside 31 VMs with 14 GB of the host's memory available: next,
+     32 replays at once with hyperthreads on the whole host between two hunts (determinismo
+     verify on run 55), then the RDTSC log and instruction trace of a parted one.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,
