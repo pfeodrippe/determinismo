@@ -53,6 +53,7 @@ pub fn sink_path(buffer: []u8, name: []const u8, filtered: bool) ![]const u8 {
 const poll_interval_ns = 10 * std.time.ns_per_ms;
 const ready_attempts_max = 6000; // 60 s of virtual time.
 const stop_attempts_max = 3000;
+const freeze_attempts_max = 100; // 1 s of virtual time.
 const link_attempts_max = 500;
 
 pub fn system_load(arena: std.mem.Allocator) !schema.System {
@@ -290,7 +291,14 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
     try file_write(paths.cgroup_freeze, "1");
     defer file_write(paths.cgroup_freeze, "0") catch {}; // Its next start runs.
     if (frozen_begun) |call| call(name);
-    try cgroup_frozen_wait(&paths);
+    // A process inside the kernel (I/O to a stalled disk) reports frozen only once its system
+    // call returns; the freeze stops it then, before the kill reaches it, so it never sees the
+    // power go. Waiting longer only stalls the fault injector: 30 s a crash, and the crash
+    // given up, in 95 timelines of PostgreSQL's run 43 (srv3, 2026-10-28).
+    cgroup_frozen_wait(&paths) catch |err| switch (err) {
+        error.NodeDidNotFreeze => {},
+        else => return err,
+    };
     // The power goes: from here nothing the node's kernel still issues reaches its disk (a
     // journal commit, the discards of what a lost transaction freed: ext4's commit callback
     // ran on and punched blocks the disk's committed state still used, directories read back
@@ -1172,9 +1180,10 @@ fn memory_limit(paths: *const Paths, memory_max_mib: ?u32) !void {
     try file_write(path, value);
 }
 
-/// Until every process of the node is frozen (one inside a system call stops when it returns).
+/// Until every process of the node is frozen (one inside a system call stops when it returns),
+/// a second at most.
 fn cgroup_frozen_wait(paths: *const Paths) !void {
-    for (0..stop_attempts_max) |_| {
+    for (0..freeze_attempts_max) |_| {
         var buffer: [256]u8 = undefined;
         const events = read_small(paths.cgroup_events, &buffer) orelse return error.NoCgroup;
         if (std.mem.indexOf(u8, events, "frozen 1") != null) return;

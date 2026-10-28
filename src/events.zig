@@ -70,6 +70,9 @@ last_event_name_size: u8 = 0,
 /// rate the "logging output" property checks.
 output_bytes: u64 = 0,
 first_vtime_ns: ?u64 = null,
+/// When the guest began streaming its checks' inputs out (composer.zig's checks_stream: the
+/// timeline's commands are over). A branch from later would hold only the rest of them.
+checks_start_ns: ?u64 = null,
 /// The latest event's moment.
 last_vtime_ns: u64 = 0,
 /// The behaviors this timeline reached (behavior_hash: an assertion with its outcome, an
@@ -177,7 +180,12 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     const value = parsed orelse return;
     if (value != .object) return;
     if (value.object.get("event")) |name| {
-        if (name == .string) events.check_event(name.string, value.object.get("details"));
+        if (name == .string) {
+            const checks = std.mem.eql(u8, name.string, "check_chunk") or
+                std.mem.eql(u8, name.string, "check_input");
+            if (checks and events.checks_start_ns == null) events.checks_start_ns = moment.vtime_ns;
+            events.check_event(name.string, value.object.get("details"));
+        }
         if (name == .string) {
             const size: u8 = @intCast(@min(name.string.len, events.last_event_name.len));
             @memcpy(events.last_event_name[0..size], name.string[0..size]);

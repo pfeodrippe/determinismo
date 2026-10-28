@@ -2045,7 +2045,11 @@ const Summary = struct {
     holders: [holders.per_timeline_max]holders.Held,
     /// Its whole trace's hash (from the setup snapshot): equal, the same timeline.
     trace_hash: u64,
-    /// At or before its last randomness pull (VM.last_pull_ns): branches return before it.
+    /// At or before its last randomness pull (VM.last_pull_ns), and before its checks' inputs
+    /// streamed out (Events.checks_start_ns): branches return before it. From later, a branch
+    /// replays the timeline's shutdown alone, and its host checks get part of their input (run
+    /// 43, srv3: the archive returned after a built-in property of the end, and Elle refused
+    /// 28 such histories).
     last_pull_ns: u64,
     /// Stopped at its horizon: it can be extended (returned to at its end), its future unknown.
     cut: bool,
@@ -2076,7 +2080,7 @@ const Summaries = struct {
         summary.end_ns = if (vm.moment()) |moment| moment.vtime_ns else |_| summary.start_ns;
         summary.behavior_count = vm.events.behavior_count;
         summary.trace_hash = vm.events.hash.final();
-        summary.last_pull_ns = vm.last_pull_ns;
+        summary.last_pull_ns = @min(vm.last_pull_ns, vm.events.checks_start_ns orelse std.math.maxInt(u64));
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.holder_count = @intCast(kept.len);
         @memcpy(summary.holders[0..kept.len], kept);

@@ -1051,6 +1051,11 @@ fn readdress_maybe(system: *const schema.System, node: *const schema.Resolved) v
 fn node_start_again(system: *const schema.System, name: []const u8) void {
     const node = system.node(name) orelse return;
     const arena = arena_active orelse return;
+    // Waiting for the node to be ready (60 s at most: nodes.ready_wait) is not a stall: a
+    // PostgreSQL recovering after a power loss took over 30 s in 95 timelines of run 43 (srv3),
+    // each one failing the property.
+    busy_end();
+    defer busy_begin();
     nodes.start(arena, system, node) catch |err| {
         sdk.event("fault_restart_failed", .{ .node = name, .err = @errorName(err) });
         return;
