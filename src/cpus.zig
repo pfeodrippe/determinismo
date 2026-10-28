@@ -16,7 +16,10 @@
 //! were the guest kernel's, which branched on TLB state that a sibling's VM perturbs most (guest
 //! patches 0001, 0002 and 0004: 150-branch spurious faults). With them, VMs on both hyperthreads
 //! of two cores replayed YugabyteDB (39 s, 382 s) and Kafka timelines (three) exactly, 20
-//! replays of 20 (srv3, 2026-10-28). With one thread per core, the pool holds each core's first;
+//! replays of 20 (srv3, 2026-10-28). But the first hunt with them (Kafka, run 55, srv3,
+//! 2026-10-28: 32 VMs on 16 cores) replayed 7 of the 9 timelines it checked exactly, two
+//! diverging with no clock hazard, while runs without them replayed 33 of 33: off, until what
+//! a sibling still perturbs is found. With one thread per core, the pool holds each core's first;
 //! a second only when the first is not this process's to run on (an affinity mask that leaves it
 //! out).
 //!

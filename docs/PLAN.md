@@ -262,8 +262,11 @@ event hashing, the guest module.
      2026-10-28 every tree's snapshot nodes, `nodes-<pid>` claims) and with its memory available
      now (MemAvailable less an 8 GB reserve); a run's nodes stop at half the host; holders are
      made with 16 GB available and give themselves up below 8 GB; timelines the kernel kills
-     anyway run again (64 at most). Next: hyperthreads (DETERMINISMO_SMT, replays proven exact)
-     on again for one watched hunt, then by default.
+     anyway run again (64 at most). Hyperthreads (DETERMINISMO_SMT) tried on a hunt (Kafka run
+     55, srv3, 2026-10-28, once serve passed the variable on: it never had): 2 of 9 sampled
+     replays diverged (no clock hazard), against 33 of 33 exact without them: off again. Next:
+     find what a sibling VM still perturbs (the guest kernel's TLB-dependent paths, patches
+     0001, 0002, 0004, were the last), with replays of a timeline beside a busy sibling.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,
