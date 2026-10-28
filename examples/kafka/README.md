@@ -111,6 +111,42 @@ the whole timeline (the coverage profile's slower brokers never got one).
 - Hunt run 67 (2026-10-28, default profile, seed 17, 2 h, the fixes above): 207 timelines,
   commits in most; Elle failed in 22, each time G0 alone (Jepsen's write cycles, now reported
   apart: `allowed`); one false data loss (below); no KAFKA-17754 yet.
+- Hunt run 68 (2026-10-28, coverage profile, seed 17, 2 h): 175 timelines. In timeline 125 a
+  transaction stayed open in partition 1 a minute after faults stopped (its last stable offset
+  254, its high watermark 333; the producers' transactions time out after 10 s), so the
+  read_committed final read stopped at 254: the 30 "lost" and 24 "torn" writes are past it.
+  Before: kafka-1 stopped (1857.5 s), lost power twice (1878.4 s, 1879.3 s), was stopped 9 ms
+  after a start (1879.8 s) and started again at 1882.1 s; partition 1's leader, kafka-2, lost
+  power at a sync point at 1858.7 s. A replay asked Kafka (`kafka-transactions.sh
+  describe-producers`) at 1965 s: partition 1's open transaction is producer 19000's, epoch 0,
+  one batch (offset 254, at 1353.9 s), no coordinator marker ever (coordinator epoch -1). The
+  coordinator's own log (kafka-2, `__transaction_state-14`, its leader from 1353.2 s) tells the
+  rest: it gave `t3506608` producer 19000 at 1354.0 s; at 1365.0 s the commit's PrepareCommit
+  append failed (the partition's in-sync replicas down to kafka-2 alone: NotEnoughReplicas),
+  and so did every abort after it, the client's and the coordinator's timeout rollbacks ("failed
+  to write an epoch fence transition ... The epoch was increased to 1 but not returned to the
+  client"), until 1383.0 s; kafka-1 rejoined the in-sync replicas at 1383.2 s, but no rollback
+  was tried again; between 1384 and 1416 s every broker restarted (kafka-2 from a stop whose
+  controlled shutdown outlasted the 3 s grace: killed, its page cache intact). Restarted,
+  kafka-2 replayed the cluster's metadata: at 1417.04 s it was elected coordinator of
+  `__transaction_state-14` at epoch 38 (an old leadership) and scheduled its load; at 1417.17 s
+  it resigned at epoch 39, and the load ran anyway: "Finished loading 0 transaction metadata ...
+  Completed loading ... for coordinator epoch 38". Kafka 3.8.0's resignation
+  (`removeTransactionsForTxnTopicPartition(partition, epoch)`) removes the loading entry of
+  the new epoch (39), never the one loading (38), so the load, reading nothing from a log
+  kafka-2 did not lead (`getLogEndOffset` is -1 then), installed an empty cache for the
+  partition. From 1418 s that cache answered `t3506608`'s InitProducerId as a new
+  transactional id: producer id 20000, epoch 0, Empty; at 1419.96 s, its coordinator elected
+  at epoch 40, kafka-2 loaded the partition again and finished it: "Initialized transactionalId
+  t3506608 with producerId 20000 and producer epoch 1". Producer 19000's transaction, Ongoing
+  on `jepsen-1` since 1353.9 s, is in no coordinator's state any more: nothing will abort it.
+  This is KAFKA-18137 ("Unloading transaction state incorrectly removes loading partitions",
+  fixed in 4.0.0; 3.8.x and 3.9.x have it), whose report says it "may not immediately cause a
+  correctness issue": here it made a hanging transaction, the last stable offset of `jepsen-1`
+  stuck at 254 for good (a read_committed consumer reads nothing past it). Not a new bug; its
+  consequence, seen here, is not in its report. Related (read only): KAFKA-21349 (open:
+  loads of records above the high watermark), KAFKA-18957 (open: hangs on 3.8.1 and 3.9.0),
+  KAFKA-9307 (2019: a load left at a previous epoch).
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
