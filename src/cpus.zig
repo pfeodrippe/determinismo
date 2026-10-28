@@ -81,6 +81,9 @@ pub const Pool = struct {
     /// The run's turn to wait: one of its processes at a time holds it.
     turn_fd: linux.fd_t = -1,
     priority: bool = false,
+    /// Whether a claim must also find its memory available now (tests of the claims' own
+    /// accounting turn it off: beside a hunt, half the host is never available).
+    available_counts: bool = true,
 
     /// Opens the pool of the CPUs this process may run on.
     pub fn open(pool: *Pool) !void {
@@ -229,13 +232,7 @@ pub const Pool = struct {
             var claim: [8]u8 = @splat(0);
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
-        if (claimed + bytes + memory_reserve_bytes > total) return false;
-        // And there now: claims count the VMs holding CPUs, not what holds memory without one
-        // (holders, in-run snapshots, host checks' services); a check beside a hunt once fit
-        // its claims and the host ran out (srv3, 2026-10-28: the OOM killer took a hunt's
-        // timeline and podman's pause process).
-        const available = memory_available();
-        return available == 0 or bytes + memory_reserve_bytes <= available;
+        return fits(claimed, bytes, total, if (pool.available_counts) memory_available() else 0);
     }
 
     /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
@@ -436,6 +433,24 @@ test "pinned, a process still counts and pools the CPUs it was given" {
     try std.testing.expectEqualSlices(usize, &given(), &mask); // Unpinned when given back.
 }
 
+/// Whether `bytes` more fit: within the claims (the VMs holding CPUs, each its guest's size) and
+/// the reserve, and there now (`available`, 0 when unknown): claims miss what holds memory
+/// without a CPU (holders, in-run snapshots, host checks' services), and a check beside a hunt
+/// once fit its claims while the host ran out (srv3, 2026-10-28: the OOM killer took a hunt's
+/// timeline and podman's pause process).
+fn fits(claimed: u64, bytes: u64, total: u64, available: u64) bool {
+    if (claimed + bytes + memory_reserve_bytes > total) return false;
+    return available == 0 or bytes + memory_reserve_bytes <= available;
+}
+
+test fits {
+    const gib = 1 << 30;
+    try std.testing.expect(fits(100 * gib, 7 * gib, 125 * gib, 40 * gib));
+    try std.testing.expect(!fits(112 * gib, 7 * gib, 125 * gib, 40 * gib)); // Past the claims.
+    try std.testing.expect(!fits(60 * gib, 7 * gib, 125 * gib, 12 * gib)); // Not there now.
+    try std.testing.expect(fits(60 * gib, 7 * gib, 125 * gib, 0)); // Unknown: the claims alone.
+}
+
 test "a VM's memory claim counts while its CPU is held" {
     var holder: Pool = undefined;
     try holder.open();
@@ -443,6 +458,8 @@ test "a VM's memory claim counts while its CPU is held" {
     var other: Pool = undefined;
     try other.open();
     defer other.close();
+    holder.available_counts = false; // The claims' accounting alone (fits has the rest).
+    other.available_counts = false;
     const total = memory_total();
     if (total == 0) return error.SkipZigTest;
     const saved = claim_bytes;
