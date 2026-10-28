@@ -73,6 +73,7 @@ pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerro
                 .ops = verdict.ops,
                 .anomaly_types = verdict.anomaly_types,
                 .anomalies = anomalies,
+                .window_ns = verdict.window_ns,
             });
             sdk.sometimes(verdict.valid == true, "Elle checked a history and found it valid", .{
                 .ops = verdict.ops,
@@ -88,6 +89,9 @@ pub const Verdict = struct {
     ops: u64,
     /// As Elle prints them.
     anomalies: []const u8,
+    /// When the anomalies formed: the earliest and latest time (the guest's clock) of the
+    /// operations they name; after it, the failure is decided (causality looks before it).
+    window_ns: ?[2]u64 = null,
 };
 
 /// Elle's verdict on a history (JSON lines), from the service on the host.
@@ -106,6 +110,7 @@ pub fn judge(context: *sdk.Check, history: []const u8, model: []const u8, consis
         anomaly_types: []const []const u8 = &.{},
         ops: u64 = 0,
         anomalies: []const u8 = "",
+        window_ns: ?[2]u64 = null,
         @"error": []const u8 = "",
     };
     const answer = try std.json.parseFromSliceLeaky(Answer, context.arena, response.body, .{
@@ -120,6 +125,7 @@ pub fn judge(context: *sdk.Check, history: []const u8, model: []const u8, consis
         .anomaly_types = answer.anomaly_types,
         .ops = answer.ops,
         .anomalies = answer.anomalies,
+        .window_ns = answer.window_ns,
     };
 }
 
@@ -145,12 +151,16 @@ fn service_ensure(context: *sdk.Check) !void {
     return error.ElleNotAnswering;
 }
 
+/// The service answers, and is this version (checkers/elle's `version`): one of another is
+/// replaced (podman rm -f, then run).
 fn answers() bool {
-    var connection: tcp.Connection = undefined;
-    connection.open(address, port, .{ .timeout_ms = 1000 }) catch return false;
-    connection.close();
-    return true;
+    var buffer: [4096]u8 = undefined;
+    const response = tcp.http_with(address, port, "GET", "/version", "", &buffer, .{ .timeout_ms = 2000 }) catch return false;
+    return response.status == 200 and std.mem.indexOf(u8, response.body, "\"version\":\"" ++ service_version ++ "\"") != null;
 }
+
+/// checkers/elle/src/elle_service.clj's `version`.
+const service_version = "2";
 
 fn command(context: *sdk.Check, argv: []const []const u8) !void {
     const result = try std.process.run(context.arena, context.io, .{ .argv = argv });
@@ -185,7 +195,6 @@ pub const History = struct {
         return .{ .path = schema.record_path(name) };
     }
 
-
     pub fn invoke(history: *const History, gpa: std.mem.Allocator, process: u64, mops: []const Mop) !void {
         return history.note(gpa, process, .invoke, mops);
     }
@@ -209,7 +218,7 @@ pub const History = struct {
     ) !void {
         var line: std.Io.Writer.Allocating = .init(gpa);
         defer line.deinit();
-        try line_write(&line.writer, process, kind, mops);
+        try line_write(&line.writer, process, kind, mops, time_ns());
         const bytes = line.written();
         const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
         const fd = linux.open(history.path, flags, 0o644);
@@ -220,10 +229,19 @@ pub const History = struct {
     }
 };
 
-/// `{"process":7,"type":"ok","f":"txn","value":[["append",3,17],["r",4,[2,9]]]}` and a newline.
-pub fn line_write(writer: *std.Io.Writer, process: u64, kind: Kind, mops: []const Mop) !void {
-    try writer.print("{{\"process\":{d},\"type\":\"{s}\",\"f\":\"txn\",\"value\":[", .{
-        process, @tagName(kind),
+/// The guest's clock (virtual, the same in every replay): when an operation was recorded, which
+/// Elle reports with the operations of an anomaly (the window the anomaly formed in).
+fn time_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+}
+
+/// `{"process":7,"type":"ok","f":"txn","time":5000000,"value":[["append",3,17],["r",4,[2,9]]]}`
+/// and a newline.
+pub fn line_write(writer: *std.Io.Writer, process: u64, kind: Kind, mops: []const Mop, time: u64) !void {
+    try writer.print("{{\"process\":{d},\"type\":\"{s}\",\"f\":\"txn\",\"time\":{d},\"value\":[", .{
+        process, @tagName(kind), time,
     });
     for (mops, 0..) |mop, index| {
         if (index > 0) try writer.writeByte(',');
@@ -255,19 +273,19 @@ test line_write {
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     const asked = [_]Mop{ .{ .append = .{ .key = 3, .value = 17 } }, .{ .read = .{ .key = 4 } } };
-    try line_write(&writer, 7, .invoke, &asked);
+    try line_write(&writer, 7, .invoke, &asked, 5);
     const done = [_]Mop{ asked[0], .{ .read = .{ .key = 4, .list = &.{ 2, 9 } } } };
-    try line_write(&writer, 7, .ok, &done);
+    try line_write(&writer, 7, .ok, &done, 9);
     const registers = [_]Mop{
         .{ .write = .{ .key = 1, .value = 5 } },
         .{ .read_register = .{ .key = 2 } },
         .{ .read_register = .{ .key = 1, .value = 5 } },
     };
-    try line_write(&writer, 8, .info, &registers);
+    try line_write(&writer, 8, .info, &registers, 12);
     try std.testing.expectEqualStrings(
-        \\{"process":7,"type":"invoke","f":"txn","value":[["append",3,17],["r",4,null]]}
-        \\{"process":7,"type":"ok","f":"txn","value":[["append",3,17],["r",4,[2,9]]]}
-        \\{"process":8,"type":"info","f":"txn","value":[["w",1,5],["r",2,null],["r",1,5]]}
+        \\{"process":7,"type":"invoke","f":"txn","time":5,"value":[["append",3,17],["r",4,null]]}
+        \\{"process":7,"type":"ok","f":"txn","time":9,"value":[["append",3,17],["r",4,[2,9]]]}
+        \\{"process":8,"type":"info","f":"txn","time":12,"value":[["w",1,5],["r",2,null],["r",1,5]]}
         \\
     , writer.buffered());
 }

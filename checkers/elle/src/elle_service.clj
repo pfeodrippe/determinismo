@@ -22,13 +22,26 @@
            (java.nio.charset StandardCharsets)))
 
 (def port 7700)
+;; What `/version` answers: the SDK (sdk/zig/elle.zig) replaces a running service that answers
+;; another. 2: operations' times, and the window the anomalies formed in (window_ns).
+(def version "2")
 (def anomalies-size-max 4000)
 
 (defn- operation [m]
   {:process (get m "process")
    :type (keyword (get m "type"))
    :f (keyword (get m "f"))
+   :time (get m "time" -1)
    :value (mapv (fn [[f k v]] [(keyword f) k v]) (get m "value"))})
+
+(defn- window
+  "When the anomalies formed: the earliest and the latest time (the guest's clock, in
+  nanoseconds) of the operations they name, or nil when they name none with a time."
+  [anomalies]
+  (let [times (->> (tree-seq coll? seq anomalies)
+                   (keep #(when (map? %) (:time %)))
+                   (filter #(and (number? %) (>= % 0))))]
+    (when (seq times) [(apply min times) (apply max times)])))
 
 (defn- closed
   "The operations, with every invocation left open closed as :info (by process, in order)."
@@ -64,11 +77,13 @@
         result (checker {:consistency-models [(keyword consistency)]}
                         (history/history operations))
         valid (:valid? result)
+        formed (window (:anomalies result))
         anomalies (pr-str (shortened (:anomalies result)))]
     {:valid (if (keyword? valid) (name valid) valid)
      :anomaly_types (map name (:anomaly-types result))
      :not (map name (:not result))
      :ops (count operations)
+     :window_ns formed
      :anomalies (subs anomalies 0 (min anomalies-size-max (count anomalies)))}))
 
 (defn- parameters [^HttpExchange exchange]
@@ -99,5 +114,9 @@
 (defn -main [& _]
   (let [server (HttpServer/create (InetSocketAddress. port) 16)]
     (.createContext server "/check" (reify HttpHandler (handle [_ exchange] (handle exchange))))
+    (.createContext server "/version" (reify HttpHandler
+                                        (handle [_ exchange]
+                                          (try (respond exchange 200 {:version version})
+                                               (finally (.close exchange))))))
     (.start server)
     (println "elle-service on port" port)))
