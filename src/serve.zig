@@ -841,6 +841,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     // Its explorer holds the run's pid file (runs.zig): how a restarted server finds it running.
     const pid = try spawn(server.arena, argv, output, run_environment(&asked), .fresh);
+    pid_note(server, directory, pid);
     runs_insert(shared, .{ .id = id, .pid = pid });
     try out.print("{{\"id\":{d}}}\n", .{id});
     return 201;
@@ -966,8 +967,12 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         }
     }
     try out.writeAll(",\"stats\":");
-    // One row: the object.
-    const text = try answer_kept(server, run.id, .stats, &stats_compute);
+    // One row: the object. A run whose events cannot be read (its explorer failed before any)
+    // is still shown: the self-test's controller answered 500 about such runs, "lost".
+    const text = answer_kept(server, run.id, .stats, &stats_compute) catch |err| {
+        try out.print("null,\"stats_error\":\"{s}\"}}\n", .{@errorName(err)});
+        return 200;
+    };
     try out.writeAll(text[1 .. text.len - 1]);
     try out.writeAll("}\n");
     return 200;
@@ -1826,6 +1831,22 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     run.* = .{ .id = id, .pid = pid };
     try out.print("{{\"id\":{d},\"state\":\"running\"}}\n", .{id});
     return 200;
+}
+
+/// A run this server started has its pid file at once (its explorer takes it over, the same
+/// pid, and holds its lock while it runs): a server started later lists it whatever happened to
+/// its explorer. Without it, one whose explorer ended without writing the file waited out the
+/// claim's grace (runs_discover), unlisted: after the self-test controller's restart, every run
+/// it had accepted was "lost".
+fn pid_note(server: *Server, directory: []const u8, pid: linux.pid_t) void {
+    const path = std.fmt.allocPrintSentinel(server.arena, "{s}/pid", .{directory}, 0) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const opened = linux.open(path, flags, 0o644);
+    if (linux.errno(opened) != .SUCCESS) return; // Its explorer wrote it first.
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    const text = std.fmt.allocPrint(server.arena, "{d}\n", .{pid}) catch return;
+    _ = linux.write(fd, text.ptr, text.len);
 }
 
 /// The runs in the data directory this server does not list yet: at its start every one, then

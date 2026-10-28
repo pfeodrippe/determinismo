@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! det-fake-explore: stands in for `determinismo explore` when the controller itself is the
 //! system under test (no KVM inside the guest). It accepts explore's arguments, writes a record
-//! like explore's (--record: run, branches, summary) over a few hundred milliseconds, and exits
-//! like explore: 0 when every property passed, 3 when some failed.
+//! like explore's (--record, or serve's --run-directory: record.jsonl there; run, branches,
+//! summary) over a few hundred milliseconds, and exits like explore: 0 when every property
+//! passed, 3 when some failed.
 const std = @import("std");
 const linux = std.os.linux;
 const sdk = @import("determinismo");
@@ -15,6 +16,9 @@ pub fn main(init: std.process.Init) !void {
     for (arguments, 0..) |argument, index| {
         if (index + 1 == arguments.len) break;
         if (std.mem.eql(u8, argument, "--record")) record = arguments[index + 1];
+        if (std.mem.eql(u8, argument, "--run-directory")) {
+            record = try std.fs.path.join(arena, &.{ arguments[index + 1], "record.jsonl" });
+        }
         if (std.mem.eql(u8, argument, "--branches")) {
             branches = std.fmt.parseInt(u32, arguments[index + 1], 10) catch 4;
         }

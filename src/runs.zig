@@ -128,8 +128,10 @@ pub fn artifact_keep(arena: std.mem.Allocator, io: std.Io, data: []const u8, pat
     });
     const kept = try std.fs.path.join(arena, &.{ directory, name });
     cwd.access(io, kept, .{}) catch {
-        // Staged under a name of this process's: two runs keeping it at once do not collide.
-        const staging = try std.fmt.allocPrintSentinel(arena, "{s}.staging-{d}", .{ kept, linux.getpid() }, 0);
+        // Staged under a name of this thread's: two runs keeping it at once do not collide, nor
+        // two requests to one server (a thread each: the self-test's controller answered 500
+        // when one renamed the file the other was about to chmod).
+        const staging = try std.fmt.allocPrintSentinel(arena, "{s}.staging-{d}-{d}", .{ kept, linux.getpid(), linux.gettid() }, 0);
         try cwd.writeFile(io, .{ .sub_path = staging, .data = bytes });
         // Executable: a test program is run from its kept copy.
         if (linux.errno(linux.fchmodat(linux.AT.FDCWD, staging, 0o755)) != .SUCCESS) return error.ChmodFailed;
