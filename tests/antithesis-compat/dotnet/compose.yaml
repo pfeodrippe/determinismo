@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The .NET SDK (sdk/dotnet) under determinismo: a C# program asserting, drawing and deciding
+# through /dev/determinismo, its catalog generated at build time.
+#   determinismo explore ... --compose tests/antithesis-compat/dotnet/compose.yaml --scenario sdk
+# The client's build context is the repository root so that its image can include sdk/dotnet.
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/dotnet/client/Dockerfile
+    command: [sleep, infinity]

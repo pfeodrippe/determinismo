@@ -16,3 +16,8 @@ guest/module/.module-common.o
 .claude/scheduled_tasks.lock
 __pycache__/
 .cpcache/
+
+# .NET builds
+sdk/dotnet/*/bin/
+sdk/dotnet/*/obj/
+sdk/dotnet/test/DeterminismoCatalog.g.cs

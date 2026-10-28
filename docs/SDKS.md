@@ -13,31 +13,32 @@ the same capabilities in each, in that language's idiom.
 | JavaScript, TypeScript | `sdk/javascript/` | one file for Node.js 18+, types in `determinismo.d.ts` |
 | Rust | `sdk/rust/` | the crate `determinismo` (`serde_json` details) |
 | Go | `sdk/go/` | the package `github.com/pfeodrippe/determinismo/sdk/go`; its catalog from `go generate` (`cmd/determinismo-catalog`) |
+| .NET (C#, F#, VB) | `sdk/dotnet/Determinismo.cs` | one file (.NET 8+); its catalog from `dotnet run --project sdk/dotnet/catalog -- <project>` (a module initializer) |
 
 ## What every SDK has
 
-| Capability | Zig | C | Python | Java | Clojure | JavaScript | Rust | Go |
-|---|---|---|---|---|---|---|---|---|
-| Random bytes, u64, below n | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Random choice | `random_choice` | (`det_random_below`) | `random_choice` | `randomChoice` | `choice` | `randomChoice` | `random_choice` | `RandomChoice` |
-| Random float in [0, 1) | `random_float` | `det_random` | `random_float` | `random` | `random-float` | `random` | `random` | `Random` |
-| A generator drawing from the platform | `rng` (std.Random) | `determinismo::random_engine` (C++) | `rng` (random.Random) | `rng` (java.util.Random) | `rng` | `rng` | `rng` (RngCore) | `Source()` (math/rand/v2) |
-| A generator seeded once | `prng` | `det_prng`, `prng_engine` (C++) | `prng` | `prng` | `prng` | `prng` | `prng` (RngCore) | `Prng()` (math/rand/v2) |
-| Named decisions | `decide`, `random_below_named` | `det_decide`, `det_random_below_named` | ✓ | ✓ | ✓ | `decide`, `randomBelowNamed` | ✓ | `Decide`, `RandomBelowNamed` |
-| Buggify, and its pauses | `buggify`, `buggify_pause` | `det_buggify`, `det_buggify_pause` | ✓ | `buggify`, `buggifyPause` | ✓ | `buggify`, `buggifyPause` | ✓ | `Buggify`, `BuggifyPause` |
-| always, always_or_unreachable, sometimes, reachable, unreachable | ✓ | `DET_*` macros | ✓ | ✓ | macros | ✓ | macros | ✓ |
-| The assertion's place in the code | debug info | `__FILE__`, `__LINE__` | the frame | the stack | the stack | the stack | `file!`, `line!`, `column!` | `runtime.Caller` |
-| Guidance comparisons (8) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| always_some, sometimes_all | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`NamedBool`) |
-| Every evaluation an event, or first pass and first failure | `assertion_events` | `det_first_pass_first_failure` | `assertion_events` | `firstPassFirstFailure` | `first-pass-first-failure!` | `setAssertionEvents` | `set_assertion_events` | `SetAssertionEvents` |
-| The catalog, announced before assertions run | det_catalog section | det_catalog section | source scan | class scan (agent) | macro expansion | source scan (CommonJS) | det_catalog section | generated `init` (`go generate`) |
-| Declare one at run time | `declare` | `det_declare` | `declare` | `declare` | (the macros) | `declare` | `declare` | `Declare` |
-| List the catalog | `catalog_assertions`, `catalog_write` | `det_catalog_write` | `catalog_assertions`, `catalog_write` | `catalogAssertions`, `catalogWrite` | `catalog-assertions`, `catalog-write` | `catalogAssertions`, `catalogWrite` | `catalog::assertions`, `catalog::write` | `CatalogAssertions`, `CatalogWrite` |
-| setup_complete, event | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Raw output (any JSON object) | `output` | `det_output` | `output` | `output` | `output` | `output` | `output` | `Output` |
-| Quiet periods, faults from the scenario | `stop_faults`, `fault` | ✓ | ✓ | ✓ | ✓ | `stopFaults`, `fault` | ✓ | `StopFaults`, `Fault` |
-| Code coverage for strategies | trace-pc-guard | trace-pc-guard | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`) | (Go's own `-cover`) |
-| Outside determinismo: local output file, else stderr | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Capability | Zig | C | Python | Java | Clojure | JavaScript | Rust | Go | .NET |
+|---|---|---|---|---|---|---|---|---|---|
+| Random bytes, u64, below n | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Random choice | `random_choice` | (`det_random_below`) | `random_choice` | `randomChoice` | `choice` | `randomChoice` | `random_choice` | `RandomChoice` | `RandomChoice` |
+| Random float in [0, 1) | `random_float` | `det_random` | `random_float` | `random` | `random-float` | `random` | `random` | `Random` | `RandomFloat` |
+| A generator drawing from the platform | `rng` (std.Random) | `determinismo::random_engine` (C++) | `rng` (random.Random) | `rng` (java.util.Random) | `rng` | `rng` | `rng` (RngCore) | `Source()` (math/rand/v2) | `Rng`, `AntithesisRandom` (System.Random) |
+| A generator seeded once | `prng` | `det_prng`, `prng_engine` (C++) | `prng` | `prng` | `prng` | `prng` | `prng` (RngCore) | `Prng()` (math/rand/v2) | `Prng` (System.Random) |
+| Named decisions | `decide`, `random_below_named` | `det_decide`, `det_random_below_named` | ✓ | ✓ | ✓ | `decide`, `randomBelowNamed` | ✓ | `Decide`, `RandomBelowNamed` | `Decide`, `RandomBelowNamed` |
+| Buggify, and its pauses | `buggify`, `buggify_pause` | `det_buggify`, `det_buggify_pause` | ✓ | `buggify`, `buggifyPause` | ✓ | `buggify`, `buggifyPause` | ✓ | `Buggify`, `BuggifyPause` | `Buggify`, `BuggifyPause` |
+| always, always_or_unreachable, sometimes, reachable, unreachable | ✓ | `DET_*` macros | ✓ | ✓ | macros | ✓ | macros | ✓ | ✓ |
+| The assertion's place in the code | debug info | `__FILE__`, `__LINE__` | the frame | the stack | the stack | the stack | `file!`, `line!`, `column!` | `runtime.Caller` | caller attributes |
+| Guidance comparisons (8) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| always_some, sometimes_all | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`NamedBool`) | ✓ |
+| Every evaluation an event, or first pass and first failure | `assertion_events` | `det_first_pass_first_failure` | `assertion_events` | `firstPassFirstFailure` | `first-pass-first-failure!` | `setAssertionEvents` | `set_assertion_events` | `SetAssertionEvents` | `Assert.FirstPassFirstFailure` |
+| The catalog, announced before assertions run | det_catalog section | det_catalog section | source scan | class scan (agent) | macro expansion | source scan (CommonJS) | det_catalog section | generated `init` (`go generate`) | generated module initializer |
+| Declare one at run time | `declare` | `det_declare` | `declare` | `declare` | (the macros) | `declare` | `declare` | `Declare` | `Catalog.Declare` |
+| List the catalog | `catalog_assertions`, `catalog_write` | `det_catalog_write` | `catalog_assertions`, `catalog_write` | `catalogAssertions`, `catalogWrite` | `catalog-assertions`, `catalog-write` | `catalogAssertions`, `catalogWrite` | `catalog::assertions`, `catalog::write` | `CatalogAssertions`, `CatalogWrite` | `Catalog.Assertions`, `Catalog.Write` |
+| setup_complete, event | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Raw output (any JSON object) | `output` | `det_output` | `output` | `output` | `output` | `output` | `output` | `Output` | `Lifecycle.Output` |
+| Quiet periods, faults from the scenario | `stop_faults`, `fault` | ✓ | ✓ | ✓ | ✓ | `stopFaults`, `fault` | ✓ | `StopFaults`, `Fault` | `Lifecycle.StopFaults`, `Lifecycle.Fault` |
+| Code coverage for strategies | trace-pc-guard | trace-pc-guard | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`) | (Go's own `-cover`) | (not yet) |
+| Outside determinismo: local output file, else stderr | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Outside determinismo (a local run, a unit test), randomness comes from the OS and events go to
 the file `DETERMINISMO_SDK_LOCAL_OUTPUT` names (Antithesis's `ANTITHESIS_SDK_LOCAL_OUTPUT` too), one
@@ -65,6 +66,8 @@ SDKs above also take Antithesis's names, so such code ports by changing an impor
 - Java: `getRandom`, `sendEvent`, `alwaysGreaterThanOrEqualTo`, ...
 - Go: `GetRandom`, `SendEvent`, `AlwaysGreaterThanOrEqualTo`, `NamedBool`, `Source` (Antithesis's
   Go SDK's), and the build tag `determinismo_off` for no-op builds (theirs: `no_antithesis_sdk`).
+- .NET: `Assert`, `Lifecycle`, `Random`, `AntithesisRandom` with the same members as Antithesis's
+  `Antithesis.SDK` (`JsonObject` details): `using Determinismo;` in place of `using Antithesis.SDK;`.
 
 What determinismo's SDKs add to Antithesis's: named decisions (strategies see what they steer),
 buggify points, faults and quiet periods from the scenario, a seeded generator, catalog listing in

@@ -149,6 +149,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "ui", check_ui },                         .{ "runs", check_runs },
         .{ "kubernetes", check_kubernetes },         .{ "steps", check_steps },
         .{ "ending", check_ending },                 .{ "sinks", check_sinks },
+        .{ "dotnet", check_dotnet },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -364,6 +365,42 @@ fn check_python_strategy(context: *Context) !void {
 
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
 /// spread over them): the workload survives faults, and a branch replays exactly.
+/// The .NET SDK (sdk/dotnet) inside determinismo: a C# program's assertions with their places,
+/// its named decisions and events, the generated catalog's announcement of an assertion it never
+/// runs; its timeline replays exactly.
+fn check_dotnet(context: *Context) !void {
+    const arena = context.arena;
+    const common = [_][]const u8{ "--compose", "tests/antithesis-compat/dotnet/compose.yaml", "--scenario", "sdk", "--seed", "1" };
+    const events = try std.fmt.allocPrint(arena, "{s}/dotnet", .{context.scratch});
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2", "--events-dir", events }));
+    const grep = struct {
+        fn found(c: *Context, pattern: []const u8, directory: []const u8) bool {
+            const result = run_kept(c, &.{ "grep", "-rlF", pattern, directory }) catch return false;
+            return result.stdout.len > 0;
+        }
+    }.found;
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var same = false;
+    if (count > 0) {
+        const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
+    }
+    expect_all(context, &.{
+        .{ "2 timelines", count == 2 },
+        .{ "the program is inside determinismo", grep(context, "\"message\":\"dotnet: inside determinismo\",\"condition\":true", events) },
+        .{ "an assertion's place in the code", grep(context, "\"file\":\"/app/Check.cs\"", events) },
+        .{ "a named decision", grep(context, "\"name\":\"dotnet.account\",\"options\":[\"alice\"", events) },
+        .{ "an event", grep(context, "\"event\":\"dotnet_transfer\"", events) },
+        .{ "the catalog announced the assertion it never runs", grep(context, "\"message\":\"dotnet: never reached\",\"hit\":false", events) },
+        .{ "no property failed", std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null },
+        .{ "a timeline replays exactly", same },
+    }, "dotnet: the .NET SDK inside determinismo", .{});
+}
+
 /// Antithesis's output sink (ANTITHESIS_OUTPUT_DIR): a node's .jsonl lines are events (an
 /// Antithesis SDK's assertion), other files' lines output, .bin files' bytes output in base64.
 fn check_sinks(context: *Context) !void {
