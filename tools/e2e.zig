@@ -998,8 +998,11 @@ fn check_runs(context: *Context) !void {
     }
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     const system = [_][]const u8{ "--data", data, "--program", program, "--scenario", "bank", "--branching", "flat", "--jobs", "2" };
-    // One to its end, as at a terminal.
-    const output = try explore(context, &(system ++ [_][]const u8{ "--seed", "3", "--branches", "8" }));
+    // One to its end, as at a terminal, its events elsewhere (--events-dir): the run links them.
+    // serve took the link for no directory (NotDir) and never opened such runs (srv3, 65-71).
+    const elsewhere = try std.fs.path.join(arena, &.{ context.scratch, "runs-events-elsewhere" });
+    cwd.deleteTree(context.io, elsewhere) catch {};
+    const output = try explore(context, &(system ++ [_][]const u8{ "--seed", "3", "--branches", "8", "--events-dir", elsewhere }));
     const claimed = std.mem.indexOf(u8, output, "[determinismo] run 1: ") != null;
     var listed: []const u8 = "";
     for (0..100) |_| {
@@ -1022,7 +1025,7 @@ fn check_runs(context: *Context) !void {
     expect_all(context, &.{
         .{ "the exploration claimed run 1", claimed },
         .{ "serve shows it failed", std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null },
-        .{ "serve lists its 8 timelines", std.mem.count(u8, timelines, "\"index\"") == 8 },
+        .{ "serve lists its 8 timelines, its events in another directory", std.mem.count(u8, timelines, "\"index\"") == 8 },
         .{ "its output.log has its timelines", std.mem.indexOf(u8, logged, "[branch") != null },
         .{ "serve replays one from what the run kept, the same", same },
     }, "runs: an exploration at a terminal is run 1 of the host's, in serve with its 8 timelines " ++

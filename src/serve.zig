@@ -350,7 +350,10 @@ fn run_update(server: *Server, id: u32) !void {
     const events = try run_store(server, id);
     var failure: duckdb.Failure = .{};
     if (!shared.attached[id]) {
-        try std.Io.Dir.cwd().createDirPath(server.io, events.directory);
+        // An exploration given --events-dir links its run's events there: a symlink to a
+        // directory, which createDirPath takes for NotDir (runs 65 to 71 on srv3 never opened).
+        std.Io.Dir.cwd().access(server.io, events.directory, .{}) catch
+            try std.Io.Dir.cwd().createDirPath(server.io, events.directory);
         const database = &shared.database;
         const arena = server.arena;
         const name = events.name;
