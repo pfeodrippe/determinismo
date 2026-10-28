@@ -149,6 +149,51 @@ fn on_terminate(_: linux.SIG) callconv(.c) void {
     stopping.store(true, .release);
 }
 
+/// A built-in property: the main loop is never busy (not waiting for its next fault or a
+/// fault's end) for long. It once waited forever on a lock (a deadlock with the durability
+/// listener), and the only signs were nodes left down and isolations never healed (srv3,
+/// 2026-10-28, Kafka run 24).
+const stall_property = "the fault injector never stalls";
+const stall_ns = 30 * std.time.ns_per_s;
+const watchdog_interval_ns = 5 * std.time.ns_per_s;
+/// When the main loop's work in hand began (CLOCK_MONOTONIC), 0 while it waits.
+var busy_since_ns = std.atomic.Value(u64).init(0);
+var watchdog_done = std.atomic.Value(bool).init(false);
+var stall_reported = std.atomic.Value(bool).init(false);
+
+fn busy_begin() void {
+    if (busy_since_ns.load(.monotonic) == 0) busy_since_ns.store(monotonic_ns(), .monotonic);
+}
+
+fn busy_end() void {
+    busy_since_ns.store(0, .monotonic);
+}
+
+/// Watches the main loop from a thread of its own: a stall fails `stall_property` once, with
+/// how long the loop had been busy.
+fn watchdog() void {
+    while (!watchdog_done.load(.acquire)) {
+        nodes.sleep_ns(watchdog_interval_ns);
+        const since = busy_since_ns.load(.monotonic);
+        if (since == 0 or stall_reported.load(.monotonic)) continue;
+        const busy = monotonic_ns() -| since;
+        if (busy < stall_ns) continue;
+        stall_reported.store(true, .monotonic);
+        sdk.assert_computed(.always, false, stall_property, .{ .busy_ms = busy / std.time.ns_per_ms });
+    }
+}
+
+fn watchdog_start() void {
+    const thread = std.Thread.spawn(.{}, watchdog, .{}) catch return;
+    thread.detach();
+}
+
+/// The loop is over (its faults undone): a timeline without a stall passes the property.
+fn watchdog_finish() void {
+    watchdog_done.store(true, .release);
+    if (!stall_reported.load(.monotonic)) sdk.assert_computed(.always, true, stall_property, .{});
+}
+
 /// The control FIFO, under /opt/determinismo, which every node sees (read-only, which FIFOs
 /// ignore). Each request is a u64, little endian: the quiet period in nanoseconds.
 pub const control_path = "/opt/determinismo/faults-control";
@@ -181,6 +226,8 @@ pub fn main(init: std.process.Init) !void {
     system_active = &system;
     arena_active = arena;
     sdk.event("faults_start", .{ .faults = count });
+    busy_begin();
+    watchdog_start();
     baseline_start(&system);
     disk_baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
@@ -209,8 +256,11 @@ pub fn main(init: std.process.Init) !void {
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
+    busy_begin();
     node_heal(&system);
     network_stop(&system);
+    busy_end();
+    watchdog_finish();
     sdk.event("faults_stop", .{ .injections = injections });
 }
 
@@ -1229,6 +1279,7 @@ fn control_open() void {
 fn sleep_ns(duration_ns: u64) void {
     const deadline_ns = monotonic_ns() + duration_ns;
     for (0..injections_max) |_| {
+        busy_begin(); // Until it waits: what follows, and the caller's work after it returns.
         const now_ns = monotonic_ns();
         if (system_active) |system| {
             network_expire(system, now_ns);
@@ -1239,6 +1290,7 @@ fn sleep_ns(duration_ns: u64) void {
         const node_end_ns = node_next_end() orelse deadline_ns;
         const wake_ns = @min(deadline_ns, network_end, node_end_ns);
         const left_ns = wake_ns -| now_ns;
+        busy_end();
         if (control < 0) {
             nodes.sleep_ns(left_ns);
             continue;

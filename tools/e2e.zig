@@ -1154,9 +1154,12 @@ fn check_builtin_properties(context: *Context) !void {
         "--branches", "8",
     });
     const all_pass = "8 branches, 0 with failing properties";
+    // Judged, not only absent: the fault injector's watchdog reports when its faults end.
+    const watched = std.mem.indexOf(u8, workers, "the fault injector never stalls") != null;
     expect_all(context, &.{
         .{ "every property passes in all 8", std.mem.indexOf(u8, workers, all_pass) != null },
         .{ "the workers' kills were reached (PASS reachable)", std.mem.indexOf(u8, workers, "PASS reachable") != null },
+        .{ "the fault injector's stall property was judged", watched },
     }, "process kills hit workers, never a node's main process", .{});
     const oom = "FAIL \"the kernel kills no process for lack of memory\"";
     expect_all(context, &.{
@@ -1969,7 +1972,9 @@ fn check_changed(context: *Context) !void {
 /// libvoidstar.so, Antithesis's native library, in a node: Python (musl) loads it with ctypes,
 /// and its SDK message is an event, its random number a decision (the same on a replay), its
 /// coverage an edge event of the module, in the timeline's events. The command runs with the
-/// node's Compose ulimits (open files 20000, 40000 hard).
+/// node's Compose ulimits (open files 20000, 40000 hard). The nodes' output forwarders hold
+/// their pipes, stdio, log and the platform's device, nothing they inherited (a copy of a lock
+/// once deadlocked the fault injector).
 fn check_voidstar(context: *Context) !void {
     const arena = context.arena;
     const code =
@@ -1986,6 +1991,7 @@ fn check_voidstar(context: *Context) !void {
         \\lib.fuzz_flush()
         \\base = lib.init_coverage_module(3, b"none.sym.tsv")
         \\print("voidstar", number, base, lib.notify_coverage(ctypes.c_size_t(base + 1)))'
+        \\for p in /proc/[0-9]*; do case "$(cat $p/comm 2>/dev/null)" in redis|client) echo "forwarder $(ls $p/fd | wc -l) files";; esac; done
     ;
     var outputs: [2][]const u8 = undefined;
     var events_found = true;
@@ -1999,7 +2005,7 @@ fn check_voidstar(context: *Context) !void {
             "--until",      "event=command_start",                         "--exec",     code,
             "--events-dir", events,
         });
-        output.* = try lines_with(arena, report, &.{ "voidstar", "nofile" });
+        output.* = try lines_with(arena, report, &.{ "voidstar", "nofile", "forwarder" });
         const path = try std.fs.path.join(arena, &.{ events, "branch-0.jsonl" });
         const cwd = std.Io.Dir.cwd();
         const text = cwd.readFileAlloc(context.io, path, arena, .limited(64 << 20)) catch "";
@@ -2015,10 +2021,23 @@ fn check_voidstar(context: *Context) !void {
     const library = try std.fs.path.join(arena, &.{ context.bin, "libvoidstar.so" });
     const tls_free = !(try elf_has_tls(context, library));
     const ulimits = std.mem.indexOf(u8, outputs[0], "nofile 20000 40000") != null;
-    const passes = answered and events_found and same and tls_free and ulimits;
+    // At most stdin, stdout, stderr, two pipes, the log and the device: 7 files each.
+    var forwarders: u32 = 0;
+    var forwarders_lean = true;
+    var forwarder_lines = std.mem.tokenizeScalar(u8, outputs[0], '\n');
+    while (forwarder_lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "forwarder ") orelse continue;
+        var words = std.mem.tokenizeScalar(u8, line[at + "forwarder ".len ..], ' ');
+        const files = std.fmt.parseInt(u32, words.next() orelse "", 10) catch 1000;
+        forwarders += 1;
+        forwarders_lean = forwarders_lean and files <= 7;
+    }
+    forwarders_lean = forwarders_lean and forwarders >= 2;
+    const passes = answered and events_found and same and tls_free and ulimits and forwarders_lean;
     expect_all(context, &.{
         .{ "notify_coverage answered (False)", answered },
         .{ "the command ran with the node's Compose ulimits (nofile 20000 40000)", ulimits },
+        .{ "every node's output forwarder holds 7 files at most (none inherited)", forwarders_lean },
         .{ "its events and edges reach the timeline", events_found },
         .{ "the same twice", same },
         .{ "libvoidstar.so has no thread-local storage", tls_free },

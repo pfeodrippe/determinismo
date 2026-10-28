@@ -463,19 +463,18 @@ places, and assertions carry no location.
 
 ## Speed
 
-- The tree's generation barrier: a generation (16 timelines) runs, the explorer waits for all
-  of them, then plans the next; Raft's timelines take 0.5 to 6.5 minutes, so most workers idle
-  at each generation's tail (the CPU pool lends them to other runs, not to this one). Next:
-  commit timelines in index order; when timeline i and all before it are done, judge it and
-  plan its branches at once, and workers take planned work as they free up. Decisions depend on
-  the committed prefix only: a seed still gives the same tree, with no wait but for a slow
-  timeline next in order when nothing else is planned.
-- One host, many runs (done, cpus.zig): workers take a CPU from one pool shared by every run on
-  the host before a timeline (or a node's replay), pinned to it, physical cores first; never
-  more VMs running than CPUs. Before it, every run pinned worker i to CPU i: seven runs of five
-  workers shared CPUs 0-4 while 31 sat idle.
-- Virtual time per wall time on busy timelines (0.3 to 0.45 now): profile the VMM's exits and
-  single-stepping for timers; cheaper timer delivery.
+- The tree's generation barrier: gone (a pull queue: a generation is the next `size`
+  timelines to finish; cores 100% busy, 2026-10-27).
+- One host, many runs (cpus.zig): one CPU pool for every run, each core's first thread before
+  any second hyperthread (both by default since 2026-10-28: a core with two VMs does about 1.4x);
+  memory admission by claims and by what is available now.
+- Busy guests: about 0.85-1x virtual per wall second now (0.3-0.6 before the exit work of
+  2026-10-27: `io_delay=none`, one PIT write, a 1 ms timer slack, RDTSC in KVM's fastpath).
+  Remaining exits: PIC port I/O, single-steps for hard stops.
+- Big systems: holders (parked VMs that make branching cheap) need memory that a YugabyteDB
+  hunt (7 GB VMs) leaves too little of; branching then replays to the moment. Next: smaller
+  holders (pages shared with their timeline, or written to disk at once), or fewer, better
+  placed.
 - Setup is one core before branches fan out: start branch workers as soon as the snapshot exists,
   and run independent e2e checks concurrently.
 
