@@ -4,5 +4,6 @@ COPY sdk/python/determinismo.py /usr/local/lib/python3.12/site-packages/determin
 COPY tests/antithesis-compat/python/client/bank.py /usr/local/lib/python3.12/site-packages/bank.py
 COPY tests/antithesis-compat/python/client/tests/ /opt/antithesis/test/v1/bank/
 COPY tests/antithesis-compat/python/client/maze/ /opt/antithesis/test/v1/maze/
-RUN chmod +x /opt/antithesis/test/v1/bank/* /opt/antithesis/test/v1/maze/*
+COPY tests/antithesis-compat/python/client/mazes/ /opt/antithesis/test/v1/mazes/
+RUN chmod +x /opt/antithesis/test/v1/bank/* /opt/antithesis/test/v1/maze/* /opt/antithesis/test/v1/mazes/*
 CMD ["sleep", "infinity"]

@@ -543,7 +543,16 @@ function changedBody(changed) {
     const badge = count > 0
       ? `<span class="badge pass">ran in ${count}/${total}</span>`
       : `<span class="badge fail">never ran</span>`;
-    return `<li style="display:flex;gap:10px;align-items:baseline">${badge}<code>${where}</code></li>`;
+    // When it first ran, or how near a timeline came (the line nearest it that ran).
+    const first = changed.first?.[index];
+    const closest = changed.closest?.[index];
+    const note = count > 0 && first != null && first < 4294967295
+      ? `first in #${first}`
+      : count === 0 && closest != null && closest < 4294967295
+        ? `nearest line run: ${closest} away`
+        : "";
+    const noteHtml = note ? `<span class="muted" style="font-size:12px">${note}</span>` : "";
+    return `<li style="display:flex;gap:10px;align-items:baseline">${badge}<code>${where}</code>${noteHtml}</li>`;
   }).join("");
   return `<ul style="list-style:none;padding:0;margin:0;display:grid;gap:6px">${rows}</ul>`;
 }

@@ -2300,7 +2300,12 @@ fn explore_tree(
     for (batch.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
     if (state.change) |*target| {
         target.summarize(state.next_index);
-        report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
+        report.record(.{ .changed = .{
+            .hunks = target.hunks,
+            .timelines = target.timelines,
+            .first = target.first,
+            .closest = target.closest,
+        } });
     }
 }
 
@@ -2798,8 +2803,17 @@ fn tree_judge(
         if (state.change) |*target| {
             @memset(state.hunks_reached, false);
             for (summary.behaviors[0..summary.behavior_count]) |behavior| {
-                const hunk = target.hunk_of(arena, behavior.name()) orelse continue;
-                if (!state.hunks_reached[hunk]) target.timelines[hunk] += 1;
+                const hunk = target.hunk_of(arena, behavior.name()) orelse {
+                    // How near the hunks no timeline ran its lines come (the report's).
+                    if (target.approach(arena, behavior.name())) |near| {
+                        target.closest[near.hunk] = @min(target.closest[near.hunk], near.distance);
+                    }
+                    continue;
+                };
+                if (!state.hunks_reached[hunk]) {
+                    target.timelines[hunk] += 1;
+                    target.first[hunk] = @min(target.first[hunk], summary.index);
+                }
                 state.hunks_reached[hunk] = true;
             }
         }

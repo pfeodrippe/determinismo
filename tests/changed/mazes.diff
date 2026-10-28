@@ -1,0 +1,7 @@
+A change to maze A of the two-maze template (tests/antithesis-compat/python/client/mazes), for
+directed exploration: its solved line, which one attempt in 10000 reaches by chance.
+--- a/tests/antithesis-compat/python/client/mazes/singleton_driver_mazes.py
++++ b/tests/antithesis-compat/python/client/mazes/singleton_driver_mazes.py
+@@ -24 +24 @@
+-                solved = 1
++                solved = True

@@ -15,6 +15,38 @@ pub const Hunk = mutate.Hunk;
 pub const Change = struct {
     hunks: []const Hunk,
     timelines: []u32,
+    /// The first timeline that ran each hunk (none: maxInt).
+    first: []u32,
+    /// For a hunk no timeline ran: how many lines before it the nearest line of its file a
+    /// timeline ran is (none yet: maxInt), for the report. Heading the tree for it (returns
+    /// first to timelines that came nearer) was measured on two mazes, one a distractor
+    /// (tests/changed/mazes.diff, four seeds, 2026-10-28): no gain, so the tree does not.
+    closest: []u32,
+
+    pub const Approach = struct { hunk: usize, distance: u32 };
+
+    /// The nearest hunk no timeline ran that a behavior's line comes before in its file, and how
+    /// many lines before it. Only lines before: the code that leads to a hunk (its condition)
+    /// precedes it, while what follows a block runs without it (the line after an `if` is one
+    /// line from its body and says nothing of reaching it).
+    pub fn approach(change: *const Change, arena: std.mem.Allocator, label: []const u8) ?Approach {
+        const prefix = "coverage line ";
+        if (!std.mem.startsWith(u8, label, prefix)) return null;
+        const place_line = label[prefix.len..];
+        const colon = std.mem.lastIndexOfScalar(u8, place_line, ':') orelse return null;
+        const number = std.fmt.parseInt(u32, place_line[colon + 1 ..], 10) catch return null;
+        const place = place_line[0..colon];
+        var best: ?Approach = null;
+        for (change.hunks, change.timelines, 0..) |hunk, count, index| {
+            if (count > 0) continue;
+            if (number >= hunk.first) continue; // In it (hunk_of's), or after it.
+            const distance = hunk.first - number;
+            if (best != null and best.?.distance <= distance) continue;
+            if (!mutate.same_source(arena, place, hunk.file)) continue;
+            best = .{ .hunk = index, .distance = distance };
+        }
+        return best;
+    }
 
     /// The hunk a behavior's label is a line of (`coverage line <place>:<n>`), if any.
     pub fn hunk_of(change: *const Change, arena: std.mem.Allocator, label: []const u8) ?usize {
@@ -37,13 +69,16 @@ pub const Change = struct {
         std.debug.print("[determinismo] changed code: {d} of {d} hunks ran\n", .{
             ran, change.hunks.len,
         });
-        for (change.hunks, change.timelines) |hunk, count| {
-            if (count == 0) {
+        for (change.hunks, change.timelines, change.first, change.closest) |hunk, count, first, closest| {
+            if (count == 0 and closest != std.math.maxInt(u32)) {
+                const line = "  NEVER RAN  {s}:{d}-{d}  (the nearest line run: {d} away)\n";
+                std.debug.print(line, .{ hunk.file, hunk.first, hunk.last, closest });
+            } else if (count == 0) {
                 const line = "  NEVER RAN  {s}:{d}-{d}\n";
                 std.debug.print(line, .{ hunk.file, hunk.first, hunk.last });
             } else {
-                std.debug.print("  ran in {d:>4}/{d} timelines  {s}:{d}-{d}\n", .{
-                    count, timelines, hunk.file, hunk.first, hunk.last,
+                std.debug.print("  ran in {d:>4}/{d} timelines  {s}:{d}-{d}  (first #{d})\n", .{
+                    count, timelines, hunk.file, hunk.first, hunk.last, first,
                 });
             }
         }
@@ -75,7 +110,11 @@ pub fn read(
     }
     const timelines = try arena.alloc(u32, found.len);
     @memset(timelines, 0);
-    return .{ .hunks = found, .timelines = timelines };
+    const first = try arena.alloc(u32, found.len);
+    @memset(first, std.math.maxInt(u32));
+    const closest = try arena.alloc(u32, found.len);
+    @memset(closest, std.math.maxInt(u32));
+    return .{ .hunks = found, .timelines = timelines, .first = first, .closest = closest };
 }
 
 fn git_diff(
@@ -153,16 +192,44 @@ test "a coverage line falls in a hunk of the same file" {
     defer state.deinit();
     const arena = state.allocator();
     var timelines = [_]u32{ 0, 0 };
+    var first = [_]u32{ std.math.maxInt(u32), std.math.maxInt(u32) };
+    var closest = first;
     const change = Change{
         .hunks = &.{
             .{ .file = "raft.go", .first = 620, .last = 630 },
             .{ .file = "replication.go", .first = 10, .last = 12 },
         },
         .timelines = &timelines,
+        .first = &first,
+        .closest = &closest,
     };
     const expect = std.testing.expectEqual;
     try expect(@as(?usize, 0), change.hunk_of(arena, "coverage line /src/raft.go:624"));
     try expect(@as(?usize, 1), change.hunk_of(arena, "coverage line /src/replication.go:12"));
     try expect(@as(?usize, null), change.hunk_of(arena, "coverage line /src/raft.go:619"));
     try expect(@as(?usize, null), change.hunk_of(arena, "coverage edge 12"));
+}
+
+test "a line near a hunk no timeline ran approaches it" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    var timelines = [_]u32{ 0, 3 };
+    var first = [_]u32{ std.math.maxInt(u32), 0 };
+    var closest = [_]u32{ std.math.maxInt(u32), std.math.maxInt(u32) };
+    const change = Change{
+        .hunks = &.{
+            .{ .file = "raft.go", .first = 620, .last = 630 },
+            .{ .file = "raft.go", .first = 600, .last = 601 },
+        },
+        .timelines = &timelines,
+        .first = &first,
+        .closest = &closest,
+    };
+    const near = change.approach(arena, "coverage line /src/raft.go:612").?;
+    try std.testing.expectEqual(@as(usize, 0), near.hunk); // The other one ran already.
+    try std.testing.expectEqual(@as(u32, 8), near.distance);
+    try std.testing.expectEqual(@as(?Change.Approach, null), change.approach(arena, "coverage line /src/raft.go:635"));
+    try std.testing.expectEqual(@as(?Change.Approach, null), change.approach(arena, "coverage line /src/raft.go:625"));
+    try std.testing.expectEqual(@as(?Change.Approach, null), change.approach(arena, "coverage line /src/log.go:612"));
 }

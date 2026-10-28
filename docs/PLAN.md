@@ -488,7 +488,13 @@ places, and assertions carry no location.
    instrumentor and libvoidstar), returns first to timelines that ran changed code, just after
    they did, and reports which hunks ran in how many timelines and which never ran (e2e
    `changed`); by commit, range or release of the system's repository, local or fetched by its
-   URL (`--changed-repository`, 2026-10-28; the UI's New run form). Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
+   URL (`--changed-repository`, 2026-10-28; the UI's New run form). The report says each hunk's
+   first timeline, and for a hunk no timeline ran, how near (lines before it) one came. Heading
+   the tree there (returning first to timelines that came nearer) was measured on two mazes, one
+   a distractor (tests/changed/mazes.diff, srv3, 400 timelines, four seeds): first solved in
+   #144/#55/#147/#122 without, #160/#55/#103/#145 with: no gain, not kept (a generation's
+   returns already go to its most novel timelines, which are the nearest ones). Next to try:
+   more of a generation's nodes for the nearest one. Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
    no timeline reaches yet, faults aimed around it, and which properties the timelines that ran
    it checked; our C and Zig SDKs' edges mapped back to lines (code built for Antithesis, C, C++
    and Rust through libvoidstar and /symbols, reports lines since 2026-10-28: e2e `lines`).
