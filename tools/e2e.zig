@@ -26,7 +26,33 @@ const Context = struct {
     /// names the ones it judged (those since the check before it), to read rather than rerun.
     outputs: std.ArrayList([]const u8) = .empty,
     output_count: u32 = 0,
+    /// bank's first timeline of seed 3 that loses money (bank_violating_branch), once found.
+    bank_violating: ?[]const u8 = null,
 };
+
+/// The first of bank's seed 3 timelines that violates "total balance is conserved", found once
+/// by exploring 16 (the timelines the until, rewind, extract and inject checks stop in). Any
+/// guest change makes other timelines: the guest kernel's TLB patch made timeline 4, these
+/// checks' for a day, one that keeps its money.
+fn bank_violating_branch(context: *Context) ![]const u8 {
+    if (context.bank_violating) |known| return known;
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const report = try explore(context, &.{
+        "--program",  program, "--scenario", "bank", "--seed", "3",
+        "--branches", "16",
+    });
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch ")) continue;
+        if (std.mem.indexOf(u8, line, "FAIL \"total balance is conserved\"") == null) continue;
+        const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+        const index = std.mem.trim(u8, line["[branch ".len..end], " ");
+        context.bank_violating = try context.arena.dupe(u8, index);
+        return context.bank_violating.?;
+    }
+    expect(context, false, "bank: one of seed 3's first 16 timelines loses money", .{});
+    return error.NoViolatingBranch;
+}
 
 /// One branch line of a report: `[branch N] seed=... events_hash=H failing=F ...`.
 const Branch = struct { index: u32, events_hash: []const u8, failing: bool };
@@ -775,33 +801,37 @@ fn check_until_and_causality(context: *Context) !void {
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "3" };
     const violation = "assert.message=\"total balance is conserved\" assert.condition=false";
+    const branch = try bank_violating_branch(context);
     var outputs: [2][]const u8 = undefined;
     for (&outputs) |*output| {
         const read = "det-nodes exec redis redis-cli mget account:0 account:1";
         const report = try explore(context, &(system ++ [_][]const u8{
-            "--branch", "4", "--until", violation, "--exec", read,
+            "--branch", branch, "--until", violation, "--exec", read,
         }));
         output.* = try lines_with(arena, report, &.{ "at moment", "exec_output" });
     }
     expect_all(context, &.{
         .{ "the command ran at the violation", std.mem.indexOf(u8, outputs[0], "exec_output") != null },
         .{ "the same output twice", std.mem.eql(u8, outputs[0], outputs[1]) },
-    }, "until: branch 4 stops at its first violation, the same twice", .{});
+    }, "until: branch {s} stops at its first violation, the same twice", .{branch});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
     try argv.appendSlice(arena, context.machine);
     try argv.appendSlice(arena, &system);
     try argv.appendSlice(arena, &.{
-        "--branch",  "4", "--property", "total balance is conserved", "--points", "4",
-        "--futures", "8", "--json",
+        "--branch",  branch, "--property", "total balance is conserved", "--points", "4",
+        "--futures", "8",    "--json",
     });
     const result = try run_kept(context, argv.items);
     // Refinement adds moments inside jumps.
     const curve = try causality_curve(arena, result.stdout);
+    // Each round counts the faults its futures went through, with and without failing.
+    const effects = std.mem.indexOf(u8, result.stdout, "{\"faults\":[") != null;
     expect_all(context, &.{
         .{ "at least 4 moments", curve.moments >= 4 },
         .{ "certain at the failure", curve.latest.probability == 1 },
         .{ "each within its 90% interval", curve.bounded },
+        .{ "the futures' faults counted (a faults line each round)", effects },
     }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
         "({d:.2}), each within its 90% interval", .{ curve.moments, curve.latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
@@ -810,7 +840,7 @@ fn check_until_and_causality(context: *Context) !void {
     try verdict_argv.appendSlice(arena, context.machine);
     try verdict_argv.appendSlice(arena, &system);
     try verdict_argv.appendSlice(arena, &.{
-        "--branch", "4", "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
+        "--branch", branch, "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
     });
     const verdict_result = try run_kept(context, verdict_argv.items);
     const verdict = try causality_curve(arena, verdict_result.stdout);
@@ -901,7 +931,7 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     var extra: std.ArrayList([]const u8) = .empty;
     try extra.appendSlice(context.arena, system);
     try extra.appendSlice(context.arena, &.{
-        "--branch", "4", "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
+        "--branch", try bank_violating_branch(context), "--until", violation, "--rewind-ms", "50", "--exec", "echo rewound",
     });
     const report = try explore(context, extra.items);
     const holds: u64 = @trunc(number_after(report, "the condition holds at ") orelse 0);
@@ -922,7 +952,7 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     var timeout: std.ArrayList([]const u8) = .empty;
     try timeout.appendSlice(context.arena, system);
     try timeout.appendSlice(context.arena, &.{
-        "--branch", "4", "--until", violation, "--at-vtime-ms", deadline, "--exec", "echo late",
+        "--branch", try bank_violating_branch(context), "--until", violation, "--at-vtime-ms", deadline, "--exec", "echo late",
     });
     const timed = try explore(context, timeout.items);
     const expected = try std.fmt.allocPrint(context.arena, "at moment vtime={d}", .{
@@ -944,7 +974,7 @@ fn check_files(context: *Context, system: []const []const u8, violation: []const
     try extract_argv.appendSlice(arena, context.machine);
     try extract_argv.appendSlice(arena, system);
     try extract_argv.appendSlice(arena, &.{
-        "--branch", "4",       "--until", violation, "--file", "redis:/etc/hostname",
+        "--branch", try bank_violating_branch(context), "--until", violation, "--file", "redis:/etc/hostname",
         "--to",     extracted,
     });
     _ = try run_kept(context, extract_argv.items);
@@ -965,7 +995,7 @@ fn check_files(context: *Context, system: []const []const u8, violation: []const
     try inject_argv.appendSlice(arena, context.machine);
     try inject_argv.appendSlice(arena, system);
     try inject_argv.appendSlice(arena, &.{
-        "--branch", "4", "--until", violation, "--file", "redis:/tmp/injected", "--from", local,
+        "--branch", try bank_violating_branch(context), "--until", violation, "--file", "redis:/tmp/injected", "--from", local,
     });
     try inject_argv.appendSlice(arena, &.{
         "--then", "md5sum /proc/$(cat /run/det/nodes/redis/pid)/root/tmp/injected",
