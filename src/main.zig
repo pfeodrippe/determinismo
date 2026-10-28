@@ -2150,9 +2150,19 @@ fn explore_tree(
                 progress_print(running[0..running_count], branches.multiverse, state.generation);
                 continue;
             };
-            try batch.plan.append(arena, running[finished].place);
-            running[finished] = running[running_count - 1];
+            const place = running[finished.at].place;
+            running[finished.at] = running[running_count - 1];
             running_count -= 1;
+            if (finished.killed) {
+                // Not served: its start snapshot's count already has it.
+                state.kills += 1;
+                if (state.kills > kills_max) return error.WorkerFailed;
+                std.debug.print("[determinismo] timeline {d} was killed (SIGKILL: the host's OOM " ++
+                    "killer?) before it finished: it runs again ({d} so far)\n", .{ place.index, state.kills });
+                try state.queue.append(arena, place);
+                continue;
+            }
+            try batch.plan.append(arena, place);
             continue;
         }
         // Nothing runs and nothing is queued: a last, partial generation judged (its returns
@@ -2247,6 +2257,17 @@ const Running = struct { pid: linux.pid_t, results: linux.fd_t, place: Planned, 
 /// In a child just forked from the explorer: it dies with it. A worker left running after the
 /// explorer was interrupted keeps its VM, its CPU and its memory (an interrupted hunt on srv2
 /// left all twelve). The signal follows the forking thread: these forks are the main thread's.
+/// The kernel's OOM killer takes a timeline's process before the host's own (sshd, tailscaled,
+/// dbus, podman's pause process: a host OOM once took that last one, and no run could start a
+/// container after, srv3 2026-10-28) and before the explorer; holders go first of all
+/// (holders.zig). A timeline it kills runs again (timeline_wait).
+fn oom_before_the_host() void {
+    const fd = linux.open("/proc/self/oom_score_adj", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    _ = linux.write(@intCast(fd), "800", 3);
+    _ = linux.close(@intCast(fd));
+}
+
 fn child_dies_with(explorer: linux.pid_t) void {
     _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
     if (linux.getppid() != explorer) linux.exit_group(1); // It died before the prctl.
@@ -2269,6 +2290,7 @@ fn timeline_start(
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
         child_dies_with(explorer);
+        oom_before_the_host();
         _ = linux.close(pipe[0]);
         var one = Summaries{ .items = batch.scratch }; // Its own copy: sent back whole.
         var mine = branches;
@@ -2338,10 +2360,13 @@ fn progress_print(running: []const Running, multiverse: *const report.Multiverse
     std.debug.print("{s}", .{line.buffered()});
 }
 
+const Finished = struct { at: usize, killed: bool = false };
+
 /// Waits for one of the running timelines to finish: its results in the run's multiverse, its
 /// summary in the generation filling (`summaries`). Returns which, or null when none finished
-/// within `timeout_ms`.
-fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summaries: *Summaries, timeout_ms: i32) !?usize {
+/// within `timeout_ms`. One killed (SIGKILL: the host's OOM killer) before it sent its results
+/// is `killed`: it runs again (the same timeline, from the same place).
+fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summaries: *Summaries, timeout_ms: i32) !?Finished {
     assert(running.len > 0);
     var polled: [jobs_max]linux.pollfd = undefined;
     for (running, polled[0..running.len]) |timeline, *entry| {
@@ -2371,9 +2396,12 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summa
     _ = linux.close(timeline.results);
     var status: i32 = 0;
     _ = linux.waitpid(timeline.pid, &status, 0);
+    const signaled: u32 = @bitCast(status);
+    const killed = linux.W.IFSIGNALED(signaled) and linux.W.TERMSIG(signaled) == .KILL;
+    if (!received and killed) return .{ .at = at, .killed = true };
     if (!received or status != 0) return error.WorkerFailed;
     try multiverse.absorb(results);
-    return at;
+    return .{ .at = at };
 }
 
 /// The first failing timeline of each property, saved to disk from its holders as it is judged
@@ -2539,7 +2567,12 @@ const TreeState = struct {
     setup: *const Snapshot,
     /// A resumed run's: recorded timelines are not run again; their summaries are judged.
     resumed: ?*const Resumed = null,
+    /// Timelines killed before they finished (and queued again).
+    kills: u32 = 0,
 };
+
+/// Killed timelines a run takes before it ends (a host that keeps killing them).
+const kills_max = 64;
 
 /// A cell of the archive: where a behavior was first reached (the moment just after it), and how
 /// often the tree returned there.

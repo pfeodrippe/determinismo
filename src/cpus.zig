@@ -227,7 +227,13 @@ pub const Pool = struct {
             var claim: [8]u8 = @splat(0);
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
-        return claimed + bytes + memory_reserve_bytes <= total;
+        if (claimed + bytes + memory_reserve_bytes > total) return false;
+        // And there now: claims count the VMs holding CPUs, not what holds memory without one
+        // (holders, in-run snapshots, host checks' services); a check beside a hunt once fit
+        // its claims and the host ran out (srv3, 2026-10-28: the OOM killer took a hunt's
+        // timeline and podman's pause process).
+        const available = memory_available();
+        return available == 0 or bytes + memory_reserve_bytes <= available;
     }
 
     /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
