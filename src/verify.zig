@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `determinismo verify <explore options> --record <run.jsonl> --tape-dir <dir> [--sample <n>]
-//! [--jobs <n>]`: replays a sample of a run's timelines from their tapes, each its own explore
+//! [--jobs <n>]`, or `determinismo verify --run <a run's directory> [--sample <n>] [--jobs <n>]`
+//! (the explore options, record and tapes of a run serve made, as its replays take them):
+//! replays a sample of a run's timelines from their tapes, each its own explore
 //! (taking CPUs from the pool, beside whatever else runs on the host: a hunt, other runs), and
 //! compares each history with the record's (its events hash). A timeline that does not replay
 //! is a determinism bug of determinismo's, found under real load: its replay's first difference
@@ -9,6 +11,7 @@
 //! Exit status: 0 every sampled timeline replayed, 3 some did not, 2 usage.
 const std = @import("std");
 const assert = std.debug.assert;
+const serve = @import("serve.zig");
 
 const sample_default = 8;
 const jobs_default = 2;
@@ -22,7 +25,13 @@ const Timeline = struct {
     diverged: []const u8 = "",
     hazards: []const u8 = "",
     status: u8 = 0,
+    /// When nothing was replayed: how the replay ended (its last lines), so that a replay that
+    /// could not start says why instead of passing for a divergence.
+    ended: []const u8 = "",
 };
+
+/// The end of a replay's output kept when it replayed nothing.
+const ended_size_max = 400;
 
 const Work = struct {
     io: std.Io,
@@ -41,6 +50,7 @@ pub fn run(
 ) !u8 {
     var record_path: ?[]const u8 = null;
     var tape_directory: ?[]const u8 = null;
+    var run_directory: ?[]const u8 = null;
     var sample: usize = sample_default;
     var jobs: usize = jobs_default;
     var rest: std.ArrayList([]const u8) = .empty;
@@ -54,6 +64,9 @@ pub fn run(
         } else if (std.mem.eql(u8, flag, "--tape-dir") and value != null) {
             tape_directory = value;
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--run") and value != null) {
+            run_directory = value;
+            index += 1;
         } else if (std.mem.eql(u8, flag, "--sample") and value != null) {
             sample = std.fmt.parseInt(usize, value.?, 10) catch return usage();
             index += 1;
@@ -61,6 +74,14 @@ pub fn run(
             jobs = std.fmt.parseInt(usize, value.?, 10) catch return usage();
             index += 1;
         } else try rest.append(arena, flag);
+    }
+    if (run_directory) |directory| {
+        var options: std.ArrayList([]const u8) = .empty;
+        try run_arguments(arena, io, directory, &options);
+        try options.appendSlice(arena, rest.items);
+        rest = options;
+        record_path = record_path orelse try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
+        tape_directory = tape_directory orelse try std.fs.path.join(arena, &.{ directory, "tapes" });
     }
     const record = record_path orelse return usage();
     const tapes = tape_directory orelse return usage();
@@ -113,6 +134,7 @@ pub fn run(
             if (timeline.hazards.len > 0) "; " else "",
             timeline.hazards,
         });
+        if (timeline.ended.len > 0) std.debug.print("    {s}\n", .{timeline.ended});
     }
     std.debug.print("[determinismo] verify: {d} of {d} timelines replayed\n", .{ chosen.len - failed, chosen.len });
     return if (failed > 0) 3 else 0;
@@ -120,8 +142,35 @@ pub fn run(
 
 fn usage() u8 {
     std.debug.print("usage: determinismo verify <explore options> --record <run.jsonl> " ++
-        "--tape-dir <dir> [--sample <n>] [--jobs <n>]\n", .{});
+        "--tape-dir <dir> [--sample <n>] [--jobs <n>]\n" ++
+        "       determinismo verify --run <run directory> [--sample <n>] [--jobs <n>]\n", .{});
     return 2;
+}
+
+/// A run's explore options, as serve's replays take them (serve.zig's run_replay): the machine
+/// it booted, its system, its pin, its seed, scenario and profile. A replay missing one is
+/// refused (other inputs) or is another system.
+fn run_arguments(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+    options: *std.ArrayList([]const u8),
+) !void {
+    const cwd = std.Io.Dir.cwd();
+    const machine_path = try std.fs.path.join(arena, &.{ directory, "machine.json" });
+    const machine_json = try cwd.readFileAlloc(io, machine_path, arena, .limited(1 << 20));
+    try options.appendSlice(arena, try std.json.parseFromSliceLeaky([]const []const u8, arena, machine_json, .{}));
+    const request_path = try std.fs.path.join(arena, &.{ directory, "request.json" });
+    const request_json = try cwd.readFileAlloc(io, request_path, arena, .limited(1 << 20));
+    const request = try std.json.parseFromSliceLeaky(serve.RunRequest, arena, request_json, .{
+        .ignore_unknown_fields = true,
+    });
+    try serve.system_arguments(arena, options, &request);
+    const pin = try std.fs.path.join(arena, &.{ directory, "events", "system.pin.json" });
+    if (cwd.access(io, pin, .{})) |_| try options.appendSlice(arena, &.{ "--system", pin }) else |_| {}
+    try options.appendSlice(arena, &.{ "--seed", try std.fmt.allocPrint(arena, "{d}", .{request.seed orelse 0}) });
+    if (request.scenario) |scenario| try options.appendSlice(arena, &.{ "--scenario", scenario });
+    if (request.profile) |profile| try options.appendSlice(arena, &.{ "--profile", profile });
 }
 
 /// The record's timelines (index, events hash) whose tape is in `tapes`.
@@ -190,6 +239,11 @@ fn replay(work: *Work, timeline: *Timeline) !void {
                 timeline.hazards = line[at + "its clock's hazards: ".len ..];
             }
         }
+    }
+    if (timeline.replayed_hash.len == 0) {
+        const output = std.mem.trimEnd(u8, result.stderr, "\n");
+        const tail = output[output.len -| ended_size_max..];
+        timeline.ended = try std.fmt.allocPrint(arena, "exit {d}: {s}", .{ timeline.status, tail });
     }
 }
 

@@ -1826,7 +1826,7 @@ test strategy_name_valid {
     try std.testing.expect(!strategy_name_valid(".hidden"));
 }
 
-fn system_arguments(
+pub fn system_arguments(
     arena: std.mem.Allocator,
     argv: *std.ArrayList([]const u8),
     asked: *const RunRequest,

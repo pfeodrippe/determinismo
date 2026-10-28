@@ -52,7 +52,8 @@ const usage =
     \\       determinismo verify  <explore options> --record <run.jsonl> --tape-dir <dir>
     \\                            [--sample <n>] [--jobs <n>]   (a sample of a run's timelines
     \\                            replayed from their tapes, beside whatever else runs: each must
-    \\                            replay to its recorded history)
+    \\                            replay to its recorded history); or --run <run directory>
+    \\                            for a run serve made: its options, record and tapes
     \\       determinismo mutate  <explore options> --mutants <mutants.jsonl> [--out <dir>]
     \\                            (each mutant a patch to a node's build: caught, never ran, or
     \\                            unnoticed)
