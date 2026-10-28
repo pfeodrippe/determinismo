@@ -74,9 +74,9 @@ pub const Options = struct {
     /// A run's snapshots on disk (causality analysis saves its timelines' moments there) go
     /// when none was saved for this long.
     snapshots_keep_ns: u64 = 24 * std.time.ns_per_hour,
-    /// Each failing property's first failing timeline is saved to disk as soon as it is found
-    /// (`--no-failure-snapshots`: not).
-    failure_snapshots: bool = true,
+    /// Each failing property's first failing timeline is analyzed (causality, in the background)
+    /// as soon as it is found (`--no-failure-analysis`: not).
+    failure_analysis: bool = true,
 };
 
 const runs_max = host_runs.runs_max;
@@ -98,7 +98,7 @@ const database_memory_mib = 4096;
 const watch_interval_ns = std.time.ns_per_s;
 /// How often it removes runs' snapshots past their time (Options.snapshots_keep_ns).
 const snapshots_sweep_interval = 600; // Watches.
-/// How often it looks for new failures to save to disk (failures_snapshot).
+/// How often it looks for new failures to analyze (failures_analyze).
 const failures_watch_interval = 15; // Watches.
 
 const Run = struct {
@@ -120,15 +120,13 @@ const Run = struct {
 const nrepl_port_base = 17000;
 
 /// A causality analysis (causality.zig) of a run's branch, in the background.
+/// An analysis serve started (POST /runs/<id>/causality, or a first failure's: failures_analyze).
 const Job = struct {
     run: u32,
-    /// A causality analysis's number; a snapshot job's timeline.
+    /// Its number (`causality-<n>.jsonl`).
     index: u32,
     pid: linux.pid_t,
     done: bool = false,
-    /// An analysis (POST /runs/<id>/causality), or a failure's snapshots saved as soon as it
-    /// was found (failures_snapshot).
-    kind: enum { causality, snapshot } = .causality,
 };
 
 /// What the threads share: runs and jobs (under `mutex`), and the runs' databases.
@@ -324,8 +322,8 @@ fn watch(shared: *Shared) void {
                 });
                 continue;
             };
-            if (watches % failures_watch_interval == 0) failures_snapshot(&server, id) catch |err| {
-                std.debug.print("[determinismo] run {d}'s failures not saved: {s} {s}\n", .{
+            if (watches % failures_watch_interval == 0) failures_analyze(&server, id) catch |err| {
+                std.debug.print("[determinismo] run {d}'s failures not analyzed: {s} {s}\n", .{
                     id, @errorName(err), server.detail orelse "",
                 });
             };
@@ -1086,7 +1084,25 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     const asked = try std.json.parseFromSliceLeaky(CausalityRequest, server.arena, body, .{
         .ignore_unknown_fields = true,
     });
-    const argv = try causality_argv(server, run, &asked);
+    const index = try causality_launch(server, run, &asked, .waited_for);
+    try out.print("{{\"id\":{d}}}\n", .{index});
+    return 201;
+}
+
+/// Who an analysis is for: someone waiting (its futures take the CPUs before any hunt's), or
+/// the run itself (a property's first failure, analyzed as soon as it is found: beside the
+/// hunt, on a few CPUs).
+const Urgency = enum { waited_for, background };
+
+/// Futures at once of an analysis in the background: the hunt keeps the rest of the host.
+const background_jobs = 4;
+
+/// Starts an analysis of the run (`causality-<n>.jsonl`, its pid beside it): returns its number.
+fn causality_launch(server: *Server, run: *const Run, asked: *const CausalityRequest, urgency: Urgency) !u32 {
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    try argv_list.appendSlice(server.arena, try causality_argv(server, run, asked));
+    if (urgency == .background) try argv_list.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{background_jobs}) });
+    const argv = argv_list.items;
     // After the analyses on disk (a server before a restart had its own jobs).
     var index: u32 = 0;
     for (try causality_indices(server, run.id)) |earlier| index = @max(index, earlier + 1);
@@ -1095,12 +1111,16 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     defer shared.unlock();
     if (shared.job_count == jobs_max) return error.TooManyJobs;
     for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id and job.kind == .causality) index = @max(index, job.index + 1);
+        if (job.run == run.id) index = @max(index, job.index + 1);
     }
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const directory = try run_directory(server, run.id);
     const output = try std.fs.path.join(server.arena, &.{ directory, name });
-    const pid = try spawn(server.arena, argv, output, &.{}, .fresh);
+    // Someone waits for it: its futures take the CPUs before any hunt's timelines (cpus.zig),
+    // which go on as they free up. Beside a hunt it once got half the host, an hour for 128
+    // futures of a YugabyteDB timeline (srv3, 2026-10-27).
+    const priority: []const []const u8 = if (urgency == .waited_for) &.{"DETERMINISMO_CPU_PRIORITY=1"} else &.{};
+    const pid = try spawn(server.arena, argv, output, priority, .fresh);
     // Its pid on disk: a server after a restart still knows it runs.
     const pid_name = try print(server, "causality-{d}.pid", .{index});
     try std.Io.Dir.cwd().writeFile(server.io, .{
@@ -1109,12 +1129,36 @@ fn causality_start(server: *Server, run: *const Run, body: []const u8, out: *std
     });
     shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
     shared.job_count += 1;
-    try out.print("{{\"id\":{d}}}\n", .{index});
-    return 201;
+    return index;
 }
 
 /// `determinismo causality` for a run's timeline: the run's machine, system and seed, the
 /// branch's tape, the run's snapshots directory and API.
+/// When the property first failed in the timeline (its ancestors' parts included: a tree's
+/// timeline begins inside them) and when setup completed, from the run's events; null when they
+/// do not say (not ingested yet: causality's replay finds them). A failure that says when it
+/// formed (`details.window_ns`, Elle's: its anomalies' operations) failed at the window's end:
+/// the check that says so runs after the timeline, long after it was decided.
+fn failure_moments(server: *Server, id: u32, branch: u32, property: []const u8) !?struct { failure_ns: u64, setup_ns: u64 } {
+    try run_update(server, id);
+    var connection = try run_database(server, id);
+    defer connection.close();
+    const Row = struct { failure_ns: ?u64, formed_ns: ?u64, setup_ns: ?u64 };
+    const found = connection.row(Row, server.arena,
+        \\WITH failure AS (SELECT vtime_ns, event FROM timeline_events WHERE timeline = $1
+        \\    AND kind = 'assert' AND name = $2 AND condition = false ORDER BY vtime_ns LIMIT 1)
+        \\SELECT (SELECT vtime_ns FROM failure),
+        \\       (SELECT TRY_CAST(event->>'$.assert.details.window_ns[1]' AS UBIGINT) FROM failure),
+        \\       (SELECT min(vtime_ns) FROM events WHERE branch IS NULL AND kind = 'lifecycle'
+        \\        AND name = 'setup_complete')
+    , .{ branch, property }) catch return null;
+    const row = found orelse return null;
+    const failure_ns = row.failure_ns orelse return null;
+    const setup_ns = row.setup_ns orelse return null;
+    const formed_ns = row.formed_ns orelse failure_ns;
+    return .{ .failure_ns = if (formed_ns > setup_ns and formed_ns < failure_ns) formed_ns else failure_ns, .setup_ns = setup_ns };
+}
+
 fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityRequest) ![]const []const u8 {
     const original = try std.json.parseFromSliceLeaky(
         RunRequest,
@@ -1159,21 +1203,29 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
-    if (asked.verdict) |verdict| try argv.appendSlice(server.arena, &.{ "--verdict", verdict });
+    if (asked.verdict) |verdict| {
+        try argv.appendSlice(server.arena, &.{ "--verdict", verdict });
+    } else if (try failure_moments(server, run.id, asked.branch, asked.property)) |moments| {
+        // The moments the run's events have: causality skips the replay that finds them.
+        try argv.appendSlice(server.arena, &.{
+            "--failure-ms",  try print(server, "{d}", .{moments.failure_ns / std.time.ns_per_ms}),
+            "--snapshot-ms", try print(server, "{d}", .{moments.setup_ns / std.time.ns_per_ms}),
+        });
+    }
     return argv.items;
 }
 
-/// Saves each failing property's first failing timeline to disk as soon as it is found
-/// (`causality --save-only`: the moment after setup and the first round's moments, a replay
-/// each), so that an analysis of it forks its futures right away and the failure is kept for
-/// `snapshots_keep_ns`. One at a time per run; `snapshots/failure-<timeline>.log` says it was
-/// started (and what it said).
-fn failures_snapshot(server: *Server, id: u32) !void {
-    if (!server.options.failure_snapshots) return;
+/// Analyzes each failing property's first failing timeline as soon as it is found (causality,
+/// in the background: `background_jobs` futures at once, no CPU priority over the hunt), so
+/// that its curve is there, or on its way, when someone looks; its moments stay on disk for
+/// `snapshots_keep_ns` (a failing timeline's ladder, the explorer's, makes it start at once).
+/// One analysis of a run at a time; `snapshots/analyzed-<timeline>` says it was started.
+fn failures_analyze(server: *Server, id: u32) !void {
+    if (!server.options.failure_analysis) return;
     const shared = server.shared;
     shared.lock();
     const busy = for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == id and job.kind == .snapshot and !job.done) break true;
+        if (job.run == id and !job.done) break true;
     } else false;
     const found: ?Run = for (shared.runs[0..shared.run_count]) |known| {
         if (known.id == id) break known;
@@ -1182,30 +1234,28 @@ fn failures_snapshot(server: *Server, id: u32) !void {
     shared.unlock();
     const run = found orelse return;
     if (busy or !room) return;
-    var connection = try run_connect(server, id);
-    defer connection.close();
-    const Row = struct { property: []const u8, branch: u32 };
-    const rows = connection.rows(Row, server.arena, store.first_failures_sql, .{}) catch |err| {
-        if (err == error.DuckDB) server.detail = connection.failure.text();
-        return err;
+    const rows = rows: {
+        var connection = try run_connect(server, id);
+        defer connection.close();
+        const Row = struct { property: []const u8, branch: u32 };
+        break :rows connection.rows(Row, server.arena, store.first_failures_sql, .{}) catch |err| {
+            if (err == error.DuckDB) server.detail = connection.failure.text();
+            return err;
+        };
     };
     const directory = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "snapshots" });
     for (rows) |row| {
-        const log = try print(server, "{s}/failure-{d}.log", .{ directory, row.branch });
-        if (std.Io.Dir.cwd().access(server.io, log, .{})) |_| continue else |_| {}
+        const marker = try print(server, "{s}/analyzed-{d}", .{ directory, row.branch });
+        if (std.Io.Dir.cwd().access(server.io, marker, .{})) |_| continue else |_| {}
         try std.Io.Dir.cwd().createDirPath(server.io, directory);
         const asked: CausalityRequest = .{ .branch = row.branch, .property = row.property };
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(server.arena, try causality_argv(server, &run, &asked));
-        try argv.append(server.arena, "--save-only");
-        const pid = try spawn(server.arena, argv.items, log, &.{}, .fresh);
-        shared.lock();
-        defer shared.unlock();
-        if (shared.job_count == jobs_max) return; // Reaped next time.
-        shared.jobs[shared.job_count] = .{ .run = id, .index = row.branch, .pid = pid, .kind = .snapshot };
-        shared.job_count += 1;
-        std.debug.print("[determinismo] run {d}: saving timeline {d} to disk (its first failure " ++
-            "of '{s}')\n", .{ id, row.branch, row.property });
+        const index = try causality_launch(server, &run, &asked, .background);
+        try std.Io.Dir.cwd().writeFile(server.io, .{
+            .sub_path = marker,
+            .data = try print(server, "causality {d}: {s}\n", .{ index, row.property }),
+        });
+        std.debug.print("[determinismo] run {d}: analyzing timeline {d} (its first failure of " ++
+            "'{s}'), causality {d}\n", .{ id, row.branch, row.property, index });
         return;
     }
 }
@@ -1234,7 +1284,7 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
     const shared = server.shared;
     shared.lock();
     const ours = for (shared.jobs[0..shared.job_count]) |job| {
-        if (job.run == run.id and job.kind == .causality and job.index == index) break !job.done;
+        if (job.run == run.id and job.index == index) break !job.done;
     } else null;
     shared.unlock();
     // One an earlier server started: running while its process is.
@@ -1253,13 +1303,19 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
         try out.print(",\"of\":{s}", .{line[header_key.len .. line.len - 1]});
         break;
     }
-    try out.writeAll(",\"points\":[");
-    var first = true;
+    // A moment's latest point: each of its futures updates it as it finishes (causality.zig).
+    var latest: std.AutoArrayHashMapUnmanaged(u64, []const u8) = .empty;
     lines.reset();
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "{\"vtime_ms\"")) continue;
-        if (!first) try out.writeAll(",");
-        first = false;
+        const key = "{\"vtime_ms\":";
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const end = std.mem.indexOfScalarPos(u8, line, key.len, ',') orelse continue;
+        const vtime_ms = std.fmt.parseInt(u64, line[key.len..end], 10) catch continue;
+        try latest.put(server.arena, vtime_ms, line);
+    }
+    try out.writeAll(",\"points\":[");
+    for (latest.values(), 0..) |line, at| {
+        if (at > 0) try out.writeAll(",");
         try out.writeAll(line);
     }
     try out.writeAll("]}");

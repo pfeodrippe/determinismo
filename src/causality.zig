@@ -4,7 +4,8 @@
 //!
 //!   determinismo causality <machine and system options> --seed <s> --branch <n>
 //!       [--tape <branch n's tape>] --property '<message>' [--points <k>] [--futures <m>]
-//!       [--refine <rounds>] [--snapshots <dir>] [--json]
+//!       [--refine <rounds>] [--snapshots <dir>] [--failure-ms <ms> --snapshot-ms <ms>]
+//!       [--jobs <futures at once>] [--json]
 //!
 //! With its tape, branch n is the one explored (a tree's branch starts inside its ancestors:
 //! the tape has its path); without, the n-th branch from the setup snapshot.
@@ -69,6 +70,13 @@ const Request = struct {
     verdict: ?[]const u8 = null,
     /// The run's HTTP API (serve's), told to planners.
     run_url: ?[]const u8 = null,
+    /// When the property first failed and the setup snapshot's moment, if known (`--failure-ms`,
+    /// `--snapshot-ms`: serve reads them in the run's events); else a replay finds them.
+    failure_ms: ?u64 = null,
+    snapshot_ms: ?u64 = null,
+    /// Futures at once (`--jobs`): 0, one per CPU of the host's pool (an analysis someone
+    /// waits for); fewer for one in the background, beside a hunt.
+    jobs: u32 = 0,
     /// Only save the first round's moments to disk (`--save-only`): serve snapshots a failure
     /// as soon as it is found, and a later analysis forks its futures right away.
     save_only: bool = false,
@@ -106,7 +114,13 @@ pub fn run(
     arguments: []const [:0]const u8,
 ) !u8 {
     const request = try arguments_parse(arena, arguments);
-    const failure = try failure_find(arena, io, self, &request) orelse {
+    // Known already (serve reads them in the run's events): no replay to find them, the first
+    // of the two a long timeline costs before any future (minutes for YugabyteDB's).
+    const known: ?Failure = if (request.failure_ms) |failure_ms| if (request.snapshot_ms) |snapshot_ms| .{
+        .snapshot_ms = snapshot_ms,
+        .failure_ms = failure_ms,
+    } else null else null;
+    const failure = known orelse try failure_find(arena, io, self, &request) orelse {
         std.debug.print("[determinismo] causality: '{s}' does not fail in branch {d}\n", .{
             request.property, request.branch,
         });
@@ -235,6 +249,22 @@ fn moment_place(analysis: *Analysis, moment_ms: u64) !Place {
     return .{ .tape = path, .branch = try std.fmt.parseInt(u32, digits, 10) };
 }
 
+/// The moments of the analyzed timeline already saved in the snapshots directory
+/// (`b<timeline>-<ms>.state`), in milliseconds.
+fn saved_moments(analysis: *Analysis) ![]const u64 {
+    var found: std.ArrayList(u64) = .empty;
+    var directory = std.Io.Dir.cwd().openDir(analysis.io, analysis.directory, .{ .iterate = true }) catch return found.items;
+    defer directory.close(analysis.io);
+    const prefix = try std.fmt.allocPrint(analysis.arena, "b{d}-", .{analysis.request.branch});
+    var entries = directory.iterate();
+    while (try entries.next(analysis.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, prefix) or !std.mem.endsWith(u8, entry.name, ".state")) continue;
+        const digits = entry.name[prefix.len .. entry.name.len - ".state".len];
+        try found.append(analysis.arena, std.fmt.parseInt(u64, digits, 10) catch continue);
+    }
+    return found.items;
+}
+
 fn snapshot_name(analysis: *Analysis, place: Place, moment_ms: u64) ![]const u8 {
     return std.fmt.allocPrint(analysis.arena, "{s}/b{d}-{d}", .{ analysis.directory, place.branch, moment_ms });
 }
@@ -309,72 +339,113 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
     for (save_threads) |thread| thread.join();
     for (saves) |save| if (save.failed) return error.NotSaved;
     if (analysis.request.save_only) return;
-    // Their futures.
+    // Their futures, in one queue over every moment: each CPU takes the next as it frees up (a
+    // moment's futures waited for its slowest, and the next moment for them: one moment at a
+    // time, half an hour for a YugabyteDB timeline's first points, srv3 2026-10-27). Each
+    // moment's first future first, then each one's second...: a rough curve after the first
+    // wave. Each future updates its moment's point at once.
+    const Item = struct { moment: u32, future: u32 };
+    var items: std.ArrayList(Item) = .empty;
+    var most: u32 = 0;
+    for (moments) |moment| most = @max(most, moment.futures);
+    for (0..most) |future| for (moments, 0..) |moment, index| {
+        if (future < moment.futures) try items.append(arena, .{ .moment = @intCast(index), .future = @intCast(future) });
+    };
     const Futures = struct {
         analysis: *Analysis,
         names: []const []const u8,
         moments: []const Moment,
+        items: []const Item,
+        /// Per moment: its futures finished so far, the failing ones among them, and where its
+        /// point is in the analysis's points.
+        finished: []u32,
+        failing: []u32,
+        at: []?usize,
         next: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
 
         fn run(futures: *@This()) void {
             while (true) {
                 const index = futures.next.fetchAdd(1, .monotonic);
-                if (index >= futures.moments.len) return;
-                futures.one(index) catch |err| {
-                    std.debug.print("[determinismo] causality: futures at {d}ms failed: {s}\n", .{
-                        futures.moments[index].vtime_ms, @errorName(err),
+                if (index >= futures.items.len) return;
+                const item = futures.items[index];
+                futures.one(item) catch |err| {
+                    std.debug.print("[determinismo] causality: future {d} at {d}ms failed: {s}\n", .{
+                        item.future, futures.moments[item.moment].vtime_ms, @errorName(err),
                     });
                     futures.failed.store(true, .monotonic);
                 };
             }
         }
 
-        fn one(futures: *@This(), index: usize) !void {
+        fn one(futures: *@This(), item: Item) !void {
             var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer arena_state.deinit();
             const scratch = arena_state.allocator();
             const owner = futures.analysis;
             const request = owner.request;
             const io = owner.io;
-            const moment = futures.moments[index];
-            const record = try std.fmt.allocPrint(scratch, "{s}/futures-{d}.jsonl", .{
-                owner.directory, moment.vtime_ms,
+            const moment = futures.moments[item.moment];
+            const record = try std.fmt.allocPrint(scratch, "{s}/futures-{d}-{d}.jsonl", .{
+                owner.directory, moment.vtime_ms, item.future,
             });
             defer std.Io.Dir.cwd().deleteFile(io, record) catch {};
             var argv: std.ArrayList([]const u8) = .empty;
             try argv.appendSlice(scratch, &.{ owner.self, "explore" });
             try argv.appendSlice(scratch, request.rest);
             try argv.appendSlice(scratch, &.{
-                "--from-snapshot", futures.names[index],
-                "--branches",      try std.fmt.allocPrint(scratch, "{d}", .{moment.futures}),
+                "--from-snapshot", futures.names[item.moment],
+                "--branch",        try std.fmt.allocPrint(scratch, "{d}", .{item.future}),
                 "--record",        record,
             });
-            // A verdict: each future stops at its first match, which counts.
+            // A verdict: the future stops at its first match, which counts.
             if (request.verdict) |verdict| try argv.appendSlice(scratch, &.{ "--until", verdict });
             _ = try std.process.run(scratch, io, .{ .argv = argv.items });
             const source = try std.Io.Dir.cwd().readFileAlloc(io, record, scratch, .limited(1 << 24));
-            const point: Point = .{
-                .vtime_ms = moment.vtime_ms,
-                .futures = moment.futures,
-                .failing = if (request.verdict != null)
-                    @intCast(std.mem.count(u8, source, "\"outcome\":\"moment_reached\""))
-                else
-                    try property_failing(scratch, source, request.property),
-            };
+            const failing: u32 = if (request.verdict != null)
+                @intCast(std.mem.count(u8, source, "\"outcome\":\"moment_reached\""))
+            else
+                try property_failing(scratch, source, request.property);
             owner.out_mutex.lockUncancelable(io);
             defer owner.out_mutex.unlock(io);
-            try owner.points.append(owner.arena, point);
-            try point_print(owner, point);
+            futures.finished[item.moment] += 1;
+            futures.failing[item.moment] += failing;
+            const point: Point = .{
+                .vtime_ms = moment.vtime_ms,
+                .futures = futures.finished[item.moment],
+                .failing = futures.failing[item.moment],
+            };
+            if (futures.at[item.moment]) |at| {
+                owner.points.items[at] = point;
+            } else {
+                futures.at[item.moment] = owner.points.items.len;
+                try owner.points.append(owner.arena, point);
+            }
+            try point_print(owner, point); // The moment's estimate so far (serve keeps the latest).
         }
     };
     const names = try arena.alloc([]const u8, moments.len);
     for (names, places.items, moments) |*name, place, moment| {
         name.* = try snapshot_name(analysis, place, moment.vtime_ms);
     }
-    var futures: Futures = .{ .analysis = analysis, .names = names, .moments = moments };
-    // The futures' explorers share the host's CPU pool: one VM per core (cpus.zig).
-    const at_once = std.math.clamp(cpus.usable_count() / analysis.request.futures, 1, moments.len);
+    const finished = try arena.alloc(u32, moments.len);
+    @memset(finished, 0);
+    const failing = try arena.alloc(u32, moments.len);
+    @memset(failing, 0);
+    const at = try arena.alloc(?usize, moments.len);
+    @memset(at, null);
+    var futures: Futures = .{
+        .analysis = analysis,
+        .names = names,
+        .moments = moments,
+        .items = items.items,
+        .finished = finished,
+        .failing = failing,
+        .at = at,
+    };
+    // One VM per future, one per CPU of the host's pool (cpus.zig), or as many as `--jobs`.
+    const wanted = if (analysis.request.jobs > 0) analysis.request.jobs else cpus.usable_count();
+    const at_once = std.math.clamp(wanted, 1, @max(1, items.items.len));
     const threads = try arena.alloc(std.Thread, at_once);
     for (threads) |*thread| thread.* = try std.Thread.spawn(.{}, Futures.run, .{&futures});
     for (threads) |thread| thread.join();
@@ -430,9 +501,27 @@ fn plan_built_in(analysis: *Analysis, round: u32) ![]const Moment {
     if (round == 0) {
         try moments.append(analysis.arena, .{ .vtime_ms = failure.snapshot_ms + 1, .futures = request.futures });
         const span = failure.failure_ms - failure.snapshot_ms;
+        // Evenly, each moment the nearest one saved already (the explorer's ladder of a failing
+        // timeline, an earlier analysis's) within half a step: those need no replay to save.
+        const saved = try saved_moments(analysis);
+        const half_step = span / request.points / 2;
         for (0..request.points) |index| {
             const step = span * (index + 1) / request.points;
-            try moments.append(analysis.arena, .{ .vtime_ms = failure.snapshot_ms + @max(step, 1), .futures = request.futures });
+            const even = failure.snapshot_ms + @max(step, 1);
+            var chosen = even;
+            var distance: u64 = half_step + 1;
+            for (saved) |ms| {
+                if (ms <= failure.snapshot_ms + 1 or ms > failure.failure_ms) continue;
+                const apart = if (ms > even) ms - even else even - ms;
+                if (apart < distance) {
+                    distance = apart;
+                    chosen = ms;
+                }
+            }
+            const repeated = for (moments.items) |moment| {
+                if (moment.vtime_ms == chosen) break true;
+            } else false;
+            try moments.append(analysis.arena, .{ .vtime_ms = if (repeated) even else chosen, .futures = request.futures });
         }
         return moments.items;
     }
@@ -532,7 +621,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             eql(u8, flag, "--refine") or eql(u8, flag, "--snapshots") or
             eql(u8, flag, "--planner") or eql(u8, flag, "--run-url") or
             eql(u8, flag, "--jump-min") or eql(u8, flag, "--gap-min-ms") or
-            eql(u8, flag, "--moments-max") or eql(u8, flag, "--verdict");
+            eql(u8, flag, "--moments-max") or eql(u8, flag, "--verdict") or
+            eql(u8, flag, "--failure-ms") or eql(u8, flag, "--snapshot-ms") or eql(u8, flag, "--jobs");
         if (!ours) {
             try rest.append(arena, flag);
             continue;
@@ -564,6 +654,12 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             request.gap_min_ms = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, flag, "--moments-max")) {
             request.moments_max = try std.fmt.parseInt(u32, value, 10);
+        } else if (eql(u8, flag, "--failure-ms")) {
+            request.failure_ms = try std.fmt.parseInt(u64, value, 10);
+        } else if (eql(u8, flag, "--snapshot-ms")) {
+            request.snapshot_ms = try std.fmt.parseInt(u64, value, 10);
+        } else if (eql(u8, flag, "--jobs")) {
+            request.jobs = try std.fmt.parseInt(u32, value, 10);
         } else {
             request.futures = try std.fmt.parseInt(u32, value, 10);
         }
