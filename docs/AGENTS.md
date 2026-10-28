@@ -92,6 +92,12 @@ use them in other repositories.
 
 ## Facts worth knowing
 
+- A system is a test program (`--program`), an Antithesis Compose project (`--compose`), or
+  Kubernetes manifests (`--kubernetes <dir>`, the MCP and HTTP `kubernetes`): a single-node K3s
+  cluster runs them, images fully qualified and taken from the host, deployed and ready before
+  branching; test templates in any image run in their pod. Its faults include single pods
+  (`pod_pause`, `pod_kill`, `pod_isolate`, `pod_degrade`, `pod_partition`), named in each fault
+  event. examples/kubernetes is one.
 - Exploration is a tree (Antithesis's "every event a potential branch point"): after each
   generation of 16 timelines, the ones that first reached something (an assertion outcome, a
   fault kind, a closer guidance distance, a new kind of output line) are returned to just after
