@@ -1127,6 +1127,11 @@ fn causality_launch(server: *Server, run: *const Run, asked: *const CausalityReq
         .sub_path = try std.fs.path.join(server.arena, &.{ directory, pid_name }),
         .data = try print(server, "{d}\n", .{pid}),
     });
+    // One nobody asked for says so (the page: "started on its first failure").
+    if (urgency == .background) try std.Io.Dir.cwd().writeFile(server.io, .{
+        .sub_path = try std.fs.path.join(server.arena, &.{ directory, try print(server, "causality-{d}.automatic", .{index}) }),
+        .data = "",
+    });
     shared.jobs[shared.job_count] = .{ .run = run.id, .index = index, .pid = pid };
     shared.job_count += 1;
     return index;
@@ -1295,7 +1300,9 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
     };
     const name = try print(server, "causality-{d}.jsonl", .{index});
     const output = run_file(server, run.id, name) catch return error.NotFound;
-    try out.print("{{\"id\":{d},\"done\":{}", .{ index, !running });
+    const automatic_name = try print(server, "causality-{d}.automatic", .{index});
+    const automatic = if (run_file(server, run.id, automatic_name)) |_| true else |_| false;
+    try out.print("{{\"id\":{d},\"done\":{},\"automatic\":{}", .{ index, !running, automatic });
     var lines = std.mem.tokenizeScalar(u8, output, '\n');
     const header_key = "{\"causality\":";
     while (lines.next()) |line| {
