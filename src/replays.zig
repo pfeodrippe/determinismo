@@ -91,7 +91,8 @@ fn results_parse(arena: std.mem.Allocator, text: []const u8) !Results {
         var words = std.mem.tokenizeScalar(u8, line, ' ');
         const index = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
         const verdict = words.next() orelse continue;
-        if (std.mem.eql(u8, verdict, "killed")) continue; // Not replayed.
+        // Not replayed: killed, or it could not run (its output kept beside the tapes).
+        if (std.mem.eql(u8, verdict, "killed") or std.mem.eql(u8, verdict, "failed")) continue;
         results.replayed += 1;
         if (std.mem.eql(u8, verdict, "same")) {
             results.same += 1;
@@ -325,6 +326,13 @@ fn replay_one(
     if (killed and std.mem.eql(u8, replayed, "none") and why.len == 0) {
         return std.fmt.allocPrint(arena, "{d} killed {s}\n", .{ index, recorded });
     }
+    // Ended without a history and without parting from its tape: it could not run (a host
+    // check's container, the host itself), which says nothing about determinism either.
+    if (std.mem.eql(u8, replayed, "none") and why.len == 0) {
+        const log = try std.fmt.allocPrint(arena, "{s}/replay-{d}.log", .{ tapes, index });
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log, .data = tail(result.stderr, 256 << 10) }) catch {};
+        return std.fmt.allocPrint(arena, "{d} failed {s}\n", .{ index, recorded });
+    }
     // Its output beside the results (the last 256 KiB): where it parted, on what CPU, its
     // clock's hazards, without replaying it again.
     const log = try std.fmt.allocPrint(arena, "{s}/replay-{d}.log", .{ tapes, index });
@@ -365,7 +373,7 @@ fn sleep_ns(ns: u64) void {
 test results_parse {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const results = try results_parse(arena.allocator(), "15 same ab\n31 different ab cd diverged\n47 same ef\n63 killed gh\n");
+    const results = try results_parse(arena.allocator(), "15 same ab\n31 different ab cd diverged\n47 same ef\n63 killed gh\n79 failed ij\n");
     try std.testing.expectEqual(3, results.replayed);
     try std.testing.expectEqual(2, results.same);
     try std.testing.expectEqual(31, results.first_different.?);

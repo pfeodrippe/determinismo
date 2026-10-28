@@ -12,7 +12,7 @@
 #   confined to its share by the kernel (cgroup cpusets: systemd's AllowedCPUs). Kept in
 #   /etc/determinismo/reserved-cores for the next start. Default 0: runs may take every core.
 #   --siblings on|off: VMs on a core's second hyperthread too, once every core's first is busy
-#   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default on.
+#   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default off.
 set -euo pipefail
 user=${1:?usage: $0 <user> start|stop [--reserved-cores N]}
 action=${2:?usage: $0 <user> start|stop [--reserved-cores N]}
@@ -52,8 +52,8 @@ case $siblings_given in
   "") ;;
   *) echo "error: --siblings takes on or off" >&2; exit 2 ;;
 esac
-smt=1
-[ "$(cat "$siblings_config" 2>/dev/null || echo on)" = off ] && smt=0
+smt=0
+[ "$(cat "$siblings_config" 2>/dev/null || echo off)" = on ] && smt=1
 read -r own_cpus run_cpus < <(python3 - "$reserved" <<'PY'
 import sys
 
@@ -95,6 +95,11 @@ PY
 [ "$own_cpus" = - ] && own_cpus= && run_cpus=
 # The user's sessions on their cores (or every core again, without a reservation).
 systemctl set-property "user-$uid.slice" "AllowedCPUs=$own_cpus"
+# The user's manager survives an OOM kill of one of its processes: its default (stop) took
+# rootless podman's pause process with it, and no run could start a container after (srv3,
+# 2026-10-28, twice).
+mkdir -p "/etc/systemd/system/user@$uid.service.d"
+printf '[Service]\nOOMPolicy=continue\n' > "/etc/systemd/system/user@$uid.service.d/determinismo.conf"
 # On the tailnet too (tailscale.sh): the web UI from your devices, without a tunnel.
 listen=127.0.0.1:7878
 if command -v tailscale >/dev/null && address=$(tailscale ip -4 2>/dev/null); then

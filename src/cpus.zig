@@ -7,10 +7,11 @@
 //! the user's: every process agrees on the CPUs, and the kernel gives a CPU back when its holder
 //! dies. Locks belong to an open file, so each process opens the pool itself (never inherited).
 //!
-//! Every hardware thread, each core's first before any second hyperthread: a VM alone on a core
-//! is fastest (with a busy sibling, about 0.7x), and once every core is busy the siblings add
-//! work (about 1.4x a core). `DETERMINISMO_SMT=0` (serve.sh's `--siblings off`) keeps one thread
-//! per core. Siblings were left out when Kafka timelines diverged within seconds with two VMs on
+//! One VM per core by default; with `DETERMINISMO_SMT=1` (serve.sh's `--siblings on`) the second
+//! hyperthreads too, once every core's first is busy: a VM alone on a core is fastest (with a
+//! busy sibling, about 0.7x), and a busy core does about 1.4x. Not the default: twice the VMs
+//! outgrew memory admission, which claims each VM's guest but not its in-run snapshots and
+//! holders (a Dgraph hunt, 53 timelines killed by the OOM killer, srv3 2026-10-28). Siblings were left out when Kafka timelines diverged within seconds with two VMs on
 //! one core (srv1, 2026-10-27), thought to perturb each other's branch counters; the divergences
 //! were the guest kernel's, which branched on TLB state that a sibling's VM perturbs most (guest
 //! patches 0001, 0002 and 0004: 150-branch spurious faults). With them, VMs on both hyperthreads
@@ -347,8 +348,8 @@ pub fn usable_count() u32 {
     return @max(count, 1);
 }
 
-/// In the set, and, with one thread per core (`DETERMINISMO_SMT=0`), not a second hyperthread
-/// whose core's first thread is in the set too.
+/// In the set, and, with one thread per core (the default), not a second hyperthread whose
+/// core's first thread is in the set too.
 fn usable(available: *const linux.cpu_set_t, cpu: usize) bool {
     const bits = @bitSizeOf(@TypeOf(available[0]));
     if (available[cpu / bits] >> @intCast(cpu % bits) & 1 == 0) return false;
@@ -359,8 +360,8 @@ fn usable(available: *const linux.cpu_set_t, cpu: usize) bool {
 }
 
 fn siblings_allowed() bool {
-    const value = std.c.getenv("DETERMINISMO_SMT") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(value), "0");
+    const value = std.c.getenv("DETERMINISMO_SMT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 /// Whether the CPU is a core's second hyperthread (not the first of its siblings).
