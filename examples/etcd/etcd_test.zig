@@ -313,14 +313,17 @@ fn increment(address: [4]u8) !void {
         key, read.mod_revision, key, values.of(next),
     });
     var buffer: [response_size_max]u8 = undefined;
-    const response = call(TxnResponse, address, "/v3/kv/txn", body, &buffer) catch |err| {
-        if (no_answer(err)) acked_note("increment", "unknown", "", 0);
-        return err;
-    };
+    // Noted before it is sent, as Jepsen's invocations: a driver the composer kills during the
+    // call (its phase ended) leaves an increment that may have applied, and noted only after,
+    // it was neither acknowledged nor unknown: the counter one over (run 64, srv3: 83
+    // timelines, the counter at acknowledged + 1).
+    acked_note("increment", "invoked", "", 0);
+    const response = try call(TxnResponse, address, "/v3/kv/txn", body, &buffer);
     if (response.succeeded) {
         acked_note("increment", "acknowledged", "", 0);
         sdk.sometimes(true, "an increment was acknowledged", .{});
     } else {
+        acked_note("increment", "failed", "", 0);
         sdk.sometimes(true, "an increment lost its compare", .{});
     }
 }
@@ -706,14 +709,18 @@ fn writes_survive(context: *System.Context) !void {
     var missing: u64 = 0;
     var changed: u64 = 0;
     var increments: u64 = 0;
-    var unknown: u64 = 0;
+    var invoked: u64 = 0;
+    var failed: u64 = 0;
     var lines = std.mem.tokenizeScalar(u8, log, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         const kind = fields.next() orelse continue;
         const first = fields.next() orelse continue;
         if (std.mem.eql(u8, kind, "increment")) {
-            if (std.mem.eql(u8, first, "acknowledged")) increments += 1 else unknown += 1;
+            // Invoked, then acknowledged or failed (its compare lost); invoked alone: unknown.
+            if (std.mem.eql(u8, first, "invoked")) invoked += 1;
+            if (std.mem.eql(u8, first, "acknowledged")) increments += 1;
+            if (std.mem.eql(u8, first, "failed")) failed += 1;
             continue;
         }
         const value = fields.next() orelse continue;
@@ -735,6 +742,7 @@ fn writes_survive(context: *System.Context) !void {
         return err;
     };
     const value = std.fmt.parseInt(u64, counter.value orelse "0", 10) catch return error.BadCounter;
+    const unknown = invoked -| increments -| failed;
     const counted = value >= increments and value <= increments + unknown;
     sdk.always(counted, "the counter counts every acknowledged increment and no more", .{
         .value = value,

@@ -86,3 +86,19 @@ index 249 while its hard state says 367 were committed. A snapshot file can reac
 its WAL record; the restart then picks a snapshot the WAL does not match. Reported as
 etcd-io/etcd#10219 and fixed by #11888 (May 2020, after 3.4.3); Jepsen's 3.4.3 analysis did not
 report it.
+
+### Not findings: hunt run 64 (srv3, 2026-10-28, `jepsen` profile, kv)
+
+4,325 timelines failed "no panics (Go)" in 246, "no unexpected container exits" in 230,
+"test commands exit successfully" in 260 and "the counter counts every acknowledged increment
+and no more" in 83. None is etcd's:
+- The panics (`tocommit(78) is out of range [lastIndex(73)]. Was the raft log corrupted,
+  truncated, or lost?`), the exits and the failed commands came from a determinismo bug: a
+  durable crash that crashed a member twice left its disk dropping writes, and its next crash
+  lost every write since. Every one of the 246 panicking timelines has such a failed crash in its
+  history (300 timelines inherited one). Fixed (determinismo's commit "A failed crash left a
+  node's disk dropping writes").
+- The counter one over its acknowledged increments (none unknown) was the workload's: it noted
+  an increment after the answer, and a driver the composer killed as its phase ended, during a
+  committed increment, left it neither acknowledged nor unknown (timeline 2028: a 0.34 s driver
+  phase, no increment noted, the counter at 1). Increments are now noted before they are sent.

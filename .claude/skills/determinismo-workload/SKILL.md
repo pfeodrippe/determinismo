@@ -44,6 +44,10 @@ fn transfers(s: *System.Scenario) void {
   those errors apart; note them with a `sometimes` and return.
 - `eventually` retries (`sdk.retry`) and ends in `assert_unreachable(...)` if the system never
   recovers.
+- Note each operation before sending it (Jepsen's invocations), then its outcome: the composer
+  may end the driver phase and kill drivers mid-call, and an operation that applied but was
+  noted only after its answer is neither acknowledged nor unknown (an etcd counter came out one
+  over in 83 timelines). Invoked without an outcome counts as unknown.
 
 ## Assertions in the service
 
