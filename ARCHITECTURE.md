@@ -148,7 +148,9 @@ Code follows TigerStyle ([docs/STYLE.md](docs/STYLE.md)); strategy plugins speak
   1 ms rather than 100 µs took a busy YugabyteDB guest from 0.62x to 0.99x virtual time (timers
   due within a millisecond fire together, and a clock read nearly always comes first). A hard
   stop single-steps from 128 branches before its target: the PMU interrupt's skid reached 65
-  branches on srv3's W-2295, and a stop that overshoots its target is another timeline.
+  branches on srv3's W-2295, and a stop that overshoots its target is another timeline. A hold
+  point or moment within a timer's slack is stopped at exactly, and the timer keeps its soft and
+  hard stops: it fires where a timeline without that hold point fires it.
 - `vtime = f(instruction count, per-event charges, modulation parameters)`. The parameters are
   inputs too, which gives **CPU modulation** as a fault (clock-speed strobing, per-operation cost
   changes) for free.
