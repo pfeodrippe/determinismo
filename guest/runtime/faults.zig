@@ -701,9 +701,13 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .throttle => nodes.cpu_limit(name, null) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
-        .pod_pause => fault.pod.write("cgroup.freeze", "0") catch {},
-        // The pod may be gone (killed, rescheduled), its namespace with it.
-        .pod_isolate, .pod_degrade => nodes.pod_netem(fault.pid, null) catch {},
+        // The pod may be gone (killed, rescheduled), its cgroup and namespace with it: said.
+        .pod_pause => fault.pod.write("cgroup.freeze", "0") catch |err| {
+            sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
+        },
+        .pod_isolate, .pod_degrade => nodes.pod_netem(fault.pid, null) catch |err| {
+            sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
+        },
         else => {},
     }
 }
@@ -778,9 +782,10 @@ const Directories = struct {
 };
 
 /// The node's pod picked by `index` (their cgroups in name order: the same pod on a replay),
-/// and a process of it (the first with a HOSTNAME naming the pod). Spared, the pods whose
-/// containers hold test templates (the drivers run there, through kubectl exec: a kill would
-/// fail them, not the system).
+/// and a process of it (the first with a HOSTNAME naming the pod). Spared, the cluster's own
+/// pods (kube-system: CoreDNS, the storage provisioner; node faults reach them) and, with
+/// spare_drivers, the pods whose containers hold test templates (the drivers run there,
+/// through kubectl exec: a kill would fail them, not the system).
 fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux.pid_t {
     var pods: Directories = .{};
     var parent_buffer: [nodes.path_size_max]u8 = undefined;
@@ -794,6 +799,7 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
     std.sort.insertion(usize, order[0..pods.count], &pods, Directories.before);
     var candidates: usize = 0;
     for (order[0..pods.count]) |at| {
+        if (pod_in_namespace(node, pods.get(at), "kube-system")) continue;
         if (spare_drivers and pod_has_templates(pods.get(at))) continue;
         order[candidates] = at;
         candidates += 1;
@@ -822,6 +828,28 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
     }
     if (pid == 0) return error.PodWithoutProcesses;
     return pid;
+}
+
+/// Whether the pod is in `namespace`: its service account's projected volume names it, in the
+/// node's /var/lib/kubelet/pods/<uid> (a tmpfs of the node's mount namespace: seen through its
+/// main process, K3s).
+fn pod_in_namespace(node: []const u8, path: []const u8, namespace: []const u8) bool {
+    const directory = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, directory, "pod")) return false;
+    const uid = directory["pod".len..];
+    const main_pid = nodes.pid_recorded(node) orelse return false;
+    var projected: Directories = .{};
+    var buffer: [nodes.path_size_max]u8 = undefined;
+    const format = "/proc/{d}/root/var/lib/kubelet/pods/{s}/volumes/kubernetes.io~projected";
+    projected.add(nodes.print_z(&buffer, format, .{ main_pid, uid }) catch return false, "kube-api-access");
+    for (0..projected.count) |at| {
+        var file_buffer: [nodes.path_size_max + 16]u8 = undefined;
+        const file = nodes.print_z(&file_buffer, "{s}/namespace", .{projected.get(at)}) catch continue;
+        var text_buffer: [256]u8 = undefined;
+        const text = nodes.read_small(file, &text_buffer) orelse continue;
+        return std.mem.eql(u8, std.mem.trim(u8, text, " \n"), namespace);
+    }
+    return false;
 }
 
 /// Whether one of the pod's containers holds Antithesis test templates.

@@ -6,7 +6,8 @@ class, in one privileged node (`src/kubernetes.zig`). Images are fully qualified
 the host (built or pulled there): the guest has no network. Helm charts are rendered first
 (`helm template ... --output-dir manifests/`).
 
-Here, Redis and a client whose image holds the test templates:
+Here, Redis (a StatefulSet, its append-only file on a local-path volume) and a client whose
+image holds the test templates:
 
     podman build -t localhost/determinismo-kubernetes-client:1 -f examples/kubernetes/Dockerfile.client .
     determinismo explore ... --memory-mib 4096 --kubernetes examples/kubernetes/manifests \

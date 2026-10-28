@@ -1,9 +1,12 @@
-# Redis behind a Service: the system the client's test templates drive.
+# Redis behind a Service: the system the client's test templates drive. A StatefulSet with a
+# volume of the cluster's local-path storage: its append-only file outlives the pod (a killed
+# pod's Redis comes back with what it had synced).
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: redis
 spec:
+  serviceName: redis
   replicas: 1
   selector:
     matchLabels:
@@ -16,13 +19,24 @@ spec:
       containers:
         - name: redis
           image: docker.io/library/redis:7.4-alpine
-          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          args: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"]
           ports:
             - containerPort: 6379
           readinessProbe:
             tcpSocket:
               port: 6379
             periodSeconds: 1
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 64Mi
 ---
 apiVersion: v1
 kind: Service
