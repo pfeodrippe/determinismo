@@ -806,7 +806,7 @@ fn scenarios_selected(
         std.debug.print("[determinismo] pick a scenario with --scenario (or all)\n", .{});
         return error.Usage;
     };
-    if (system.scenario("all") != null) {
+    if (std.mem.eql(u8, wanted, "all") and system.scenario("all") != null) {
         std.debug.print("[determinismo] a scenario is named all: rename it (--scenario all " ++
             "explores every scenario, so it would never run alone)\n", .{});
         return error.Usage;
