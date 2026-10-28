@@ -475,6 +475,12 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
             std.fmt.parseInt(u64, std.mem.span(text), 10) catch 0
         else
             0,
+        // With --trace: RDTSC exits logged, the first 4M by default (DETERMINISMO_RDTSC_LOG_CAP:
+        // more, for a divergence later in a long timeline; 16 bytes each, in the host kernel).
+        .rdtsc_log_cap = if (std.c.getenv("DETERMINISMO_RDTSC_LOG_CAP")) |text|
+            std.fmt.parseInt(u32, std.mem.span(text), 10) catch VM.rdtsc_log_cap_default
+        else
+            VM.rdtsc_log_cap_default,
         .moment_vtime_ns = if (arguments.moment_vtime_ms) |ms| ms * std.time.ns_per_ms else null,
         .moment_command = arguments.moment_command,
         .until = arguments.until,

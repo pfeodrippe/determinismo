@@ -121,6 +121,7 @@ stats: Stats,
 /// first divergence of two runs.
 trace_fd: ?linux.fd_t,
 rdtsc_log_fd: ?linux.fd_t,
+rdtsc_log_cap: u32,
 itrace_fd: ?linux.fd_t,
 itrace_at: u64,
 /// Exploration hooks, attached by the caller between init and run (null when not exploring):
@@ -162,6 +163,7 @@ pub const Options = struct {
     trace_fd: ?linux.fd_t = null,
     /// Debugging: where the (branch count, RIP) at each RDTSC exit goes when the VM ends.
     rdtsc_log_fd: ?linux.fd_t = null,
+    rdtsc_log_cap: u32 = rdtsc_log_cap_default,
     /// Debugging: every instruction's (branch count, RIP) from the RDTSC exit numbered
     /// `itrace_at` to the next, single-stepped (where two runs part, which branch went another
     /// way), written here when the VM ends.
@@ -423,6 +425,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .stats = .{},
         .trace_fd = options.trace_fd,
         .rdtsc_log_fd = options.rdtsc_log_fd,
+        .rdtsc_log_cap = options.rdtsc_log_cap,
         .itrace_fd = options.itrace_fd,
         .itrace_at = options.itrace_at,
         .strategy = null,
@@ -1318,8 +1321,9 @@ fn trace(vm: *VM, comptime kind: []const u8, value: u64) !void {
     _ = linux.write(fd, line.ptr, line.len); // Best effort: a debugging aid.
 }
 
-/// Debugging: the log of RDTSC exits, (branch count, RIP) pairs, appended to rdtsc_log_fd.
-const rdtsc_log_cap = 1 << 22;
+/// Debugging: the log of RDTSC exits, (branch count, RIP) pairs, appended to rdtsc_log_fd: the
+/// first `rdtsc_log_cap` of them.
+pub const rdtsc_log_cap_default = 1 << 22;
 
 fn rdtsc_log_enable(vm: *VM) !void {
     if (vm.itrace_fd != null and vm.itrace_at > 0) {
@@ -1327,7 +1331,7 @@ fn rdtsc_log_enable(vm: *VM) !void {
         _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ITRACE_ENABLE, @intFromPtr(&window));
     }
     if (vm.rdtsc_log_fd == null) return;
-    var cap: u64 = rdtsc_log_cap;
+    var cap: u64 = vm.rdtsc_log_cap;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_ENABLE, @intFromPtr(&cap));
 }
 
@@ -1335,9 +1339,9 @@ const itrace_cap = 1 << 22;
 
 fn rdtsc_log_write(vm: *VM) void {
     const fd = vm.rdtsc_log_fd orelse return;
-    const pairs = std.heap.page_allocator.alloc(u64, 2 * rdtsc_log_cap) catch return;
+    const pairs = std.heap.page_allocator.alloc(u64, 2 * @max(vm.rdtsc_log_cap, itrace_cap)) catch return;
     defer std.heap.page_allocator.free(pairs);
-    var request: kvm.DetLog = .{ .buf = @intFromPtr(pairs.ptr), .cap = rdtsc_log_cap, .len = 0 };
+    var request: kvm.DetLog = .{ .buf = @intFromPtr(pairs.ptr), .cap = vm.rdtsc_log_cap, .len = 0 };
     _ = kvm.ioctl(vm.vcpu_fd, kvm.DET_LOG_READ, @intFromPtr(&request)) catch return;
     const bytes = std.mem.sliceAsBytes(pairs[0 .. 2 * request.len]);
     _ = linux.write(fd, bytes.ptr, bytes.len);
