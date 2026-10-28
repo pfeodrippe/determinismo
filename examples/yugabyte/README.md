@@ -86,7 +86,18 @@ timelines, Elle found:
   …209]`. Appends only concatenate to a row (or insert it when there is none), so the row that
   held 160 vanished and was inserted again: a lost committed insert.
 The run had no outage: kill outages (every node killed at once, #2125's first trigger) came
-after it.
+after it. At 64 timelines, besides "no process crashes: postgres" in every one (YSQL's
+backends, below: known crashes since), it failed:
+- "no process crashes: yb-tserver" in 6: aborts in `mvcc.cc:340` (`Check failed: result >=
+  enforced_min_time`, a write's safe time below the tablet's minimum), #2571 above.
+- "no process crashes: yb-master" in 1 (timeline 17): a master killed and restarted found its
+  newest sys-catalog WAL segment, `wal-000000051`, with "12 initial NULL bytes instead of
+  magic and header length" (renamed into place, its header never written: the kill came
+  between the two), and 20 s after it started, rolling over to its next segment, it could
+  not open its active one, `wal-000000051`: "No such file or directory" (`log.cc:1068`, in
+  `SwitchToAllocatedSegment`), and aborted. The same abort, in the same function, is open
+  upstream as #30325 (2026-02, 2.29, under kernel shutdowns): here after a process kill alone.
+- "the kernel kills no process for lack of memory" in 7: the VMs' memory, not YugabyteDB's.
 
 ## Observed (1.3.1, not investigated further)
 
