@@ -178,6 +178,15 @@ commands in shell, Python and Java), which `zig build e2e` runs to keep the impo
 determinismo explore ... --compose tests/antithesis-compat/bank/compose.yaml --scenario bank --branches 40
 ```
 
+Or Kubernetes manifests, as Antithesis's Kubernetes setup takes them (raw, Helm rendered first,
+images fully qualified and on the host): a single-node K3s cluster runs them, deployed and ready
+before branching, and the test templates in their images run in their pods
+([examples/kubernetes](examples/kubernetes)):
+
+```
+determinismo explore ... --memory-mib 4096 --kubernetes examples/kubernetes/manifests --scenario counter
+```
+
 ## Quickstart (on the host)
 
 One command from your machine sets up a host, from a Hetzner box in its rescue system to an

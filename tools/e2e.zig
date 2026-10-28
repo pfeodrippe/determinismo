@@ -147,6 +147,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "pinned", check_pinned },                 .{ "saved", check_saved },
         .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
         .{ "ui", check_ui },                         .{ "runs", check_runs },
+        .{ "kubernetes", check_kubernetes },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -362,6 +363,46 @@ fn check_python_strategy(context: *Context) !void {
 
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
 /// spread over them): the workload survives faults, and a branch replays exactly.
+/// Kubernetes manifests imported (kubernetes.zig), as Antithesis runs them: a single-node K3s
+/// cluster with the manifests' images (one built here), deployed and ready before branching,
+/// the client image's test templates run in its pod; one timeline replays exactly.
+fn check_kubernetes(context: *Context) !void {
+    const arena = context.arena;
+    const build = try run_kept(context, &.{
+        "podman", "build",                                 "--quiet", "--tag", "localhost/determinismo-kubernetes-client:1",
+        "--file", "examples/kubernetes/Dockerfile.client", ".",
+    });
+    const common = [_][]const u8{
+        "--kubernetes", "examples/kubernetes/manifests", "--scenario", "counter", "--seed", "1",
+        "--memory-mib", "4096",
+    };
+    const explored = try std.fmt.allocPrint(arena, "{s}/kubernetes", .{context.scratch});
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "4", "--events-dir", explored }));
+    var branches: [4]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const deployed = std.mem.indexOf(u8, report, "test command completed: setup_kubernetes") != null;
+    const driven = std.mem.indexOf(u8, report, "test command completed: parallel_driver_increment") != null;
+    const read = std.mem.indexOf(u8, report, "test command completed: eventually_counter_readable") != null;
+    const passing = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
+    var same = false;
+    if (count > 0) {
+        const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
+    }
+    expect_all(context, &.{
+        .{ "the client image builds", build.term.success() },
+        .{ "4 timelines", count == 4 },
+        .{ "the manifests deployed and became ready (setup_kubernetes)", deployed },
+        .{ "a driver ran in the client's pod", driven },
+        .{ "the counter read back once faults stopped", read },
+        .{ "no property failed", passing },
+        .{ "a timeline replays exactly", same },
+    }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod", .{});
+}
+
 fn check_k3s(context: *Context) !void {
     try check_k3s_profile(context, "single", "4096", "one node");
     try check_k3s_profile(context, "cluster", "8192", "three nodes");

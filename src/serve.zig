@@ -742,9 +742,11 @@ fn database_answer(
 
 /// What a client may ask for; mirrors explore's flags.
 pub const RunRequest = struct {
-    /// The system: a test program, or a Compose file (exactly one).
+    /// The system: a test program, a Compose file, or a directory of Kubernetes manifests
+    /// (exactly one).
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
+    kubernetes: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     /// Absent: a fresh one, drawn by the server and kept in the run's request.json (as
@@ -913,7 +915,7 @@ fn runs_list(server: *Server, out: *std.Io.Writer) !u16 {
         if (std.json.parseFromSliceLeaky(RunRequest, server.arena, request_json, .{
             .ignore_unknown_fields = true,
         })) |asked| {
-            const system = std.fs.path.basename(asked.program orelse asked.compose orelse "");
+            const system = std.fs.path.basename(asked.program orelse asked.compose orelse asked.kubernetes orelse "");
             try out.print(",\"system\":{f},\"scenario\":{f},\"from_branch\":{f}", .{
                 std.json.fmt(system, .{}),            std.json.fmt(asked.scenario, .{}),
                 std.json.fmt(asked.from_branch, .{}),
@@ -1530,9 +1532,9 @@ fn run_identity(server: *Server, id: u32) ![]const u8 {
         id,
         "request.json",
     ), .{ .ignore_unknown_fields = true });
-    return print(server, "{s}|{s}|{s}|{s}", .{
-        asked.program orelse "", asked.compose orelse "", asked.scenario orelse "",
-        asked.profile orelse "",
+    return print(server, "{s}|{s}|{s}|{s}|{s}", .{
+        asked.program orelse "", asked.compose orelse "",    asked.scenario orelse "",
+        asked.profile orelse "", asked.kubernetes orelse "",
     });
 }
 
@@ -1726,9 +1728,12 @@ fn system_arguments(
     argv: *std.ArrayList([]const u8),
     asked: *const RunRequest,
 ) !void {
-    if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
+    const sources = @as(u32, @intFromBool(asked.program != null)) + @intFromBool(asked.compose != null) +
+        @intFromBool(asked.kubernetes != null);
+    if (sources != 1) return error.BadRequest;
     if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
+    if (asked.kubernetes) |manifests| try argv.appendSlice(arena, &.{ "--kubernetes", manifests });
     try argv.append(arena, if (asked.cpu_modulation) "--cpu-modulation" else "--no-cpu-modulation");
     // They change the system (what its nodes allow): runs and their replays both.
     if (asked.faults) |kinds| try argv.appendSlice(arena, &.{ "--faults", kinds });

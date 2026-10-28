@@ -13,12 +13,16 @@ const std = @import("std");
 const assert = std.debug.assert;
 const schema = @import("determinismo").schema;
 const compose = @import("compose.zig");
+const kubernetes = @import("kubernetes.zig");
 
 pub const Options = struct {
     /// The test program (its `--describe`), or else a Compose file whose services become the
     /// nodes and whose images' Antithesis test templates become the scenarios.
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
+    /// Or a directory of Kubernetes manifests, run in a single-node K3s cluster (kubernetes.zig)
+    /// whose images' Antithesis test templates become the scenarios.
+    kubernetes: ?[]const u8 = null,
     /// A script for the composer and the fault injector (/det/script.json on the system disk).
     script: ?[]const u8 = null,
     /// The profile to resolve; null takes the first one.
@@ -77,7 +81,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         .mutant = options.mutant,
     };
     const cwd = std.Io.Dir.cwd();
-    for ([_][]const u8{ "images", "systems", "staging", "profiles", "mutants" }) |directory| {
+    for ([_][]const u8{ "images", "systems", "staging", "profiles", "mutants", "kubernetes" }) |directory| {
         try cwd.createDirPath(io, try path_join(context, &.{ context.cache, directory }));
     }
     if (options.pinned) |path| return pinned_prepare(context, options, path);
@@ -103,6 +107,8 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         .profile = profile.name,
         .nodes = resolved,
         .scenarios = scenarios.items,
+        // Compose's systems declare their setup through an Antithesis SDK; a Kubernetes one's
+        // is its setup command's (kapp's readiness, as Antithesis's).
         .sdk_setup = options.compose != null,
         .checks = description.checks,
     };
@@ -110,7 +116,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
     try std.json.Stringify.value(system, .{ .emit_null_optional_fields = false }, &writer.writer);
     const system_json = writer.written();
     const prepared = try system_finish(context, options, system, system_json, disk_paths);
-    const source = options.program orelse options.compose.?;
+    const source = options.program orelse options.compose orelse options.kubernetes.?;
     try profile_remember(context, source, &system, system_json);
     return prepared;
 }
@@ -340,6 +346,7 @@ pub fn profile_names(arena: std.mem.Allocator, io: std.Io, options: Options) ![]
 }
 
 fn describe(context: Context, options: Options) !schema.Description {
+    if (options.kubernetes) |directory| return kubernetes_describe(context, directory);
     if (options.compose) |path| {
         const profiles = try context.arena.alloc(schema.Profile, 1);
         profiles[0] = try compose.profile(context.arena, context.io, path);
@@ -348,6 +355,168 @@ fn describe(context: Context, options: Options) !schema.Description {
     const program = options.program orelse return error.NoProgram;
     const output = try tool(context, &.{ program, "--describe" });
     return schema.parse(schema.Description, context.arena, output);
+}
+
+/// Kubernetes manifests as a system (kubernetes.zig): one K3s node, its image built from a
+/// context made here (`<cache>/kubernetes/<hash>`: K3s, the workload's images saved, the
+/// manifests, the setup and exec scripts, a wrapper per test template), and a scenario per
+/// template directory found in the workload's images, its first command the setup.
+fn kubernetes_describe(context: Context, directory: []const u8) !schema.Description {
+    const arena = context.arena;
+    const cwd = std.Io.Dir.cwd();
+    // The manifests, by path relative to the directory (sorted: the hash and the copy follow).
+    var files: std.ArrayList([]const u8) = .empty;
+    var contents: std.ArrayList([]const u8) = .empty;
+    var images: std.ArrayList([]const u8) = .empty;
+    const listed = try tool(context, &.{ "find", directory, "-type", "f", "(", "-name", "*.yaml", "-o", "-name", "*.yml", "-o", "-name", "*.json", ")" });
+    var lines = std.mem.tokenizeScalar(u8, listed, '\n');
+    while (lines.next()) |path| try files.append(arena, path);
+    std.sort.insertion([]const u8, files.items, {}, string_before);
+    if (files.items.len == 0) return error.NoManifests;
+    var hasher = std.hash.Wyhash.init(0);
+    for (files.items) |path| {
+        const text = try cwd.readFileAlloc(context.io, path, arena, .limited(16 << 20));
+        try contents.append(arena, text);
+        hasher.update(path[directory.len..]);
+        hasher.update(text);
+        try kubernetes.images_note(arena, text, &images);
+    }
+    // Every image, as K3s will find it (fully qualified: nothing is pulled in the guest), with
+    // its executables: test templates may be in any of them.
+    var executables: std.ArrayList([]const u8) = .empty;
+    var owners: std.ArrayList([]const u8) = .empty; // The image of each executable.
+    for (images.items) |image| {
+        if (!kubernetes.qualified(image)) {
+            std.debug.print("[determinismo] {s}: images in Kubernetes manifests are fully qualified " ++
+                "(registry, name and tag or digest), as Antithesis asks\n", .{image});
+            return error.ImageNotQualified;
+        }
+        const id = try image_id(context, image);
+        hasher.update(id);
+        for (try image_executables(context, image, id)) |path| {
+            try executables.append(arena, path);
+            try owners.append(arena, image);
+        }
+    }
+    const hash = hasher.final();
+    const build = try path_join(context, &.{ context.cache, "kubernetes", try std.fmt.allocPrint(arena, "{x:0>16}", .{hash}) });
+    var scenarios: std.ArrayList(schema.Scenario) = .empty;
+    try compose.templates(arena, kubernetes.node_name, executables.items, &scenarios);
+    if (scenarios.items.len == 0) {
+        std.debug.print("[determinismo] no Antithesis test template in the manifests' images " ++
+            "(/opt/antithesis/test/v1/<template>/<command>)\n", .{});
+        return error.NoScenarios;
+    }
+    // Each scenario's first command deploys the manifests and waits until they are ready.
+    for (scenarios.items) |*scenario| {
+        const commands = try arena.alloc(schema.Command, scenario.commands.len + 1);
+        commands[0] = .{ .kind = .setup, .name = "setup_kubernetes", .path = kubernetes.ready_path };
+        @memcpy(commands[1..], scenario.commands);
+        scenario.commands = commands;
+    }
+    if (!exists(context, try path_join(context, &.{ build, "Dockerfile" }))) {
+        try kubernetes_context(context, build, directory, files.items, contents.items, images.items, executables.items, owners.items);
+    }
+    const nodes = try arena.alloc(schema.Node, 1);
+    nodes[0] = .{
+        .name = kubernetes.node_name,
+        .source = .{ .build = .{ .context = build } },
+        .command = &kubernetes.command,
+        .env = &.{kubernetes.kubeconfig},
+        .ready = .{ .tcp = kubernetes.api_port },
+        .privileged = true,
+    };
+    const profiles = try arena.alloc(schema.Profile, 1);
+    profiles[0] = .{ .name = "kubernetes", .nodes = nodes };
+    return .{ .profiles = profiles, .scenarios = scenarios.items };
+}
+
+/// The K3s node's build context (kubernetes_describe), written whole into a staging directory
+/// and then moved: a context that is there is complete.
+fn kubernetes_context(
+    context: Context,
+    build: []const u8,
+    directory: []const u8,
+    files: []const []const u8,
+    contents: []const []const u8,
+    images: []const []const u8,
+    executables: []const []const u8,
+    owners: []const []const u8,
+) !void {
+    const arena = context.arena;
+    const cwd = std.Io.Dir.cwd();
+    const staging = try std.fmt.allocPrint(arena, "{s}.partial", .{build});
+    cwd.deleteTree(context.io, staging) catch {};
+    const tools = try path_join(context, &.{ staging, "determinismo-kubernetes" });
+    try cwd.createDirPath(context.io, try path_join(context, &.{ tools, "manifests" }));
+    for (files, contents) |path, text| {
+        const target = try path_join(context, &.{ tools, "manifests", path[directory.len..] });
+        if (std.fs.path.dirname(target)) |parent| try cwd.createDirPath(context.io, parent);
+        try cwd.writeFile(context.io, .{ .sub_path = target, .data = text });
+    }
+    try executable_write(context, try path_join(context, &.{ tools, "ready" }), kubernetes.ready_script);
+    try executable_write(context, try path_join(context, &.{ tools, "exec" }), kubernetes.exec_script);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (executables, owners) |raw, image| {
+        const path = std.mem.trimStart(u8, raw, "./");
+        if (!std.mem.startsWith(u8, path, "opt/antithesis/test/v1/")) continue;
+        if ((try seen.getOrPut(arena, path)).found_existing) continue; // The first image's.
+        const target = try path_join(context, &.{ staging, "antithesis", path["opt/antithesis/".len..] });
+        if (std.fs.path.dirname(target)) |parent| try cwd.createDirPath(context.io, parent);
+        try executable_write(context, target, try kubernetes.wrapper(arena, image, try std.fmt.allocPrint(arena, "/{s}", .{path})));
+    }
+    if (images.len > 0) {
+        std.debug.print("[determinismo] saving the manifests' {d} images for K3s\n", .{images.len});
+        var argv: std.ArrayList([]const u8) = .empty;
+        const archive = try path_join(context, &.{ staging, "images.tar" });
+        try argv.appendSlice(arena, &.{ "podman", "save", "--quiet", "--multi-image-archive", "--format", "docker-archive", "--output", archive });
+        try argv.appendSlice(arena, images);
+        _ = try tool(context, argv.items);
+    }
+    const text = try kubernetes.dockerfile(arena, images.len > 0, seen.count() > 0);
+    try cwd.writeFile(context.io, .{ .sub_path = try path_join(context, &.{ staging, "Dockerfile" }), .data = text });
+    cwd.deleteTree(context.io, build) catch {};
+    try cwd.rename(staging, cwd, build, context.io);
+}
+
+fn executable_write(context: Context, path: []const u8, data: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(context.io, .{ .sub_path = path, .data = data });
+    const path_z = try context.arena.dupeSentinel(u8, path, 0);
+    if (std.os.linux.errno(std.os.linux.fchmodat(std.os.linux.AT.FDCWD, path_z, 0o755)) != .SUCCESS) return error.Chmod;
+}
+
+fn string_before(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// An image's ID, pulled first when it is not on the host.
+fn image_id(context: Context, reference: []const u8) ![]const u8 {
+    if (!try tool_succeeds(context, &.{ "podman", "image", "exists", reference })) {
+        std.debug.print("[determinismo] pulling {s}\n", .{reference});
+        _ = try tool(context, &.{ "podman", "pull", "--quiet", reference });
+    }
+    const inspect_json = try tool(context, &.{ "podman", "image", "inspect", reference });
+    const inspect = try schema.parse([]const ImageInspect, context.arena, inspect_json);
+    if (inspect.len != 1) return error.ImageInspect;
+    return inspect[0].Id;
+}
+
+/// An image's executables (for test templates), listed once (`<cache>/images/<id>.erofs.tests`,
+/// beside the disk image_disk makes of it, when it makes one).
+fn image_executables(context: Context, reference: []const u8, id: []const u8) ![]const []const u8 {
+    const disk = try path_join(context, &.{ context.cache, "images", try std.fmt.allocPrint(context.arena, "{s}.erofs", .{id}) });
+    const tests = try std.fmt.allocPrint(context.arena, "{s}.tests", .{disk});
+    if (!exists(context, tests)) {
+        const container = std.mem.trim(u8, try tool(context, &.{ "podman", "create", "--quiet", reference }), " \n");
+        defer _ = tool(context, &.{ "podman", "rm", "--force", container }) catch {};
+        const tar = try std.fmt.allocPrint(context.arena, "{s}.listing.tar", .{disk});
+        _ = try tool(context, &.{ "podman", "export", "--output", tar, container });
+        defer std.Io.Dir.cwd().deleteFile(context.io, tar) catch {};
+        const listing = try tool(context, &.{ "tar", "-tvf", tar });
+        try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = tests, .data = try executables_of(context.arena, listing) });
+    }
+    return tests_listing(context, disk);
 }
 
 /// The image's executables, recorded next to its disk when it was flattened.

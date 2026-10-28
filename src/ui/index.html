@@ -182,9 +182,9 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
   <form method="dialog" id="run-form">
     <h3 style="margin:0">New run</h3>
     <label>System
-      <select name="kind"><option value="program">Test program</option><option value="compose">Compose file</option></select>
+      <select name="kind"><option value="program">Test program</option><option value="compose">Compose file</option><option value="kubernetes">Kubernetes manifests</option></select>
     </label>
-    <label>Path (on the server)<input name="path" required placeholder="zig-out/bin/bank-test or a compose.yaml"></label>
+    <label>Path (on the server)<input name="path" required placeholder="zig-out/bin/bank-test, a compose.yaml or a manifests directory"></label>
     <label>Scenario<input name="scenario" placeholder="bank"></label>
     <label>Profile<input name="profile" placeholder="default"></label>
     <label data-tip="How long each timeline's drivers run, in virtual time (empty: 4 to 64 command starts)">Timeline length<input name="timeline" placeholder="e.g. 15m"></label>
@@ -434,7 +434,7 @@ function render() {
     <div style="display:flex;align-items:baseline;gap:14px">
       <h2>Run ${run.id} ${info.scenario ? "· " + escape(info.scenario) : ""}</h2>${stateBadge(run.state)}
     </div>
-    <div class="muted" style="margin-top:4px">${escape(info.program || info.compose || "")}
+    <div class="muted" style="margin-top:4px">${escape(info.program || info.compose || info.kubernetes || "")}
       ${info.profile ? "· profile " + escape(info.profile) : ""} · seed ${escape(info.seed || "")} · inputs ${escape(info.inputs || "")}
       ${info.strategy ? "· strategy " + escape(info.strategy) : ""}
       ${info.timeline_ms ? "· timelines of " + duration(info.timeline_ms / 1000) : ""}
@@ -1638,7 +1638,7 @@ function logsWire() {
     const request = { scenario: info.scenario, profile: info.profile, strategy: info.strategy || undefined,
       branches: Math.max(1, Number($("#fork-branches").value) || 16),
       from_branch: state.logs.branch, from_vtime_ms: Math.floor(state.logs.vtime_ns / 1e6) };
-    if (info.program) request.program = info.program; else request.compose = info.compose;
+    for (const key of ["program", "compose", "kubernetes"]) if (info[key]) request[key] = info[key];
     // Seeds are 64-bit: written into the JSON as an exact integer.
     const body = JSON.stringify({ ...request, seed: 0 }).replace('"seed":0', `"seed":${BigInt("0x" + (info.seed || "0"))}`);
     const response = await fetch("/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body });

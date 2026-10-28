@@ -140,7 +140,8 @@ const usage =
     \\                            --node <node> [--pid <pid>]   (every thread's stack there)
     \\
     \\system options (instead of --disk; see ARCHITECTURE.md §10):
-    \\  (--program <test program> | --compose <compose.yaml>) [--profile <name>|<a,b,..>|all]
+    \\  (--program <test program> | --compose <compose.yaml> | --kubernetes <manifests dir>)
+    \\  [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
     \\  [--faults +restart,+crash,...]   (fault kinds every node also allows)
     \\  [--no-faults <node>,...]   (nodes that get no faults: a client, a monitor)
@@ -306,6 +307,8 @@ const Arguments = struct {
     program_path: ?[]const u8 = null,
     /// Or a Compose file: services become nodes, Antithesis test templates scenarios.
     compose_path: ?[]const u8 = null,
+    /// Or a directory of Kubernetes manifests: a K3s node runs them (kubernetes.zig).
+    kubernetes_path: ?[]const u8 = null,
     /// Commands and faults follow this script (determinismo script) instead of choosing.
     script_path: ?[]const u8 = null,
     profile: ?[]const u8 = null,
@@ -355,6 +358,7 @@ pub fn main(init: std.process.Init) !void {
     const names = if (all) try prepare.profile_names(arena, init.io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .kubernetes = arguments.kubernetes_path,
         .cache_directory = arguments.cache_directory,
     }) else try list_split(arena, profile);
     const verdicts = try arena.alloc(u32, names.len);
@@ -462,6 +466,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     if (arguments.command == .explore and !exploration_is_run(&arguments)) oom_before_the_host();
     if (arguments.resume_run) try resume_settings_adopt(arena, init.io, &arguments);
     const has_system = arguments.program_path != null or arguments.compose_path != null or
+        arguments.kubernetes_path != null or
         arguments.pinned != null;
     const prepared = if (has_system) try system_prepare(arena, init.io, &arguments) else null;
     const cwd = std.Io.Dir.cwd();
@@ -644,6 +649,7 @@ fn run_request_write(
         .program = if (arguments.program_path) |path| try runs.artifact_keep(arena, io, data, path) else null,
         .program_asked = if (arguments.program_path) |path| try runs.absolute(arena, path) else null,
         .compose = if (arguments.compose_path) |path| try runs.absolute(arena, path) else null,
+        .kubernetes = if (arguments.kubernetes_path) |path| try runs.absolute(arena, path) else null,
         .scenario = arguments.scenario,
         .profile = arguments.profile,
         .seed = arguments.seed,
@@ -770,10 +776,13 @@ fn system_prepare(
     arguments: *Arguments,
 ) !prepare.Prepared {
     if (arguments.disk_count > 0) return error.DisksAndProgram;
-    if (arguments.program_path != null and arguments.compose_path != null) return error.Usage;
+    const sources = @as(u32, @intFromBool(arguments.program_path != null)) +
+        @intFromBool(arguments.compose_path != null) + @intFromBool(arguments.kubernetes_path != null);
+    if (sources > 1) return error.Usage;
     const prepared = try prepare.prepare(arena, io, .{
         .program = arguments.program_path,
         .compose = arguments.compose_path,
+        .kubernetes = arguments.kubernetes_path,
         .script = arguments.script_path,
         .profile = arguments.profile,
         .cache_directory = arguments.cache_directory,
@@ -1263,6 +1272,7 @@ fn command_explore(
                 .profile = arguments.profile,
                 .program = arguments.program_path,
                 .compose = arguments.compose_path,
+                .kubernetes = arguments.kubernetes_path,
                 .system = arguments.system,
                 .inputs = &hex16(exploration.inputs),
                 .seed = &hex16(arguments.seed),
@@ -3999,6 +4009,8 @@ fn parse_option(
         arguments.script_path = value;
     } else if (eql(u8, flag, "--compose")) {
         arguments.compose_path = value;
+    } else if (eql(u8, flag, "--kubernetes")) {
+        arguments.kubernetes_path = value;
     } else if (eql(u8, flag, "--profile")) {
         arguments.profile = value;
     } else if (eql(u8, flag, "--scenario")) {
@@ -4251,5 +4263,6 @@ test {
     _ = @import("profile.zig");
     _ = @import("regex.zig");
     _ = @import("compose.zig");
+    _ = @import("kubernetes.zig");
     _ = @import("yaml.zig");
 }

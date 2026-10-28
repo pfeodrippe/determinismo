@@ -49,6 +49,10 @@
           "type": "string",
           "description": "A Compose file instead of a test program"
         },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
         "timeline": {
           "type": "string",
           "description": "How long each timeline's drivers run, in virtual time (e.g. 15m); replays and forks of its timelines need the same"
@@ -116,6 +120,10 @@
           "type": "string",
           "description": "A Compose file instead of a test program"
         },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
         "until": {
           "type": "string",
           "description": "A condition: the moment is the first event matching it (with at_vtime_ms too, that time at the latest: a timeout)"
@@ -170,6 +178,10 @@
         "compose": {
           "type": "string",
           "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
         },
         "timeline": {
           "type": "string",
@@ -307,6 +319,10 @@
         "compose": {
           "type": "string"
         },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
+        },
         "scenario": {
           "type": "string"
         },
@@ -358,6 +374,10 @@
         "compose": {
           "type": "string",
           "description": "A Compose file instead of a test program"
+        },
+        "kubernetes": {
+          "type": "string",
+          "description": "Or a directory of Kubernetes manifests (raw, images fully qualified): a single-node K3s cluster runs them, as Antithesis does; test templates in their images are the scenarios"
         },
         "scenario": {
           "type": "string"

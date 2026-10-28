@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# The Kubernetes example's client: redis-cli and the test templates, as Antithesis finds them in
+# any container (/opt/antithesis/test/v1/<template>/).
+FROM docker.io/library/redis:7.4-alpine
+COPY examples/kubernetes/client/ /opt/antithesis/test/v1/

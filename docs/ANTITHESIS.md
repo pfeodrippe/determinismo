@@ -10,7 +10,7 @@ change that moves it.
 | Antithesis | determinismo | Status |
 |---|---|---|
 | Docker Compose setup | `--compose` importer: images, builds, env, depends_on, ports, mem_limit, privileged, ulimits | ✅ |
-| Kubernetes setup | K3s in a privileged node, or a three-node cluster (`examples/k3s`) | 🟡 no importer for your own manifests: the example is a template |
+| Kubernetes setup | `--kubernetes <manifests directory>` (CLI, HTTP, MCP, the UI's New run): raw manifests (Helm rendered first) in a single-node K3s cluster with CoreDNS and local-path storage, no Traefik, ServiceLB or metrics-server; images fully qualified and taken from the host into the node (the guest has no network); applied until all apply, then every container given the SDK's output and everything rolled out and ready (kapp's readiness) before branching; test templates in any image run in its pod (`kubectl exec`); `examples/kubernetes`. K3s in a test program's node, or a three-node cluster: `examples/k3s` | 🟡 faults act on the K3s node (its processes, the pods' among them), not between pods; bare Pods do not get the SDK's output |
 | Setup mode, `setup_complete` | snapshot at `setup_complete` (SDKs, composer, `setup_` template commands) | ✅ |
 | The Antithesis environment (one vCPU, no rdrand, deterministic time) | patched KVM, branches clock, CPUID baseline | ✅ |
 | Handling external dependencies | no network beyond the guest; [DEPENDENCIES.md](DEPENDENCIES.md): containers or mocks (MinIO, LocalStack, emulators, stripe-mock), names, readiness, storage, memory | ✅ |

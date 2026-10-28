@@ -28,6 +28,7 @@ const Arguments = struct {
     /// The system: a test program or a Compose file.
     program: ?[]const u8 = null,
     compose: ?[]const u8 = null,
+    kubernetes: ?[]const u8 = null,
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
@@ -181,9 +182,12 @@ fn tool_call(
     else if (eql(u8, name, "mutate")) "mutate" else "explore";
     try argv.appendSlice(arena, &.{ options.self, command });
     try argv.appendSlice(arena, options.machine);
-    if ((arguments.program == null) == (arguments.compose == null)) return error.ProgramOrCompose;
+    const sources = @as(u32, @intFromBool(arguments.program != null)) +
+        @intFromBool(arguments.compose != null) + @intFromBool(arguments.kubernetes != null);
+    if (sources != 1) return error.ProgramOrCompose;
     if (arguments.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (arguments.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
+    if (arguments.kubernetes) |manifests| try argv.appendSlice(arena, &.{ "--kubernetes", manifests });
     try argv.appendSlice(arena, &.{ "--seed", try number(arena, arguments.seed) });
     if (arguments.cpu_modulation) |on| try argv.append(arena, if (on) "--cpu-modulation" else "--no-cpu-modulation");
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
