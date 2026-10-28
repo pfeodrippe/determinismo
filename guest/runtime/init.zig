@@ -287,15 +287,16 @@ fn wait_for(pid: linux.pid_t) u32 {
 
 /// Built-in property: a node's main process never exits on its own. Faults that kill a node
 /// remove its pidfile first, so an exit of the process a pidfile names is unexpected.
-const node_exit_property = "nodes do not exit unexpectedly";
+const node_exit_property = "no unexpected container exits";
 var node_names: []const []const u8 = &.{};
 
 fn orphan_reaped(pid: linux.pid_t, status: u32) void {
     for (node_names) |name| {
         if (nodes.pid_recorded(name) != pid) continue;
         const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
-        // As Antithesis's "no unexpected container exits": 0, SIGKILL and SIGTERM are expected;
-        // and any exit while the node's disk fails (giving up on I/O errors is legitimate).
+        // As Antithesis judges a container's exit: 0, SIGKILL and SIGTERM are expected; and any
+        // exit while the node's disk fails (giving up on I/O errors is legitimate). Kubernetes
+        // pods' containers are judged by det-podlogs, under the same property.
         const signaled = code == 128 + 9 or code == 128 + 15;
         const expected = code == 0 or signaled or nodes.disk_failing(name);
         const details = .{ .node = name, .status = code };

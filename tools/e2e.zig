@@ -554,6 +554,8 @@ fn check_kubernetes(context: *Context) !void {
     // namespace): none.
     const pod_failures = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rh 'fault_failed\\|fault_heal_failed' {s} | grep -c kubernetes || true", .{explored}) });
     const named = try run_kept(context, &.{ "grep", "-rhoE", "\"pod\":\"[a-z0-9-]+\"", explored });
+    // Pods' containers' exits judged as Antithesis judges a container's (a pod kill's 137).
+    const exits = try run_kept(context, &.{ "grep", "-rlF", "\"no unexpected container exits\",\"condition\":true,\"details\":{\"pod\"", explored });
     var same = false;
     if (count > 0) {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
@@ -572,6 +574,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "a timeline replays exactly", same },
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
         .{ "the pods' output as events named after them (redis-0)", pod_output.stdout.len > 0 },
+        .{ "pods' container exits judged (no unexpected container exits)", exits.stdout.len > 0 },
         .{ "no fault of the K3s node or its pods failed to apply or heal", std.mem.eql(u8, std.mem.trim(u8, pod_failures.stdout, " \n"), "0") },
     }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
         "pod faults: {s}", .{std.mem.trim(u8, pod_faults.stdout[0..@min(pod_faults.stdout.len, 120)], "\n")});
@@ -1403,7 +1406,7 @@ fn check_builtin_properties(context: *Context) !void {
     const crash = try explore(context, &.{
         "--program", program, "--scenario", "node_exit", "--seed", "1", "--branches", "1",
     });
-    const caught = std.mem.indexOf(u8, crash, "FAIL \"nodes do not exit unexpectedly\"") != null;
+    const caught = std.mem.indexOf(u8, crash, "FAIL \"no unexpected container exits\"") != null;
     expect(context, caught, "built-in properties catch a node that exits", .{});
     const hog = try explore(context, &.{
         "--program",  program, "--profile", "memory", "--scenario", "oom", "--seed", "1",

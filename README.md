@@ -36,7 +36,7 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   steerable randomness from SDKs for Zig, Python, C (and FFI) and the JVM, or any Antithesis SDK
   (Compose projects' nodes have a `libvoidstar.so` of determinismo's, so programs built with
   Antithesis's instrumentors report their coverage, as source lines for Go);
-  Antithesis's default properties built in (nodes do not exit unexpectedly, no process crashes,
+  Antithesis's default properties built in (no unexpected container exits, no process crashes,
   no OOM kills, kernel warnings, panics or uncaught exceptions, test commands start, finish and
   exit 0, peak memory under 95%, logging under 200 MB per virtual hour, the fault injector
   started), and virtual time per wall time.

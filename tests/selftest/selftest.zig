@@ -5,7 +5,7 @@
 //!   steady     the node answers; every property passes (and fails on profile "mutant", whose
 //!              echo node answers in uppercase: the tests catch the mutant)
 //!   node_exit  a driver makes the node exit: the built-in property
-//!              "nodes do not exit unexpectedly" must fail
+//!              "no unexpected container exits" must fail
 //!   oom        (profile "memory") a command in the echo node exceeds its memory limit: the
 //!              built-in property "the kernel kills no process for lack of memory" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report

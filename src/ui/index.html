@@ -645,7 +645,7 @@ async function discoveryDraw() {
 
 // Properties: each assertion with its verdict across the timelines so far (the run's events
 // database judges them as Antithesis does).
-const builtin = new Set(["test commands exit successfully", "nodes do not exit unexpectedly",
+const builtin = new Set(["test commands exit successfully", "no unexpected container exits",
   "no process crashes (segfault, illegal instruction, ...)",
   "the kernel kills no process for lack of memory", "the kernel reports no warnings, BUGs or hung tasks",
   "the guest finishes its scenario (no panic, hang or crash)",
