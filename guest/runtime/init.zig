@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     assert(linux.getpid() == 1);
     const arena = init.arena.allocator();
     system_mount();
+    limits_raise();
     cores_setup();
     var cmdline_buffer: [cmdline_size_max]u8 = undefined;
     const cmdline = read_cmdline(&cmdline_buffer);
@@ -115,6 +116,18 @@ fn system_mount() void {
     defer socket.close();
     socket.link_set("lo", .up) catch {};
     _ = linux.syscall2(.sethostname, @intFromPtr("runner"), "runner".len);
+}
+
+/// Docker's open-file limit (1048576, soft and hard) for everything init starts, nodes
+/// included: the kernel's at boot is 1024 (4096 hard), and systems deployed in containers count
+/// on Docker's. Under 1024, YugabyteDB's tablet servers could not open their tablets' files
+/// ("Too many open files"), aborted and restarted in every timeline (2026-10-27).
+const open_files_max = 1 << 20;
+
+fn limits_raise() void {
+    const limit: linux.rlimit = .{ .cur = open_files_max, .max = open_files_max };
+    const result = linux.setrlimit(.NOFILE, &limit);
+    if (linux.errno(result) != .SUCCESS) std.debug.print("[guest] open-file limit: {s}\n", .{@tagName(linux.errno(result))});
 }
 
 /// Core dumps of any process, in any node, go to det-core (cores.zig), which keeps them in
@@ -285,8 +298,14 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
 /// Built-in properties from the kernel's log (all of it, whatever the console shows), read
 /// once when the timeline ends: no OOM kills, no process killed by an error signal (Antithesis's
 /// "no unexpected crashes"), and no warnings, BUGs, oopses or hung tasks.
+///
+/// A crash fails a property of its process ("no process crashes: postgres"): a system's known
+/// crash (YugabyteDB's YSQL backends on exit) then leaves another process's crash its own
+/// failing property, never one more failure of the same one. A timeline without any crash
+/// passes `crash_property`.
 const oom_property = "the kernel kills no process for lack of memory";
 const crash_property = "no process crashes (segfault, illegal instruction, ...)";
+const crash_property_prefix = "no process crashes: ";
 const kernel_property = "the kernel reports no warnings, BUGs or hung tasks";
 const kmsg_records_max = 1 << 16;
 
@@ -309,9 +328,12 @@ fn kernel_check() void {
             const record = kmsg_record(buffer[0..size]) orelse continue;
             const problem = kernel_problem(record.text) orelse continue;
             seen.set(problem, true);
+            var crash_buffer: [crash_property_prefix.len + 64]u8 = undefined;
             const property = switch (problem) {
                 .oom_kill => oom_property,
-                .crash => crash_property,
+                .crash => std.fmt.bufPrint(&crash_buffer, crash_property_prefix ++ "{s}", .{
+                    crash_process(record.text),
+                }) catch crash_property,
                 .kernel => kernel_property,
             };
             const details = .{ .kernel_us = record.time_us, .line = record.text };
@@ -335,6 +357,21 @@ fn kmsg_record(record: []const u8) ?KmsgRecord {
     const rest = record[separator + 1 ..];
     const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
     return .{ .time_us = time_us, .text = rest[0..end] };
+}
+
+/// The process a crash line names: "prog[42]: segfault at ...", "traps: prog[42] general
+/// protection fault ...", "prog: thread: potentially unexpected fatal signal 6.".
+fn crash_process(text: []const u8) []const u8 {
+    const rest = if (std.mem.startsWith(u8, text, "traps: ")) text["traps: ".len..] else text;
+    const end = std.mem.indexOfAny(u8, rest, "[: ") orelse rest.len;
+    return if (end == 0) "?" else rest[0..@min(end, 64)];
+}
+
+test crash_process {
+    try std.testing.expectEqualStrings("postgres", crash_process("postgres[1057]: segfault at 0 ip 0"));
+    try std.testing.expectEqualStrings("postgres", crash_process("traps: postgres[10976] general protection fault"));
+    try std.testing.expectEqualStrings("yb-tserver", crash_process("yb-tserver: tablet-bootstra: potentially unexpected fatal signal 6."));
+    try std.testing.expectEqualStrings("?", crash_process("[1] odd"));
 }
 
 fn kernel_problem(text: []const u8) ?KernelProblem {
