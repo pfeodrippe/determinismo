@@ -644,8 +644,10 @@ fn run_route(
         return nrepl_start(server, run.id, out);
     }
     if (eql(u8, action, "causality")) {
-        if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
-        const index_text = parts.next() orelse return causality_list(server, run, out);
+        const index_text = parts.next() orelse {
+            if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
+            return causality_list(server, run, out);
+        };
         const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
         if (parts.next()) |verb| {
             if (eql(u8, verb, "stop") and eql(u8, request.method, "POST")) return causality_stop(server, run, index, out);
