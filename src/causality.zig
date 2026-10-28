@@ -46,6 +46,7 @@ const cpus = @import("cpus.zig");
 const assert = std.debug.assert;
 
 const Strategy = @import("strategy.zig");
+const Snapshot = @import("snapshot.zig");
 
 const points_max = 64;
 /// Moments in all (`--moments-max`), at most.
@@ -244,7 +245,9 @@ pub fn run(
     try out.flush();
     const cwd = std.Io.Dir.cwd();
     const temporary = request.snapshots == null;
-    const directory = request.snapshots orelse
+    const directory = if (request.snapshots) |kept|
+        try Snapshot.layout_directory(arena, kept)
+    else
         try std.fmt.allocPrint(arena, "/tmp/determinismo-causality-{d}", .{std.os.linux.getpid()});
     try cwd.createDirPath(io, directory);
     defer if (temporary) cwd.deleteTree(io, directory) catch {};

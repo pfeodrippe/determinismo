@@ -2161,7 +2161,7 @@ fn explore_tree(
         for ([_]u64{ exploration.inputs, exploration.exploration_seed, setup.tsc, setup.branches }) |value| {
             hasher.update(std.mem.asBytes(&value));
         }
-        const directory = try std.fs.path.join(arena, &.{ run, "snapshots" });
+        const directory = try Snapshot.layout_directory(arena, try std.fs.path.join(arena, &.{ run, "snapshots" }));
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
         const made = try arena.create(Ladders);
         made.* = .{
@@ -2627,7 +2627,9 @@ const Ladders = struct {
         }
         text.append(std.heap.page_allocator, '\n') catch return;
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const marker = std.fmt.bufPrint(&path_buffer, "{s}/failure-{d}.log", .{ ladders.ladder.directory, job.branch }) catch return;
+        // Serve's marker, in the run's snapshots directory (above the layout's).
+        const snapshots = std.fs.path.dirname(ladders.ladder.directory) orelse return;
+        const marker = std.fmt.bufPrint(&path_buffer, "{s}/failure-{d}.log", .{ snapshots, job.branch }) catch return;
         std.Io.Dir.cwd().writeFile(ladders.io, .{ .sub_path = marker, .data = text.items }) catch {};
         std.debug.print("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk\n", .{
             job.branch, saved, job.helds.len,

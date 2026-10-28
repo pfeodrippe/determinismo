@@ -1272,27 +1272,27 @@ fn causality_launch(server: *Server, run: *const Run, asked: *const CausalityReq
 /// branch's tape, the run's snapshots directory and API.
 /// When the property first failed in the timeline (its ancestors' parts included: a tree's
 /// timeline begins inside them) and when setup completed, from the run's events; null when they
-/// do not say (not ingested yet: causality's replay finds them). A failure that says when it
-/// formed (`details.window_ns`, Elle's: its anomalies' operations) failed at the window's end:
-/// the check that says so runs after the timeline, long after it was decided.
+/// do not say (not ingested yet: causality's replay finds them). Not when a failure says it
+/// formed (`details.window_ns`, Elle's: its anomalies' operations): those times are the guest's
+/// clock, which CPU modulation leaves behind virtual time, so the window's end came before the
+/// anomaly existed (run 43, srv3: a cycle complete at 101.3 s by the guest's clock; futures from
+/// 101.3 s of virtual time all passed, from 125 s all failed). The analysis's rounds narrow the
+/// jump down from the check's moment.
 fn failure_moments(server: *Server, id: u32, branch: u32, property: []const u8) !?struct { failure_ns: u64, setup_ns: u64 } {
     try run_update(server, id);
     var connection = try run_database(server, id);
     defer connection.close();
-    const Row = struct { failure_ns: ?u64, formed_ns: ?u64, setup_ns: ?u64 };
+    const Row = struct { failure_ns: ?u64, setup_ns: ?u64 };
     const found = connection.row(Row, server.arena,
-        \\WITH failure AS (SELECT vtime_ns, event FROM timeline_events WHERE timeline = $1
-        \\    AND kind = 'assert' AND name = $2 AND condition = false ORDER BY vtime_ns LIMIT 1)
-        \\SELECT (SELECT vtime_ns FROM failure),
-        \\       (SELECT TRY_CAST(event->>'$.assert.details.window_ns[1]' AS UBIGINT) FROM failure),
+        \\SELECT (SELECT vtime_ns FROM timeline_events WHERE timeline = $1 AND kind = 'assert'
+        \\        AND name = $2 AND condition = false ORDER BY vtime_ns LIMIT 1),
         \\       (SELECT min(vtime_ns) FROM events WHERE branch IS NULL AND kind = 'lifecycle'
         \\        AND name = 'setup_complete')
     , .{ branch, property }) catch return null;
     const row = found orelse return null;
     const failure_ns = row.failure_ns orelse return null;
     const setup_ns = row.setup_ns orelse return null;
-    const formed_ns = row.formed_ns orelse failure_ns;
-    return .{ .failure_ns = if (formed_ns > setup_ns and formed_ns < failure_ns) formed_ns else failure_ns, .setup_ns = setup_ns };
+    return .{ .failure_ns = failure_ns, .setup_ns = setup_ns };
 }
 
 fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityRequest) ![]const []const u8 {

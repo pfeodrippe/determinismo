@@ -244,6 +244,14 @@ pub const disk_name_max = 64;
 /// A chain's length at most: deeper is a directory nobody pruned.
 const disk_chain_max = 4096;
 
+/// Where a run's snapshots of this build's layout go, under its snapshots directory: a chain
+/// saved by another layout (a deploy changed it) is never reused, its moments saved again (an
+/// analysis whose base snapshot was the previous build's had every future refuse it, srv3,
+/// 2026-10-28).
+pub fn layout_directory(arena: std.mem.Allocator, snapshots: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/layout-{d}", .{ snapshots, @sizeOf(Snapshot) });
+}
+
 const DiskHeader = extern struct {
     magic: [8]u8 = disk_magic,
     /// This build's layout of the state: another build's snapshot is refused.

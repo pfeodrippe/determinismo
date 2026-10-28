@@ -1061,7 +1061,9 @@ function causalityChart(analysis) {
       ${(jump.a.probability * 100).toFixed(0)}% → ${(jump.b.probability * 100).toFixed(0)}%:
       ${jump.faults.length ? jump.faults.map((event) => `${escape(faultName(event))} <span class="muted">at ${seconds(event.vtime_ns)}</span>`).join(", ")
         : analysis.faults ? `<span class="muted">no fault injected: look at the logs</span>` : `<span class="muted">…</span>`}</div>`).join("")}</div>`
-    : analysis.done ? `<div class="muted">No jump: the bug was ${points[0].probability >= 0.5 ? "already likely" : "unlikely until the very end"} at every moment analyzed.</div>` : "";
+    : analysis.done ? (points[points.length - 1].probability === 0
+      ? `<div class="t-fail">Even the futures from the failure's moment never failed: the analysis did not reproduce the failure (a property judged at the timeline's end from a moment too early, or one its futures cannot see). Its points say nothing about where the bug was decided.</div>`
+      : `<div class="muted">No jump: the bug was ${points[0].probability >= 0.5 ? "already likely" : "unlikely until the very end"} at every moment analyzed.</div>`) : "";
   const zoomed = analysis.view ? ` <a class="clickable" data-zoom-reset>whole timeline</a>` : "";
   // Everything drawn inside the axes only (a zoom leaves points outside).
   const clip = `<clipPath id="causality-clip"><rect x="${L}" y="${T - 6}" width="${W - L - R}" height="${H - T - B + 12}"/></clipPath>`;
