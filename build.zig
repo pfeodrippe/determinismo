@@ -48,7 +48,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     check_exe.root_module.link_libc = true;
-    b.step("check", "Compile determinismo without linking it (no DuckDB needed)").dependOn(&check_exe.step);
+    const check = b.step("check", "Compile determinismo without linking it (no DuckDB needed), and the guest's programs");
+    check.dependOn(&check_exe.step);
 
     // A small Redis client, shared by the examples and the plain workload.
     const resp = b.createModule(.{
@@ -152,6 +153,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         b.installArtifact(guest_exe);
+        check.dependOn(&guest_exe.step);
     }
 
     // libvoidstar.so, Antithesis's native library for the system's processes (nodes with
