@@ -617,7 +617,7 @@ fn run_loop(vm: *VM) !Outcome {
         // without that stop has no exit there).
         switch (vm.run.exit_reason) {
             .io, .mmio, .hlt => try vm.modulate(),
-            .det_target => if (vm.target_kind == .timer) try vm.modulate(),
+            .det_target => if (vm.target_kind == .timer or try vm.soft_stopped()) try vm.modulate(),
             else => {},
         }
         switch (vm.run.exit_reason) {
@@ -633,6 +633,12 @@ fn run_loop(vm: *VM) !Outcome {
             .det_target => {
                 assert(vm.deterministic);
                 vm.stats.exits.getPtr(.det_target).* += 1;
+                // The timer's soft stop while a hold point or a moment is the target.
+                if (vm.target_kind != .timer and try vm.soft_stopped()) {
+                    try vm.target_set(0); // Re-armed next loop.
+                    if (vm.pit.armed) try vm.timer_fire();
+                    continue;
+                }
                 switch (vm.target_kind) {
                     .moment => {
                         vm.target_branches = 0;
@@ -644,7 +650,7 @@ fn run_loop(vm: *VM) !Outcome {
                     },
                     .timer => {
                         try vm.target_set(0); // A soft stop leaves the hard one armed.
-                        try vm.timer_fire();
+                        if (vm.pit.armed) try vm.timer_fire();
                     },
                 }
             },
@@ -718,14 +724,17 @@ fn deadline_next(vm: *const VM) ?Deadline {
     return next;
 }
 
-/// Asks KVM to stop the vCPU at the next deadline. A moment stops at its exact branch count. A
-/// timer stops at the first RDTSC at or past its deadline (a soft stop, free), or at most
-/// `timer_slack` later at an exact branch count (a hard stop, which costs single-stepping):
-/// both are exact points of the guest's execution, so replays deliver it at the same place.
+/// Asks KVM to stop the vCPU at the next deadline. A moment stops at its exact branch count, and
+/// so does a hold point. A timer stops at the first RDTSC at or past its deadline (a soft stop,
+/// free), or at most `timer_slack` later at an exact branch count (a hard stop, which costs
+/// single-stepping): both are exact points of the guest's execution, so replays deliver it at
+/// the same place. A hold point or a moment within a timer's slack is the target, and the timer
+/// keeps its soft stop and then its hard one: the timer fires where a timeline without the hold
+/// point fires it (passing it, the hold point was dropped: a causality replay with a 1 ms slack
+/// saved 3 of 5 moments).
 fn timer_arm(vm: *VM) !void {
     assert(vm.deterministic);
     if (vm.target_branches != 0) return;
-    const deadline = vm.deadline_next() orelse return;
     const state = try vm.det_state();
     // Virtual time in thousandths of a tick: the guest's clock and what the CPU modulation owes
     // it (added at the next exit). It grows by per_branch a branch, so a stop computed from it
@@ -735,32 +744,68 @@ fn timer_arm(vm: *VM) !void {
     else
         0;
     const now_milli = state.tsc * 1000 + owed_milli;
-    if (deadline.tsc * 1000 <= now_milli) switch (deadline.kind) {
-        .moment => {
-            vm.moment_tsc = state.tsc; // Already past: the moment is now.
-            vm.target_kind = .moment;
-            return vm.target_set(state.branches + 1); // Stop right after the next branch.
-        },
-        .hold => { // Past (not where a replay would stop): none, a replay makes the node.
-            vm.hold_tsc = null;
+    // The next exact deadline, past ones dealt with.
+    const exact: ?Deadline = while (vm.exact_next()) |next| {
+        if (next.tsc * 1000 > now_milli) break next;
+        switch (next.kind) {
+            .moment => {
+                vm.moment_tsc = state.tsc; // Already past: the moment is now.
+                vm.target_kind = .moment;
+                return vm.target_set(state.branches + 1); // Stop right after the next branch.
+            },
+            .hold => vm.hold_tsc = null, // Past (not where a replay would stop): none, a replay makes the node.
+            .timer => unreachable,
+        }
+    } else null;
+    const timer_tsc = vm.pit.deadline_tsc();
+    var stop = exact;
+    if (timer_tsc) |deadline| {
+        const hard_tsc = deadline + vm.timer_slack_tsc;
+        if (hard_tsc * 1000 <= now_milli) {
+            // Its hard stop is now: fired, and the next deadline armed (a hold point next must
+            // not wait for the guest's next exit).
+            try vm.timer_fire();
             return vm.timer_arm();
-        },
-        .timer => return vm.timer_fire(),
-    };
-    const slack_tsc = if (deadline.kind.exact()) 0 else vm.timer_slack_tsc;
-    const hard_tsc = deadline.tsc + slack_tsc;
+        }
+        if (stop == null or hard_tsc < stop.?.tsc) stop = .{ .tsc = hard_tsc, .kind = .timer };
+    }
+    const target = stop orelse return;
     // With CPU modulation a branch takes more virtual time than the guest's clock shows until
     // the next exit adds it: count branches at the modulated rate, and place the soft stop at
     // the first clock read that, its owed time added, reads the deadline.
     const permille: u64 = 1000 + if (vm.modulation) |m| m.slowdown_permille else 0;
     const per_branch = @as(u64, vm.tsc_per_branch) * permille;
-    const branches_left = @divCeil(hard_tsc * 1000 - now_milli, per_branch);
+    const branches_left = @divCeil(target.tsc * 1000 - now_milli, per_branch);
     assert(branches_left > 0);
-    vm.target_kind = deadline.kind;
+    vm.target_kind = target.kind;
     try vm.target_set(state.branches + branches_left);
-    if (!deadline.kind.exact() and slack_tsc > 0) {
-        try vm.soft_set(state.tsc + @divCeil(deadline.tsc * 1000 - now_milli, permille));
-    }
+    if (timer_tsc) |deadline| if (vm.timer_slack_tsc > 0) {
+        // Due already (a hold point within its slack stopped first): the next clock read.
+        const soft_tsc = if (deadline * 1000 <= now_milli)
+            state.tsc
+        else
+            state.tsc + @divCeil(deadline * 1000 - now_milli, permille);
+        try vm.soft_set(soft_tsc);
+    };
+}
+
+/// The next moment or hold point, whichever comes first (at the same time the moment).
+fn exact_next(vm: *const VM) ?Deadline {
+    const stop: ?Deadline = if (vm.moment_reached) null else if (vm.moment_tsc) |tsc| .{
+        .tsc = tsc,
+        .kind = .moment,
+    } else null;
+    const hold: ?Deadline = if (vm.hold_tsc) |tsc| .{ .tsc = tsc, .kind = .hold } else null;
+    const first = stop orelse return hold;
+    const other = hold orelse return first;
+    return if (other.tsc < first.tsc) other else first;
+}
+
+/// Whether this target exit is a soft stop (a clock read at or past the timer's deadline, before
+/// the exact target): the timer's, whatever the target is.
+fn soft_stopped(vm: *VM) !bool {
+    if (vm.target_branches == 0) return false;
+    return (try vm.det_state()).branches < vm.target_branches;
 }
 
 /// Adds the extra virtual time of the branches run since the last exit, and at the end of a
@@ -844,10 +889,11 @@ fn soft_set(vm: *VM, soft_tsc: u64) !void {
 /// deadline has passed instead of waiting for its soft or hard stop.
 fn timer_due(vm: *VM) !void {
     if (!vm.deterministic or vm.timer_slack_tsc == 0) return; // No slack: stops are exact.
-    if (vm.target_branches == 0 or vm.target_kind != .timer) return;
     const deadline = vm.pit.deadline_tsc() orelse return;
     const state = try vm.det_state();
     if (state.tsc < deadline) return;
+    // Whatever the target: a hold point or a moment armed before the timer's hard stop does not
+    // move where it fires.
     try vm.target_set(0);
     try vm.timer_fire();
     vm.stats.exit_timer_fires += 1;

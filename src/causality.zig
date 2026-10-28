@@ -271,12 +271,12 @@ fn snapshot_name(analysis: *Analysis, place: Place, moment_ms: u64) ![]const u8 
 
 /// Saves the moments not saved yet (a replay per timeline they are in, at once), then forks
 /// each one's futures (some moments at a time: each explore takes its futures' CPUs).
-fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
+fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
     const arena = analysis.arena;
     var tapes: std.ArrayList(?[]const u8) = .empty;
     var groups: std.ArrayList(std.ArrayList(u64)) = .empty;
     var places: std.ArrayList(Place) = .empty;
-    for (moments) |moment| {
+    for (moments_all) |moment| {
         const ms = moment.vtime_ms;
         const place = try moment_place(analysis, ms);
         try places.append(arena, place);
@@ -324,10 +324,11 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
             }
             try argv.appendSlice(scratch, &.{ "--save-snapshots", save.analysis.directory, "--save-at-ms", list.items });
             const result = try std.process.run(scratch, save.analysis.io, .{ .argv = argv.items });
-            if (std.mem.count(u8, result.stderr, "saved snapshot ") != save.moments.len) {
-                std.debug.print("{s}\n", .{result.stderr[result.stderr.len -| 4096..]});
-                return error.NotSaved;
-            }
+            const saved = std.mem.count(u8, result.stderr, "saved snapshot ");
+            if (saved != save.moments.len) std.debug.print("[determinismo] causality: {d} of {d} " ++
+                "moments saved (the others are left out)\n{s}\n", .{
+                saved, save.moments.len, result.stderr[result.stderr.len -| 4096..],
+            });
         }
     };
     const saves = try arena.alloc(Save, groups.items.len);
@@ -339,6 +340,18 @@ fn moments_analyze(analysis: *Analysis, moments: []const Moment) !void {
     for (save_threads) |thread| thread.join();
     for (saves) |save| if (save.failed) return error.NotSaved;
     if (analysis.request.save_only) return;
+    // The moments on disk: one a replay could not save is left out, not the analysis.
+    var kept_moments: std.ArrayList(Moment) = .empty;
+    var kept_places: std.ArrayList(Place) = .empty;
+    for (moments_all, places.items) |moment, place| {
+        const state = try std.fmt.allocPrint(arena, "{s}.state", .{try snapshot_name(analysis, place, moment.vtime_ms)});
+        std.Io.Dir.cwd().access(analysis.io, state, .{}) catch continue;
+        try kept_moments.append(arena, moment);
+        try kept_places.append(arena, place);
+    }
+    if (kept_moments.items.len == 0) return error.NotSaved;
+    const moments = kept_moments.items;
+    places = kept_places;
     // Their futures, in one queue over every moment: each CPU takes the next as it frees up (a
     // moment's futures waited for its slowest, and the next moment for them: one moment at a
     // time, half an hour for a YugabyteDB timeline's first points, srv3 2026-10-27). Each
