@@ -394,7 +394,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// The commands that read what explorations wrote (tla, query, causality): their exit status,
-/// or null for other commands. A usage error exits with 2.
+/// or null for other commands. An error exits with 2 (`runs search` keeps 1 for no match).
 fn command_tool(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -428,8 +428,14 @@ fn command_tool(
         runs_cli.run(arena, io, rest)
     else
         return null;
+    // The usage for a usage error only: after another (a run's events held by serve, a missing
+    // file) it buried what was said in a hundred lines.
     return result catch |err| {
-        std.debug.print("{s}\n{s}", .{ @errorName(err), usage });
+        if (err == error.Usage) {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        std.debug.print("error: {s}\n", .{@errorName(err)});
         return 2;
     };
 }
@@ -2239,7 +2245,13 @@ fn explore_tree(
     if (state.resumed) |resumed| try tree_rejudge(context, vm, options, branches, &state, &batch, resumed);
     var running: [jobs_max]Running = undefined;
     var running_count: u32 = 0;
+    // How busy the workers were: timelines running, over the loop's wall time (status.json and
+    // the end's line). A hunt's 16 workers ran 8.8 timelines at once by their wall times (Kafka,
+    // srv3 2026-10-28): which share was idle, and for memory, is what this says.
+    var busy: Busy = .{ .jobs = jobs, .start_ns = monotonic_ns(), .last_ns = monotonic_ns() };
+    defer busy.print(branches.multiverse);
     while (true) {
+        busy.advance(running_count);
         const late = if (branches.deadline_ns) |deadline| monotonic_ns() >= deadline else false;
         // A complete generation: judged at once, its returns at the queue's end.
         if (!late and batch.summaries.count == size) {
@@ -2270,7 +2282,7 @@ fn explore_tree(
         if (running_count > 0) {
             // Every half minute without a timeline finishing, what the run is doing: a long
             // timeline (minutes) otherwise leaves its output silent.
-            status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, state.generation);
+            status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, state.generation, &busy);
             const finished = try timeline_wait(running[0..running_count], branches.multiverse, &batch.summaries, progress_interval_ms) orelse {
                 progress_print(running[0..running_count], branches.multiverse, state.generation);
                 continue;
@@ -2444,7 +2456,42 @@ const progress_interval_ms = 30 * std.time.ms_per_s;
 /// The run's state for whoever shows it (serve): `status.json` in its directory, written whole
 /// (renamed into place) as timelines start and finish: those running (each since when, in
 /// seconds since the epoch), those done and failing, the generation judged next.
-fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *const report.Multiverse, generation: u32) void {
+/// Timelines running, integrated over a tree loop's wall time.
+const Busy = struct {
+    jobs: u32,
+    start_ns: u64,
+    last_ns: u64,
+    running_ns: u128 = 0,
+
+    /// `count` timelines ran since the last call.
+    fn advance(busy: *Busy, count: u32) void {
+        const now_ns = monotonic_ns();
+        busy.running_ns += @as(u128, count) * (now_ns - busy.last_ns);
+        busy.last_ns = now_ns;
+    }
+
+    /// Timelines at once, on average so far.
+    fn at_once(busy: *const Busy) f64 {
+        const span_ns = busy.last_ns - busy.start_ns;
+        if (span_ns == 0) return 0;
+        return @as(f64, @floatFromInt(busy.running_ns)) / @as(f64, @floatFromInt(span_ns));
+    }
+
+    fn print(busy: *Busy, multiverse: *report.Multiverse) void {
+        busy.advance(0);
+        multiverse.workers = busy.jobs;
+        multiverse.at_once = busy.at_once();
+        std.debug.print("[determinismo] workers: {d:.1} timelines at once of {d} on average " ++
+            "({d:.0}%); their VMs waited {d:.0}s for memory\n", .{
+            busy.at_once(),
+            busy.jobs,
+            100 * busy.at_once() / @as(f64, @floatFromInt(@max(busy.jobs, 1))),
+            @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s,
+        });
+    }
+};
+
+fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *const report.Multiverse, generation: u32, busy: *const Busy) void {
     const known = directory orelse return;
     var buffer: [8192]u8 = undefined;
     var text: std.Io.Writer = .fixed(&buffer);
@@ -2456,8 +2503,10 @@ fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *c
         const since_s = wall.sec - @as(i64, @intCast((now_ns - timeline.start_ns) / std.time.ns_per_s));
         text.print("{s}{{\"index\":{d},\"since_s\":{d}}}", .{ if (at == 0) "" else ",", timeline.index, since_s }) catch return;
     }
-    text.print("],\"done\":{d},\"failing\":{d},\"generation\":{d},\"at_s\":{d}}}\n", .{
-        multiverse.branches, multiverse.failing_branches, generation, wall.sec,
+    text.print("],\"done\":{d},\"failing\":{d},\"generation\":{d},\"at_s\":{d}," ++
+        "\"workers\":{d},\"at_once\":{d:.2},\"memory_wait_s\":{d:.1}}}\n", .{
+        multiverse.branches, multiverse.failing_branches, generation,                                                             wall.sec,
+        busy.jobs,           busy.at_once(),              @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s,
     }) catch return;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const staging = std.fmt.bufPrintSentinel(&path_buffer, "{s}/status.json.next", .{known}, 0) catch return;

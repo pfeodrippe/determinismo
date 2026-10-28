@@ -249,6 +249,11 @@ pub const Multiverse = struct {
     /// Output the timelines printed, and the virtual time they printed it over: Antithesis's
     /// "Logging output was limited" is a ratio over the whole simulation, not per timeline.
     output_bytes: u64 = 0,
+    /// How long its timelines waited for the host's memory before they started (Branch).
+    memory_wait_ns: u64 = 0,
+    /// A tree's workers, and how many timelines ran at once on average (main.zig's Busy).
+    workers: u32 = 0,
+    at_once: f64 = 0,
     output_span_ns: u64 = 0,
 
     pub const Branch = struct {
@@ -327,6 +332,7 @@ pub const Multiverse = struct {
         multiverse.xinuse_unfixed += state.xinuse_unfixed;
         multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
         multiverse.wall_ns += branch.wall_ns;
+        multiverse.memory_wait_ns += branch.memory_wait_ns;
         multiverse.output_bytes += vm.events.output_bytes;
         multiverse.output_span_ns += vm.events.output_span_ns(state.tsc / tsc_per_ns);
         try multiverse.logging_judge();
@@ -583,6 +589,9 @@ pub const Multiverse = struct {
             .overshoots = multiverse.overshoots,
             .vtime_ns = multiverse.vtime_ns,
             .vtime_per_wall = multiverse.vtime_per_wall(),
+            .workers = multiverse.workers,
+            .at_once = multiverse.at_once,
+            .memory_wait_ns = multiverse.memory_wait_ns,
             .properties = lines[0..multiverse.aggregate_count],
         } });
     }
