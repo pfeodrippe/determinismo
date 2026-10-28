@@ -2418,9 +2418,15 @@ const Ladders = struct {
                 holders.end(held);
                 continue;
             }
-            if (!holders.ask_disk(ladders.explorer, held, base)) {
-                broken = true;
-                continue;
+            switch (holders.ask_disk(ladders.explorer, held, base)) {
+                .written => {},
+                // Left for memory, as holders do (a YugabyteDB ladder kept 2 of 9 that way):
+                // the next one is diffed against the same base.
+                .gone => continue,
+                .failed => {
+                    broken = true;
+                    continue;
+                },
             }
             const name = holders.ladder_name(&names[saved], job.branch, held.vtime_ns);
             name_lengths[saved] = name.len;

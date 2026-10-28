@@ -399,17 +399,22 @@ pub fn end(held: Held) void {
 
 /// Asks a holder set aside (Registry.set_aside) to write itself to the ladder, diffed against
 /// `base`; then it ends. Whether it did (a holder gone meanwhile, for memory, did not).
-pub fn ask_disk(explorer: linux.pid_t, held: Held, base: []const u8) bool {
+pub fn ask_disk(explorer: linux.pid_t, held: Held, base: []const u8) Written {
     defer kill(held.pid);
     const at = address(explorer, held.worker, held.id);
-    const socket = connect(&at) orelse return false;
+    const socket = connect(&at) orelse return .gone;
     defer _ = linux.close(socket);
     var request: Request = .{ .vtime_ns = held.vtime_ns, .kind = .disk, .base_len = @intCast(base.len) };
     @memcpy(request.base[0..base.len], base);
-    if (!write_all(socket, std.mem.asBytes(&request))) return false;
+    if (!write_all(socket, std.mem.asBytes(&request))) return .gone;
     var answer: [1]u8 = undefined;
-    return read_exact(socket, &answer) and answer[0] == 0;
+    return if (read_exact(socket, &answer) and answer[0] == 0) .written else .failed;
 }
+
+/// A ladder step: written; or the holder was gone (left for memory before it was asked: the
+/// shared page hashes are untouched, still the base's); or its write failed on the way (they
+/// may be partly its own).
+pub const Written = enum { written, gone, failed };
 
 /// Ends a holder and waits for it (it may have been waited for already, by its worker).
 fn kill(pid: linux.pid_t) void {
