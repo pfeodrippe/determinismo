@@ -513,14 +513,17 @@ pub const properties_sql =
 /// made false, an `unreachable` reached.
 /// Each failing property's first failing timeline (the lowest index; the failing evaluations
 /// of timelines_sql): what serve snapshots as soon as it is found.
+/// Each failing property's first failing timeline, the rarest failures first (fewest failing
+/// timelines): what serve analyzes on its own, one at a time, a failure every timeline has (a
+/// crash at every exit) last.
 pub const first_failures_sql =
-    \\SELECT name AS property, min(timeline) AS branch
+    \\SELECT name AS property, min(timeline) AS branch, count(DISTINCT timeline) AS timelines
     \\FROM timeline_events
     \\WHERE kind IN ('assert', 'antithesis_assert')
     \\    AND ((type IN ('always', 'always_or_unreachable') AND NOT condition)
     \\        OR (type = 'unreachable' AND condition IS NOT NULL))
     \\GROUP BY name
-    \\ORDER BY branch
+    \\ORDER BY timelines, branch
 ;
 
 pub const timelines_sql =

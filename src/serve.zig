@@ -1269,7 +1269,7 @@ fn failures_analyze(server: *Server, id: u32) !void {
     const rows = rows: {
         var connection = try run_connect(server, id);
         defer connection.close();
-        const Row = struct { property: []const u8, branch: u32 };
+        const Row = struct { property: []const u8, branch: u32, timelines: u64 };
         break :rows connection.rows(Row, server.arena, store.first_failures_sql, .{}) catch |err| {
             if (err == error.DuckDB) server.detail = connection.failure.text();
             return err;
