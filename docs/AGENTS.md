@@ -95,6 +95,13 @@ use them in other repositories.
   `stacks`, ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
 - `POST /runs/<id>/stop` stops a run (its timelines so far stay; state `stopped`). A restarted
   `serve` adopts the runs still going (each run's `pid` file).
+- Determinism checks: every run replays every 16th timeline from its tape as it goes and judges
+  "timelines replay to their recorded history" (`explore --verify-replays <n>`, HTTP
+  `verify_replays`; 1 replays them all). `priority: true` (HTTP) gives a run's VMs the CPUs
+  before other runs': a check beside a hunt, which goes on with the CPUs left. A timeline that
+  did not replay keeps its output beside the tapes (`replay-<n>.log`); to find where it parts,
+  replay it with `--trace` (`DETERMINISMO_RDTSC_LOG_CAP` for long timelines), then
+  `DETERMINISMO_ITRACE_AT=<RDTSC exit>` for the instructions of that interval.
 
 - A branch is identified by (inputs, seed, branch index[, fork point]). Inputs are the kernel,
   initramfs, command line (scenario included), timer slack and disks; `explore` prints their hash.

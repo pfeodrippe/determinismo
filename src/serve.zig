@@ -786,7 +786,18 @@ pub const RunRequest = struct {
     /// The guest's memory, instead of the server's (explore's --memory-mib): for systems of
     /// several large nodes. Kept in the run's machine arguments, so its replays boot the same.
     memory_mib: ?u32 = null,
+    /// Every n-th timeline replayed as the run goes (explore's --verify-replays; 16 by
+    /// default): 1 makes the run a determinism check of the system.
+    verify_replays: ?u32 = null,
+    /// Its VMs take CPUs before other runs' (DETERMINISMO_CPU_PRIORITY, cpus.zig): a check
+    /// beside a hunt, which goes on with the CPUs it leaves.
+    priority: bool = false,
 };
+
+/// The environment a run's explorer starts with.
+fn run_environment(asked: *const RunRequest) []const []const u8 {
+    return if (asked.priority) &.{"DETERMINISMO_CPU_PRIORITY=1"} else &.{};
+}
 
 fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     var asked = try std.json.parseFromSliceLeaky(RunRequest, server.arena, body, .{
@@ -824,7 +835,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     const argv = try explore_arguments(server, &asked, directory, machine);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     // Its explorer holds the run's pid file (runs.zig): how a restarted server finds it running.
-    const pid = try spawn(server.arena, argv, output, &.{}, .fresh);
+    const pid = try spawn(server.arena, argv, output, run_environment(&asked), .fresh);
     runs_insert(shared, .{ .id = id, .pid = pid });
     try out.print("{{\"id\":{d}}}\n", .{id});
     return 201;
@@ -872,6 +883,9 @@ fn explore_arguments(
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
     }
     if (asked.changed) |source| try argv.appendSlice(server.arena, &.{ "--changed", source });
+    if (asked.verify_replays) |every| {
+        try argv.appendSlice(server.arena, &.{ "--verify-replays", try print(server, "{d}", .{every}) });
+    }
     for (asked.retroactive) |text| try argv.appendSlice(server.arena, &.{ "--retroactive", text });
     if (asked.from_branch) |branch| {
         try argv.appendSlice(server.arena, &.{
@@ -1785,7 +1799,7 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     try argv.appendSlice(server.arena, try explore_arguments(server, &asked, directory, machine));
     try argv.append(server.arena, "--resume");
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
-    const pid = try spawn(server.arena, argv.items, output, &.{}, .appended);
+    const pid = try spawn(server.arena, argv.items, output, run_environment(&asked), .appended);
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
     run.* = .{ .id = id, .pid = pid };
