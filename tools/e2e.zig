@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     var guest: []const u8 = try std.fs.path.join(arena, &.{ home, "guest" });
     var cache: []const u8 = try std.fs.path.join(arena, &.{ home, "cache" });
     var only: []const u8 = "";
+    var bb: ?[]const u8 = init.environ_map.get("DETERMINISMO_BB");
     var index: usize = 1;
     while (index + 1 < arguments.len) : (index += 2) {
         const flag = arguments[index];
@@ -77,6 +78,8 @@ pub fn main(init: std.process.Init) !void {
             cache = value;
         } else if (std.mem.eql(u8, flag, "--only")) {
             only = value;
+        } else if (std.mem.eql(u8, flag, "--bb")) {
+            bb = value;
         } else return error.Usage;
     }
     // Its own: suites run at once (a full one and a single check) do not share files.
@@ -94,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     var context = Context{
         .arena = arena,
         .io = init.io,
-        .bb = init.environ_map.get("DETERMINISMO_BB"),
+        .bb = bb,
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
         .machine = &.{
             "--kernel",     kernel,
@@ -867,7 +870,7 @@ fn check_serve(context: *Context) !void {
     }, "serve: the notebook is kept with the run", .{});
     // Clojure cells, evaluated with babashka: a query of the run's events, and a value.
     if (context.bb == null) {
-        std.debug.print("SKIP serve: notebook evaluation ($DETERMINISMO_BB is not set)\n", .{});
+        std.debug.print("SKIP serve: notebook evaluation (no babashka: -Dbb or $DETERMINISMO_BB)\n", .{});
         return;
     }
     const evaluate = "{\"cells\":[\"(def failing (query \\\"assert.condition=false\\\"))\"," ++

@@ -224,7 +224,7 @@ pub fn build(b: *std.Build) void {
         });
         // Frame pointers: determinismo's stacks and profiles unwind by them.
         const flags = [_][]const u8{
-            "-std=gnu11",               "-DFLECS_SANITIZE", "-fsanitize-coverage=trace-pc-guard",
+            "-std=gnu11",              "-DFLECS_SANITIZE", "-fsanitize-coverage=trace-pc-guard",
             "-fno-omit-frame-pointer",
         };
         flecs_stress.root_module.addCSourceFile(.{
@@ -297,6 +297,9 @@ pub fn build(b: *std.Build) void {
     if (e2e_only) |only| e2e_run.addArgs(&.{ "--only", only });
     const e2e_guest = b.option([]const u8, "guest", "e2e: the guest kernel and initramfs ($HOME/guest)");
     if (e2e_guest) |guest| e2e_run.addArgs(&.{ "--guest", guest });
+    // Babashka, for the notebook's checks ($DETERMINISMO_BB did not reach the suite on srv3).
+    const e2e_bb = b.option([]const u8, "bb", "e2e: babashka, for notebook evaluation");
+    if (e2e_bb) |bb| e2e_run.addArgs(&.{ "--bb", bb });
     b.step("e2e", "Boot real systems: exploration, exact replays, tapes (on the Linux host)")
         .dependOn(&e2e_run.step);
 
