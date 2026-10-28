@@ -18,5 +18,7 @@ hostPath volume), then everything rolled out and ready (kapp's readiness); setup
 follows. The template's commands run in a running container of the image that has them, through
 `kubectl exec`.
 
-Faults act on the K3s node (its processes, the pods' among them); faults between pods are not
-there yet.
+Faults act on the K3s node (its processes, the pods' among them) and on single pods: a pod
+frozen (`pod_pause`), killed at once with kubelet starting it again (`pod_kill`; pods holding
+test templates are spared: the drivers run there), cut off (`pod_isolate`) or its network
+degraded (`pod_degrade`), in the pod's own network namespace. Each fault event names its pod.

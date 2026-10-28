@@ -89,6 +89,12 @@ const Kind = enum {
     /// within a process, without instrumentation (Antithesis's thread pausing).
     thread_pause,
     process_kill,
+    /// One pod of a Kubernetes node (Faults.pods) frozen, killed, cut off, or its network
+    /// degraded, in its own network namespace.
+    pod_pause,
+    pod_kill,
+    pod_isolate,
+    pod_degrade,
     /// The runner and the nodes split into groups that cannot talk across (Antithesis's
     /// partitions), with one disruption form.
     partition_groups,
@@ -329,6 +335,8 @@ const Applied = struct {
     after_sync: bool = false,
     stall_ms_min: u32 = 1,
     stall_ms_max: u32 = 0,
+    /// For the pod faults: the pod's name (process_index picks it among the node's pods).
+    pod: []const u8 = "",
 };
 
 /// A fault's parameters, drawn from platform randomness.
@@ -345,8 +353,14 @@ fn draw(fault: *const Fault) Applied {
             const range = throttle_percent_max - throttle_percent_min;
             applied.cpu_percent = @intCast(throttle_percent_min + sdk.random_below(range + 1));
         },
-        .process_pause, .process_kill => {
+        .process_pause, .process_kill, .pod_pause, .pod_kill, .pod_isolate => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
+        .pod_degrade => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            applied.flavor = flavor;
+            applied.netem = degradation(flavor);
         },
         .thread_pause => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
@@ -490,6 +504,11 @@ fn faults_collect(
         if (allowed.process_kill) {
             faults_add(faults, &count, .{ .kind = .process_kill, .node = node.name });
         }
+        if (allowed.pods) {
+            for ([_]Kind{ .pod_pause, .pod_kill, .pod_isolate, .pod_degrade }) |kind| {
+                faults_add(faults, &count, .{ .kind = kind, .node = node.name });
+            }
+        }
         for (allowed.custom) |program| {
             faults_add(faults, &count, .{ .kind = .custom, .node = node.name, .program = program });
         }
@@ -566,8 +585,12 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .throttle,
         .process_pause,
         .thread_pause,
+        .pod_pause,
+        .pod_isolate,
+        .pod_degrade,
         => node_start(system, applied),
         .process_kill => apply_process_kill(system, applied),
+        .pod_kill => apply_pod_kill(applied),
         .isolate, .partition, .degrade, .partition_groups, .clog => network_start(system, applied),
         .restore => network_restore(system, applied),
         .clock_skip => {
@@ -592,8 +615,11 @@ const NodeFault = struct {
     /// A stop: when what the node left running is killed (its grace period ends), if still
     /// pending.
     grace_end_ns: ?u64 = null,
-    /// The process or thread stopped (process_pause, thread_pause).
+    /// The process or thread stopped (process_pause, thread_pause); for a pod fault, a process
+    /// of the pod (its network namespace).
     pid: linux.pid_t = 0,
+    /// The pod's cgroup (pod faults).
+    pod: Pod = .{},
 };
 var nodes_faulted: [schema.nodes_max]?NodeFault = @splat(null);
 /// For starting nodes again when their fault ends (set once faults start).
@@ -614,6 +640,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     if (slot.* != null) return;
     var fault = NodeFault{ .applied = applied.*, .end_ns = monotonic_ns() + applied.duration_ns };
     const started: anyerror!void = switch (applied.kind) {
+        .pod_pause, .pod_isolate, .pod_degrade => pod_begin(&fault),
         .pause => nodes.freeze(applied.node, .frozen),
         .restart => nodes.kill(applied.node),
         .crash => nodes.crash(applied.node),
@@ -630,8 +657,11 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
-    sdk.event("fault", applied.*);
     slot.* = fault;
+    // A pod fault's event names its pod (kept in the slot, which the event reads).
+    const node_fault = &slot.*.?;
+    if (node_fault.pod.path_size > 0) node_fault.applied.pod = node_fault.pod.name();
+    sdk.event("fault", node_fault.applied);
 }
 
 fn node_end(system: *const schema.System, slot: *?NodeFault) void {
@@ -671,8 +701,196 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .throttle => nodes.cpu_limit(name, null) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
+        .pod_pause => fault.pod.write("cgroup.freeze", "0") catch {},
+        // The pod may be gone (killed, rescheduled), its namespace with it.
+        .pod_isolate, .pod_degrade => nodes.pod_netem(fault.pid, null) catch {},
         else => {},
     }
+}
+// Pod faults (Faults.pods) --------------------------------------------------------------------
+// A Kubernetes node's pods are cgroups of its own (kubepods/<qos>/pod<uid>, or kubepods/pod<uid>
+// for guaranteed ones): one is picked in name order by the fault's process_index.
+
+const pods_max = 256;
+const pod_containers_max = 16;
+
+const Pod = struct {
+    path_buffer: [nodes.path_size_max]u8 = undefined,
+    path_size: usize = 0,
+    name_buffer: [64]u8 = undefined,
+    name_size: usize = 0,
+
+    fn path(pod: *const Pod) []const u8 {
+        return pod.path_buffer[0..pod.path_size];
+    }
+
+    /// Its name: a process's HOSTNAME (the pod's, as Kubernetes sets it), else its cgroup's.
+    fn name(pod: *const Pod) []const u8 {
+        if (pod.name_size > 0) return pod.name_buffer[0..pod.name_size];
+        return std.fs.path.basename(pod.path());
+    }
+
+    fn write(pod: *const Pod, file: []const u8, content: []const u8) !void {
+        var buffer: [nodes.path_size_max + 32]u8 = undefined;
+        try nodes.file_write(try nodes.print_z(&buffer, "{s}/{s}", .{ pod.path(), file }), content);
+    }
+};
+
+const Directories = struct {
+    paths: [pods_max][nodes.path_size_max]u8 = undefined,
+    sizes: [pods_max]usize = undefined,
+    count: usize = 0,
+
+    fn get(directories: *const Directories, index: usize) []const u8 {
+        return directories.paths[index][0..directories.sizes[index]];
+    }
+
+    /// The subdirectories of `parent` whose names start with `prefix`.
+    fn add(directories: *Directories, parent: [:0]const u8, prefix: []const u8) void {
+        const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+        const opened = linux.open(parent, flags, 0);
+        if (linux.errno(opened) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+        var entries: [8192]u8 align(8) = undefined;
+        while (true) {
+            const size = linux.getdents64(fd, &entries, entries.len);
+            if (linux.errno(size) != .SUCCESS or size == 0) return;
+            var at: usize = 0;
+            while (at < size) {
+                const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
+                at += entry.reclen;
+                if (entry.type != linux.DT.DIR) continue;
+                const entry_name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+                if (entry_name[0] == '.' or !std.mem.startsWith(u8, entry_name, prefix)) continue;
+                if (directories.count == pods_max) return;
+                const slot = &directories.paths[directories.count];
+                const full = std.fmt.bufPrint(slot, "{s}/{s}", .{ parent, entry_name }) catch continue;
+                directories.sizes[directories.count] = full.len;
+                directories.count += 1;
+            }
+        }
+    }
+
+    fn before(directories: *const Directories, a: usize, b: usize) bool {
+        return std.mem.lessThan(u8, directories.get(a), directories.get(b));
+    }
+};
+
+/// The node's pod picked by `index` (their cgroups in name order: the same pod on a replay),
+/// and a process of it (the first with a HOSTNAME naming the pod). Spared, the pods whose
+/// containers hold test templates (the drivers run there, through kubectl exec: a kill would
+/// fail them, not the system).
+fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux.pid_t {
+    var pods: Directories = .{};
+    var parent_buffer: [nodes.path_size_max]u8 = undefined;
+    for ([_][]const u8{ "", "/burstable", "/besteffort" }) |class| {
+        const format = nodes.cgroup_root ++ "/{s}/kubepods{s}";
+        pods.add(try nodes.print_z(&parent_buffer, format, .{ node, class }), "pod");
+    }
+    if (pods.count == 0) return error.NoPods;
+    var order: [pods_max]usize = undefined;
+    for (order[0..pods.count], 0..) |*slot, at| slot.* = at;
+    std.sort.insertion(usize, order[0..pods.count], &pods, Directories.before);
+    var candidates: usize = 0;
+    for (order[0..pods.count]) |at| {
+        if (spare_drivers and pod_has_templates(pods.get(at))) continue;
+        order[candidates] = at;
+        candidates += 1;
+    }
+    if (candidates == 0) return error.NoPods;
+    const picked = pods.get(order[index % candidates]);
+    @memcpy(pod.path_buffer[0..picked.len], picked);
+    pod.path_size = picked.len;
+    pod.name_size = 0;
+    var containers: Directories = .{};
+    containers.add(try nodes.print_z(&parent_buffer, "{s}", .{picked}), "");
+    var pid: linux.pid_t = 0;
+    for (0..@min(containers.count, pod_containers_max)) |at| {
+        var procs_buffer: [nodes.path_size_max + 16]u8 = undefined;
+        const procs = try nodes.print_z(&procs_buffer, "{s}/cgroup.procs", .{containers.get(at)});
+        var text_buffer: [64]u8 = undefined;
+        const text = nodes.read_small(procs, &text_buffer) orelse continue;
+        const line = std.mem.trim(u8, std.mem.sliceTo(text, '\n'), " ");
+        const first = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
+        if (pid == 0) pid = first;
+        if (hostname_of(first, &pod.name_buffer)) |host| {
+            pod.name_size = host.len;
+            pid = first;
+            break;
+        }
+    }
+    if (pid == 0) return error.PodWithoutProcesses;
+    return pid;
+}
+
+/// Whether one of the pod's containers holds Antithesis test templates.
+fn pod_has_templates(path: []const u8) bool {
+    var containers: Directories = .{};
+    var buffer: [nodes.path_size_max]u8 = undefined;
+    containers.add(nodes.print_z(&buffer, "{s}", .{path}) catch return false, "");
+    for (0..@min(containers.count, pod_containers_max)) |at| {
+        var procs_buffer: [nodes.path_size_max + 16]u8 = undefined;
+        const procs = nodes.print_z(&procs_buffer, "{s}/cgroup.procs", .{containers.get(at)}) catch continue;
+        var text_buffer: [64]u8 = undefined;
+        const text = nodes.read_small(procs, &text_buffer) orelse continue;
+        const line = std.mem.trim(u8, std.mem.sliceTo(text, '\n'), " ");
+        const pid = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
+        var templates_buffer: [64]u8 = undefined;
+        const templates = std.fmt.bufPrintSentinel(&templates_buffer, "/proc/{d}/root/opt/antithesis/test/v1", .{pid}, 0) catch continue;
+        if (linux.errno(linux.access(templates, linux.F_OK)) == .SUCCESS) return true;
+    }
+    return false;
+}
+
+/// A process's HOSTNAME (from its environment), into `buffer`.
+fn hostname_of(pid: linux.pid_t, buffer: *[64]u8) ?[]const u8 {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/environ", .{pid}, 0) catch
+        return null;
+    var environment: [8192]u8 = undefined;
+    const text = nodes.read_small(path, &environment) orelse return null;
+    var entries = std.mem.splitScalar(u8, text, 0);
+    while (entries.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry, "HOSTNAME=")) continue;
+        const value = entry["HOSTNAME=".len..];
+        if (value.len == 0 or value.len > buffer.len) return null;
+        @memcpy(buffer[0..value.len], value);
+        return buffer[0..value.len];
+    }
+    return null;
+}
+
+/// A pod fault with a duration begins: the pod frozen, or its network cut off or degraded.
+fn pod_begin(fault: *NodeFault) !void {
+    const applied = &fault.applied;
+    fault.pid = try pod_pick(applied.node, applied.process_index, &fault.pod, false);
+    switch (applied.kind) {
+        .pod_pause => try fault.pod.write("cgroup.freeze", "1"),
+        .pod_isolate => try nodes.pod_netem(fault.pid, .{
+            .delay_ns = 0,
+            .loss_ppm = nodes.Netem.ppm,
+            .seed = applied.duration_ns,
+        }),
+        .pod_degrade => try nodes.pod_netem(fault.pid, applied.netem.?),
+        else => unreachable,
+    }
+}
+
+/// Every process of a pod killed at once (cgroup.kill): kubelet starts its containers again.
+fn apply_pod_kill(applied: *const Applied) void {
+    var pod: Pod = .{};
+    _ = pod_pick(applied.node, applied.process_index, &pod, true) catch |err| {
+        sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+        return;
+    };
+    pod.write("cgroup.kill", "1") catch |err| {
+        sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+        return;
+    };
+    var named = applied.*;
+    named.pod = pod.name();
+    sdk.event("fault", named);
 }
 
 fn readdress_maybe(system: *const schema.System, node: *const schema.Resolved) void {
@@ -1476,8 +1694,14 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
     }
     switch (request.kind) {
         .throttle => applied.cpu_percent = request.cpu_percent,
-        .process_pause, .process_kill => {
+        .process_pause, .process_kill, .pod_pause, .pod_kill, .pod_isolate => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
+        .pod_degrade => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+            const flavor = sdk.random_choice(Degradation, std.enums.values(Degradation));
+            applied.flavor = flavor;
+            applied.netem = degradation(flavor);
         },
         .thread_pause => {
             applied.process_index = @intCast(sdk.random_below(processes_max));

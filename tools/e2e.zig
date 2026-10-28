@@ -436,6 +436,9 @@ fn check_kubernetes(context: *Context) !void {
     const driven = std.mem.indexOf(u8, report, "test command completed: parallel_driver_increment") != null;
     const read = std.mem.indexOf(u8, report, "test command completed: eventually_counter_readable") != null;
     const passing = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
+    // Faults on single pods (Faults.pods), each naming its pod.
+    const pod_faults = try run_kept(context, &.{ "grep", "-rhoE", "\"kind\":\"pod_[a-z]+\"", explored });
+    const named = try run_kept(context, &.{ "grep", "-rhoE", "\"pod\":\"[a-z0-9-]+\"", explored });
     var same = false;
     if (count > 0) {
         const index = try std.fmt.allocPrint(arena, "{d}", .{branches[0].index});
@@ -452,7 +455,9 @@ fn check_kubernetes(context: *Context) !void {
         .{ "the counter read back once faults stopped", read },
         .{ "no property failed", passing },
         .{ "a timeline replays exactly", same },
-    }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod", .{});
+        .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
+    }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
+        "pod faults: {s}", .{std.mem.trim(u8, pod_faults.stdout[0..@min(pod_faults.stdout.len, 120)], "\n")});
 }
 
 fn check_k3s(context: *Context) !void {

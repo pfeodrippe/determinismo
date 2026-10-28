@@ -978,6 +978,16 @@ pub fn link_degrade(from: []const u8, to: []const u8, netem: ?netlink.Netem) !vo
 
 pub const Netem = netlink.Netem;
 
+/// A Kubernetes pod's network (faults.zig's pod faults): netem on its eth0, in the namespace of
+/// one of its processes; null clears it.
+pub fn pod_netem(pid: linux.pid_t, netem: ?Netem) !void {
+    if (netem) |settings| {
+        try netlink.in_namespace_of(pid, netlink.Socket.netem_set, .{ "eth0", settings });
+    } else {
+        try netlink.in_namespace_of(pid, netlink.Socket.netem_clear, .{"eth0"});
+    }
+}
+
 /// The PID (in the guest's root namespace) of the node's first process, or 1 for the runner.
 pub fn pid_of(name: []const u8) ?linux.pid_t {
     if (std.mem.eql(u8, name, schema.runner_name)) return 1;
@@ -1619,7 +1629,7 @@ pub fn file_write(path: [:0]const u8, content: []const u8) !void {
     if (linux.errno(written) != .SUCCESS or written != content.len) return error.WriteFailed;
 }
 
-fn read_small(path: [:0]const u8, buffer: []u8) ?[]const u8 {
+pub fn read_small(path: [:0]const u8, buffer: []u8) ?[]const u8 {
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return null;
     defer _ = linux.close(@intCast(fd));

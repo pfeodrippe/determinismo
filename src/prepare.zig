@@ -425,6 +425,7 @@ fn kubernetes_describe(context: Context, directory: []const u8) !schema.Descript
         .env = &.{kubernetes.kubeconfig},
         .ready = .{ .tcp = kubernetes.api_port },
         .privileged = true,
+        .faults = .{ .pods = true },
     };
     const profiles = try arena.alloc(schema.Profile, 1);
     profiles[0] = .{ .name = "kubernetes", .nodes = nodes };

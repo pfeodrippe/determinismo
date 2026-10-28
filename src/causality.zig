@@ -122,6 +122,8 @@ fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
         node: []const u8 = "",
         peer: []const u8 = "",
         flavor: ?[]const u8 = null,
+        /// A pod fault's pod (Kubernetes): it names the fault, not the node it runs in.
+        pod: []const u8 = "",
     } };
     const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch return null;
     const fault = parsed.details;
@@ -131,7 +133,7 @@ fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
         if (fault.flavor != null) " " else "",
         fault.flavor orelse "",
         if (fault.node.len > 0) " " else "",
-        fault.node,
+        if (fault.pod.len > 0) fault.pod else fault.node,
         if (fault.peer.len > 0) "↔" else "",
         fault.peer,
     });
@@ -146,6 +148,8 @@ test fault_label {
     const degrade = "{\"event\":\"fault\",\"details\":{\"kind\":\"degrade\",\"node\":\"yb3\",\"peer\":\"yb1\",\"flavor\":\"delay_loss\"}}";
     try std.testing.expectEqualStrings("degrade delay_loss yb3↔yb1", (try fault_label(arena, degrade)).?);
     try std.testing.expectEqual(null, try fault_label(arena, "not json"));
+    const pod = "{\"event\":\"fault\",\"details\":{\"kind\":\"pod_kill\",\"node\":\"kubernetes\",\"pod\":\"redis-7c9-x2k\"}}";
+    try std.testing.expectEqualStrings("pod_kill redis-7c9-x2k", (try fault_label(arena, pod)).?);
 }
 
 /// The faults' effects so far, as one line (serve keeps the latest): each fault seen in at least

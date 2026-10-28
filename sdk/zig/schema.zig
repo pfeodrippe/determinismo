@@ -194,6 +194,10 @@ pub const Faults = struct {
     /// shell killed leaves its server unsupervised; a start script's helper killed under set -e
     /// ends the script, the node down for good: Dgraph's and Scylla's first hunts).
     process_kill_names: []const []const u8 = &.{},
+    /// Kubernetes pods run in it (`explore --kubernetes`, kubernetes.zig): faults also act on one
+    /// of its pods at a time, as Antithesis's on a cluster's pods: frozen, killed (kubelet starts
+    /// its containers again), cut off, or its network degraded (in the pod's own namespace).
+    pods: bool = false,
     /// Commands in the node (an absolute path, then arguments, split at spaces: no shell) that
     /// the fault injector runs at random times, as Antithesis's custom faults: calling an admin
     /// API, forcing a compaction, a failover. They can draw from the SDK's randomness.
