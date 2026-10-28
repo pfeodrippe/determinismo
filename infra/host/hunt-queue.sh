@@ -25,12 +25,32 @@ if timelines < window: sys.exit(1)
 before = [b for t, b in points if t <= timelines - window]
 sys.exit(0 if before and before[-1] == behaviors else 1)'
 }
+rare_said=
+rare_check() { # <run id>: once it has 100 timelines, says (once) which sometimes properties
+  # held in under 5% of them (report.zig's rarely_true): a workload that hardly ever got where
+  # it should (Kafka's run 56 committed in 9 timelines of 508, and passed, for hours)
+  [ "$rare_said" = "$1" ] && return
+  local said
+  said=$(curl -s --max-time 30 localhost:7878/runs/$1 | python3 -c '
+import sys, json, urllib.request
+run = json.load(sys.stdin)
+timelines = (run.get("stats") or {}).get("timelines") or 0
+if timelines < 100: sys.exit(1)
+properties = json.load(urllib.request.urlopen("http://localhost:7878/runs/%d/properties" % run["id"], timeout=30))
+rare = [p for p in properties if p.get("type") == "sometimes" and p.get("status") == "passing"
+        and 0 < (p.get("timelines_true") or 0) and p["timelines_true"] * 20 < timelines]
+print("; ".join("%s (%d of %d)" % (p["message"], p["timelines_true"], timelines) for p in rare))
+' 2>/dev/null) || return
+  rare_said=$1
+  [ -n "$said" ] && echo "$(date +%H:%M) run $1: rarely true, the workload may hardly progress: $said"
+}
 wait_run() { # <run id>: until it has not run for 3 minutes running (a stop and a resume, or
   # serve restarting, take seconds: not an end)
   local idle=0
   while [ $idle -lt 3 ]; do
     if running "$1"; then
       idle=0
+      rare_check "$1"
       if plateaued "$1"; then
         echo "$(date +%H:%M) run $1: no new behavior lately, stopping it"
         curl -s -X POST localhost:7878/runs/$1/stop > /dev/null
