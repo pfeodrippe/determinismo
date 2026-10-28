@@ -88,11 +88,18 @@ pub fn running_mark(arena: std.mem.Allocator, directory: []const u8) !void {
         _ = linux.close(fd);
         return error.RunRunning; // Another explorer has it.
     }
+    // One run at a time: the one before (an exploration of several scenarios, each its own
+    // run) has ended.
+    if (running_fd) |before| _ = linux.close(before);
+    running_fd = fd;
     _ = linux.ftruncate(fd, 0);
     var text_buffer: [16]u8 = undefined;
     const text = std.fmt.bufPrint(&text_buffer, "{d}\n", .{linux.getpid()}) catch unreachable;
     if (linux.errno(linux.pwrite(fd, text.ptr, text.len, 0)) != .SUCCESS) return error.PidFile;
 }
+
+/// The pid file this process holds (locked) for the run it explores.
+var running_fd: ?linux.fd_t = null;
 
 /// The run's explorer, if it runs: the pid its pid file names, while the file is locked.
 pub fn running_pid(arena: std.mem.Allocator, directory: []const u8) ?linux.pid_t {

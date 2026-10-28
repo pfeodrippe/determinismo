@@ -104,7 +104,94 @@ const Analysis = struct {
     out_mutex: std.Io.Mutex = .init,
     failure: Failure,
     planner: ?*Strategy = null,
+    /// The faults the futures went through (after their moment), each with how many futures had
+    /// it and how many of those failed: which faults make the failure more likely (as
+    /// Antithesis's causality shows which events do). Under out_mutex.
+    effects: std.StringArrayHashMapUnmanaged(Effect) = .empty,
+    futures_total: u32 = 0,
+    futures_failing: u32 = 0,
 };
+
+const Effect = struct { with: u32 = 0, with_failing: u32 = 0 };
+
+/// A fault event's name, as the page names faults: its kind (a degradation's flavor too), its
+/// node, and its peer ("partition kafka-2↔runner"); null for another line.
+fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
+    const Line = struct { details: struct {
+        kind: []const u8 = "",
+        node: []const u8 = "",
+        peer: []const u8 = "",
+        flavor: ?[]const u8 = null,
+    } };
+    const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch return null;
+    const fault = parsed.details;
+    if (fault.kind.len == 0) return null;
+    return try std.fmt.allocPrint(arena, "{s}{s}{s}{s}{s}{s}{s}", .{
+        fault.kind,
+        if (fault.flavor != null) " " else "",
+        fault.flavor orelse "",
+        if (fault.node.len > 0) " " else "",
+        fault.node,
+        if (fault.peer.len > 0) "↔" else "",
+        fault.peer,
+    });
+}
+
+test fault_label {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const partition = "{\"event\":\"fault\",\"details\":{\"at_ns\":0,\"kind\":\"partition\",\"node\":\"kafka-2\",\"peer\":\"runner\",\"flavor\":null}}";
+    try std.testing.expectEqualStrings("partition kafka-2↔runner", (try fault_label(arena, partition)).?);
+    const degrade = "{\"event\":\"fault\",\"details\":{\"kind\":\"degrade\",\"node\":\"yb3\",\"peer\":\"yb1\",\"flavor\":\"delay_loss\"}}";
+    try std.testing.expectEqualStrings("degrade delay_loss yb3↔yb1", (try fault_label(arena, degrade)).?);
+    try std.testing.expectEqual(null, try fault_label(arena, "not json"));
+}
+
+/// The faults' effects so far, as one line (serve keeps the latest): each fault seen in at least
+/// two futures, the strongest first (how much more often futures with it failed than without).
+fn effects_print(analysis: *Analysis) !void {
+    if (analysis.futures_total == 0) return;
+    const Ranked = struct { name: []const u8, effect: Effect, lift: f64 };
+    var ranked: std.ArrayList(Ranked) = .empty;
+    const total: f64 = @floatFromInt(analysis.futures_total);
+    const failing: f64 = @floatFromInt(analysis.futures_failing);
+    for (analysis.effects.keys(), analysis.effects.values()) |name, effect| {
+        if (effect.with < 2) continue;
+        const with: f64 = @floatFromInt(effect.with);
+        const with_failing: f64 = @floatFromInt(effect.with_failing);
+        const without = total - with;
+        const rate_without = if (without > 0) (failing - with_failing) / without else 0;
+        try ranked.append(analysis.arena, .{ .name = name, .effect = effect, .lift = with_failing / with - rate_without });
+    }
+    std.mem.sort(Ranked, ranked.items, {}, struct {
+        fn more(_: void, a: Ranked, b: Ranked) bool {
+            return a.lift > b.lift;
+        }
+    }.more);
+    const out = analysis.out;
+    if (!analysis.request.json) {
+        try out.print("faults, by how much more often futures with them failed ({d} futures, {d} failing):\n", .{
+            analysis.futures_total, analysis.futures_failing,
+        });
+        for (ranked.items[0..@min(ranked.items.len, 12)]) |entry| {
+            try out.print("  {d:>5.1}%  {s}  ({d} of {d} failed)\n", .{
+                entry.lift * 100, entry.name, entry.effect.with_failing, entry.effect.with,
+            });
+        }
+        try out.flush();
+        return;
+    }
+    try out.print("{{\"faults\":[", .{});
+    for (ranked.items[0..@min(ranked.items.len, 40)], 0..) |entry, at| {
+        if (at > 0) try out.writeAll(",");
+        try out.print("{{\"fault\":{f},\"with\":{d},\"with_failing\":{d}}}", .{
+            std.json.fmt(entry.name, .{}), entry.effect.with, entry.effect.with_failing,
+        });
+    }
+    try out.print("],\"futures\":{d},\"failing\":{d}}}\n", .{ analysis.futures_total, analysis.futures_failing });
+    try out.flush();
+}
 
 pub fn run(
     arena: std.mem.Allocator,
@@ -403,6 +490,10 @@ fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
                 owner.directory, moment.vtime_ms, item.future,
             });
             defer std.Io.Dir.cwd().deleteFile(io, record) catch {};
+            const faults = try std.fmt.allocPrint(scratch, "{s}/faults-{d}-{d}.jsonl", .{
+                owner.directory, moment.vtime_ms, item.future,
+            });
+            defer std.Io.Dir.cwd().deleteFile(io, faults) catch {};
             var argv: std.ArrayList([]const u8) = .empty;
             try argv.appendSlice(scratch, &.{ owner.self, "explore" });
             try argv.appendSlice(scratch, request.rest);
@@ -410,6 +501,7 @@ fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
                 "--from-snapshot", futures.names[item.moment],
                 "--branch",        try std.fmt.allocPrint(scratch, "{d}", .{item.future}),
                 "--record",        record,
+                "--faults-record", faults,
             });
             // A verdict: the future stops at its first match, which counts.
             if (request.verdict) |verdict| try argv.appendSlice(scratch, &.{ "--until", verdict });
@@ -419,8 +511,26 @@ fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
                 @intCast(std.mem.count(u8, source, "\"outcome\":\"moment_reached\""))
             else
                 try property_failing(scratch, source, request.property);
+            // The faults it went through, each once.
+            var seen: std.StringArrayHashMapUnmanaged(void) = .empty;
+            const fault_lines = std.Io.Dir.cwd().readFileAlloc(io, faults, scratch, .limited(16 << 20)) catch "";
+            var fault_iterator = std.mem.tokenizeScalar(u8, fault_lines, '\n');
+            while (fault_iterator.next()) |line| {
+                if (try fault_label(scratch, line)) |label| try seen.put(scratch, label, {});
+            }
             owner.out_mutex.lockUncancelable(io);
             defer owner.out_mutex.unlock(io);
+            owner.futures_total += 1;
+            owner.futures_failing += @intFromBool(failing > 0);
+            for (seen.keys()) |label| {
+                const entry = try owner.effects.getOrPut(owner.arena, label);
+                if (!entry.found_existing) {
+                    entry.key_ptr.* = try owner.arena.dupe(u8, label);
+                    entry.value_ptr.* = .{};
+                }
+                entry.value_ptr.with += 1;
+                entry.value_ptr.with_failing += @intFromBool(failing > 0);
+            }
             futures.finished[item.moment] += 1;
             futures.failing[item.moment] += failing;
             const point: Point = .{
@@ -462,6 +572,7 @@ fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
     const threads = try arena.alloc(std.Thread, at_once);
     for (threads) |*thread| thread.* = try std.Thread.spawn(.{}, Futures.run, .{&futures});
     for (threads) |thread| thread.join();
+    try effects_print(analysis);
     if (futures.failed.load(.monotonic)) return error.FuturesFailed;
 }
 

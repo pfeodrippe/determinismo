@@ -178,6 +178,8 @@ const Arguments = struct {
     /// The raw PMU event that is the guest's clock (see VM.Options.branch_event).
     branch_event: u64 = 0x01c4,
     events_path: ?[]const u8 = null,
+    /// The timeline's fault events only (`--faults-record`: causality's futures).
+    faults_record_path: ?[]const u8 = null,
     /// The resolved system (nodes, scenarios), recorded with the run: its environment.
     system: ?std.json.Value = null,
     /// The moment is the first event matching this (`--until '<condition>'`, query.zig).
@@ -276,7 +278,7 @@ const Arguments = struct {
     raw_argv: []const [:0]const u8 = &.{},
     /// While exploring with a record and tapes, every this many timelines one is replayed from
     /// its tape (replays.zig); 0: none.
-    verify_every: u32 = 16,
+    verify_every: u32 = verify_every_default,
     /// Continue the run whose record is `record_path`: its timelines already recorded are
     /// skipped (flat branching; the same inputs and seed).
     resume_run: bool = false,
@@ -302,6 +304,9 @@ const Arguments = struct {
     scenario: ?[]const u8 = null,
     cache_directory: []const u8 = ".determinismo-cache",
 };
+
+/// Every n-th timeline a run replays as it goes (--verify-replays).
+const verify_every_default = 16;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -443,6 +448,10 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     const arena = init.arena.allocator();
     var arguments = arguments_given;
     if (exploration_is_run(&arguments)) try run_register(arena, init.io, &arguments);
+    // A replay or a future (one VM, not a run's explorer): the OOM killer's before the host's
+    // own processes, as a run's timelines are (one killed by it once took podman's pause
+    // process down with it: user@.service's OOM policy).
+    if (arguments.command == .explore and !exploration_is_run(&arguments)) oom_before_the_host();
     if (arguments.resume_run) try resume_settings_adopt(arena, init.io, &arguments);
     const has_system = arguments.program_path != null or arguments.compose_path != null or
         arguments.pinned != null;
@@ -468,6 +477,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         .timer_slack_ns = arguments.timer_slack_us * std.time.ns_per_us,
         .branch_event = arguments.branch_event,
         .events_fd = if (arguments.events_path) |path| try open_for_writing(arena, path) else null,
+        .faults_record_fd = if (arguments.faults_record_path) |path| try open_for_writing(arena, path) else null,
         .events_parse_buffer = try arena.alloc(u8, Events.parse_buffer_size),
         .trace_fd = if (arguments.trace_path) |path| try open_for_writing(arena, path) else null,
         .rdtsc_log_fd = if (arguments.trace_path) |path|
@@ -514,7 +524,13 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
     var failing_scenarios: u32 = 0;
     var catalog = report.Catalog{ .arena = arena };
     const scenarios = try scenarios_selected(arena, &arguments, prepared);
-    for (scenarios) |scenario| {
+    for (scenarios, 0..) |scenario, index| {
+        // Several scenarios explored: each its own run (its record, events and tapes, branch
+        // numbers of its own); in one run, each scenario's timelines took the same files, and the
+        // last scenario's were all that stayed (Quint, srv3 run 25).
+        if (scenarios.len > 1 and exploration_is_run(&arguments)) {
+            try run_scenario(arena, init.io, &arguments, scenario.?, index == 0);
+        }
         options.cmdline = try cmdline_build(arena, base_cmdline, &arguments, scenario);
         options.check_scenario = scenario orelse "";
         if (scenario) |name| std.debug.print("[determinismo] scenario {s}\n", .{name});
@@ -575,6 +591,38 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
     }
 }
 
+/// One scenario of an exploration of several, as a run of its own: the first keeps the run
+/// already claimed (its request now naming the scenario), each next one claims another, with
+/// its own output, request, record, events and tapes, the one before ending.
+fn run_scenario(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    arguments: *Arguments,
+    scenario: []const u8,
+    first: bool,
+) !void {
+    const data = try runs.data_directory(arena, arguments.data_directory);
+    arguments.scenario = scenario;
+    if (first) {
+        try run_request_write(arena, io, data, arguments.run_directory.?, arguments);
+        return;
+    }
+    const run = try runs.claim(arena, io, data);
+    try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
+    std.debug.print("[determinismo] run {d}: {s} (scenario {s})\n", .{ run.id, run.directory, scenario });
+    try run_request_write(arena, io, data, run.directory, arguments);
+    try runs.running_mark(arena, run.directory);
+    // The record is opened once per run (command_explore): this one's anew.
+    if (report.record_fd) |fd| {
+        close(fd);
+        report.record_fd = null;
+    }
+    arguments.run_directory = run.directory;
+    arguments.events_directory = try std.fs.path.join(arena, &.{ run.directory, "events" });
+    arguments.record_path = try std.fs.path.join(arena, &.{ run.directory, "record.jsonl" });
+    arguments.tape_directory = try std.fs.path.join(arena, &.{ run.directory, "tapes" });
+}
+
 /// A run started here: what was asked (serve's request: the program kept by its content, as
 /// serve keeps it) and the machine it boots (its kernel and initramfs kept the same way).
 fn run_request_write(
@@ -608,6 +656,8 @@ fn run_request_write(
         .from_vtime_ms = arguments.from_vtime_ms,
         .cpu_modulation = arguments.cpu_modulation,
         .memory_mib = arguments.memory_mib,
+        .verify_replays = if (arguments.verify_every != verify_every_default) arguments.verify_every else null,
+        .priority = std.c.getenv("DETERMINISMO_CPU_PRIORITY") != null,
     };
     var machine: std.ArrayList([]const u8) = .empty;
     try machine.appendSlice(arena, &.{ "--kernel", try runs.artifact_keep(arena, io, data, arguments.kernel_path) });
@@ -2271,10 +2321,10 @@ const Running = struct { pid: linux.pid_t, results: linux.fd_t, place: Planned, 
 /// In a child just forked from the explorer: it dies with it. A worker left running after the
 /// explorer was interrupted keeps its VM, its CPU and its memory (an interrupted hunt on srv2
 /// left all twelve). The signal follows the forking thread: these forks are the main thread's.
-/// The kernel's OOM killer takes a timeline's process before the host's own (sshd, tailscaled,
-/// dbus, podman's pause process: a host OOM once took that last one, and no run could start a
-/// container after, srv3 2026-10-28) and before the explorer; holders go first of all
-/// (holders.zig). A timeline it kills runs again (timeline_wait).
+/// The kernel's OOM killer takes a timeline's process (or a replay's, or a future's) before the
+/// host's own (sshd, tailscaled, dbus, podman's pause process: a host OOM once took that last
+/// one, and no run could start a container after, srv3 2026-10-28) and before the explorer;
+/// holders go first of all (holders.zig). A timeline it kills runs again (timeline_wait).
 fn oom_before_the_host() void {
     const fd = linux.open("/proc/self/oom_score_adj", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
@@ -3905,6 +3955,8 @@ fn parse_option(
         arguments.timer_slack_us = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--events")) {
         arguments.events_path = value;
+    } else if (eql(u8, flag, "--faults-record")) {
+        arguments.faults_record_path = value;
     } else if (eql(u8, flag, "--events-dir")) {
         arguments.events_directory = value;
     } else if (eql(u8, flag, "--trace")) {

@@ -15,8 +15,9 @@
 //!   POST /runs               {program | compose, scenario?, profile?, seed?, branches?, jobs?,
 //!                             strategy?, from_branch?, from_vtime_ms?}  -> {id}
 //!   GET  /runs               every run: {id, state, scenario, system, from_branch}
-//!   GET  /runs/<id>          its state, its record (run, snapshot, summary, changed) and stats
-//!                             (timelines, failing_timelines, vtime_ns, wall_ns, behaviors, events)
+//!   GET  /runs/<id>          its state, its request (as asked, its seed drawn), its record (run,
+//!                             snapshot, summary, changed) and stats (timelines,
+//!                             failing_timelines, vtime_ns, wall_ns, behaviors, events)
 //!   GET  /runs/<id>/timelines  every finished timeline, with the properties it violates
 //!   GET  /runs/<id>/properties every property with its verdict across the timelines so far
 //!   GET  /runs/<id>/discovery  {points: [[timelines, behaviors], ...]}: new behavior discovery
@@ -28,7 +29,8 @@
 //!   GET  /runs/<id>/causality  every analysis: [{id, done, of: {branch, property, failure_ms,
 //!                            snapshot_ms, futures, planner}, points: [...]}]
 //!   GET  /runs/<id>/causality/<n>  one: {id, done, of, points: [{vtime_ms, futures, failing,
-//!                            probability, low, high}]}
+//!                            probability, low, high}], fault_effects?: {faults: [{fault, with,
+//!                            with_failing}], futures, failing}}
 //!   GET  /runs/<id>/timelines?offset=<n>  the timelines after the first n ingested
 //!   GET  /runs/<id>/failures  every failing evaluation, as map marks (JSON lines), kept
 //!   POST /runs/<id>/extract  {branch, at_vtime_ms, node, path} -> the file's bytes at that moment
@@ -947,6 +949,11 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const trimmed = std.mem.trim(u8, status, " \n");
         if (trimmed.len > 0 and trimmed[0] == '{') try out.print(",\"progress\":{s}", .{trimmed});
     } else |_| {};
+    // As asked (POST /runs, its seed drawn): what a run again starts from.
+    if (run_file(server, run.id, "request.json")) |request| {
+        const trimmed = std.mem.trim(u8, request, " \n");
+        if (trimmed.len > 0 and trimmed[0] == '{') try out.print(",\"request\":{s}", .{trimmed});
+    } else |_| {}
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
         for ([_][]const u8{ "run", "summary", "snapshot", "changed" }) |key| {
@@ -1426,7 +1433,15 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
         if (at > 0) try out.writeAll(",");
         try out.writeAll(line);
     }
-    try out.writeAll("]}");
+    try out.writeAll("]");
+    // The faults' effects on the futures, the latest count (causality.zig: one a round).
+    var effects: ?[]const u8 = null;
+    lines.reset();
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "{\"faults\":")) effects = line;
+    }
+    if (effects) |line| try out.print(",\"fault_effects\":{s}", .{line});
+    try out.writeAll("}");
 }
 
 /// Stops an analysis, and its futures: it runs in a session of its own (spawn), its futures in its

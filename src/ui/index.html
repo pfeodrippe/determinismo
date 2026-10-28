@@ -442,8 +442,9 @@ function render() {
     <div class="muted" id="run-times" style="margin-top:2px">${timesHtml()}</div>
     ${run.state === "running" ? `<div class="progress"><div style="width:${100 * progress()}%"></div></div>
       <div><button id="run-stop" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Stop this run: the timelines it explored so far stay">Stop run</button></div>` : ""}
-    ${run.state === "stopped" || run.state === "interrupted" ? `
-      <div><button id="run-resume" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Continue this run where it ended: the timelines it has stay, the others run">Resume run</button></div>` : ""}
+    ${run.state !== "running" ? `<div style="display:flex;gap:8px">
+      ${run.state === "stopped" || run.state === "interrupted" ? `<button id="run-resume" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Continue this run where it ended: the timelines it has stay, the others run">Resume run</button>` : ""}
+      ${run.request ? `<button id="run-again" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="A new run as this one was asked for: the same system, scenario and options, the host's current build of the program, a fresh seed">Run again</button>` : ""}</div>` : ""}
     <div class="tabs view-tabs"><button data-view="report" class="${state.view === "report" ? "on" : ""}">Report</button>
       <button data-view="notebook" class="${state.view === "notebook" ? "on" : ""}">Notebook</button></div>`;
   if (state.view === "notebook") {
@@ -504,6 +505,22 @@ function viewTabsWire() {
     await api(`/runs/${state.runId}/stop`, {}).catch(() => {});
     await runRefresh();
     runsRefresh();
+  });
+  // As asked, but its seed: serve draws a fresh one, and starts the program as asked (the
+  // host's build now, program_asked), not the copy this run kept.
+  const again = document.getElementById("run-again");
+  if (again) again.addEventListener("click", async () => {
+    again.disabled = true;
+    const asked = { ...state.run.request };
+    delete asked.seed;
+    try {
+      const created = await apiJson("/runs", asked);
+      await runsRefresh();
+      runOpen(created.id);
+    } catch (error) {
+      again.disabled = false;
+      again.title = error.message;
+    }
   });
 }
 
@@ -876,6 +893,15 @@ function causalityDraw(property) {
   box.innerHTML = causalityChart(analysis);
   box.querySelectorAll("[data-vtime]").forEach((target) => target.addEventListener("click", () =>
     logsOpen(analysis.branch, Number(target.dataset.vtime))));
+  const curlLink = box.querySelector(".causality-curl");
+  if (curlLink) curlLink.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const text = causalityCurl(analysis);
+    try { await clipboardWrite(text); curlLink.textContent = "copied"; }
+    catch { curlLink.textContent = "copy failed"; curlLink.title = text; }
+    setTimeout(() => { curlLink.textContent = "copy as curl"; }, 1500);
+  });
   // Zoom: drag across the chart for a range, a jump's "zoom" for its window, double click or
   // "whole timeline" back.
   const zoom = (view) => { analysis.view = view; causalityDraw(property); };
@@ -917,12 +943,40 @@ function faultName(event) {
   const kind = [d.kind, d.flavor].filter(Boolean).join(" ");
   return `${kind || "fault"}${d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}`;
 }
+// Text to the clipboard: the Clipboard API where the page is a secure context, else a selected
+// textarea and the copy command (serve is often reached over plain HTTP, at a Tailscale address,
+// where the API does not exist).
+async function clipboardWrite(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  if (!copied) throw new Error("copy failed");
+}
+// The analysis's request as a shell command: its branch, property, futures, planner and verdict,
+// the other parameters as the options now are (POST /runs/<id>/causality).
+function causalityCurl(analysis) {
+  const of = analysis.of || {};
+  const body = { branch: of.branch, property: of.property, futures: of.futures,
+    points: Number(causalityOptions.points), refine: Number(causalityOptions.refine),
+    jump_min: Number(causalityOptions.jump_min) };
+  if (of.planner && of.planner !== "built-in") body.planner = of.planner;
+  if (of.verdict) body.verdict = of.verdict;
+  const json = JSON.stringify(body).replace(/'/g, "'\\''");
+  return `curl -X POST ${location.origin}/runs/${analysis.run}/causality -H 'Content-Type: application/json' -d '${json}'`;
+}
 function causalityChart(analysis) {
   const of = analysis.of || {};
   const planner = of.planner && of.planner !== "built-in" ? ` · planner ${escape(of.planner)}` : "";
   const number = Number.isFinite(analysis.id) ? ` · analysis ${analysis.id}` : "";
   const automatic = analysis.automatic ? " · started on its first failure" : "";
-  const title = `<div class="group-title">Bug probability · branch ${analysis.branch}${planner}${number}${automatic}${analysis.done ? "" : " (running)"}</div>`;
+  const curl = of.property ? ` · <a href="#" class="causality-curl" data-tip="Copy the HTTP request that starts this analysis again (curl)">copy as curl</a>` : "";
+  const title = `<div class="group-title">Bug probability · branch ${analysis.branch}${planner}${number}${automatic}${analysis.done ? "" : " (running)"}${curl}</div>`;
   const points = [...analysis.points].sort((x, y) => x.vtime_ms - y.vtime_ms);
   if (!points.length) return title + `<div class="muted">${analysis.done ? "The property did not fail again in this timeline's replay."
     : "Saving the timeline's moments to disk, then forking futures from each…"}</div>`;
@@ -994,7 +1048,26 @@ function causalityChart(analysis) {
   const plotted = svg.replaceAll("data-clip", 'clip-path="url(#causality-clip)"');
   return title + `<svg class="causality-chart" viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;user-select:none"
     data-width="${W}" data-left="${L}" data-right="${W - R}" data-x0="${x0}" data-x1="${x1}">${clip}${plotted}</svg>` + legend + zoomed + list +
+    causalityEffects(analysis) +
     `<div class="muted">Each point: its futures forked from a snapshot of the timeline saved there. A jump means the timeline made the bug likely inside it: click it for the logs up to there. Drag across the chart to zoom, double click to see it all.</div>`;
+}
+// The faults the futures went through, by how much more often futures with one failed than those
+// without (causality.zig counts them): which faults make the bug more likely.
+function causalityEffects(analysis) {
+  const effects = analysis.fault_effects;
+  if (!effects || !effects.faults || !effects.faults.length || !effects.futures) return "";
+  const rows = effects.faults.slice(0, 8).map((entry) => {
+    const withRate = entry.with_failing / entry.with;
+    const without = effects.futures - entry.with;
+    const withoutRate = without > 0 ? (effects.failing - entry.with_failing) / without : 0;
+    return { ...entry, withRate, withoutRate };
+  }).filter((entry) => entry.withRate - entry.withoutRate >= 0.1);
+  if (!rows.length) return `<div class="muted" style="margin:6px 0">No fault the futures went through makes the failure clearly more likely (${effects.futures} futures).</div>`;
+  const percent = (rate) => `${Math.round(rate * 100)}%`;
+  return `<div class="group-title" style="margin-top:8px">Faults that make the failure more likely</div>
+    <table class="mono" style="font-size:12px"><tr><th>Fault (after the moment)</th><th>Futures with it failing</th><th>Without it</th></tr>
+    ${rows.map((entry) => `<tr><td>${escape(entry.fault)}</td><td>${percent(entry.withRate)} (${entry.with_failing} of ${entry.with})</td>
+      <td class="muted">${percent(entry.withoutRate)}</td></tr>`).join("")}</table>`;
 }
 
 // Tooltips: any element with data-tip (HTML) shows it in one styled tooltip near the pointer.

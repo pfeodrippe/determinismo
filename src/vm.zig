@@ -120,6 +120,9 @@ stats: Stats,
 /// idle skips and guest requests, each with branch count and RIP. Diffing two traces finds the
 /// first divergence of two runs.
 trace_fd: ?linux.fd_t,
+/// The faults the timeline went through (det-faults' fault events), one JSON line each: what
+/// causality relates to its futures' failures.
+faults_record_fd: ?linux.fd_t,
 rdtsc_log_fd: ?linux.fd_t,
 rdtsc_log_cap: u32,
 itrace_fd: ?linux.fd_t,
@@ -158,6 +161,8 @@ pub const Options = struct {
     seed: u64,
     /// Where to append the guest's events as JSON lines.
     events_fd: ?linux.fd_t,
+    /// Where to append its fault events only (causality's futures: `--faults-record`).
+    faults_record_fd: ?linux.fd_t = null,
     /// Scratch memory for parsing guest events, reserved once by the caller (see events.zig).
     events_parse_buffer: []u8,
     trace_fd: ?linux.fd_t = null,
@@ -326,6 +331,7 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
         vm.modulation = if (options.from_hold != null) snapshot.modulation.? else .{};
     }
     vm.events.log_fd = options.events_fd;
+    vm.faults_record_fd = options.faults_record_fd;
     vm.events.retroactive = options.retroactive;
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
     vm.last_pull_ns = 0;
@@ -424,6 +430,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .events = undefined,
         .stats = .{},
         .trace_fd = options.trace_fd,
+        .faults_record_fd = options.faults_record_fd,
         .rdtsc_log_fd = options.rdtsc_log_fd,
         .rdtsc_log_cap = options.rdtsc_log_cap,
         .itrace_fd = options.itrace_fd,
@@ -1171,6 +1178,10 @@ fn handle_request(vm: *VM, address: u32) !void {
             while (lines.next()) |line| {
                 vm.decision_note(line, source);
                 try vm.events.emit(moment_now, line);
+                if (vm.faults_record_fd) |fd| if (std.mem.startsWith(u8, line, "{\"event\":\"fault\",")) {
+                    _ = linux.write(fd, line.ptr, line.len);
+                    _ = linux.write(fd, "\n", 1);
+                };
                 try vm.checkpoint(moment_now);
                 if (vm.until != null and !vm.until_hit and !vm.moment_reached) {
                     vm.until_hit = vm.until_matches(moment_now, line);
