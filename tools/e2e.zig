@@ -2075,7 +2075,7 @@ fn check_durability(context: *Context) !void {
         "a crash just before a sync loses the write",
         "a crash just after a sync keeps the write",
         "a write crashed at its sync never returns",
-        "after a crash at two durability points at once, the disk keeps what is synced",
+        "after a crash at a durability point, the disk keeps what is synced next",
     };
     var lines: [properties.len + 1][]const u8 = undefined;
     lines[0] = "2 branches, 0 with failing properties";
@@ -2096,8 +2096,8 @@ fn check_durability(context: *Context) !void {
         .{ "every durability property passes in both timelines", passes },
         .{ "a timeline replays exactly", same },
     }, "durability points: a stall holds a node's syncs; a crash just before a sync loses the " ++
-        "write, just after keeps it; two at once crash once, the disk storing writes after; a " ++
-        "timeline replays exactly", .{});
+        "write, just after keeps it, and the disk stores what is synced next; a timeline replays " ++
+        "exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});

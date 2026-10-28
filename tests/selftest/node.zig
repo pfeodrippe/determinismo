@@ -42,8 +42,13 @@ pub fn main(init: std.process.Init) !void {
         linux.exit_group(0);
     }
     if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "write2")) {
-        const other = try std.Thread.spawn(.{}, synced_write_or_exit, .{arguments[3]});
-        synced_write(arguments[2], "written\n") catch linux.exit_group(1);
+        // Both written first, then synced together: the two syncs reach the guest module at
+        // once, before the first one's crash freezes the node.
+        const first = try file_create(arguments[2], "written\n");
+        const second = try file_create(arguments[3], "written\n");
+        const other = try std.Thread.spawn(.{}, fsync_at_start, .{second});
+        while (!started.load(.acquire)) {}
+        _ = linux.fsync(first);
         other.join();
         linux.exit_group(0);
     }
@@ -98,8 +103,11 @@ fn synced_write(path: [*:0]const u8, content: []const u8) !void {
     if (linux.errno(linux.fsync(@intCast(directory))) != .SUCCESS) return error.Fsync;
 }
 
-fn synced_write_or_exit(path: [*:0]const u8) void {
-    synced_write(path, "written\n") catch linux.exit_group(1);
+var started: std.atomic.Value(bool) = .init(false);
+
+fn fsync_at_start(fd: linux.fd_t) void {
+    started.store(true, .release);
+    _ = linux.fsync(fd);
 }
 
 fn file_create(path: [*:0]const u8, content: []const u8) !linux.fd_t {

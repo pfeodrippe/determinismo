@@ -404,7 +404,9 @@ fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
         try mapper_table(try mapper_name(&name_buffer, node.name), try disk_table_now(paths, loop, &record_buffer, &parameters_buffer));
         _ = linux.unlink(paths.dropping);
     }
-    sdk.always(!dropping, "a node's disk is never left dropping writes", .{ .node = node.name });
+    // Computed, as determinismo's other properties: not in the catalog, so a run whose nodes
+    // have no such disk does not list it as never reached.
+    sdk.assert_computed(.always, !dropping, "a node's disk is never left dropping writes", .{ .node = node.name });
     var device_buffer: [32]u8 = undefined;
     const device = try print_z(&device_buffer, "/dev/dm-{d}", .{minor});
     try device_wait(device);
@@ -914,6 +916,36 @@ pub fn freeze(name: []const u8, state: enum { frozen, thawed }) !void {
     var paths: Paths = undefined;
     try paths.init(name);
     try file_write(paths.cgroup_freeze, if (state == .frozen) "1" else "0");
+}
+
+/// What a fault may have left on a node once faults stop, or "" for nothing: its cgroup frozen,
+/// a thread stopped (SIGSTOP), its disk dropping writes. A fault's effect outliving it made two
+/// false findings (srv3, 2026-10-28: a node cut from its own address, a disk left dropping
+/// writes); faults.zig checks every node at the stop.
+pub fn leftover(name: []const u8) []const u8 {
+    if (state_of(name) == .paused) return "its cgroup frozen";
+    var paths: Paths = undefined;
+    paths.init(name) catch return "";
+    if (exists(paths.dropping)) return "its disk dropping writes";
+    var pids: [1024]linux.pid_t = undefined;
+    const count = processes(name, &pids) catch return "";
+    for (pids[0..count]) |pid| {
+        var tids: [1024]linux.pid_t = undefined;
+        for (tids[0..threads(pid, &tids)]) |tid| {
+            if (thread_stopped(pid, tid)) return "a thread stopped";
+        }
+    }
+    return "";
+}
+
+/// Whether a thread is stopped by a signal ('T' in its stat, after the command's parenthesis).
+fn thread_stopped(pid: linux.pid_t, tid: linux.pid_t) bool {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/task/{d}/stat", .{ pid, tid }, 0) catch return false;
+    var buffer: [512]u8 = undefined;
+    const text = read_small(path, &buffer) orelse return false;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+    return close + 2 < text.len and text[close + 2] == 'T';
 }
 
 pub const State = enum { running, paused, stopped };

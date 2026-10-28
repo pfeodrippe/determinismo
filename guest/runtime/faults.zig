@@ -268,9 +268,33 @@ pub fn main(init: std.process.Init) !void {
     busy_begin();
     node_heal(&system);
     network_stop(&system);
+    leftovers_check(&system);
     busy_end();
     watchdog_finish();
     sdk.event("faults_stop", .{ .injections = injections });
+}
+
+/// Once faults stop, nothing of them lasts: what the system does after (its recovery, the
+/// eventually commands) is its own. Each node's state as the kernel has it (nodes.leftover), and
+/// the injector's own: no durability point armed, no link down or degraded beyond the baseline.
+fn leftovers_check(system: *const schema.System) void {
+    for (system.nodes, 0..) |node, index| {
+        const node_left = nodes.leftover(node.name);
+        const armed = durable_active[index];
+        const left = if (node_left.len > 0) node_left else if (armed) "a durability point armed" else "";
+        sdk.assert_computed(.always, left.len == 0, "faults leave nothing behind once they stop", .{
+            .node = node.name,
+            .left = left,
+        });
+    }
+    var links_down: u32 = 0;
+    for (network.down) |row| {
+        for (row) |down| links_down += @intFromBool(down);
+    }
+    sdk.assert_computed(.always, links_down == 0 and network.count == 0, "faults leave nothing behind once they stop", .{
+        .node = "",
+        .left = if (links_down > 0) "links down" else if (network.count > 0) "network faults under way" else "",
+    });
 }
 
 /// A stretch of the pacing, drawn from a tenth of `max_ms` up to it.
@@ -477,6 +501,7 @@ fn run_script(
     }
     node_heal(system);
     network_stop(system);
+    leftovers_check(system);
     sdk.event("faults_stop", .{ .injections = injections, .script = true });
 }
 
@@ -1222,7 +1247,10 @@ fn durable_listen() void {
         if (!durable_active[node[1]]) continue; // Its fault ended: disarmed, nothing parked.
         // Crashed already during this fault (two of its threads were parked at durability
         // points): it is down until the fault's end starts it again.
-        if (durable_crashed[node[1]]) continue;
+        if (durable_crashed[node[1]]) {
+            sdk.event("durable_crash_again", .{ .node = node[0], .pid = request.pid });
+            continue;
+        }
         sdk.event("durable_crash", .{
             .node = node[0],
             .process = std.mem.sliceTo(&request.comm, 0),
