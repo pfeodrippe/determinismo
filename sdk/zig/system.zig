@@ -340,6 +340,11 @@ pub fn System(comptime Nodes: type) type {
                 target.* = try Self.profile_convert(arena, source);
             }
             const scenario_names = comptime std.meta.fieldNames(@TypeOf(definition.scenarios));
+            comptime for (scenario_names) |name| {
+                // `--scenario all` explores every scenario: one named so would never run alone.
+                if (std.mem.eql(u8, name, "all")) @compileError("a scenario cannot be named " ++
+                    "\"all\": --scenario all explores every scenario");
+            };
             var scenarios: [scenario_names.len]schema.Scenario = undefined;
             inline for (scenario_names, 0..) |name, index| {
                 const scenario = try arena.create(Scenario);

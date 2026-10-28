@@ -23,7 +23,10 @@ specification's errors as values); a panic in the Rust evaluator is one too (the
 them to report their seed); a sample's trace has at most max-steps + 1 states; a violation names
 an invariant it violates.
 
-    determinismo explore ... --memory-mib 4096 --program zig-out/bin/quint-test --scenario all
+    determinismo explore ... --memory-mib 4096 --program zig-out/bin/quint-test --scenario mixed
+
+(`mixed` draws each request among the four checks; `--scenario all` explores each scenario in
+turn.)
 
 ## Found while building it (v0.33.0, evaluator v0.7.0)
 

@@ -8,9 +8,10 @@
 //! Scenarios: `eval` (generated expressions on both backends: the same value, or Rust's
 //! documented 64-bit limit), `simulate` (the same seed, the same simulation), `test` (the
 //! examples' tests pass on both backends), `typecheck` (mutated specifications: an answer, the
-//! same twice, never an internal error). `--scenario all` explores them all.
+//! same twice, never an internal error). `mixed`: every check, each request a decision among
+//! them; `--scenario all` explores each scenario in turn.
 //!
-//!   determinismo explore ... --memory-mib 4096 --program zig-out/bin/quint-test --scenario all
+//!   determinismo explore ... --memory-mib 4096 --program zig-out/bin/quint-test --scenario mixed
 const std = @import("std");
 const sdk = @import("determinismo");
 
@@ -31,7 +32,8 @@ pub fn main(init: std.process.Init) !void {
         .simulate = Check(&.{"simulate"}).scenario,
         .@"test" = Check(&.{"test"}).scenario,
         .typecheck = Check(&.{"typecheck"}).scenario,
-        .all = Check(&.{ "eval", "simulate", "test", "typecheck" }).scenario,
+        // Every check in each timeline (`--scenario all` is every scenario, each on its own).
+        .mixed = Check(&.{ "eval", "simulate", "test", "typecheck" }).scenario,
     } });
 }
 
