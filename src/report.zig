@@ -369,6 +369,9 @@ pub const Multiverse = struct {
             .path = branch.path,
             .generation = branch.generation,
             .why = branch.why,
+            // What judges logging volume (logging_judge), for serve's properties too.
+            .output_bytes = vm.events.output_bytes,
+            .output_span_ns = vm.events.output_span_ns(state.tsc / tsc_per_ns),
         };
         record(.{ .branch = timeline });
         if (timelines_fd) |fd| line_write(fd, timeline);

@@ -26,7 +26,7 @@ pub const duckdb = @import("duckdb.zig");
 
 pub const file_name = "events.duckdb";
 /// The tables' shape: a database of another version is rebuilt from the files.
-const schema_version = 3;
+const schema_version = 4;
 
 /// Paths of the events' JSON that searches read most (the UI's): kept as columns, their text
 /// (`->>`) and their JSON type, which a condition reads instead of parsing every event
@@ -160,6 +160,16 @@ fn schema_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
     const asked = "SELECT version FROM schema_version";
     const known = connection.row(Version, arena, asked, .{}) catch null;
     if (known) |found| if (found.version == schema_version) return;
+    // Version 3 lacks only the timelines' output (the logging property): added in place, its
+    // timelines' left empty (a rebuild would ingest every run's events again, gigabytes).
+    if (known) |found| if (found.version == 3) {
+        try connection.exec(
+            \\ALTER TABLE timelines ADD COLUMN output_bytes UBIGINT;
+            \\ALTER TABLE timelines ADD COLUMN output_span_ns UBIGINT;
+            \\UPDATE schema_version SET version = 4;
+        );
+        return;
+    };
     // Another version (or none): rebuilt, then ingested again from the files.
     try connection.exec(
         \\DROP VIEW IF EXISTS timeline_events;
@@ -171,7 +181,7 @@ fn schema_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
 }
 
 const schema_sql =
-    \\CREATE TABLE schema_version AS SELECT 3 AS version;
+    \\CREATE TABLE schema_version AS SELECT 4 AS version;
     \\CREATE MACRO categorical(j, path) AS
     \\    CASE WHEN json_type(j, path) IN ('VARCHAR', 'BOOLEAN') THEN j ->> path END;
     \\CREATE TABLE events (
@@ -207,7 +217,9 @@ const schema_sql =
     \\    why VARCHAR,
     \\    parent UINTEGER,
     \\    start_ns UBIGINT,
-    \\    path JSON
+    \\    path JSON,
+    \\    output_bytes UBIGINT,
+    \\    output_span_ns UBIGINT
     \\);
     \\CREATE TABLE steps (
     \\    branch UINTEGER, step UINTEGER, ancestor UINTEGER, from_ns UBIGINT, to_ns UBIGINT
@@ -325,7 +337,8 @@ pub fn ingest(
         \\read_json({s}, format = 'newline_delimited', columns = {{
         \\    "index": 'UINTEGER', seed: 'VARCHAR', outcome: 'VARCHAR', vtime_ns: 'UBIGINT',
         \\    wall_ns: 'UBIGINT', events: 'UBIGINT', events_hash: 'VARCHAR', generation: 'UINTEGER',
-        \\    why: 'VARCHAR', path: 'STRUCT(branch UINTEGER, seed UBIGINT, vtime_ns UBIGINT)[]'}})
+        \\    why: 'VARCHAR', path: 'STRUCT(branch UINTEGER, seed UBIGINT, vtime_ns UBIGINT)[]',
+        \\    output_bytes: 'UBIGINT', output_span_ns: 'UBIGINT'}})
     , .{timelines});
     const Arrived = struct { index: u32 };
     const arrived = try connection.rows(Arrived, arena, try std.fmt.allocPrintSentinel(arena,
@@ -392,7 +405,7 @@ pub fn ingest(
         \\        any_value(wall_ns),
         \\        any_value(events), any_value(events_hash), any_value(generation), any_value(why),
         \\        any_value(path[-1].branch), coalesce(any_value(path[-1].vtime_ns), 0),
-        \\        any_value(path)::JSON
+        \\        any_value(path)::JSON, any_value(output_bytes), any_value(output_span_ns)
         \\    FROM {s} WHERE "index" IN ({s}) GROUP BY "index";
     , .{ timelines_read, indices.written(), timelines_read, indices.written() }, 0));
     try connection.exec("COMMIT");
@@ -504,6 +517,14 @@ pub const properties_sql =
     \\    min(timeline) FILTER (WHERE NOT same), NULL, min(timeline), count(*),
     \\    count(*) FILTER (WHERE same), 'replays.zig'
     \\FROM replays HAVING count(*) > 0
+    \\UNION ALL
+    \\-- Logging volume over all the timelines (report.logging_judge: 200 MB an hour of virtual
+    \\-- time, a run's property that no timeline fails alone).
+    \\SELECT 'always', 'logging output stays under 200 MB per hour of virtual time',
+    \\    CASE WHEN sum(output_bytes) * 3600000000000 >= 200000000 * sum(output_span_ns)
+    \\        AND sum(output_span_ns) >= 1000000000 THEN 'failing' ELSE 'passing' END,
+    \\    count(*), count(*), 0, NULL, NULL, min(branch), count(*), count(*), 'report.zig'
+    \\FROM timelines HAVING count(output_span_ns) > 0
     \\)
     \\SELECT * FROM listed
     \\ORDER BY status = 'failing' DESC, timelines_failing DESC, message
@@ -761,4 +782,54 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
     try testing.expectEqual(Point{ .timelines = 1, .behaviors = 4 }, points[0]);
     try testing.expectEqual(Point{ .timelines = 2, .behaviors = 5 }, points[1]);
     try testing.expectEqual(Point{ .timelines = 3, .behaviors = 5 }, points[2]);
+
+    // Logging volume, a run's property: the timelines' output over their output span. These
+    // timelines had no such fields (older lines): no row. Timeline 4 logs 2 GB in an hour:
+    // over 200 MB an hour, the run fails it (no timeline alone).
+    const logging = "logging output stays under 200 MB per hour of virtual time";
+    const before = try connection.rows(Property, arena,
+        \\SELECT type, message, status, timelines_failing, first_failing_timeline FROM (
+    ++ properties_sql ++
+        \\) WHERE message LIKE 'logging output%'
+    , .{});
+    try testing.expectEqual(0, before.len);
+    const loud = comptime more ++
+        "{\"index\":4,\"outcome\":\"shutdown\",\"vtime_ns\":3600000000000,\"wall_ns\":10,\"path\":[]," ++
+        "\"output_bytes\":2000000000,\"output_span_ns\":3600000000000}\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = loud });
+    try testing.expectEqual(1, try ingest(&connection, arena, io, directory));
+    const after = try connection.rows(Property, arena,
+        \\SELECT type, message, status, timelines_failing, first_failing_timeline FROM (
+    ++ properties_sql ++
+        \\) WHERE message LIKE 'logging output%'
+    , .{});
+    try testing.expectEqual(1, after.len);
+    try testing.expectEqualStrings(logging, after[0].message);
+    try testing.expectEqualStrings("failing", after[0].status);
+    try testing.expectEqual(0, after[0].failing);
+}
+
+test "a version 3 database gains the timelines' output in place" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var failure: duckdb.Failure = .{};
+    var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
+    defer database.close();
+    var connection = try database.connect(&failure);
+    defer connection.close();
+    try schema_ensure(&connection, arena);
+    // As version 3 left it: a timeline, no output columns.
+    try connection.exec(
+        \\ALTER TABLE timelines DROP COLUMN output_bytes;
+        \\ALTER TABLE timelines DROP COLUMN output_span_ns;
+        \\UPDATE schema_version SET version = 3;
+        \\INSERT INTO timelines (branch, outcome) VALUES (7, 'shutdown');
+    );
+    try schema_ensure(&connection, arena);
+    const Kept = struct { branch: u32, version: u32, output: ?u64 };
+    const kept = (try connection.row(Kept, arena,
+        \\SELECT branch, (SELECT version FROM schema_version), output_bytes FROM timelines
+    , .{})).?;
+    try testing.expectEqual(Kept{ .branch = 7, .version = 4, .output = null }, kept);
 }
