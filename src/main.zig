@@ -171,6 +171,9 @@ const Arguments = struct {
     initrd_path: ?[]const u8 = null,
     memory_mib: u32 = 1024,
     cmdline: []const u8 = cmdline_default,
+    /// The command line as given (--cmdline, --append), before --deterministic adds its own:
+    /// what a run keeps (machine.json) for its replays, which add them again.
+    cmdline_given: []const u8 = cmdline_default,
     deterministic: bool = false,
     seed: u64 = 0,
     margin_branches: u32 = 128,
@@ -663,7 +666,7 @@ fn run_request_write(
     try machine.appendSlice(arena, &.{ "--kernel", try runs.artifact_keep(arena, io, data, arguments.kernel_path) });
     if (arguments.initrd_path) |path| try machine.appendSlice(arena, &.{ "--initrd", try runs.artifact_keep(arena, io, data, path) });
     try machine.appendSlice(arena, &.{
-        "--cmdline",    arguments.cmdline,
+        "--cmdline",    arguments.cmdline_given,
         "--cache",      try runs.absolute(arena, arguments.cache_directory),
         "--memory-mib", try std.fmt.allocPrint(arena, "{d}", .{arguments.memory_mib}),
     });
@@ -3946,6 +3949,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.save_directory != null or arguments.rewind_ms != null;
         if (elsewhere or arguments.branching == .tree) return error.Usage;
     }
+    arguments.cmdline_given = arguments.cmdline;
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };
         arguments.cmdline = try std.mem.join(arena, " ", &parts);

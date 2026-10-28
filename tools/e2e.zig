@@ -738,13 +738,24 @@ fn check_runs(context: *Context) !void {
     }
     const timelines = curl(context, &.{url ++ "/runs/1/timelines"}) catch "";
     const logged = cwd.readFileAlloc(context.io, try std.fs.path.join(arena, &.{ data, "runs", "1", "output.log" }), arena, .limited(1 << 24)) catch "";
+    // Replayed through serve from what the run kept (machine.json, request.json, its tape): the
+    // same timeline. A terminal's command line was kept with --deterministic's part, which the
+    // replay added again: other inputs, and the tape refused (srv3, Quint run 32).
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(output, &branches);
+    const asked = try std.fmt.allocPrint(arena, "{{\"branch\":{d}}}", .{if (count > 0) branches[0].index else 0});
+    const replay = curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs/1/replay" }) catch "";
+    var replayed: [1]Branch = undefined;
+    const same = count > 0 and parse_branches(replay, &replayed) == 1 and
+        std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
     expect_all(context, &.{
         .{ "the exploration claimed run 1", claimed },
         .{ "serve shows it failed", std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null },
         .{ "serve lists its 8 timelines", std.mem.count(u8, timelines, "\"index\"") == 8 },
         .{ "its output.log has its timelines", std.mem.indexOf(u8, logged, "[branch") != null },
+        .{ "serve replays one from what the run kept, the same", same },
     }, "runs: an exploration at a terminal is run 1 of the host's, in serve with its 8 timelines " ++
-        "and its output, failed as it ended", .{});
+        "and its output, failed as it ended, replayed by serve", .{});
     // Another, long, which serve stops.
     var command: std.ArrayList(u8) = .empty;
     try command.print(arena, "exec '{s}' explore", .{context.determinismo});
