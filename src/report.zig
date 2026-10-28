@@ -197,6 +197,27 @@ test property_failing {
     try std.testing.expect(!property_failing(.sometimes, one_true));
 }
 
+/// A `sometimes` that passed but held in under 5% of 100 timelines or more. Such properties
+/// often mark the workload's progress ("a transaction committed"): when one is that rare, the
+/// system hardly ever got there (faults too dense to recover from, a setup that did not make it
+/// ready), and every other property was judged on timelines that did nothing. Kafka's run 56
+/// committed in 9 timelines of 508 and passed; on srv3's runs of 100 timelines or more (Dgraph,
+/// PostgreSQL, Galera, Kafka, a Compose project) only Kafka's had any.
+pub const rare_branches_min = 100;
+
+pub fn rarely_true(kind: Events.Kind, branches_true: u32, branches: u32) bool {
+    return kind == .sometimes and branches >= rare_branches_min and branches_true > 0 and
+        @as(u64, branches_true) * 20 < branches;
+}
+
+test rarely_true {
+    try std.testing.expect(rarely_true(.sometimes, 9, 508));
+    try std.testing.expect(!rarely_true(.sometimes, 26, 508)); // Over 5%.
+    try std.testing.expect(!rarely_true(.sometimes, 0, 523)); // Failing, not rare.
+    try std.testing.expect(!rarely_true(.sometimes, 1, 64)); // Too few timelines to say.
+    try std.testing.expect(!rarely_true(.always, 1, 523));
+}
+
 const logging_property = "logging output stays under 200 MB per hour of virtual time";
 pub const replays_property = "timelines replay to their recorded history";
 const logging_bytes_per_hour_max = 200 * 1000 * 1000;
@@ -475,6 +496,16 @@ pub const Multiverse = struct {
             const where = aggregate.property.where();
             if (where.len > 0) print("  at {s}", .{where});
             print("\n", .{});
+        }
+        for (multiverse.aggregates[0..multiverse.aggregate_count]) |*aggregate| {
+            if (aggregate.unreached_here() or aggregate.failing()) continue;
+            const kind = aggregate.property.kind;
+            if (!rarely_true(kind, aggregate.branches_true, multiverse.branches)) continue;
+            print("[determinismo] rarely true: \"{s}\" held in {d} of {d} timelines: if it marks " ++
+                "the workload's progress, the system hardly ever got there (faults too dense to " ++
+                "recover from? a setup that left it unready?)\n", .{
+                aggregate.property.name(), aggregate.branches_true, multiverse.branches,
+            });
         }
         print("[determinismo] exact stops: largest skid {d} branches, {d} overshoots, {d} " ++
             "counter throttles restarted, {d} reached at another exit; XINUSE restored {d} times " ++

@@ -716,11 +716,11 @@ function propertiesSummary() {
 function propertiesBody() {
   const list = properties();
   const passed = list.filter((p) => !isFailing(p)).length;
-  const counts = { all: list.length, passed, failed: list.length - passed };
-  const tabs = ["all", "passed", "failed"].map((tab) =>
+  const counts = { all: list.length, passed, failed: list.length - passed, rare: list.filter(rarelyTrue).length };
+  const tabs = ["all", "passed", "failed", "rare"].filter((tab) => tab !== "rare" || counts.rare).map((tab) =>
     `<button data-tab="${tab}" class="${state.tab === tab ? "on" : ""}">${tab[0].toUpperCase() + tab.slice(1)} ${counts[tab]}</button>`).join("");
-  const shown = list.filter((p) => (state.tab === "all" || (state.tab === "passed") === !isFailing(p))
-    && p.message.toLowerCase().includes(state.filter.toLowerCase()));
+  const inTab = (p) => state.tab === "all" || (state.tab === "rare" ? rarelyTrue(p) : (state.tab === "passed") === !isFailing(p));
+  const shown = list.filter((p) => inTab(p) && p.message.toLowerCase().includes(state.filter.toLowerCase()));
   const command = (p) => p.message.startsWith("test command ");
   const own = (p) => !isBuiltin(p.message) && !command(p);
   const groups = [
@@ -735,10 +735,19 @@ function propertiesBody() {
     ${groups.map(([title, items]) => `<div class="group-title">${title}</div>${items.map(propertyHtml).join("")}`).join("")
       || `<div class="empty">No properties ${state.run.state === "running" ? "yet" : ""}</div>`}`;
 }
+// A sometimes that passed in under 5% of 100 timelines or more (report.zig's rarely_true): when
+// it marks the workload's progress, the system hardly ever got there.
+function rarelyTrue(property) {
+  const timelines = (state.run.branches || []).length;
+  return property.kind === "sometimes" && !isFailing(property) && timelines >= 100
+    && property.branches_true > 0 && property.branches_true * 20 < timelines;
+}
 function propertyHtml(property) {
   const failed = isFailing(property);
+  const rare = rarelyTrue(property);
   const badge = failed ? `<span class="badge fail">failed</span>`
     : property.status === "unreached" ? `<span class="badge error" title="Never reached in this run's scenario: judged across scenarios">unreached</span>`
+    : rare ? `<span class="badge error" title="Held in under 5% of the timelines: if it marks the workload's progress, the system hardly ever got there (faults too dense to recover from? a setup that left it unready?)">rare</span>`
     : `<span class="badge pass">passed</span>`;
   return `<div class="property" data-message="${escape(property.message)}" data-kind="${escape(property.kind)}">
     <div class="row">${badge}
