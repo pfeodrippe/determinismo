@@ -1,0 +1,10 @@
+{
+  "name": "determinismo",
+  "version": "0.1.0",
+  "description": "determinismo SDK for JavaScript and TypeScript: assertions, events and platform randomness",
+  "license": "MIT",
+  "main": "determinismo.js",
+  "types": "determinismo.d.ts",
+  "files": ["determinismo.js", "determinismo.d.ts"],
+  "engines": { "node": ">=18" }
+}
