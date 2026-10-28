@@ -915,7 +915,8 @@ function causalityChart(analysis) {
   const of = analysis.of || {};
   const planner = of.planner && of.planner !== "built-in" ? ` · planner ${escape(of.planner)}` : "";
   const number = Number.isFinite(analysis.id) ? ` · analysis ${analysis.id}` : "";
-  const title = `<div class="group-title">Bug probability · branch ${analysis.branch}${planner}${number}${analysis.done ? "" : " (running)"}</div>`;
+  const automatic = analysis.automatic ? " · started on its first failure" : "";
+  const title = `<div class="group-title">Bug probability · branch ${analysis.branch}${planner}${number}${automatic}${analysis.done ? "" : " (running)"}</div>`;
   const points = [...analysis.points].sort((x, y) => x.vtime_ms - y.vtime_ms);
   if (!points.length) return title + `<div class="muted">${analysis.done ? "The property did not fail again in this timeline's replay."
     : "Saving the timeline's moments to disk, then forking futures from each…"}</div>`;

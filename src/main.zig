@@ -44,7 +44,9 @@ const usage =
     \\                            causality analyses: removed when none was saved for that long;
     \\                            24 by default) [--no-failure-snapshots]   (by default each
     \\                            failing property's first failing timeline is saved to disk as
-    \\                            soon as it is found, unless the explorer's ladder did) <machine options>
+    \\                            soon as it is found, unless the explorer's ladder did)
+    \\                            [--failure-analysis]   (each analyzed at once, in the background,
+    \\                            on 4 CPUs beside the runs) <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
     \\       determinismo verify  <explore options> --record <run.jsonl> --tape-dir <dir>
     \\                            [--sample <n>] [--jobs <n>]   (a sample of a run's timelines
@@ -624,6 +626,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var archive: ?[]const u8 = null;
     var snapshots_keep_hours: u64 = 24;
     var failure_snapshots = true;
+    var failure_analysis = false;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -644,6 +647,8 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
             index += 1;
         } else if (std.mem.eql(u8, flag, "--no-failure-snapshots")) {
             failure_snapshots = false;
+        } else if (std.mem.eql(u8, flag, "--failure-analysis")) {
+            failure_analysis = true;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
             explorer = value; // Self-tests: a stand-in for `determinismo explore`.
             index += 1;
@@ -666,6 +671,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         .bb = bb,
         .snapshots_keep_ns = snapshots_keep_hours * std.time.ns_per_hour,
         .failure_snapshots = failure_snapshots,
+        .failure_analysis = failure_analysis,
     });
 }
 

@@ -90,8 +90,9 @@ event hashing, the guest module.
     reprogram, not two.
   - First failures on disk at once: the explorer's ladder (the timeline's holders), or, when no
     holders could be made (a big system's memory), serve's save-only replay on one CPU; an
-    analysis from the page starts from them. (Analyzing every first failure automatically, beside
-    the hunt, was tried and dropped: four cores of the hunt for curves nobody may look at.)
+    analysis from the page starts from them. Analyzing every first failure automatically, beside
+    the hunt, is `serve --failure-analysis`, off by default (four cores of the hunt for curves
+    nobody may look at); our hosts leave it off.
   - Deadlock found by the tree e2e on a pool of two CPUs: the explorer waited for a holder that
     waited for a CPU, both CPUs held by a node maker and a holder blocked writing answers (1.3 MB
     snapshots) the explorer had not read yet. Makers and holders now give their CPU back before
