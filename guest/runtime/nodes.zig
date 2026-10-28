@@ -159,6 +159,7 @@ pub fn exec(
         .env = node.env,
         .workdir = node.workdir,
         .user = node.user,
+        .ulimits = node.ulimits, // As docker exec: the container's limits.
     };
     var paths: Paths = undefined;
     try paths.init(node.name);
