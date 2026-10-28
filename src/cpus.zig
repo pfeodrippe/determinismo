@@ -15,8 +15,12 @@
 //! process's to run on (an affinity mask that leaves it out).
 //!
 //! A process with `DETERMINISMO_CPU_PRIORITY` set (checks, e.g. `zig build e2e`) goes first: while
-//! one waits it holds a shared lock on the pool's `priority` file, and the others leave the next
-//! free CPU to it. Exploration runs never have to stop for a check.
+//! one waits it holds a shared lock on the `priority-<cpu>` file of each CPU it may run on, and
+//! the others leave those CPUs to it when they come free. Only those: a check confined to cores
+//! of its own (a host's reserved cores, infra/host/serve.sh) never holds back a hunt on the rest.
+//!
+//! The memory a VM claims counts on the whole host, whatever CPUs a process may run on: a hunt
+//! and a check on cores of their own still share one memory.
 //!
 //! Runs share the host: one process of a run waits for a CPU at a time (the others queue on the
 //! run's `run-<key>.turn` lock), and the waiting runs are served at random (each tries again after
@@ -26,6 +30,7 @@
 //! time while other runs' waiters slept 100 ms; and served at random, runs got CPUs in
 //! proportion to their waiting processes: one run with 300 held most of the host.)
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
@@ -59,14 +64,17 @@ fn given() linux.cpu_set_t {
 }
 
 pub const Pool = struct {
-    /// The CPUs this process may run on, and their lock files.
+    /// The CPUs this process may run on, their lock files, and their `priority-<cpu>` files
+    /// (shared-locked by priority processes while they wait).
     cpus: [cpus_max]u16 = undefined,
     fds: [cpus_max]linux.fd_t = undefined,
+    priority_fds: [cpus_max]linux.fd_t = undefined,
     count: u32 = 0,
+    /// Every CPU of the host's lock file, for the memory claimed on them (claim_fits).
+    host_fds: [cpus_max]linux.fd_t = undefined,
+    host_count: u32 = 0,
     /// The run's turn to wait: one of its processes at a time holds it.
     turn_fd: linux.fd_t = -1,
-    /// The pool's `priority` file: shared-locked by priority processes while they wait.
-    priority_fd: linux.fd_t = -1,
     priority: bool = false,
 
     /// Opens the pool of the CPUs this process may run on.
@@ -74,34 +82,33 @@ pub const Pool = struct {
         pool.* = .{};
         const available = given();
         var directory_buffer: [64]u8 = undefined;
-        const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-{d}", .{
-            linux.getuid(),
-        }, 0);
+        // Unit tests have a pool of their own: the host's runs' claims and locks are not theirs
+        // (a test's claim of half the host never fit beside a hunt's, and waited forever).
+        const directory = if (builtin.is_test)
+            try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-test-{d}", .{linux.getpid()}, 0)
+        else
+            try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-{d}", .{linux.getuid()}, 0);
         const made = linux.mkdir(directory, 0o700);
         if (linux.errno(made) != .SUCCESS and linux.errno(made) != .EXIST) return error.PoolDirectory;
         errdefer pool.close();
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
         const bits = @bitSizeOf(@TypeOf(available[0]));
         for (0..available.len * bits) |cpu| {
             if (!usable(&available, cpu)) continue;
             if (pool.count == cpus_max) break;
-            var path_buffer: [96]u8 = undefined;
-            const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/cpu-{d}", .{ directory, cpu }, 0);
-            const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
-            const fd = linux.open(path, flags, 0o600);
-            if (linux.errno(fd) != .SUCCESS) return error.PoolFile;
             pool.cpus[pool.count] = @intCast(cpu);
-            pool.fds[pool.count] = @intCast(fd);
+            pool.fds[pool.count] = try pool_file(directory, "cpu", cpu);
+            pool.priority_fds[pool.count] = pool_file(directory, "priority", cpu) catch |err| {
+                _ = linux.close(pool.fds[pool.count]);
+                return err;
+            };
             pool.count += 1;
         }
         if (pool.count == 0) return error.NoCpus;
-        var priority_buffer: [96]u8 = undefined;
-        const priority_path = try std.fmt.bufPrintSentinel(&priority_buffer, "{s}/priority", .{
-            directory,
-        }, 0);
-        const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
-        const priority_fd = linux.open(priority_path, flags, 0o600);
-        if (linux.errno(priority_fd) != .SUCCESS) return error.PoolFile;
-        pool.priority_fd = @intCast(priority_fd);
+        for (0..@min(host_cpu_count(), cpus_max)) |cpu| {
+            pool.host_fds[pool.host_count] = try pool_file(directory, "cpu", cpu);
+            pool.host_count += 1;
+        }
         pool.priority = std.c.getenv("DETERMINISMO_CPU_PRIORITY") != null;
         var turn_buffer: [96]u8 = undefined;
         const turn_path = try std.fmt.bufPrintSentinel(&turn_buffer, "{s}/run-{d}.turn", .{
@@ -131,19 +138,23 @@ pub const Pool = struct {
 
     pub fn close(pool: *Pool) void {
         for (pool.fds[0..pool.count]) |fd| _ = linux.close(fd);
-        if (pool.priority_fd >= 0) _ = linux.close(pool.priority_fd);
+        for (pool.priority_fds[0..pool.count]) |fd| _ = linux.close(fd);
+        for (pool.host_fds[0..pool.host_count]) |fd| _ = linux.close(fd);
         if (pool.turn_fd >= 0) _ = linux.close(pool.turn_fd);
         pool.count = 0;
+        pool.host_count = 0;
     }
 
     /// Takes a free CPU (the first, physical cores first), waiting while none is, and pins this
     /// process to it.
     pub fn take(pool: *Pool) Held {
         assert(pool.count > 0);
-        // Waiting with priority: the others see it, and leave free CPUs to it.
-        if (pool.priority) _ = linux.flock(pool.priority_fd, std.posix.LOCK.SH);
-        defer if (pool.priority) {
-            _ = linux.flock(pool.priority_fd, std.posix.LOCK.UN);
+        // Waiting with priority: the others see it, and leave the CPUs it may run on to it.
+        if (pool.priority) for (pool.priority_fds[0..pool.count]) |fd| {
+            _ = linux.flock(fd, std.posix.LOCK.SH);
+        };
+        defer if (pool.priority) for (pool.priority_fds[0..pool.count]) |fd| {
+            _ = linux.flock(fd, std.posix.LOCK.UN);
         };
         // The run's turn: its other processes queue behind this one (in the kernel, asleep).
         if (!pool.priority) {
@@ -155,22 +166,21 @@ pub const Pool = struct {
         // Host-side only (which CPU a timeline runs on never changes it): any seed will do.
         var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
         while (true) {
-            // Every CPU runs a VM, or one waits with priority: back-pressure, until one is free.
-            // A priority process tries at once; the others wait their turn first, at random.
+            // Every CPU runs a VM, or a priority process waits for it: back-pressure, until one
+            // is free. A priority process tries at once; the others wait their turn first, at
+            // random.
             if (!pool.priority) {
                 const wait_ns = random.random().intRangeAtMost(u64, wait_ns_min, wait_ns_max);
                 const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns) };
                 _ = linux.nanosleep(&pause, null);
-                if (pool.priority_waiting()) continue;
             }
-            // The host's memory too: no VM starts while less than the reserve is available
-            // (runs share the host's memory as its CPUs, and waiting workers and holders keep
-            // theirs: srv2 once had 0 GB available), until timelines end or holders go; nor
-            // while the VMs running and this one could come to need more than the host has
-            // (a VM's memory grows after it starts, up to its guest's size: 18 YugabyteDB VMs
-            // admitted with memory free filled srv2 and the OOM killer took serve, 2026-10-27).
+            // The host's memory too: no VM starts while the VMs running and this one could come
+            // to need more than the host has (a VM's memory grows after it starts, up to its
+            // guest's size: 18 YugabyteDB VMs admitted with memory free filled srv2 and the OOM
+            // killer took serve, 2026-10-27); nor while less than half the reserve is available
+            // (holders go below the reserve, holders.zig: they make room before a VM waits).
             const available = memory_available(); // 0: unknown, never a reason to wait.
-            if ((available != 0 and available < memory_reserve_bytes) or !pool.claim_fits(claim_bytes)) {
+            if ((available != 0 and available < memory_reserve_bytes / 2) or !pool.claim_fits(claim_bytes)) {
                 if (pool.priority) {
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
@@ -179,6 +189,7 @@ pub const Pool = struct {
             }
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
+                if (!pool.priority and pool.priority_waiting(slot)) continue;
                 const locked = linux.flock(pool.fds[slot], std.posix.LOCK.EX | std.posix.LOCK.NB);
                 if (linux.errno(locked) != .SUCCESS) continue;
                 // The claim, where the others read it while this process holds the CPU.
@@ -194,14 +205,15 @@ pub const Pool = struct {
         }
     }
 
-    /// Whether `bytes` more fit beside what the held CPUs' processes claimed: within the host's
-    /// memory less the reserve. A CPU's claim counts while its lock is held.
+    /// Whether `bytes` more fit beside what the held CPUs' processes claimed, on any CPU of the
+    /// host: within the host's memory less the reserve. A CPU's claim counts while its lock is
+    /// held.
     fn claim_fits(pool: *Pool, bytes: u64) bool {
         if (bytes == 0) return true;
         const total = memory_total();
         if (total == 0) return true; // Unknown: never a reason to wait.
         var claimed: u64 = 0;
-        for (pool.fds[0..pool.count]) |fd| {
+        for (pool.host_fds[0..pool.host_count]) |fd| {
             const probe = linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB);
             if (linux.errno(probe) == .SUCCESS) {
                 _ = linux.flock(fd, std.posix.LOCK.UN);
@@ -213,11 +225,13 @@ pub const Pool = struct {
         return claimed + bytes + memory_reserve_bytes <= total;
     }
 
-    /// Whether a priority process waits for a CPU (it holds the `priority` file shared).
-    fn priority_waiting(pool: *Pool) bool {
-        const probe = linux.flock(pool.priority_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
+    /// file shared).
+    fn priority_waiting(pool: *Pool, slot: u32) bool {
+        const fd = pool.priority_fds[slot];
+        const probe = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         if (linux.errno(probe) != .SUCCESS) return true;
-        _ = linux.flock(pool.priority_fd, std.posix.LOCK.UN);
+        _ = linux.flock(fd, std.posix.LOCK.UN);
         return false;
     }
 
@@ -229,6 +243,62 @@ pub const Pool = struct {
 };
 
 pub const Held = struct { slot: u32 };
+
+/// The pool directory's `<kind>-<cpu>` file, opened (made if new).
+fn pool_file(directory: [:0]const u8, comptime kind: []const u8, cpu: usize) !linux.fd_t {
+    var path_buffer: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/" ++ kind ++ "-{d}", .{ directory, cpu }, 0);
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o600);
+    if (linux.errno(fd) != .SUCCESS) return error.PoolFile;
+    return @intCast(fd);
+}
+
+/// The host's CPUs, whatever this process may run on: one past the last of
+/// /sys/devices/system/cpu/possible ("0-35"), or 0 if unknown (then only the pool's count).
+fn host_cpu_count() usize {
+    const fd = linux.open("/sys/devices/system/cpu/possible", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [256]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return 0;
+    return possible_count(std.mem.trim(u8, buffer[0..size], " \n"));
+}
+
+/// One past the highest CPU of a kernel CPU list ("0-35", "0,2-5").
+fn possible_count(list: []const u8) usize {
+    var highest: ?usize = null;
+    var ranges = std.mem.splitScalar(u8, list, ',');
+    while (ranges.next()) |range| {
+        const last = if (std.mem.indexOfScalar(u8, range, '-')) |dash| range[dash + 1 ..] else range;
+        const cpu = std.fmt.parseInt(usize, last, 10) catch continue;
+        highest = @max(highest orelse 0, cpu);
+    }
+    return if (highest) |cpu| cpu + 1 else 0;
+}
+
+test "a check waiting for a CPU leaves the others to the rest" {
+    var waiter: Pool = undefined;
+    try waiter.open();
+    defer waiter.close();
+    var other: Pool = undefined;
+    try other.open();
+    defer other.close();
+    if (other.count < 2) return error.SkipZigTest;
+    // A priority process confined to the first CPU waits for it.
+    _ = linux.flock(waiter.priority_fds[0], std.posix.LOCK.SH);
+    defer _ = linux.flock(waiter.priority_fds[0], std.posix.LOCK.UN);
+    try std.testing.expect(other.priority_waiting(0));
+    try std.testing.expect(!other.priority_waiting(1));
+}
+
+test "a kernel CPU list's count" {
+    try std.testing.expectEqual(@as(usize, 36), possible_count("0-35"));
+    try std.testing.expectEqual(@as(usize, 6), possible_count("0,2-5"));
+    try std.testing.expectEqual(@as(usize, 1), possible_count("0"));
+    try std.testing.expectEqual(@as(usize, 0), possible_count(""));
+}
 
 /// Memory kept free on the host: no VM starts, and no holder is made, below it.
 pub const memory_reserve_bytes = 8 << 30;
