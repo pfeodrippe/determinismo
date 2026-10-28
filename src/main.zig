@@ -1318,6 +1318,13 @@ fn command_explore(
         // instance here (and one per worker).
         try strategy_start(context, arguments, &exploration);
         defer if (exploration.strategy) |strategy| strategy.stop();
+        if (arguments.time_budget_text) |budget| {
+            std.debug.print("[determinismo] a tree for {s} (at most {d} timelines) on {d} workers\n", .{
+                budget, arguments.branches, jobs,
+            });
+        } else {
+            std.debug.print("[determinismo] a tree of {d} timelines on {d} workers\n", .{ arguments.branches, jobs });
+        }
         try explore_tree(context, vm, options, branches, jobs);
     } else if (jobs == 1) {
         try strategy_start(context, arguments, &exploration);

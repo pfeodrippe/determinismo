@@ -801,26 +801,14 @@ fn check_until_and_causality(context: *Context) !void {
         "--futures", "8", "--json",
     });
     const result = try run_kept(context, argv.items);
-    // Points come as their futures finish, and refinement adds moments inside jumps.
-    const Point = struct { vtime_ms: u64, probability: f64, low: f64, high: f64 };
-    var points: u32 = 0;
-    var latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
-    var bounded = true;
-    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
-    while (lines.next()) |line| {
-        const point = std.json.parseFromSliceLeaky(Point, arena, line, .{
-            .ignore_unknown_fields = true,
-        }) catch continue;
-        bounded = bounded and point.low <= point.probability and point.probability <= point.high;
-        points += 1;
-        if (point.vtime_ms >= latest.vtime_ms) latest = point;
-    }
+    // Refinement adds moments inside jumps.
+    const curve = try causality_curve(arena, result.stdout);
     expect_all(context, &.{
-        .{ "at least 4 moments", points >= 4 },
-        .{ "certain at the failure", latest.probability == 1 },
-        .{ "each within its 90% interval", bounded },
+        .{ "at least 4 moments", curve.moments >= 4 },
+        .{ "certain at the failure", curve.latest.probability == 1 },
+        .{ "each within its 90% interval", curve.bounded },
     }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
-        "({d:.2}), each within its 90% interval", .{ points, latest.probability });
+        "({d:.2}), each within its 90% interval", .{ curve.moments, curve.latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
     var verdict_argv: std.ArrayList([]const u8) = .empty;
     try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });
@@ -830,23 +818,37 @@ fn check_until_and_causality(context: *Context) !void {
         "--branch", "4", "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
     });
     const verdict_result = try run_kept(context, verdict_argv.items);
-    var verdict_points: u32 = 0;
-    var verdict_latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
-    var verdict_lines = std.mem.tokenizeScalar(u8, verdict_result.stdout, '\n');
-    while (verdict_lines.next()) |line| {
+    const verdict = try causality_curve(arena, verdict_result.stdout);
+    expect_all(context, &.{
+        .{ "5 moments (the 4 points and the setup's)", verdict.moments == 5 },
+        .{ "certain at the failure", verdict.latest.probability == 1 },
+    }, "causality with a verdict (an event condition, no property): {d} moments, certain at the " ++
+        "failure ({d:.2})", .{ verdict.moments, verdict.latest.probability });
+    try check_files(context, &system, violation);
+    try check_rewind(context, &system, violation);
+}
+
+const Point = struct { vtime_ms: u64, futures: u32 = 0, probability: f64, low: f64, high: f64 };
+
+/// A causality analysis's curve from its `--json` lines: a moment's point comes again each time
+/// one of its futures finishes, so each moment's last (most futures) is its point.
+fn causality_curve(arena: std.mem.Allocator, stdout: []const u8) !struct { moments: u32, latest: Point, bounded: bool } {
+    var by_moment: std.AutoArrayHashMapUnmanaged(u64, Point) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
         const point = std.json.parseFromSliceLeaky(Point, arena, line, .{
             .ignore_unknown_fields = true,
         }) catch continue;
-        verdict_points += 1;
-        if (point.vtime_ms >= verdict_latest.vtime_ms) verdict_latest = point;
+        const entry = try by_moment.getOrPut(arena, point.vtime_ms);
+        if (!entry.found_existing or point.futures >= entry.value_ptr.futures) entry.value_ptr.* = point;
     }
-    expect_all(context, &.{
-        .{ "5 moments", verdict_points == 5 },
-        .{ "certain at the failure", verdict_latest.probability == 1 },
-    }, "causality with a verdict (an event condition, no property): {d} moments, certain at the " ++
-        "failure ({d:.2})", .{ verdict_points, verdict_latest.probability });
-    try check_files(context, &system, violation);
-    try check_rewind(context, &system, violation);
+    var latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
+    var bounded = true;
+    for (by_moment.values()) |point| {
+        bounded = bounded and point.low <= point.probability and point.probability <= point.high;
+        if (point.vtime_ms >= latest.vtime_ms) latest = point;
+    }
+    return .{ .moments = @intCast(by_moment.count()), .latest = latest, .bounded = bounded };
 }
 
 /// The profiler at a moment of the self-test's echo node (a static Zig binary, with symbols):
