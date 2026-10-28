@@ -113,11 +113,20 @@ pub const Behavior = struct {
     /// What it is, for people: `always "balance is conserved": false`, `fault partition`.
     label: [behavior_label_size]u8 = undefined,
     label_size: u8 = 0,
+    /// The node it came from, when it says (a node's output, an event's `details.node`):
+    /// where a branch from just after it aims its first fault (VM.Options.branch_signal).
+    node_name: [behavior_node_size]u8 = undefined,
+    node_size: u8 = 0,
 
     pub fn name(behavior: *const Behavior) []const u8 {
         return behavior.label[0..behavior.label_size];
     }
+
+    pub fn node(behavior: *const Behavior) []const u8 {
+        return behavior.node_name[0..behavior.node_size];
+    }
 };
+pub const behavior_node_size = 32;
 pub const behavior_label_size = 72;
 /// Room for instrumented programs' coverage (a Go service reports thousands of lines early on)
 /// besides what comes after it.
@@ -215,7 +224,22 @@ fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
     var writer: std.Io.Writer = .fixed(&behavior.label);
     behavior_label(&writer, value);
     behavior.label_size = @intCast(writer.end);
+    const node = behavior_node(value);
+    const size = @min(node.len, behavior_node_size);
+    @memcpy(behavior.node_name[0..size], node[0..size]);
+    behavior.node_size = @intCast(size);
     events.behavior_count += 1;
+}
+
+/// The node a behavior came from: a node's output's source, an event's `details.node`; "" when
+/// it does not say (an assertion's).
+fn behavior_node(value: std.json.Value) []const u8 {
+    if (value.object.get("output")) |output| if (output == .object) {
+        return string_field(output.object, "source") orelse "";
+    };
+    const details = value.object.get("details") orelse return "";
+    if (details != .object) return "";
+    return string_field(details.object, "node") orelse "";
 }
 
 /// A behavior's label, cut where the label ends.
@@ -315,6 +339,7 @@ const runtime_events = [_][]const u8{
     "composer_start", "composer_done", "command_start", "command_exit", "faults_phase",
     "faults_start",   "faults_stop",   "fault",         "nodes_up",     "node_start",
     "node_ready",     "node_kill",     "exec_start",    "exec_output",  "exec_done",
+    "faults_branch",
 };
 const behavior_keys = [_][]const u8{ "kind", "flavor", "mode", "name", "node", "peer", "state" };
 
@@ -676,4 +701,24 @@ test "always fails on the first false condition and records its moment" {
     try events.emit(.{ .vtime_ns = 2, .branches = 20 }, fail);
     try std.testing.expectEqual(@as(u32, 1), events.failing_count());
     try std.testing.expectEqual(@as(u64, 20), events.properties[0].first_failure.?.branches);
+}
+
+test "a behavior keeps the node it came from" {
+    const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
+    defer std.testing.allocator.free(parse_buffer);
+    var events: Events = undefined;
+    events.init(parse_buffer, .{ .log_fd = null });
+    const output = "{\"output\":{\"source\":\"yb2\",\"stream\":\"stderr\",\"text\":\"tablet 7 lagging\"}}";
+    const event = "{\"event\":\"leader\",\"details\":{\"node\":\"yb3\",\"state\":\"elected\"}}";
+    const assertion = "{\"assert\":{\"type\":\"sometimes\",\"message\":\"m\",\"condition\":true}}";
+    try events.emit(.{ .vtime_ns = 1, .branches = 10 }, output);
+    try events.emit(.{ .vtime_ns = 2, .branches = 20 }, event);
+    try events.emit(.{ .vtime_ns = 3, .branches = 30 }, assertion);
+    // A branch point's own event names a node, but is the platform's, not the system's.
+    const branch = "{\"event\":\"faults_branch\",\"details\":{\"quiet_ended\":true,\"node\":\"yb1\"}}";
+    try events.emit(.{ .vtime_ns = 4, .branches = 40 }, branch);
+    try std.testing.expectEqual(@as(u32, 3), events.behavior_count);
+    try std.testing.expectEqualStrings("yb2", events.behaviors[0].node());
+    try std.testing.expectEqualStrings("yb3", events.behaviors[1].node());
+    try std.testing.expectEqualStrings("", events.behaviors[2].node());
 }

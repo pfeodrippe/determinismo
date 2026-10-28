@@ -18,6 +18,13 @@
 //! Network faults overlap (see "Network faults" below); node faults happen one at a time on a
 //! node, several nodes at once (see "Node faults").
 //!
+//! Branch points: the platform tells det-agent (its `det:branch` action, agent.zig), which tells
+//! this, where a timeline begins at a moment of another (the tree's returns, just after a new
+//! behavior), and which node that behavior came from. A quiet stretch of the pacing ends there
+//! and a fault is drawn at once, among those involving that node when any does: each branch is
+//! perturbed right after the moment it was chosen for, where it happened, never seconds later
+//! somewhere else. Quiet periods a node or command asked for stay.
+//!
 //! Faults from the scenario: `det-faults inject '<json>'` (any language, any node or command)
 //! or the SDK's `fault`, while the injector runs, apply that fault now, logged and undone like a
 //! drawn one: {"kind": "pause", "node": "db", "duration_ms": 2000}, {"kind":
@@ -190,6 +197,7 @@ pub fn main(init: std.process.Init) !void {
             // A quiet stretch (healing what is under way), then the next stretch of faults.
             if (pacing.quiet_ms_max > 0) {
                 quiet_request(stretch_ns("fault.quiet_ms", pacing.quiet_ms_max));
+                quiet_pacing = true;
                 const now_ns = monotonic_ns();
                 if (quiet_until_ns > now_ns) sleep_ns(quiet_until_ns - now_ns);
                 if (stopping.load(.acquire)) break;
@@ -197,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
             active_until_ns = @max(quiet_until_ns, monotonic_ns()) + stretch_ns("fault.active_ms", pacing.active_ms_max);
         }
         // Labeled decisions: a strategy sees which faults it chooses among, by name.
-        const applied = draw(&faults[sdk.decide("fault", names)]);
+        const applied = draw(&faults[fault_choose(faults[0..count], names)]);
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
@@ -1260,13 +1268,19 @@ fn sleep_through_ns(duration_ns: u64) void {
 }
 
 /// A request on the control FIFO is a u64 (little endian): a quiet period in nanoseconds, or,
-/// with its top bit set, the length (low 32 bits) of the JSON fault that follows (`inject`).
-/// Each fits in one write of at most PIPE_BUF: atomic.
+/// with its top bit set, the length (low 32 bits) of the JSON fault that follows (`inject`),
+/// or, with `branch_flag`, the length (low 8 bits) of the node name that follows, "" for none
+/// (`branch`). Each fits in one write of at most PIPE_BUF: atomic.
 const inject_flag: u64 = 1 << 63;
+pub const branch_flag: u64 = 1 << 62;
+/// The quiet period under way is the pacing's own (no node or command asked for it): a branch
+/// point ends it.
+var quiet_pacing = false;
 const request_size_max = 4096;
 
 /// Takes the pending requests: injected faults are applied; the quiet period ends at the latest
-/// one asks for. Returns how many quiet-period requests there were.
+/// one asks for; a branch point ends the pacing's. Returns how many requests end a sleep (quiet
+/// periods and branch points).
 fn requests_read() u32 {
     var buffer: [16 * request_size_max]u8 = undefined;
     const size = linux.read(control, &buffer, buffer.len);
@@ -1284,9 +1298,50 @@ fn requests_read() u32 {
             continue;
         }
         quiet += 1;
+        if (header & branch_flag != 0) {
+            const length: usize = @intCast(header & 0xff);
+            if (at + length > size) break;
+            branch_point(buffer[at..][0..length]);
+            at += length;
+            continue;
+        }
+        quiet_pacing = false; // A node or command asked: it stays, branch points or not.
         quiet_request(header);
     }
     return quiet;
+}
+
+/// A timeline begins here, at a moment of another: the pacing's quiet stretch ends, the sleep
+/// under way returns, and the main loop draws a fault at once, aimed at `node` when one of the
+/// faults involves it.
+fn branch_point(node: []const u8) void {
+    const quiet = quiet_pacing and quiet_until_ns > monotonic_ns();
+    if (quiet) {
+        quiet_until_ns = 0;
+        quiet_pacing = false;
+    }
+    @memcpy(branch_node[0..node.len], node);
+    branch_node_size = node.len;
+    sdk.event("faults_branch", .{ .quiet_ended = quiet, .node = node });
+}
+
+/// The next fault's index: after a branch point, one of those involving its node (a named
+/// decision: strategies see it, tapes replay it), when any does; else any (`fault`).
+fn fault_choose(faults: []const Fault, names: []const []const u8) usize {
+    defer branch_node_size = 0;
+    const node = branch_node[0..branch_node_size];
+    if (node.len > 0) {
+        var aimed: [faults_max]usize = undefined;
+        var count: usize = 0;
+        for (faults, 0..) |fault, index| {
+            if (std.mem.eql(u8, fault.node, node) or std.mem.eql(u8, fault.peer, node)) {
+                aimed[count] = index;
+                count += 1;
+            }
+        }
+        if (count > 0) return aimed[sdk.random_below_named("fault.branch_aim", count)];
+    }
+    return sdk.decide("fault", names);
 }
 
 fn quiet_request(duration_ns: u64) void {
@@ -1418,6 +1473,26 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
 }
 
 /// `det-faults inject '<json>'`: asks the running injector for that fault now.
+/// Tells the running injector a timeline begins here (det-agent, on the platform's `det:branch`),
+/// and at which node (the newest behavior's, "" for none) its first fault aims. Without an
+/// injector (no driver phase under way), nothing to do.
+pub fn branch_request(node: []const u8) void {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open(control_path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var message: [8 + branch_node_max]u8 = undefined;
+    const size = @min(node.len, branch_node_max);
+    std.mem.writeInt(u64, message[0..8], branch_flag | size, .little);
+    @memcpy(message[8..][0..size], node[0..size]);
+    _ = linux.write(@intCast(fd), &message, 8 + size);
+}
+
+const branch_node_max = 32;
+/// The node a branch point aims the next fault at (cleared once drawn).
+var branch_node: [branch_node_max]u8 = undefined;
+var branch_node_size: usize = 0;
+
 fn inject_request(json: []const u8) !void {
     if (json.len + 8 > request_size_max) return error.RequestTooLarge;
     const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };

@@ -64,9 +64,9 @@ const usage =
     \\                            [--no-archive]   (Go-Explore's archive, on by default: half the
     \\                            returns to the newest frontier, the rest to the least visited
     \\                            behaviors of any generation; without it, the frontier only)
-    \\                            [--pipeline <n>]   (a tree's generations in flight, 1 to 4: it
-    \\                            returns to moments from generation n on; default 2 up to 16
-    \\                            workers, else 3)
+    \\                            [--pipeline <n>]   (a tree's generations of timelines planned
+    \\                            from the setup snapshot before its first returns, 1 to 4, and
+    \\                            queued ahead after: default 2 up to 16 workers, else 3)
     \\                            [--generation <n>]   (a tree's timelines per generation: 16,
     \\                            or a multiple of it for machines with more CPUs)
     \\                            [--timeline-limit <duration>]   (1h: a timeline not finished by
@@ -208,8 +208,8 @@ const Arguments = struct {
     /// timeline's end.
     horizon_ns: ?u64 = null,
     horizon_text: ?[]const u8 = null,
-    /// Generations in flight at once (`--pipeline`): the tree returns to moments from this
-    /// generation on; more keeps workers busy while long timelines finish.
+    /// Generations planned ahead (`--pipeline`): that many start from the setup snapshot, and the
+    /// queue keeps that many while one fills (explore_tree); enough keeps every worker busy.
     pipeline: u32 = pipeline_depth_default,
     pipeline_given: bool = false,
     /// Go-Explore's archive (on unless `--no-archive`): the tree keeps every behavior any timeline
@@ -881,14 +881,15 @@ fn snapshot_diff(init: std.process.Init, names: []const []const u8) !void {
 }
 
 /// What a resumed run (--resume) takes from its record: the timelines it has, and for a tree
-/// each one's summary (`<record>.summaries`) and how many recorded timelines each return (its
-/// generation, parent and moment) started.
+/// each one's summary (`<record>.summaries`), how many recorded timelines each return (its
+/// generation, parent and moment) started, and the timelines of each generation judged, in order.
 const Resumed = struct {
     done: std.AutoHashMapUnmanaged(u32, void) = .empty,
     summaries: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     /// The summaries file up to its last whole record (appended to from there).
     summaries_size: u64 = 0,
     children: std.AutoHashMapUnmanaged(ReturnKey, u32) = .empty,
+    generations: std.ArrayList([]const u32) = .empty,
 };
 const ReturnKey = struct { generation: u32, branch: u32, vtime_ns: u64 };
 
@@ -931,12 +932,14 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
             pipeline: ?u32 = null,
             archive: ?bool = null,
             horizon_ns: ?u64 = null,
+            queue: bool = false,
         } = null,
         branch: ?struct {
             index: u32,
             generation: u32 = 0,
             path: []const struct { branch: u32, vtime_ns: u64 } = &.{},
         } = null,
+        generation: ?struct { number: u32, branches: []const u32 } = null,
     };
     const source = try std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .unlimited);
     const resumed = try context.arena.create(Resumed);
@@ -955,16 +958,21 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
                 std.mem.eql(u8, run.branching orelse "", @tagName(arguments.branching)) and
                 (!tree_run or (run.generation == arguments.generation_size and
                     run.pipeline == arguments.pipeline and run.archive == arguments.archive and
-                    run.horizon_ns == arguments.horizon_ns));
+                    run.horizon_ns == arguments.horizon_ns and run.queue));
             if (!same) {
                 std.debug.print("[determinismo] {s} is the record of another run (inputs {s}, " ++
                     "seed {s}, {s} branching; these: {s}, {s}, {s}; a tree's generation, " ++
-                    "pipeline, archive and horizon too): start a new run\n", .{
+                    "pipeline, archive, horizon and queue too): start a new run\n", .{
                     path,                          run.inputs orelse "?", run.seed orelse "?",
                     run.branching orelse "?",      &hex16(inputs),        &hex16(arguments.seed),
                     @tagName(arguments.branching),
                 });
                 return error.Usage;
+            }
+        }
+        if (line.generation) |judged| {
+            if (judged.number == resumed.generations.items.len) {
+                try resumed.generations.append(context.arena, judged.branches);
             }
         }
         if (line.branch) |branch| {
@@ -1067,6 +1075,7 @@ fn summary_load(summary: *Summary, bytes: []const u8) void {
     summary.last_pull_ns = header.last_pull_ns;
     summary.cut = header.cut != 0;
     summary.holder_count = 0; // Gone with the run: its moments are made again by replay.
+    summary.failing_count = 0; // Its holders went with the run: no ladder to save.
     summary.behavior_count = header.behavior_count;
     @memcpy(std.mem.sliceAsBytes(summary.behaviors[0..header.behavior_count]), bytes[@sizeOf(SummaryHeader)..]);
 }
@@ -1164,28 +1173,33 @@ fn command_explore(
         }
     }
     if (arguments.record_path != null and !arguments.resume_run) {
-        report.record(.{ .run = .{
-            .scenario = scenario_of(options.cmdline),
-            .profile = arguments.profile,
-            .program = arguments.program_path,
-            .compose = arguments.compose_path,
-            .system = arguments.system,
-            .inputs = &hex16(exploration.inputs),
-            .seed = &hex16(arguments.seed),
-            .branches = arguments.branches,
-            .from_branch = arguments.from_branch,
-            .from_vtime_ms = arguments.from_vtime_ms,
-            .shard = &.{ arguments.shard_index, arguments.shard_count },
-            .time_budget_s = if (arguments.time_budget_ns) |ns| ns / std.time.ns_per_s else null,
-            .timeline_ms = arguments.timeline_ms,
-            .generation = arguments.generation_size,
-            .pipeline = arguments.pipeline,
-            .archive = arguments.archive,
-            .horizon_ns = arguments.horizon_ns,
-            .jobs = jobs_count(arguments),
-            .strategy = arguments.strategy_command,
-            .branching = @tagName(arguments.branching),
-        } });
+        report.record(.{
+            .run = .{
+                .scenario = scenario_of(options.cmdline),
+                .profile = arguments.profile,
+                .program = arguments.program_path,
+                .compose = arguments.compose_path,
+                .system = arguments.system,
+                .inputs = &hex16(exploration.inputs),
+                .seed = &hex16(arguments.seed),
+                .branches = arguments.branches,
+                .from_branch = arguments.from_branch,
+                .from_vtime_ms = arguments.from_vtime_ms,
+                .shard = &.{ arguments.shard_index, arguments.shard_count },
+                .time_budget_s = if (arguments.time_budget_ns) |ns| ns / std.time.ns_per_s else null,
+                .timeline_ms = arguments.timeline_ms,
+                .generation = arguments.generation_size,
+                .pipeline = arguments.pipeline,
+                .archive = arguments.archive,
+                .horizon_ns = arguments.horizon_ns,
+                .jobs = jobs_count(arguments),
+                .strategy = arguments.strategy_command,
+                .branching = @tagName(arguments.branching),
+                // A tree's generations are the timelines that finished together, recorded as
+                // judged (explore_tree): a record without them is not one to resume.
+                .queue = true,
+            },
+        });
     }
     if (arguments.tape_path) |path| {
         const overrides = try context.arena.create(tape.Overrides);
@@ -1258,11 +1272,11 @@ fn command_explore(
             try context.arena.create(tape.Overrides)
         else
             undefined;
-        for (replay.header.chain) |segment| {
+        for (replay.header.chain, 0..) |segment, depth| {
             const overrides = try tape_overrides(context, directory, segment.branch, ancestor);
             const arena = context.arena;
             const at = segment.vtime_ns;
-            start = try node_make(arena, vm, options, start, segment.seed, at, overrides);
+            start = try node_make(arena, vm, options, start, segment.seed, at, overrides, depth > 0);
         }
         // Futures from a moment of the taped branch (`--tape ... --from-vtime-ms`, causality
         // analysis): the branch itself replayed to the moment, then new branches from there,
@@ -1271,7 +1285,8 @@ fn command_explore(
             const own = try context.arena.create(tape.Overrides);
             const overrides = try tape_overrides(context, directory, replay.header.branch, own);
             const at = ms * std.time.ns_per_ms;
-            start = try node_make(context.arena, vm, options, start, replay.header.branch_seed, at, overrides);
+            const branch_point = replay.header.chain.len > 0;
+            start = try node_make(context.arena, vm, options, start, replay.header.branch_seed, at, overrides, branch_point);
             exploration.replay = null;
             exploration.exploration_seed = futures_seed(exploration.exploration_seed, start);
         }
@@ -1681,6 +1696,8 @@ const Branches = struct {
     /// CPU modulation).
     holders: ?linux.pid_t = null,
     seen: ?*const std.AutoHashMapUnmanaged(u64, void) = null,
+    /// Where its holders write themselves when it fails (Ladders).
+    ladder: ?*const holders.Ladder = null,
     /// Shared by parallel workers (memory mapped before they fork): the next position to run.
     /// A timeline is the same whichever worker runs it, so a worker that finished takes the
     /// next instead of idling while others run long ones.
@@ -1736,6 +1753,11 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             try rewind(vm, options, branches.snapshot, exploration, ms * std.time.ns_per_ms);
         }
         if (branches.pool == null) own_cpu.take(); // In this process: its own CPU.
+        // From a node (a moment of another timeline): a branch point. Not for causality's
+        // futures from a moment (--from-vtime-ms): how likely a failure is from there, not
+        // after a fault drawn there.
+        options.branch_signal = place.path.len > 0 and branches.arguments.from_vtime_ms == null;
+        defer options.branch_signal = false;
         try vm.init_from_snapshot(options, place.snapshot);
         defer vm.deinit();
         if (branches.arguments.events_directory) |directory| {
@@ -1769,6 +1791,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                     null),
                 .snapshot = capture,
                 .make = .{ .context = &maker, .function = HolderMaker.make },
+                .ladder = branches.ladder,
             };
             try owner.attach(vm);
         }
@@ -1898,6 +1921,12 @@ const Summary = struct {
     last_pull_ns: u64,
     /// Stopped at its horizon: it can be extended (returned to at its end), its future unknown.
     cut: bool,
+    /// The properties it fails (their messages' hashes), up to `failing_max`: the explorer saves
+    /// the first failing timeline of each to disk from its holders (Ladders).
+    failing: [failing_max]u64 = undefined,
+    failing_count: u8 = 0,
+
+    const failing_max = 16;
 };
 
 const Summaries = struct {
@@ -1923,6 +1952,12 @@ const Summaries = struct {
         summary.cut = place.horizon_ns != null and outcome == .moment_reached;
         summary.holder_count = @intCast(kept.len);
         @memcpy(summary.holders[0..kept.len], kept);
+        summary.failing_count = 0;
+        for (vm.events.properties[0..vm.events.property_count]) |*property| {
+            if (property.passing() or summary.failing_count == Summary.failing_max) continue;
+            summary.failing[summary.failing_count] = std.hash.Wyhash.hash(0, property.name());
+            summary.failing_count += 1;
+        }
         @memcpy(
             summary.behaviors[0..summary.behavior_count],
             vm.events.behaviors[0..vm.events.behavior_count],
@@ -1977,6 +2012,27 @@ fn explore_tree(
     const holding = !deciding;
     if (holding) try registry.init();
     defer if (holding) registry.release();
+    // The failing timelines' holders go to the run's snapshots (a run's: a directory to keep
+    // them). The table of page hashes is shared before the workers fork: their holders write it.
+    const ladders: ?*Ladders = if (holding) if (branches.arguments.run_directory) |run| ladders: {
+        const setup = branches.setup orelse branches.snapshot;
+        const page_hashes = try Snapshot.PageHashes.init(setup.memory_size);
+        var hasher = std.hash.Wyhash.init(0);
+        for ([_]u64{ exploration.inputs, exploration.exploration_seed, setup.tsc, setup.branches }) |value| {
+            hasher.update(std.mem.asBytes(&value));
+        }
+        const directory = try std.fs.path.join(arena, &.{ run, "snapshots" });
+        try std.Io.Dir.cwd().createDirPath(context.io, directory);
+        const made = try arena.create(Ladders);
+        made.* = .{
+            .ladder = .{ .directory = directory, .hashes = page_hashes.hashes },
+            .setup = setup,
+            .setup_name = try std.fmt.allocPrint(arena, "setup-{x:0>16}", .{hasher.final()}),
+            .explorer = linux.getpid(),
+            .io = context.io,
+        };
+        break :ladders made;
+    } else null else null;
     const change: ?changed.Change = if (branches.arguments.changed) |source|
         try changed.read(arena, context.io, source)
     else
@@ -1994,6 +2050,7 @@ fn explore_tree(
         .change = change,
         .hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0),
         .candidates = try arena.alloc(Candidate, size),
+        .ladders = ladders,
         .tape_buffer = if (exploration.strategy != null)
             try arena.create(tape.Overrides)
         else
@@ -2011,89 +2068,145 @@ fn explore_tree(
         close(fd);
         tree_summaries_fd = null;
     };
-    // Generations in flight (a ring): the first ones all start from the setup snapshot. Judged
-    // in order, each once complete: a seed gives the same tree.
-    var flight_all: [pipeline_depth_max]InFlight = undefined;
-    const flight = flight_all[0..state.pipeline];
-    for (flight, 0..) |*slot, number| {
-        slot.* = .{ .generation = @intCast(number), .items = try arena.alloc(Summary, size) };
-        slot.summaries = .{ .items = slot.items };
-        while (state.next_index < state.total and slot.plan.items.len < size) {
-            try slot.plan.append(arena, .{
-                .index = state.next_index,
-                .seed = branch_seed(state.base, state.next_index),
-                .snapshot = branches.snapshot,
-                .generation = @intCast(number),
-            });
-            state.next_index += 1;
-        }
+    // A queue of planned timelines, taken in order as CPUs free up; a generation is the next
+    // `size` timelines to finish, whatever their indices, judged as soon as it is complete and
+    // its returns planned at the queue's end. No CPU waits for a slow timeline: it is judged
+    // with a later generation (a fixed set of indices once held back every timeline planned
+    // after it, and minutes-long timelines left cores idle). The queue starts with `pipeline`
+    // generations from the setup snapshot: while one fills, the others keep every CPU busy.
+    // Which timelines formed each generation is recorded, and a resumed run judges the same
+    // generations again: the tree follows the timelines' finishing order, its record says which.
+    for (0..state.pipeline * size) |_| {
+        if (state.next_index >= state.total) break;
+        try queue_push(arena, &state, .{
+            .index = state.next_index,
+            .seed = branch_seed(state.base, state.next_index),
+            .snapshot = branches.snapshot,
+        });
+        state.next_index += 1;
     }
-    var oldest: u32 = 0;
+    var batch: Batch = .{ .items = try arena.alloc(Summary, size), .scratch = try arena.alloc(Summary, 1) };
+    batch.summaries = .{ .items = batch.items };
+    if (state.resumed) |resumed| try tree_rejudge(context, vm, options, branches, &state, &batch, resumed);
     var running: [jobs_max]Running = undefined;
     var running_count: u32 = 0;
     while (true) {
-        // Timelines start as CPUs free up, the oldest generation's first; none past the budget.
         const late = if (branches.deadline_ns) |deadline| monotonic_ns() >= deadline else false;
-        var progressed = false;
-        while (!late and running_count < jobs) {
-            const slot = for (0..flight.len) |offset| {
-                const candidate = &flight[(oldest + offset) % flight.len];
-                if (candidate.started < candidate.plan.items.len) break candidate;
-            } else break;
+        // A complete generation: judged at once, its returns at the queue's end.
+        if (!late and batch.summaries.count == size) {
+            try tree_judge(context, vm, options, branches, &state, &batch, true);
+            continue;
+        }
+        // Timelines start as CPUs free up, in the queue's order; none past the budget.
+        if (!late and running_count < jobs) if (queue_next(&state)) |place| {
             // A resumed run's recorded timeline: its summary, not the timeline again.
-            if (state.resumed) |resumed| {
-                if (resumed.summaries.get(slot.plan.items[slot.started].index)) |bytes| {
-                    summary_load(&slot.summaries.items[slot.summaries.count], bytes);
-                    slot.summaries.count += 1;
-                    slot.started += 1;
-                    progressed = true;
-                    continue;
-                }
-            }
+            if (state.resumed) |resumed| if (resumed.summaries.get(place.index)) |bytes| {
+                summary_load(&batch.items[batch.summaries.count], bytes);
+                batch.summaries.count += 1;
+                try batch.plan.append(arena, place);
+                continue;
+            };
             var mine = branches;
-            mine.plan = slot.plan.items[slot.started..][0..1];
+            mine.plan = (&place)[0..1];
             if (holding) {
                 mine.holders = registry.explorer;
                 mine.seen = &state.seen;
+                if (ladders) |known| mine.ladder = &known.ladder;
             }
-            running[running_count] = try timeline_start(context, vm, options, mine, slot);
+            running[running_count] = try timeline_start(context, vm, options, mine, &batch);
             running_count += 1;
-            slot.started += 1;
-        }
+            continue;
+        };
         if (running_count > 0) {
             // Every half minute without a timeline finishing, what the run is doing: a long
             // timeline (minutes) otherwise leaves its output silent.
-            const generation = flight[oldest % flight.len].generation;
-            status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, generation);
-            const finished = try timeline_wait(running[0..running_count], branches.multiverse, progress_interval_ms) orelse {
-                progress_print(running[0..running_count], branches.multiverse, generation);
+            status_write(branches.arguments.run_directory, running[0..running_count], branches.multiverse, state.generation);
+            const finished = try timeline_wait(running[0..running_count], branches.multiverse, &batch.summaries, progress_interval_ms) orelse {
+                progress_print(running[0..running_count], branches.multiverse, state.generation);
                 continue;
             };
+            try batch.plan.append(arena, running[finished].place);
             running[finished] = running[running_count - 1];
             running_count -= 1;
-            progressed = true;
+            continue;
         }
-        // The oldest generation, once every timeline of it finished: judged, and its slot
-        // planned with the generation `state.pipeline` after it.
-        while (!late) {
-            const slot = &flight[oldest % flight.len];
-            if (slot.plan.items.len == 0) break;
-            if (slot.summaries.count < slot.plan.items.len) break;
-            const judged = slot.generation;
-            const next = try tree_judge(context, vm, options, branches, &state, judged, slot);
-            slot.* = .{ .generation = judged + state.pipeline, .items = slot.items, .plan = next };
-            slot.summaries = .{ .items = slot.items };
-            oldest += 1;
-            progressed = true;
+        // Nothing runs and nothing is queued: a last, partial generation judged (its returns
+        // keep the run going), or the run is over (out of time, or of timelines).
+        if (!late and batch.summaries.count > 0 and state.next_index < state.total) {
+            try tree_judge(context, vm, options, branches, &state, &batch, true);
+            if (state.queue_head < state.queue.items.len) continue;
         }
-        if (!progressed) break; // Out of time, or of timelines.
+        break;
     }
-    for (flight) |*slot| {
-        for (slot.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
-    }
+    for (state.queue.items[state.queue_head..]) |entry| node_free(entry.snapshot, branches.snapshot);
+    for (batch.plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
     if (state.change) |*target| {
         target.summarize(state.next_index);
         report.record(.{ .changed = .{ .hunks = target.hunks, .timelines = target.timelines } });
+    }
+}
+
+/// Plans a timeline at the queue's end: its start snapshot has one more timeline to serve.
+fn queue_push(arena: std.mem.Allocator, state: *TreeState, place: Planned) !void {
+    try state.queue.append(arena, place);
+    const entry = try state.users.getOrPut(arena, place.snapshot);
+    entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+}
+
+/// The next planned timeline, if any.
+fn queue_next(state: *TreeState) ?Planned {
+    if (state.queue_head == state.queue.items.len) return null;
+    const place = state.queue.items[state.queue_head];
+    state.queue_head += 1;
+    return place;
+}
+
+/// A judged timeline's start snapshot serves one timeline fewer: freed with its last (siblings
+/// from one moment can finish in different generations).
+fn node_served(state: *TreeState, snapshot: *const Snapshot) void {
+    const entry = state.users.getEntry(snapshot) orelse return;
+    entry.value_ptr.* -= 1;
+    if (entry.value_ptr.* > 0) return;
+    _ = state.users.remove(snapshot);
+    node_free(snapshot, state.setup);
+}
+
+/// A resumed run's recorded generations judged again, in their order, each from its timelines'
+/// summaries (none runs again): the queue is then the interrupted run's. A generation whose
+/// summaries the interruption cut ends it: from there the run goes on as a new one would.
+fn tree_rejudge(
+    context: Context,
+    vm: *VM,
+    options: *VM.Options,
+    branches: Branches,
+    state: *TreeState,
+    batch: *Batch,
+    resumed: *const Resumed,
+) !void {
+    const arena = context.arena;
+    for (resumed.generations.items) |members| {
+        if (members.len > batch.items.len) return;
+        for (members) |index| if (!resumed.summaries.contains(index)) return;
+        var found: usize = 0;
+        for (state.queue.items[state.queue_head..]) |entry| {
+            if (std.mem.indexOfScalar(u32, members, entry.index) != null) found += 1;
+        }
+        if (found != members.len) return; // Not the plan this record was made with.
+        // Its timelines out of the queue (the rest keeps its order), their summaries in.
+        var kept: usize = state.queue_head;
+        for (state.queue.items[state.queue_head..]) |entry| {
+            const member = std.mem.indexOfScalar(u32, members, entry.index) != null;
+            if (member) {
+                summary_load(&batch.items[batch.summaries.count], resumed.summaries.get(entry.index).?);
+                batch.summaries.count += 1;
+                try batch.plan.append(arena, entry);
+            } else {
+                state.queue.items[kept] = entry;
+                kept += 1;
+            }
+        }
+        state.queue.shrinkRetainingCapacity(kept);
+        try tree_judge(context, vm, options, branches, state, batch, false);
     }
 }
 
@@ -2102,8 +2215,9 @@ fn deciding_strategy(exploration: *const Exploration) bool {
     return if (exploration.strategy) |plugin| plugin.decides else false;
 }
 
-/// A timeline running in a process of its own (explore_tree): where its summary comes back.
-const Running = struct { pid: linux.pid_t, results: linux.fd_t, slot: *InFlight, index: u32, start_ns: u64 };
+/// A timeline running in a process of its own (explore_tree): where its results come back, and
+/// where it started.
+const Running = struct { pid: linux.pid_t, results: linux.fd_t, place: Planned, index: u32, start_ns: u64 };
 
 /// In a child just forked from the explorer: it dies with it. A worker left running after the
 /// explorer was interrupted keeps its VM, its CPU and its memory (an interrupted hunt on srv2
@@ -2120,7 +2234,7 @@ fn timeline_start(
     vm: *VM,
     options: *VM.Options,
     branches: Branches,
-    slot: *InFlight,
+    batch: *Batch,
 ) !Running {
     assert(branches.plan.?.len == 1);
     var pipe: [2]linux.fd_t = undefined;
@@ -2131,7 +2245,7 @@ fn timeline_start(
     if (pid == 0) {
         child_dies_with(explorer);
         _ = linux.close(pipe[0]);
-        var one = Summaries{ .items = slot.items[slot.summaries.count..][0..1] };
+        var one = Summaries{ .items = batch.scratch }; // Its own copy: sent back whole.
         var mine = branches;
         mine.summaries = &one;
         mine.next = null;
@@ -2141,7 +2255,7 @@ fn timeline_start(
     return .{
         .pid = @intCast(pid),
         .results = pipe[0],
-        .slot = slot,
+        .place = branches.plan.?[0],
         .index = branches.plan.?[0].index,
         .start_ns = monotonic_ns(),
     };
@@ -2200,8 +2314,9 @@ fn progress_print(running: []const Running, multiverse: *const report.Multiverse
 }
 
 /// Waits for one of the running timelines to finish: its results in the run's multiverse, its
-/// summary in its generation's. Returns which, or null when none finished within `timeout_ms`.
-fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, timeout_ms: i32) !?usize {
+/// summary in the generation filling (`summaries`). Returns which, or null when none finished
+/// within `timeout_ms`.
+fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summaries: *Summaries, timeout_ms: i32) !?usize {
     assert(running.len > 0);
     var polled: [jobs_max]linux.pollfd = undefined;
     for (running, polled[0..running.len]) |timeline, *entry| {
@@ -2220,7 +2335,6 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, timeo
     const timeline = running[at];
     const results = try std.heap.page_allocator.create(report.Multiverse);
     defer std.heap.page_allocator.destroy(results);
-    const summaries = &timeline.slot.summaries;
     var count: u32 = 0;
     var received = read_exact(timeline.results, std.mem.asBytes(results));
     received = received and read_exact(timeline.results, std.mem.asBytes(&count));
@@ -2236,6 +2350,121 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, timeo
     try multiverse.absorb(results);
     return at;
 }
+
+/// The first failing timeline of each property, saved to disk from its holders as it is judged
+/// (holders.Ladder): `b<timeline>-<ms>` at each of its in-run snapshots' moments, each diffed
+/// against the one before, from the setup snapshot (saved first when it is not). Causality and
+/// multiverse debugging then start from them, without the replay that otherwise saves them (a
+/// YugabyteDB timeline's took longer than its exploration, srv3 2026-10-27). In a thread of
+/// the explorer's (the tree goes on meanwhile), one ladder at a time: one table of page hashes.
+const Ladders = struct {
+    ladder: holders.Ladder,
+    setup: *const Snapshot,
+    setup_name: []const u8,
+    /// The setup's page hashes, copied into the shared table before each ladder; null until the
+    /// first.
+    setup_hashes: ?[]u64 = null,
+    explorer: linux.pid_t,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    /// Properties (their messages' hashes) a ladder was saved for: the first failure of each.
+    saved: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    const Job = struct { ladders: *Ladders, branch: u32, helds: []holders.Held, room: []holders.Held };
+
+    /// A timeline judged: when it fails a property no ladder has yet, its holders nobody took
+    /// are set aside and written in a thread; else they go with their generation.
+    fn consider(ladders: *Ladders, arena: std.mem.Allocator, registry: *holders.Registry, summary: *const Summary) !void {
+        var new = false;
+        for (summary.failing[0..summary.failing_count]) |hash| {
+            if (!(try ladders.saved.getOrPut(arena, hash)).found_existing) new = true;
+        }
+        if (!new) return;
+        const room = try std.heap.page_allocator.alloc(holders.Held, holders.per_timeline_max + 1);
+        const helds = registry.set_aside(summary.index, room);
+        if (helds.len == 0) {
+            std.heap.page_allocator.free(room);
+            return;
+        }
+        const job = try std.heap.page_allocator.create(Job);
+        job.* = .{ .ladders = ladders, .branch = summary.index, .helds = helds, .room = room };
+        const thread = try std.Thread.spawn(.{}, run, .{job});
+        thread.detach();
+    }
+
+    fn run(job: *Job) void {
+        defer {
+            std.heap.page_allocator.free(job.room);
+            std.heap.page_allocator.destroy(job);
+        }
+        const ladders = job.ladders;
+        ladders.mutex.lockUncancelable(ladders.io);
+        defer ladders.mutex.unlock(ladders.io);
+        const setup_hashes = ladders.setup_hashes orelse ladders.setup_prepare() catch |err| {
+            std.debug.print("[determinismo] ladder of timeline {d}: the setup snapshot: {s}\n", .{ job.branch, @errorName(err) });
+            for (job.helds) |held| holders.end(held);
+            return;
+        };
+        @memcpy(ladders.ladder.hashes, setup_hashes);
+        var base_buffer: [Snapshot.disk_name_max]u8 = undefined;
+        var base: []const u8 = ladders.setup_name;
+        var saved: u32 = 0;
+        var names: [holders.per_timeline_max + 1][Snapshot.disk_name_max]u8 = undefined;
+        var name_lengths: [holders.per_timeline_max + 1]usize = undefined;
+        // After a failed write the table is no longer the base's: the rest go unsaved.
+        var broken = false;
+        for (job.helds) |held| {
+            if (broken) {
+                holders.end(held);
+                continue;
+            }
+            if (!holders.ask_disk(ladders.explorer, held, base)) {
+                broken = true;
+                continue;
+            }
+            const name = holders.ladder_name(&names[saved], job.branch, held.vtime_ns);
+            name_lengths[saved] = name.len;
+            @memcpy(base_buffer[0..name.len], name);
+            base = base_buffer[0..name.len];
+            saved += 1;
+        }
+        // A marker serve reads: this failure is on disk (its own replay that saves one is not
+        // needed).
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(std.heap.page_allocator);
+        text.print(std.heap.page_allocator, "saved by the explorer from timeline {d}'s in-run snapshots:", .{job.branch}) catch return;
+        for (names[0..saved], name_lengths[0..saved]) |*name, length| {
+            text.print(std.heap.page_allocator, " {s}", .{name[0..length]}) catch return;
+        }
+        text.append(std.heap.page_allocator, '\n') catch return;
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const marker = std.fmt.bufPrint(&path_buffer, "{s}/failure-{d}.log", .{ ladders.ladder.directory, job.branch }) catch return;
+        std.Io.Dir.cwd().writeFile(ladders.io, .{ .sub_path = marker, .data = text.items }) catch {};
+        std.debug.print("[determinismo] ladder of timeline {d}: {d} of {d} in-run snapshots on disk\n", .{
+            job.branch, saved, job.helds.len,
+        });
+    }
+
+    /// The setup snapshot on disk (saved unless it is there) and its page hashes.
+    fn setup_prepare(ladders: *Ladders) ![]u64 {
+        const setup = ladders.setup;
+        const size = setup.memory_size;
+        const address = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, setup.memory_fd, 0);
+        if (linux.errno(address) != .SUCCESS) return error.Map;
+        defer _ = linux.munmap(@ptrFromInt(address), size);
+        const memory = @as([*]align(std.heap.page_size_min) const u8, @ptrFromInt(address))[0..size];
+        const directory = ladders.ladder.directory;
+        @memset(ladders.ladder.hashes, 0); // A fresh table: every page is new.
+        if (Snapshot.disk_exists(directory, ladders.setup_name)) {
+            try Snapshot.pages_hash(memory, setup.memory_fd, ladders.ladder.hashes);
+        } else {
+            try Snapshot.disk_save(setup, memory, setup.memory_fd, ladders.ladder.hashes, directory, ladders.setup_name, null, false);
+        }
+        const hashes = try std.heap.page_allocator.dupe(u64, ladders.ladder.hashes);
+        ladders.setup_hashes = hashes;
+        return hashes;
+    }
+};
 
 /// The tree explorer's state across generations (explore_tree, tree_judge).
 const TreeState = struct {
@@ -2258,6 +2487,15 @@ const TreeState = struct {
     /// Parents' tapes are read into this (a strategy's overrides), one at a time.
     tape_buffer: *tape.Overrides,
     next_index: u32 = 0,
+    /// The failing timelines' holders written to disk (with a run directory).
+    ladders: ?*Ladders = null,
+    /// Planned timelines, taken in order from `queue_head` (explore_tree).
+    queue: std.ArrayList(Planned) = .empty,
+    queue_head: u32 = 0,
+    /// Each start snapshot's timelines not judged yet: freed after its last (node_served).
+    users: std.AutoHashMapUnmanaged(*const Snapshot, u32) = .empty,
+    /// The generation filling: judged next.
+    generation: u32 = 0,
     /// Go-Explore's archive (`--archive`): each behavior's cell, and every branch planned (its
     /// seed and path: one of an earlier generation is rebuilt from the setup snapshot).
     archive: bool,
@@ -2272,41 +2510,42 @@ const TreeState = struct {
 /// often the tree returned there.
 const Cell = struct { branch: u32, vtime_ns: u64, label: []const u8, visits: u32 = 0 };
 
-/// Generations in flight at once by default (`--pipeline`): when one is judged, the one that many after it is
-/// planned, and meanwhile the generations between run. Timelines of very different lengths
-/// (Raft's: half a minute to six) no longer leave workers idle at each generation's tail (they
-/// were busy 13 to 23% of the time). The cost: the tree deepens from the generation
-/// pipeline depth on (the ones before all start from the setup snapshot): with a generation's
-/// worth of workers or fewer (16), one generation ahead fills a tail, and the tree branches from
-/// timeline 32 instead of 48 (a system whose timelines take five minutes on six workers waited
-/// three quarters of an hour for its first branch).
+/// Generations planned ahead by default (`--pipeline`): the queue starts with that many from the
+/// setup snapshot, and each generation judged plans as many timelines as it had, so the queue,
+/// the generation filling and the timelines running always add up to that many generations.
+/// Every worker is busy while they hold at least a generation more than the workers: two for up
+/// to a generation's worth of workers (16), three for more. More only delays the first returns:
+/// the tree deepens from timeline `pipeline * generation` on (a system whose timelines take five
+/// minutes on six workers once waited three quarters of an hour for its first branch).
 const pipeline_depth_default = 3;
 const pipeline_depth_few_workers = 2;
 const pipeline_depth_max = 4;
 
-/// A generation in flight: its plan, how many of its timelines started, and their summaries
-/// (in `items`, kept for the slot's next generations).
-const InFlight = struct {
-    generation: u32,
+/// The generation filling: the timelines finished since the last was judged, where each started
+/// and its summary (in `items`, reused by every generation). `scratch`: a worker's own summary.
+const Batch = struct {
     plan: std.ArrayList(Planned) = .empty,
-    started: u32 = 0,
     items: []Summary,
     summaries: Summaries = .{ .items = &.{} },
+    scratch: []Summary,
 };
 
-/// A generation, every timeline of it finished: what each reached that none before it had,
-/// the moments returned to (nodes made), and the plan of the generation `state.pipeline` after.
+/// A generation complete (the timelines that finished since the last): what each reached that
+/// none before it had, the moments returned to (nodes made), and their branches planned at the
+/// queue's end; the generation recorded unless `recording` is false (a resumed run's, judged
+/// again).
 fn tree_judge(
     context: Context,
     vm: *VM,
     options: *VM.Options,
     branches: Branches,
     state: *TreeState,
-    generation: u32,
-    slot: *const InFlight,
-) !std.ArrayList(Planned) {
-    const plan = &slot.plan;
-    const summaries = &slot.summaries;
+    batch: *Batch,
+    recording: bool,
+) !void {
+    const plan = &batch.plan;
+    const summaries = &batch.summaries;
+    const generation = state.generation;
     const arena = context.arena;
     const exploration = branches.exploration;
     // In index order (workers finish in any): what each reached that none before it had.
@@ -2314,6 +2553,9 @@ fn tree_judge(
     const done = try arena.alloc(*const Summary, summaries.count);
     for (done, summaries.items[0..summaries.count]) |*entry, *summary| entry.* = summary;
     std.sort.insertion(*const Summary, done, {}, summary_before);
+    const members = try arena.alloc(u32, done.len);
+    for (members, done) |*member, summary| member.* = summary.index;
+    if (recording) report.record(.{ .generation = .{ .number = generation, .branches = members } });
     if (state.holding) for (done) |summary| {
         state.registry.add(summary.index, summary.holders[0..summary.holder_count]);
     };
@@ -2424,7 +2666,7 @@ fn tree_judge(
         // (its timelines are planned from the setup snapshot, never started).
         if (state.resumed) |resumed| {
             const key: ReturnKey = .{
-                .generation = generation + state.pipeline,
+                .generation = generation + 1,
                 .branch = back.branch,
                 .vtime_ns = back.vtime_ns,
             };
@@ -2472,13 +2714,12 @@ fn tree_judge(
     while (finished < making_count) : (finished += 1) {
         node_make_finish(arena, &makings[finished]);
     }
+    // A property's first failing timeline: its holders nobody took, to disk (Ladders).
+    if (state.ladders) |ladders| for (done) |summary| {
+        if (summary.failing_count > 0) try ladders.consider(arena, state.registry, summary);
+    };
     // Their memory: this generation's (the ones in flight keep theirs).
-    if (state.holding) {
-        const first = plan.items[0].index;
-        const last = plan.items[plan.items.len - 1].index;
-        assert(last - first + 1 == plan.items.len); // One after the other.
-        state.registry.release_branches(first, last);
-    }
+    if (state.holding) state.registry.release_listed(members);
     if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
         const held_node = making.snapshot orelse continue;
         if (!making.held) continue;
@@ -2489,7 +2730,7 @@ fn tree_judge(
         snapshots_compare(making.back, held_node, replay_node);
         node_free(replay_node, branches.snapshot);
     };
-    var next: std.ArrayList(Planned) = .empty;
+    const planned_before = state.queue.items.len;
     var made: u32 = 0;
     for (makings[0..making_count]) |*making| {
         const snapshot = making.snapshot orelse continue;
@@ -2510,28 +2751,28 @@ fn tree_judge(
         };
         for (0..tree.children) |_| {
             if (state.next_index >= state.total) break;
-            try next.append(arena, .{
+            try queue_push(arena, state, .{
                 .index = state.next_index,
                 .seed = branch_seed(state.base, state.next_index),
                 .snapshot = snapshot,
                 .path = path,
-                .generation = generation + state.pipeline,
+                .generation = generation + 1,
                 .why = back.why,
                 .horizon_ns = if (back.horizon_ns orelse branches.arguments.horizon_ns) |horizon| at + horizon else null,
             });
             state.next_index += 1;
         }
     }
-    // This generation's snapshots served their branches, and their children's snapshots.
-    for (plan.items) |entry| node_free(entry.snapshot, branches.snapshot);
-    // While generations are in flight, the setup snapshot is everyone's: never freed.
-    // The rest of the generation starts over from the setup snapshot.
-    while (state.next_index < state.total and next.items.len < state.size) : (state.next_index += 1) {
-        try next.append(arena, .{
+    // These timelines served their start snapshots (a snapshot goes with its last timeline;
+    // the setup snapshot is everyone's: never freed).
+    for (plan.items) |entry| node_served(state, entry.snapshot);
+    // As many planned as judged: the rest start over from the setup snapshot.
+    while (state.next_index < state.total and state.queue.items.len - planned_before < done.len) : (state.next_index += 1) {
+        try queue_push(arena, state, .{
             .index = state.next_index,
             .seed = branch_seed(state.base, state.next_index),
             .snapshot = branches.snapshot,
-            .generation = generation + state.pipeline,
+            .generation = generation + 1,
             .why = "From the setup snapshot: some timelines of every generation start " ++
                 "over, so the tree does not only deepen.",
         });
@@ -2540,7 +2781,9 @@ fn tree_judge(
         "({d} known); {d} moments returned to ({d} from in-run snapshots)\n", .{
         generation, done.len, reached.count(), state.seen.count(), made, held,
     });
-    return next;
+    summaries.count = 0;
+    plan.clearRetainingCapacity();
+    state.generation += 1;
 }
 
 /// After changed code, the least virtual time a timeline must go on for the tree to return
@@ -2804,10 +3047,14 @@ fn node_make(
     vtime_ns: u64,
     /// The branch's tape when a strategy overrode its decisions: they are replayed too.
     overrides: ?*tape.Overrides,
+    /// `from` is a node (a moment of another timeline): the run is a branch's, from its branch
+    /// point (VM.Options.branch_signal), as the timeline it replays was.
+    branch_point: bool,
 ) !*const Snapshot {
     try moment_after_snapshot(from, vtime_ns);
     var probe = options.*;
     probe.seed = seed;
+    probe.branch_signal = branch_point;
     probe.moment_vtime_ns = vtime_ns;
     probe.moment_command = null;
     probe.moment_continue = false;
@@ -2843,7 +3090,7 @@ const HolderMaker = struct {
         var options = maker.options.*;
         assert(options.from_hold == null);
         options.from_hold = point; // The timeline goes on as it did there.
-        return node_make(maker.arena, vm, &options, from, seed, vtime_ns, null);
+        return node_make(maker.arena, vm, &options, from, seed, vtime_ns, null, false);
     }
 };
 
@@ -2894,8 +3141,8 @@ fn node_make_start(
         const seed = parent.seed;
         if (making.chain_from) |setup| {
             from = setup;
-            for (parent.path) |segment| {
-                from = node_make(arena, vm, options, from, segment.seed, segment.vtime_ns, null) catch |err| {
+            for (parent.path, 0..) |segment, depth| {
+                from = node_make(arena, vm, options, from, segment.seed, segment.vtime_ns, null, depth > 0) catch |err| {
                     std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}'s path: {s}\n", .{
                         segment.vtime_ns, segment.branch, @errorName(err),
                     });
@@ -2903,7 +3150,7 @@ fn node_make_start(
                 };
             }
         }
-        const snapshot = node_make(arena, vm, options, from, seed, at, overrides) catch |err| {
+        const snapshot = node_make(arena, vm, options, from, seed, at, overrides, parent.path.len > 0) catch |err| {
             std.debug.print("[determinismo] tree: no snapshot at {d}ns of branch {d}: {s}\n", .{
                 at, parent.index, @errorName(err),
             });
@@ -2982,6 +3229,33 @@ const host_time_msrs = [_]u32{ 0x10, 0x40000010, 0x40000020 };
 /// A snapshot field the same in both, but for what the guest cannot see: host-time MSRs, the
 /// last exception's or interrupt's leftovers while none is pending or injected (struct
 /// kvm_vcpu_events), and the attributes of unusable segments.
+/// Two machines' event states, by what they hold: never their padding, nor the arrays past
+/// what is used (a holder's copy and a replay's differ there and nowhere the guest or the tree
+/// can see: run on srv3, 2026-10-27, `check_inputs`' padding).
+fn events_same(a: *const Events, b: *const Events) bool {
+    if (a.count != b.count or !std.meta.eql(a.hash, b.hash)) return false;
+    if (a.property_count != b.property_count) return false;
+    for (a.properties[0..a.property_count], b.properties[0..b.property_count]) |*x, *y| {
+        if (x.kind != y.kind or x.hits != y.hits or x.trues != y.trues) return false;
+        if (!std.mem.eql(u8, x.name(), y.name()) or !std.mem.eql(u8, x.where(), y.where())) return false;
+        if (!std.meta.eql(x.first_failure, y.first_failure)) return false;
+    }
+    if (!std.meta.eql(a.setup_complete, b.setup_complete) or a.guest_done != b.guest_done) return false;
+    const a_last = a.last_event_name[0..a.last_event_name_size];
+    if (!std.mem.eql(u8, a_last, b.last_event_name[0..b.last_event_name_size])) return false;
+    if (a.output_bytes != b.output_bytes or !std.meta.eql(a.first_vtime_ns, b.first_vtime_ns)) return false;
+    if (a.last_vtime_ns != b.last_vtime_ns or a.behavior_count != b.behavior_count) return false;
+    for (a.behaviors[0..a.behavior_count], b.behaviors[0..b.behavior_count]) |*x, *y| {
+        if (x.hash != y.hash or x.vtime_ns != y.vtime_ns or !std.mem.eql(u8, x.name(), y.name())) return false;
+    }
+    if (!std.mem.eql(u64, &a.behavior_slots, &b.behavior_slots)) return false;
+    if (a.check_used != b.check_used) return false;
+    for (a.check_inputs, b.check_inputs) |x, y| {
+        if (!std.meta.eql(x, y)) return false;
+    }
+    return true;
+}
+
 fn field_same(comptime name: []const u8, held: *const Snapshot, replayed: *const Snapshot) bool {
     if (comptime std.mem.eql(u8, name, "msrs")) {
         if (held.msrs.count != replayed.msrs.count) return false;
@@ -3026,6 +3300,7 @@ fn field_same(comptime name: []const u8, held: *const Snapshot, replayed: *const
     if (comptime std.mem.eql(u8, name, "modulation")) {
         return std.meta.eql(held.modulation, replayed.modulation);
     }
+    if (comptime std.mem.eql(u8, name, "events")) return events_same(&held.events, &replayed.events);
     const a = std.mem.asBytes(&@field(held, name));
     const b = std.mem.asBytes(&@field(replayed, name));
     return std.mem.eql(u8, a, b);

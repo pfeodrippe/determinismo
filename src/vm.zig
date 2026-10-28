@@ -61,6 +61,8 @@ until_hit: bool,
 moment_printing: bool,
 /// What the guest agent receives on its next action request.
 action_pending: ?[]const u8,
+/// Room for a branch point's action (branch_action_make).
+branch_action_buffer: [64]u8 = undefined,
 /// The moment's commands after the one running: a moment command can be several, separated by
 /// NUL bytes (which no argument can contain), run one after the other (`--exec-script`).
 moment_commands_rest: []const u8,
@@ -167,6 +169,11 @@ pub const Options = struct {
     moment_command: ?[]const u8 = null,
     /// After the command at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    /// The run begins at a branch point (init_from_snapshot of a node: a moment of another
+    /// timeline): the guest agent hears of it before the guest runs again (det:branch), and the
+    /// fault injector perturbs the branch at once (guest/runtime/faults.zig). Every run from a
+    /// node has it, timelines and the replays that make nodes alike: the same machine either way.
+    branch_signal: bool = false,
     /// Or the moment is the first event matching this condition.
     until: ?*const query.Condition = null,
     disks: []const Disk = &.{},
@@ -316,6 +323,28 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     vm.last_pull_ns = 0;
     vm.idle_pending = if (options.from_hold) |point| point.idle else false;
     assert(vm.branches_offset == snapshot.branches);
+    if (options.branch_signal) {
+        assert(options.from_hold == null); // A holder continues its own timeline.
+        vm.action_pending = vm.branch_action_make(snapshot);
+        try vm.irq_pulse(irq_action);
+    }
+}
+
+/// The agent's action at a branch point (guest/runtime/agent.zig): `det:branch`, and the node of
+/// the newest behavior the snapshot reached (the one the tree returned for, just before its
+/// moment), where the fault injector aims its first fault. From the snapshot's own state: a
+/// replay that makes the node says the same.
+const branch_action = "det:branch";
+
+fn branch_action_make(vm: *VM, snapshot: *const Snapshot) []const u8 {
+    const behaviors = snapshot.events.behaviors[0..snapshot.events.behavior_count];
+    var newest: ?*const Events.Behavior = null;
+    for (behaviors) |*behavior| {
+        if (behavior.node_size == 0) continue;
+        if (newest == null or behavior.vtime_ns >= newest.?.vtime_ns) newest = behavior;
+    }
+    const node = if (newest) |behavior| behavior.node() else return branch_action;
+    return std.fmt.bufPrint(&vm.branch_action_buffer, branch_action ++ " {s}", .{node}) catch branch_action;
 }
 
 pub fn deinit(vm: *VM) void {

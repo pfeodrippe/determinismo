@@ -9,6 +9,11 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
+const faults = @import("faults.zig");
+
+/// The platform's action where a timeline begins at a moment of another (VM.Options
+/// .branch_signal): not a command, no events; the fault injector hears of it (faults.zig).
+const branch_action = "det:branch";
 
 const action_size_max = sdk.message_size_max;
 /// Output travels in events, which are JSON-escaped: keep chunks well under the event limit.
@@ -34,7 +39,14 @@ pub fn main() !void {
         if (result == 0) continue; // Woken without an action.
         assert(result <= action_size_max);
         action_buffer[result] = 0;
-        run(action_buffer[0..result :0]);
+        const action = action_buffer[0..result :0];
+        if (std.mem.startsWith(u8, action, branch_action)) {
+            // "det:branch" and, after a space, the node the branch aims its first fault at.
+            const rest = action[branch_action.len..];
+            faults.branch_request(if (rest.len > 1 and rest[0] == ' ') rest[1..] else "");
+            continue;
+        }
+        run(action);
     }
 }
 

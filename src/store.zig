@@ -292,7 +292,8 @@ fn events_select(
         \\                AND event ->> '$.event' NOT IN ('composer_start', 'composer_done',
         \\                    'command_start', 'command_exit', 'faults_phase', 'faults_start',
         \\                    'faults_stop', 'fault', 'nodes_up', 'node_start', 'node_ready',
-        \\                    'node_kill', 'exec_start', 'exec_output', 'exec_done')
+        \\                    'node_kill', 'exec_start', 'exec_output', 'exec_done',
+        \\                    'faults_branch')
         \\            THEN hash('event', event ->> '$.event',
         \\                categorical(event, '$.details.kind'),
         \\                categorical(event, '$.details.flavor'),

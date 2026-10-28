@@ -7,8 +7,10 @@
 //! from the timeline's start, as before: the tree is the same either way, only faster.
 //!
 //! A holder costs the memory its timeline writes after it (the pages it still shares are free):
-//! a timeline keeps a few, spread out, none while memory runs low, and the kernel's OOM killer
-//! takes holders first (a node then costs a replay, never a timeline).
+//! a timeline keeps a few, spread out, none while memory runs low. Its cost grows as its timeline
+//! goes on, so a holder goes by itself once the host's memory runs low (a node then costs a
+//! replay, never a timeline): the VMs' memory comes first (cpus.zig). 18 YugabyteDB timelines
+//! and their holders once left srv2 0 GB, thrashing until the OOM killer acted (2026-10-27).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -24,11 +26,38 @@ pub const per_timeline_max = 8;
 /// behaviors in bursts: one holder per burst).
 const spacing_divisor = 64;
 const spacing_ns_min = 10 * std.time.ns_per_ms;
-/// No holder is made with less memory than this available (MemAvailable).
-const memory_reserve_bytes = cpus.memory_reserve_bytes;
+/// No holder is made with less memory than this available (MemAvailable): room to grow in.
+const make_available_min = 2 * cpus.memory_reserve_bytes;
+/// A holder goes once less than this is available, above where a VM start waits (cpus.zig).
+const keep_available_min = cpus.memory_reserve_bytes;
+/// How often a holder looks at the host's memory, plus up to as much again by its pid: holders
+/// look at different moments, so the first ones gone can give enough back for the rest.
+const memory_check_ms = 200;
 
-/// What the explorer asks a holder: the moment of the node to make.
-const Request = extern struct { vtime_ns: u64 };
+/// What the explorer asks a holder: the moment of the node to make; or (`disk`) to write its
+/// snapshot to the run's ladder directory, diffed against `base` (Ladder).
+pub const Request = extern struct {
+    vtime_ns: u64,
+    kind: Kind = .node,
+    base_len: u32 = 0,
+    base: [Snapshot.disk_name_max]u8 = @splat(0),
+
+    pub const Kind = enum(u32) { node, disk };
+};
+
+/// A failing timeline's holders, written to disk one after the other (main.zig's ladder): each
+/// `b<timeline>-<ms>`, the pages changed since the one before (its base). Set before the
+/// workers fork: `hashes` is a shared mapping (Snapshot.PageHashes), the base's page hashes,
+/// which each holder's save updates to its own for the next.
+pub const Ladder = struct {
+    directory: []const u8,
+    hashes: []u64,
+};
+
+/// The name a holder's snapshot gets on disk (causality's, for a moment of the timeline).
+pub fn ladder_name(buffer: *[Snapshot.disk_name_max]u8, branch: u32, vtime_ns: u64) []const u8 {
+    return std.fmt.bufPrint(buffer, "b{d}-{d}", .{ branch, vtime_ns / std.time.ns_per_ms }) catch unreachable;
+}
 
 /// A holder as its timeline's summary carries it to the explorer: its process, and where it
 /// listens (an abstract Unix socket named after the explorer, its worker and its number there).
@@ -91,19 +120,36 @@ pub const Registry = struct {
         }
     }
 
-    /// The holders of branches `first` to `last` that nobody took go (their memory: a
-    /// generation judged; a generation's branches are numbered one after the other).
-    pub fn release_branches(registry: *Registry, first: u32, last: u32) void {
-        assert(first <= last);
+    /// The holders of `branches` that nobody took go (their memory: a generation judged).
+    pub fn release_listed(registry: *Registry, branches: []const u32) void {
         var kept: u32 = 0;
         for (registry.entries[0..registry.count]) |entry| {
-            const theirs = entry.branch >= first and entry.branch <= last;
+            const theirs = std.mem.indexOfScalar(u32, branches, entry.branch) != null;
             if (!theirs) {
                 registry.entries[kept] = entry;
                 kept += 1;
             } else if (!entry.taken) kill(entry.held.pid);
         }
         registry.count = kept;
+    }
+
+    /// The holders of `branch` nobody took, set aside (they are not released with their
+    /// generation): the caller writes them to disk, then they go (`Taken`'s socket closed, or
+    /// `kill`). Sorted by moment, into `out`.
+    pub fn set_aside(registry: *Registry, branch: u32, out: []Held) []Held {
+        var count: usize = 0;
+        for (registry.entries[0..registry.count]) |*entry| {
+            if (entry.taken or entry.branch != branch or count == out.len) continue;
+            entry.taken = true;
+            out[count] = entry.held;
+            count += 1;
+        }
+        std.sort.insertion(Held, out[0..count], {}, held_earlier);
+        return out[0..count];
+    }
+
+    fn held_earlier(_: void, a: Held, b: Held) bool {
+        return a.vtime_ns < b.vtime_ns;
     }
 
     /// The holders nobody took go (their memory, before the next generation runs).
@@ -129,6 +175,8 @@ pub const Owner = struct {
     /// A capture's room (large: a snapshot carries the timeline's events state).
     snapshot: *Snapshot,
     make: Make,
+    /// Where holders write themselves when the explorer asks (a failing timeline's ladder).
+    ladder: ?*const Ladder = null,
     hold: VM.Hold = undefined,
     /// The moment armed (as the explorer will ask for it), and whether it follows a behavior
     /// (else it is periodic: a timeline that finds nothing new for a while still has holders,
@@ -209,7 +257,7 @@ pub const Owner = struct {
         owner.armed_new = false;
         owner.last_ns = moment;
         try owner.arm(vm, moment + owner.period(), false); // The next, unless one is new first.
-        if (cpus.memory_available() < memory_reserve_bytes) return;
+        if (cpus.memory_available() < make_available_min) return;
         // Not once host checks' inputs arrived (the timeline's end): their bytes are in this
         // worker's buffer, and a node goes to any worker with its state, not that buffer's
         // content. A replay makes such a node right.
@@ -277,11 +325,18 @@ pub const Owner = struct {
             .{ .fd = listener, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = @intCast(explorer), .events = linux.POLL.IN, .revents = 0 },
         };
+        const check_ms = memory_check_ms + @as(i32, @intCast(@mod(linux.getpid(), memory_check_ms)));
         while (true) {
-            const ready = linux.poll(&polled, polled.len, -1);
+            const ready = linux.poll(&polled, polled.len, check_ms);
             if (linux.errno(ready) == .INTR) continue;
             if (linux.errno(ready) != .SUCCESS or polled[1].revents != 0) linux.exit_group(0);
             if (polled[0].revents != 0) break;
+            const available = cpus.memory_available(); // 0: unknown, never a reason to go.
+            if (available == 0 or available >= keep_available_min) continue;
+            // Going, unless the explorer asked meanwhile.
+            const asked = linux.poll(polled[0..1], 1, 0);
+            if (linux.errno(asked) == .SUCCESS and polled[0].revents != 0) break;
+            linux.exit_group(0);
         }
         _ = linux.close(@intCast(explorer));
         const accepted = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
@@ -290,6 +345,7 @@ pub const Owner = struct {
         const socket: linux.fd_t = @intCast(accepted);
         var request: Request = undefined;
         if (!read_exact(socket, std.mem.asBytes(&request))) linux.exit_group(0); // Released.
+        if (request.kind == .disk) owner.disk_write(vm, socket, &request, moment_ns);
         if (request.vtime_ns < moment_ns) linux.exit_group(1);
         owner.snapshot.capture_memory(vm.memory, vm.memory_fd) catch linux.exit_group(1);
         // Running on to a later moment is a VM run: on a CPU of the host's pool, alone on its
@@ -314,7 +370,43 @@ pub const Owner = struct {
         if (!write_all(socket, std.mem.asBytes(node))) linux.exit_group(1);
         linux.exit_group(0);
     }
+
+    /// Writes this holder's snapshot to the ladder (its pages changed since the base's, whose
+    /// hashes the shared table holds, then its own), answers one byte (0: written), and ends:
+    /// the explorer asks the next holder after it.
+    fn disk_write(owner: *Owner, vm: *VM, socket: linux.fd_t, request: *const Request, moment_ns: u64) noreturn {
+        const ladder = owner.ladder orelse linux.exit_group(1);
+        var name_buffer: [Snapshot.disk_name_max]u8 = undefined;
+        const name = ladder_name(&name_buffer, owner.branch, moment_ns);
+        const base = request.base[0..request.base_len];
+        const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
+        Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, ladder.hashes, ladder.directory, name, base, owner.point.idle) catch {
+            _ = write_all(socket, &.{1});
+            linux.exit_group(1);
+        };
+        _ = write_all(socket, &.{0});
+        linux.exit_group(0);
+    }
 };
+
+/// Ends a holder set aside (Registry.set_aside) without writing it.
+pub fn end(held: Held) void {
+    kill(held.pid);
+}
+
+/// Asks a holder set aside (Registry.set_aside) to write itself to the ladder, diffed against
+/// `base`; then it ends. Whether it did (a holder gone meanwhile, for memory, did not).
+pub fn ask_disk(explorer: linux.pid_t, held: Held, base: []const u8) bool {
+    defer kill(held.pid);
+    const at = address(explorer, held.worker, held.id);
+    const socket = connect(&at) orelse return false;
+    defer _ = linux.close(socket);
+    var request: Request = .{ .vtime_ns = held.vtime_ns, .kind = .disk, .base_len = @intCast(base.len) };
+    @memcpy(request.base[0..base.len], base);
+    if (!write_all(socket, std.mem.asBytes(&request))) return false;
+    var answer: [1]u8 = undefined;
+    return read_exact(socket, &answer) and answer[0] == 0;
+}
 
 /// Ends a holder and waits for it (it may have been waited for already, by its worker).
 fn kill(pid: linux.pid_t) void {
