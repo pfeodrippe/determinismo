@@ -379,7 +379,17 @@ fn check_sinks(context: *Context) !void {
             return result.stdout.len > 0;
         }
     }.found;
+    // The retroactive sink (ANTITHESIS_FILTERED_OUTPUT_DIR): out of the exploration's events,
+    // in a replay's.
+    const replayed = try std.fmt.allocPrint(arena, "{s}/sinks-replay.jsonl", .{context.scratch});
+    _ = try explore(context, &.{
+        "--program", program, "--scenario", "sinks", "--seed", "1", "--branch", "0", "--events", replayed,
+    });
+    const hidden = !grep(context, "a filtered line", events);
+    const recovered = grep(context, "\"stream\":\"filtered verbose.log\",\"text\":\"a filtered line\"", replayed);
     expect_all(context, &.{
+        .{ "the retroactive sink's line is out of the exploration's events", hidden },
+        .{ "and in a replay's", recovered },
         .{ "the node has ANTITHESIS_OUTPUT_DIR", std.mem.indexOf(u8, report, "nodes have ANTITHESIS_OUTPUT_DIR") != null and
             std.mem.indexOf(u8, report, "FAIL always                hit in    2/2 branches, failing in    2  nodes have") == null },
         .{ "a .jsonl line is an event (an Antithesis SDK assertion)", grep(context, "\"message\":\"a sink assertion\"", events) },

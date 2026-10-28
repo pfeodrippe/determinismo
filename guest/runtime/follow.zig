@@ -59,6 +59,18 @@ pub const File = struct {
         file.name_size = name_size;
     }
 
+    /// Its lines' stream is "filtered <file>" (a retroactive sink's: hidden while exploring).
+    pub fn filtered(file: *File) void {
+        const prefix = "filtered ";
+        const base = file.name_buffer[0..file.name_size];
+        var named: [name_size_max]u8 = undefined;
+        const size = @min(prefix.len + base.len, name_size_max);
+        @memcpy(named[0..prefix.len], prefix);
+        @memcpy(named[prefix.len..size], base[0 .. size - prefix.len]);
+        @memcpy(file.name_buffer[0..size], named[0..size]);
+        file.name_size = size;
+    }
+
     pub fn path(file: *const File) [:0]const u8 {
         return file.path_buffer[0..file.path_size :0];
     }

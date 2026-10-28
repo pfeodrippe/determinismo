@@ -223,6 +223,8 @@ fn sink_write(_: *System.Context) !void {
     try sink_append(sink ++ "/sdk.jsonl", assertion);
     try sink_append(sink ++ "/debug.log", "hello sink\n");
     try sink_append(sink ++ "/data.bin", "\x00\x01\x02");
+    // The retroactive sink: out of the exploration's logs, back in a replay's.
+    try sink_append("/run/det/nodes/echo/root/run/antithesis-filtered/verbose.log", "a filtered line\n");
     // The node's main process has the variable (Antithesis sets it in every container).
     const pid = nodes_pid_of("echo") orelse return error.NoEcho;
     var path_buffer: [64]u8 = undefined;

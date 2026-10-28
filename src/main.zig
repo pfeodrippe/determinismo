@@ -528,7 +528,7 @@ fn system_run(init: std.process.Init, vm: *VM, arguments_given: Arguments) !u32 
         else
             &.{},
         .cpu_modulation = arguments.cpu_modulation,
-        .retroactive = retroactive_texts(&arguments),
+        .retroactive = try retroactive_texts(arena, &arguments),
         .vtime_limit_ns = arguments.timeline_limit_ns,
     };
     const context = Context{
@@ -1562,12 +1562,19 @@ const retroactive_max = 16;
 
 /// The texts retroactive logging hides: none when looking at one timeline (a replay, a moment, a
 /// tape), which writes everything.
-fn retroactive_texts(arguments: *const Arguments) []const []const u8 {
+fn retroactive_texts(arena: std.mem.Allocator, arguments: *const Arguments) ![]const []const u8 {
     const one = arguments.branch_only != null or arguments.tape_path != null or
         arguments.moment_vtime_ms != null or arguments.until != null;
     if (one) return &.{};
-    return arguments.retroactive[0..arguments.retroactive_count];
+    // And Antithesis's retroactive sink (ANTITHESIS_FILTERED_OUTPUT_DIR: det-sinks names its
+    // lines' stream "filtered <file>"), whatever was asked.
+    const texts = try arena.alloc([]const u8, arguments.retroactive_count + 1);
+    @memcpy(texts[0..arguments.retroactive_count], arguments.retroactive[0..arguments.retroactive_count]);
+    texts[arguments.retroactive_count] = filtered_stream_text;
+    return texts;
 }
+
+const filtered_stream_text = "\"stream\":\"filtered ";
 
 fn changed_needs_tree() error{Usage} {
     std.debug.print("[determinismo] --changed aims the tree explorer: not with flat branching, " ++

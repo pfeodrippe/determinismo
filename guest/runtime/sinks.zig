@@ -37,7 +37,10 @@ pub fn main(init: std.process.Init) !void {
     _ = linux.sigaction(linux.SIG.TERM, &action, null);
     for (0..polls_max) |_| {
         const last = stopping.load(.acquire);
-        for (system.nodes) |node| scan(node.name);
+        for (system.nodes) |node| {
+            scan(node.name, false);
+            scan(node.name, true);
+        }
         for (files[0..files_count]) |*file| file.follow(device);
         if (last) return;
         const request = linux.timespec{ .sec = 0, .nsec = poll_ns };
@@ -45,24 +48,27 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// The node's sink files, followed from their start once found.
-fn scan(node: []const u8) void {
+/// The node's sink files (or its retroactive sink's), followed from their start once found.
+fn scan(node: []const u8, filtered: bool) void {
     var directory_buffer: [follow.path_size_max]u8 = undefined;
-    const directory = nodes.sink_path(&directory_buffer, node) catch return;
+    const directory = nodes.sink_path(&directory_buffer, node, filtered) catch return;
     var entries = follow.Entries.of(directory);
     while (entries.next()) |entry| {
         if (entry.directory) continue;
         var path_buffer: [follow.path_size_max]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ directory, entry.name }) catch continue;
-        note(path, node, follow.Kind.of_sink(entry.name));
+        // The retroactive sink's are output whatever their kind, under "filtered <file>".
+        const kind = follow.Kind.of_sink(entry.name);
+        note(path, node, if (filtered and kind == .jsonl) .text else kind, filtered);
     }
 }
 
-fn note(path: []const u8, node: []const u8, kind: follow.Kind) void {
+fn note(path: []const u8, node: []const u8, kind: follow.Kind, filtered: bool) void {
     for (files[0..files_count]) |*file| {
         if (std.mem.eql(u8, file.path(), path)) return;
     }
     if (files_count == files_max) return;
     files[files_count].init(path, node, kind) catch return;
+    if (filtered) files[files_count].filtered();
     files_count += 1;
 }

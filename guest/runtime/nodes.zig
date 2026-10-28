@@ -35,14 +35,20 @@ const platform_environment = [_][:0]const u8{
     "DETERMINISMO_STOP_FAULTS=" ++ stop_faults_path,
     "ANTITHESIS_STOP_FAULTS=" ++ stop_faults_path,
     "ANTITHESIS_OUTPUT_DIR=" ++ sink_directory,
+    "ANTITHESIS_FILTERED_OUTPUT_DIR=" ++ filtered_directory,
 };
 /// Antithesis's output sink in every node (ANTITHESIS_OUTPUT_DIR): what is written to files
 /// there becomes events (det-sinks, sinks.zig).
 pub const sink_directory = "/run/antithesis";
+/// Antithesis's retroactive sink (ANTITHESIS_FILTERED_OUTPUT_DIR): what is written there is left
+/// out of an exploration's logs and comes back in a replay of the timeline (det-sinks sends it as
+/// output whose stream is "filtered <file>"; the host's retroactive logging hides those).
+pub const filtered_directory = "/run/antithesis-filtered";
 
-/// A node's sink directory, as the runner sees it.
-pub fn sink_path(buffer: []u8, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, state_root ++ "/{s}/root" ++ sink_directory, .{name});
+/// A node's sink directory (or its retroactive one), as the runner sees it.
+pub fn sink_path(buffer: []u8, name: []const u8, filtered: bool) ![]const u8 {
+    const directory = if (filtered) filtered_directory else sink_directory;
+    return std.fmt.bufPrint(buffer, state_root ++ "/{s}/root{s}", .{ name, directory });
 }
 const poll_interval_ns = 10 * std.time.ns_per_ms;
 const ready_attempts_max = 6000; // 60 s of virtual time.
@@ -1440,6 +1446,7 @@ const Launch = struct {
         }
         // Antithesis's output sink (ANTITHESIS_OUTPUT_DIR).
         try mkdir_all(try print_z(&buffer, "{s}" ++ sink_directory, .{launch.root}));
+        try mkdir_all(try print_z(&buffer, "{s}" ++ filtered_directory, .{launch.root}));
         // The platform's binaries and the fault injector's control FIFO, read-only.
         const platform = try print_z(&buffer, "{s}/opt/determinismo", .{launch.root});
         try mkdir_all(platform);
