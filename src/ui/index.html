@@ -645,7 +645,11 @@ const builtin = new Set(["test commands exit successfully", "nodes do not exit u
   "the guest finishes its scenario (no panic, hang or crash)",
   "peak memory usage stays under 95% of the machine's memory",
   "logging output stays under 200 MB per hour of virtual time", "host checks run to completion",
-  "the fault injector started", "timelines replay to their recorded history"]);
+  "the fault injector started", "the fault injector never stalls",
+  "timelines replay to their recorded history"]);
+// Also determinismo's: a crash named by its process, a language runtime's panic (Go, Rust, Java).
+const isBuiltin = (message) => builtin.has(message) || message.startsWith("no process crashes")
+  || /^no (panics|fatal errors|data races|uncaught exceptions) \((Go|Rust|Java)\)$/.test(message);
 function properties() {
   return (state.run.properties || []).map((p) => ({
     kind: p.type, message: p.message, location: p.location, status: p.status,
@@ -670,9 +674,9 @@ function propertiesBody() {
   const shown = list.filter((p) => (state.tab === "all" || (state.tab === "passed") === !isFailing(p))
     && p.message.toLowerCase().includes(state.filter.toLowerCase()));
   const command = (p) => p.message.startsWith("test command ");
-  const own = (p) => !builtin.has(p.message) && !command(p);
+  const own = (p) => !isBuiltin(p.message) && !command(p);
   const groups = [
-    ["determinismo", shown.filter((p) => builtin.has(p.message))],
+    ["determinismo", shown.filter((p) => isBuiltin(p.message))],
     ["Test commands", shown.filter(command)],
     ["Always assertions", shown.filter((p) => own(p) && p.kind.startsWith("always"))],
     ["Sometimes assertions", shown.filter((p) => own(p) && p.kind === "sometimes")],

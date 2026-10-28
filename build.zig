@@ -327,6 +327,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/profile.zig",
         "guest/runtime/cores.zig",
         "guest/runtime/voidstar.zig",
+        "guest/runtime/output.zig",
         "examples/nrepl/bencode.zig",
         "examples/nats/client.zig",
         "examples/sql/append.zig",

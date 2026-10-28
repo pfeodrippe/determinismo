@@ -186,7 +186,7 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
     }
     events.behavior_note(moment, value);
     if (value.object.get("lifecycle")) |lifecycle| events.on_lifecycle(moment, lifecycle);
-    if (value.object.get("output")) |output| try events.on_output(moment, output);
+    if (value.object.get("output")) |output| events.on_output(output);
     if (value.object.get("assert")) |assertion| try events.on_assert(moment, assertion);
     if (value.object.get("antithesis_assert")) |assertion| {
         try events.on_antithesis_assert(moment, assertion);
@@ -407,31 +407,12 @@ test behavior_note {
     try std.testing.expectEqualStrings("closer to \"sum\"", events.behaviors[1].name());
 }
 
-/// Language properties, from what processes print (Antithesis's "No panics (Go)" and others):
-/// the signature of a panic, a fatal error, a data race or an uncaught exception, at the start
-/// of a line. Each fails its property where it appears; a property never hit passes.
-const language_signs = [_]struct { prefix: []const u8, property: []const u8 }{
-    .{ .prefix = "panic: ", .property = "no panics (Go)" },
-    .{ .prefix = "fatal error: ", .property = "no fatal errors (Go)" },
-    .{ .prefix = "WARNING: DATA RACE", .property = "no data races (Go)" },
-    .{ .prefix = "thread '", .property = "no panics (Rust)" },
-    .{ .prefix = "Exception in thread \"", .property = "no uncaught exceptions (Java)" },
-};
-
-fn on_output(events: *Events, moment: Moment, output: std.json.Value) !void {
+/// Language properties (a Go panic, ...) are the guest's output forwarder's assertions
+/// (guest/runtime/output.zig): events as any other, for queries and a run's properties alike.
+fn on_output(events: *Events, output: std.json.Value) void {
     if (output != .object) return;
     const text = string_field(output.object, "text") orelse return;
     events.output_bytes += text.len;
-    for (language_signs) |sign| {
-        if (!std.mem.startsWith(u8, text, sign.prefix)) continue;
-        // Rust's panic line: "thread 'main' panicked at src/main.rs:4:5:".
-        const rust = std.mem.eql(u8, sign.prefix, "thread '");
-        if (rust and std.mem.indexOf(u8, text, "' panicked at ") == null) continue;
-        const property = try events.property_get_or_put(.always_or_unreachable, sign.property);
-        property.hits += 1;
-        if (property.first_failure == null) property.first_failure = moment;
-        return;
-    }
 }
 
 fn on_lifecycle(events: *Events, moment: Moment, lifecycle: std.json.Value) void {
@@ -671,22 +652,6 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) void {
         written += result;
     }
     assert(written <= bytes.len);
-}
-
-test "language properties from output" {
-    const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
-    defer std.testing.allocator.free(parse_buffer);
-    var events: Events = undefined;
-    events.init(parse_buffer, .{ .log_fd = null });
-    const fine = "{\"output\":{\"source\":\"api\",\"stream\":\"stderr\"," ++
-        "\"text\":\"thread 'x' started\"}}";
-    const panic = "{\"output\":{\"source\":\"api\",\"stream\":\"stderr\"," ++
-        "\"text\":\"thread 'main' panicked at src/main.rs:4:5:\"}}";
-    try events.emit(.{ .vtime_ns = 1, .branches = 10 }, fine);
-    try std.testing.expectEqual(@as(u32, 0), events.property_count);
-    try events.emit(.{ .vtime_ns = 2, .branches = 20 }, panic);
-    try std.testing.expectEqual(@as(u32, 1), events.failing_count());
-    try std.testing.expectEqualStrings("no panics (Rust)", events.properties[0].name());
 }
 
 test "always fails on the first false condition and records its moment" {

@@ -8,6 +8,10 @@
 //! the lines it has as one write (one request to the platform), not one per line. It takes the
 //! source's name as its own (its comm), so the events' source is the node or command. It ends
 //! when every process writing to the pipes has closed them.
+//!
+//! A line that starts as a language runtime's panic, fatal error, data race or uncaught exception
+//! does (Antithesis's "No panics (Go)" and others) is also an assertion that fails, right after
+//! it: queries, a run's properties and its timelines all see it as any other.
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -147,16 +151,26 @@ const Batch = struct {
     size: usize = 0,
 
     fn line(batch: *Batch, stream: []const u8, text: []const u8) void {
-        var event_buffer: [3 * line_size_max]u8 = undefined;
+        batch.event(.{ .output = .{ .source = batch.source, .stream = stream, .text = text } });
+        const property = language_property(text) orelse return;
+        batch.event(.{ .assert = .{
+            .type = "always_or_unreachable",
+            .message = property,
+            .condition = false,
+            .details = .{ .source = batch.source, .text = text },
+        } });
+    }
+
+    fn event(batch: *Batch, value: anytype) void {
+        var event_buffer: [3 * line_size_max + 512]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&event_buffer);
-        const value = .{ .output = .{ .source = batch.source, .stream = stream, .text = text } };
         std.json.Stringify.value(value, .{}, &writer) catch return;
         writer.writeAll("\n") catch return;
-        const event = writer.buffered();
-        if (event.len > batch.buffer.len) return; // Escaping can grow a line; never cut JSON.
-        if (batch.size + event.len > batch.buffer.len) batch.flush();
-        @memcpy(batch.buffer[batch.size..][0..event.len], event);
-        batch.size += event.len;
+        const bytes = writer.buffered();
+        if (bytes.len > batch.buffer.len) return; // Escaping can grow a line; never cut JSON.
+        if (batch.size + bytes.len > batch.buffer.len) batch.flush();
+        @memcpy(batch.buffer[batch.size..][0..bytes.len], bytes);
+        batch.size += bytes.len;
     }
 
     fn flush(batch: *Batch) void {
@@ -166,3 +180,48 @@ const Batch = struct {
         _ = linux.write(fd, &batch.buffer, batch.size);
     }
 };
+
+/// Language properties (Antithesis's "No panics (Go)" and others): the signature of a panic, a
+/// fatal error, a data race or an uncaught exception, at the start of a line.
+const language_signs = [_]struct { prefix: []const u8, property: []const u8 }{
+    .{ .prefix = "panic: ", .property = "no panics (Go)" },
+    .{ .prefix = "fatal error: ", .property = "no fatal errors (Go)" },
+    .{ .prefix = "WARNING: DATA RACE", .property = "no data races (Go)" },
+    .{ .prefix = "thread '", .property = "no panics (Rust)" },
+    .{ .prefix = "Exception in thread \"", .property = "no uncaught exceptions (Java)" },
+};
+
+/// The language property a line of output violates, if any.
+fn language_property(text: []const u8) ?[]const u8 {
+    for (language_signs) |sign| {
+        if (!std.mem.startsWith(u8, text, sign.prefix)) continue;
+        // Rust's panic line: "thread 'main' panicked at src/main.rs:4:5:".
+        const rust = std.mem.eql(u8, sign.prefix, "thread '");
+        if (rust and std.mem.indexOf(u8, text, "' panicked at ") == null) continue;
+        return sign.property;
+    }
+    return null;
+}
+
+test language_property {
+    try std.testing.expectEqual(@as(?[]const u8, null), language_property("thread 'x' started"));
+    try std.testing.expectEqualStrings("no panics (Rust)", language_property(
+        "thread 'main' panicked at src/main.rs:4:5:",
+    ).?);
+    try std.testing.expectEqualStrings("no panics (Go)", language_property(
+        "panic: runtime error: invalid memory address or nil pointer dereference",
+    ).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), language_property("I0101 panic: later"));
+}
+
+test "a panic line is its output event, then its property's failing assertion" {
+    var batch: Batch = .{ .source = "dg5", .device = null };
+    batch.line("stderr", "panic: runtime error: invalid memory address or nil pointer dereference");
+    batch.line("stderr", "goroutine 275 [running]:");
+    const sent = batch.buffer[0..batch.size];
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sent, "\n"));
+    const output = std.mem.indexOf(u8, sent, "{\"output\":{\"source\":\"dg5\"").?;
+    const assertion = std.mem.indexOf(u8, sent, "{\"assert\":{\"type\":\"always_or_unreachable\"," ++
+        "\"message\":\"no panics (Go)\",\"condition\":false,\"details\":{\"source\":\"dg5\"").?;
+    try std.testing.expect(output < assertion);
+}
