@@ -44,6 +44,13 @@ the file `DETERMINISMO_SDK_LOCAL_OUTPUT` names (Antithesis's `ANTITHESIS_SDK_LOC
 JSON object a line, else to stderr. Buggify points are always false there, and nothing is
 announced; the catalog still lists.
 
+Code coverage, for strategies that keep timelines reaching new code: C and Zig with
+`-fsanitize-coverage=trace-pc-guard` (`sanitize_coverage_trace_pc_guard`); Rust with the
+feature `coverage` and `RUSTFLAGS="-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3
+-C llvm-args=-sanitizer-coverage-trace-pc-guard"`, building with `--target <triple>`; Python
+(3.12+) with `coverage_start()`; the JVM with the coverage agent; Node.js with `coverageStart()`.
+Each edge, line or block reports itself once, the first time a process runs it.
+
 ## Antithesis's SDKs
 
 Programs written against Antithesis's SDKs run under determinismo as they are: their libvoidstar

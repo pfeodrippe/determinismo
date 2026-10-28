@@ -11,12 +11,18 @@ rust-version = "1.70"
 # the OS, for builds that must not carry it (as Antithesis's `full`).
 default = ["full"]
 full = []
-# The callbacks of `-C passes=sancov-module -C llvm-args=-sanitizer-coverage-trace-pc-guard`
-# builds: each edge reports itself the first time it runs (docs/SDKS.md).
-coverage = []
+# The callbacks of builds with `-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3
+# -C llvm-args=-sanitizer-coverage-trace-pc-guard`: each edge reports itself the first time it
+# runs (docs/SDKS.md). In C (src/coverage.c), compiled without the instrumentation: a callback
+# in Rust would be instrumented itself, and call itself. Build with `--target <triple>`, so that
+# RUSTFLAGS reach the program's code and not the dependencies' build scripts.
+coverage = ["dep:cc"]
 # `RngCore` for `Rng` and `Prng`, for the `rand` crate's users.
 rand_core_0_6 = ["dep:rand_core_0_6"]
 rand_core_0_9 = ["dep:rand_core_0_9"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [dependencies]
 serde_json = "1"
