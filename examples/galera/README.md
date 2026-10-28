@@ -22,3 +22,15 @@ error log goes to stderr, into the run's events.
 
 Faults: Antithesis's set, restarts, graceful stops and power losses (each node's data on its own
 disk), and stalls and power losses at the nodes' syncs.
+
+## Status
+
+- Hunt run 58 (srv3, 2026-10-28, `jepsen` profile, 12.1.2, seed 2, 2 h): 532 timelines, Elle
+  found no anomaly (Jepsen's lost updates and lost commits not rediscovered), and "no process
+  crashes: mariadbd" failed in 22. Each is Galera's own abort: a node rejoining after a crash
+  needed a state transfer whose donor left the group ("Donor ... is no longer in the group.
+  State transfer cannot be completed, need to abort", then `abort()`; the signal 11 is glibc's
+  last resort inside it): by design, not a bug. Elle had plenty to judge: 86,970 operations,
+  about 1,000 of them of unknown outcome (1.2%: a `sometimes` true in most timelines says one
+  happened, not that most did); the commit errors were all `Error while appending streaming
+  replication fragment (provider status: Not connected to Primary Component)`.

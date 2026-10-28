@@ -108,6 +108,9 @@ the whole timeline (the coverage profile's slower brokers never got one).
 - First timelines (srv1): producers could not start under the first faults (transaction state
   being created), and kafka-2 could not start again after power losses.
 
+- Hunt run 67 (2026-10-28, default profile, seed 17, 2 h, the fixes above): 207 timelines,
+  commits in most; Elle failed in 22, each time G0 alone (Jepsen's write cycles, now reported
+  apart: `allowed`); one false data loss (below); no KAFKA-17754 yet.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
