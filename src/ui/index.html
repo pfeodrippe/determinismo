@@ -331,12 +331,19 @@ async function runOpen(id, view) {
   state.examplesOpen = new Set();
   state.logs = null;
   state.notebook = null;
-  clearInterval(state.poll);
+  clearTimeout(state.poll);
   runsRefresh();
   await runRefresh();
-  state.poll = setInterval(() => {
-    if (state.run && state.run.state === "running") { runRefresh(); runsRefresh(); }
-  }, 2000);
+  // While it runs: again 2 s after a refresh, or five times as long as the last took (serve
+  // answers from the run's database, on the hunt's CPUs: 0.6 s a refresh at 3,000 timelines).
+  const poll = async () => {
+    if (state.runId !== id) return;
+    const started = performance.now();
+    if (state.run && state.run.state === "running") { await runRefresh(); runsRefresh(); }
+    if (state.runId !== id) return;
+    state.poll = setTimeout(poll, Math.max(2000, 5 * (performance.now() - started)));
+  };
+  state.poll = setTimeout(poll, 2000);
 }
 
 async function runRefresh() {
