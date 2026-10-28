@@ -87,6 +87,10 @@ event hashing, the guest module.
     Next: a branch's future with fresh randomness (fork's), and containers in notebook cells.
   - The serve self-test (controller) failed 7 of 16: three serve bugs under concurrency and
     restarts (fixed), and its fake explorer out of date.
+  - The Raft POC benchmark (20 minutes a seed, seeds 1 and 2, the whole host): the default tree
+    found the leadership-transfer deadlock at 67 s and 73 s, the archive at 906 s and 236 s;
+    neither found the other three in that time. Every run counts finds from moments apart now
+    (`found_from_moment`).
 - srv3 (2026-10-27, night), found and fixed:
   - Nodes ran with the kernel's 1024 open files: YugabyteDB's tablet servers aborted on "Too many
     open files" in every timeline (run 1's 39 failures were that). det-init now gives Docker's

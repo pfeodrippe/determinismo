@@ -41,11 +41,16 @@ wait_run() { # <run id>: until it has not run for 3 minutes running (a stop and 
     sleep 60
   done
 }
-start() { # <request JSON>: its run's id, once serve takes it (retried while serve is away)
-  local id=""
+start() { # <request JSON>: its run's id, once serve takes it (retried while serve is away;
+  # what serve answered instead is logged, on stderr: run 37 waited 10 minutes unexplained)
+  local id="" answer
   while [ -z "$id" ]; do
-    id=$(curl -s -X POST localhost:7878/runs -d "$1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' 2>/dev/null)
-    [ -n "$id" ] || sleep 30
+    answer=$(curl -s --max-time 120 -w "\nHTTP %{http_code}" -X POST localhost:7878/runs -d "$1")
+    id=$(printf '%s' "$answer" | head -1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' 2>/dev/null)
+    if [ -z "$id" ]; then
+      echo "$(date +%H:%M) serve did not start the run: $(printf '%s' "$answer" | tr '\n' ' ' | cut -c1-300)" >&2
+      sleep 30
+    fi
   done
   echo "$id"
 }
