@@ -600,6 +600,21 @@ fn exploration_is_run(arguments: *const Arguments) bool {
 fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !void {
     const directory = arguments.run_directory orelse claimed: {
         const data = try runs.data_directory(arena, arguments.data_directory);
+        // Never over another run's events, record or tapes: they would be its no more.
+        for ([_]struct { []const u8, ?[]const u8, []const u8 }{
+            .{ "events", arguments.events_directory, "--events-dir" },
+            .{ "record.jsonl", arguments.record_path, "--record" },
+            .{ "tapes", arguments.tape_directory, "--tape-dir" },
+        }) |asked| {
+            const path = asked[1] orelse continue;
+            const target = try runs.absolute(arena, path);
+            if (try runs.linked_by(arena, data, asked[0], target)) |id| {
+                std.debug.print("error: {s} {s} holds run {d}'s; give another (or delete it)\n", .{
+                    asked[2], path, id,
+                });
+                return error.DirectoryOfAnotherRun;
+            }
+        }
         const run = try runs.claim(arena, io, data);
         try runs.output_tee(arena, try std.fs.path.join(arena, &.{ run.directory, "output.log" }));
         std.debug.print("[determinismo] run {d}: {s}\n", .{ run.id, run.directory });

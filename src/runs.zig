@@ -45,6 +45,21 @@ pub fn claim(arena: std.mem.Allocator, io: std.Io, data: []const u8) !Claimed {
     return error.TooManyRuns;
 }
 
+/// The run whose `<name>` (its events, record or tapes, asked elsewhere) links to `target`, if
+/// any: a new run there would replace that one's (runs 69 to 71 on srv3 shared /tmp/rmq, and
+/// serve could open only one: DuckDB attaches a file once).
+pub fn linked_by(arena: std.mem.Allocator, data: []const u8, name: []const u8, target: []const u8) !?u32 {
+    const runs_path = try std.fs.path.join(arena, &.{ data, "runs" });
+    for (try ids(arena, runs_path)) |id| {
+        const link = try std.fs.path.joinZ(arena, &.{ try directory_of(arena, data, id), name });
+        var buffer: [4096]u8 = undefined;
+        const size = linux.readlinkat(linux.AT.FDCWD, link, &buffer, buffer.len);
+        if (linux.errno(size) != .SUCCESS) continue; // Its own, or none.
+        if (std.mem.eql(u8, buffer[0..size], target)) return id;
+    }
+    return null;
+}
+
 /// The run ids there, ascending.
 pub fn ids(arena: std.mem.Allocator, runs_path: []const u8) ![]u32 {
     var found: std.ArrayList(u32) = .empty;

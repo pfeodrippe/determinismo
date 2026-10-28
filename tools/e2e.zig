@@ -1004,6 +1004,9 @@ fn check_runs(context: *Context) !void {
     cwd.deleteTree(context.io, elsewhere) catch {};
     const output = try explore(context, &(system ++ [_][]const u8{ "--seed", "3", "--branches", "8", "--events-dir", elsewhere }));
     const claimed = std.mem.indexOf(u8, output, "[determinismo] run 1: ") != null;
+    // Another with the same events directory would make run 1's its own: refused.
+    const again = try explore(context, &(system ++ [_][]const u8{ "--seed", "4", "--branches", "1", "--events-dir", elsewhere }));
+    const refused = std.mem.indexOf(u8, again, "holds run 1's") != null;
     var listed: []const u8 = "";
     for (0..100) |_| {
         listed = curl(context, &.{url ++ "/runs/1"}) catch "";
@@ -1024,6 +1027,7 @@ fn check_runs(context: *Context) !void {
         std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
     expect_all(context, &.{
         .{ "the exploration claimed run 1", claimed },
+        .{ "another given its events directory is refused", refused },
         .{ "serve shows it failed", std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null },
         .{ "serve lists its 8 timelines, its events in another directory", std.mem.count(u8, timelines, "\"index\"") == 8 },
         .{ "its output.log has its timelines", std.mem.indexOf(u8, logged, "[branch") != null },
@@ -2939,9 +2943,11 @@ fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
         .exited => |code| code,
         else => 255,
     };
-    // Refusals some checks expect (a tape on other inputs, a moment before the snapshot).
+    // Refusals some checks expect (a tape on other inputs, a moment before the snapshot, a
+    // directory of another run's).
     const refusal = std.mem.indexOf(u8, result.stderr, "recorded with") != null or
-        std.mem.indexOf(u8, result.stderr, "is not after the snapshot") != null;
+        std.mem.indexOf(u8, result.stderr, "is not after the snapshot") != null or
+        std.mem.indexOf(u8, result.stderr, "holds run") != null;
     if (status != 0 and status != 3 and !refusal) {
         std.debug.print("e2e: determinismo exited with {d}:\n{s}\n", .{ status, result.stderr });
     }
