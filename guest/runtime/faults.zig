@@ -1320,8 +1320,9 @@ fn branch_point(node: []const u8) void {
         quiet_until_ns = 0;
         quiet_pacing = false;
     }
-    @memcpy(branch_node[0..node.len], node);
-    branch_node_size = node.len;
+    // The FIFO's header allows 255 bytes; det-agent sends at most branch_node_max.
+    branch_node_size = @min(node.len, branch_node_max);
+    @memcpy(branch_node[0..branch_node_size], node[0..branch_node_size]);
     sdk.event("faults_branch", .{ .quiet_ended = quiet, .node = node });
 }
 
