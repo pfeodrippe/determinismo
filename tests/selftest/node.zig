@@ -9,7 +9,8 @@
 //! With DET_DURABLE set, a first start writes /data/synced (synced: the file and its directory)
 //! and /data/unsynced (not synced): what crashes and wipes must keep and lose.
 //! `det-selftest-node write <path>` writes a file in /data and syncs it and its directory,
-//! exiting 1 if the disk refused (disk faults); `write2 <path> <path>` writes two at once, from
+//! exiting 1 if the disk refused (disk faults); `unsynced <path>` writes one and syncs nothing;
+//! `write2 <path> <path>` writes two at once, from
 //! two threads (two durability points together). `det-selftest-node ping <a.b.c.d>` exits 0 if
 //! the service at that address answers a line (a node reaching itself while isolated).
 const std = @import("std");
@@ -39,6 +40,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "write")) {
         synced_write(arguments[2], "written\n") catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "unsynced")) {
+        const file = file_create(arguments[2], "lost in a power loss\n") catch linux.exit_group(1);
+        _ = linux.close(file);
         linux.exit_group(0);
     }
     if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "write2")) {

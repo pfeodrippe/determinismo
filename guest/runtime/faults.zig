@@ -33,7 +33,8 @@
 //! {"kind": "clog", "node": "a", "direction": "inbound"}, {"kind": "throttle", "node": "a",
 //! "cpu_percent": 10}, {"kind": "clock_skip", "skip_ms": 500, "forward": true} (permanent),
 //! {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
-//! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); restart, crash,
+//! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); {"kind": "outage",
+//! "nodes": ["a", "b"]} (every node that allows crashes when none are named); restart, crash,
 //! durable_crash, wipe, stop, process_pause, thread_pause, process_kill, isolate and partition
 //! (with "peer") too.
 //!
@@ -72,6 +73,11 @@ const Kind = enum {
     restart,
     /// A power loss: the node's disk keeps what was synced, then it starts again.
     crash,
+    /// A power loss of several nodes at the same moment (a rack's, a datacenter's; Jepsen's
+    /// kill of a majority or of all): each keeps what it synced, and all start again at its end.
+    /// Systems that acknowledge before a sync, counting on their replicas (Galera's
+    /// recommended settings, Kafka's), lose acknowledged writes only so.
+    outage,
     /// A power loss at a durability point: its fsyncs and sync writes are decisions, and the
     /// one picked crashes the node there (before its data is on disk, or just after).
     durable_crash,
@@ -353,6 +359,8 @@ const Applied = struct {
     /// For partition_groups: each endpoint's group (runner first), group_none for those left out.
     /// (u16, not u8: JSON writes byte arrays as strings.)
     groups: [endpoints_max]u16 = @splat(group_none),
+    /// For outage: the nodes that lose power (runner first, never it).
+    outage: [endpoints_max]bool = @splat(false),
     /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
     injected: bool = false,
     disk: ?nodes.DiskFault = null,
@@ -411,6 +419,7 @@ fn draw(fault: *const Fault) Applied {
             applied.skip_ns = sdk.random_below(clock_skip_ns_max);
             applied.permanent = sdk.random_below(4) == 0;
         },
+        .outage => applied.outage = outage_draw(fault.endpoints),
         .partition_groups => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
             applied.groups = groups_draw(fault.endpoints);
@@ -467,6 +476,29 @@ fn groups_draw(allowed: [endpoints_max]bool) [endpoints_max]u16 {
         groups[at] = (groups[at] + 1) % count; // At least two sides.
     };
     return groups;
+}
+
+/// The nodes of an outage, among those allowed: all of them half the time (a datacenter's
+/// power), else a random group of at least two (a rack's).
+fn outage_draw(allowed: [endpoints_max]bool) [endpoints_max]bool {
+    if (sdk.random_below_named("fault.outage_all", 2) == 0) return allowed;
+    var candidates: [endpoints_max]u8 = undefined;
+    var count: u32 = 0;
+    for (allowed, 0..) |yes, index| {
+        if (!yes) continue;
+        candidates[count] = @intCast(index);
+        count += 1;
+    }
+    assert(count >= 2);
+    const size = 2 + sdk.random_below_named("fault.outage_size", count - 1);
+    // The first `size` of a partial Fisher-Yates shuffle.
+    var picked: [endpoints_max]bool = @splat(false);
+    for (0..size) |at| {
+        const other = at + sdk.random_below(count - at);
+        std.mem.swap(u8, &candidates[at], &candidates[other]);
+        picked[candidates[at]] = true;
+    }
+    return picked;
 }
 
 fn script_faults(arena: std.mem.Allocator) ?[]const Applied {
@@ -559,6 +591,13 @@ fn faults_collect(
     if (partitionable >= 3) {
         faults_add(faults, &count, .{ .kind = .partition_groups, .endpoints = endpoints });
     }
+    var crashable: [endpoints_max]bool = @splat(false);
+    var crashable_count: u32 = 0;
+    for (system.nodes, 1..) |node, index| {
+        crashable[index] = node.faults.crash;
+        crashable_count += @intFromBool(node.faults.crash);
+    }
+    if (crashable_count >= 2) faults_add(faults, &count, .{ .kind = .outage, .endpoints = crashable });
     if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
     const networked = for (faults[0..count]) |fault| switch (fault.kind) {
         .isolate, .partition, .degrade, .partition_groups, .clog => break true,
@@ -624,6 +663,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .pod_degrade,
         .pod_partition,
         => node_start(system, applied),
+        .outage => outage_start(system, applied),
         .process_kill => apply_process_kill(system, applied),
         .pod_kill => apply_pod_kill(applied),
         .isolate, .partition, .degrade, .partition_groups, .clog => network_start(system, applied),
@@ -728,7 +768,7 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
                 node_start_again(system, name);
             }
         },
-        .restart, .crash, .wipe, .stop => {
+        .restart, .crash, .outage, .wipe, .stop => {
             if (fault.grace_end_ns != null) nodes.kill_remaining(name) catch {}; // Healed early.
             // Antithesis's restarted nodes may rejoin with a new address: a decision.
             if (system.node(name)) |node| readdress_maybe(system, node);
@@ -1120,6 +1160,55 @@ fn node_next_end() ?u64 {
 
 fn node_heal(system: *const schema.System) void {
     for (&nodes_faulted) |*slot| node_end(system, slot);
+}
+
+/// An outage begins: its nodes all frozen first (none runs on while the others lose power),
+/// then each crashed, each holding its own slot until the fault's end, when all start again.
+/// A node busy with another fault, or down already, is left out; with fewer than two left
+/// there is no outage.
+fn outage_start(system: *const schema.System, applied: *const Applied) void {
+    var taken = applied.*;
+    const count_nodes = system.nodes.len;
+    var count: u32 = 0;
+    for (system.nodes, nodes_faulted[0..count_nodes], taken.outage[1..][0..count_nodes]) |node, slot, *in| {
+        if (!in.*) continue;
+        in.* = slot == null and nodes.state_of(node.name) != .stopped;
+        count += @intFromBool(in.*);
+    }
+    if (count < 2) {
+        sdk.event("fault_skipped", .{ .kind = "outage", .err = "FewerThanTwoNodes" });
+        return;
+    }
+    for (system.nodes, taken.outage[1..][0..count_nodes]) |node, in| {
+        if (in) nodes.freeze(node.name, .frozen) catch {};
+    }
+    const end_ns = monotonic_ns() + applied.duration_ns;
+    var down: u32 = 0;
+    for (system.nodes, nodes_faulted[0..count_nodes], taken.outage[1..][0..count_nodes]) |node, *slot, *in| {
+        if (!in.*) continue;
+        nodes.crash(node.name) catch |err| {
+            nodes.freeze(node.name, .thawed) catch {};
+            sdk.event("fault_failed", .{ .kind = "outage", .node = node.name, .err = @errorName(err) });
+            in.* = false;
+            continue;
+        };
+        var one = taken;
+        one.node = node.name;
+        slot.* = .{ .applied = one, .end_ns = end_ns };
+        down += 1;
+    }
+    if (down == 0) return;
+    // Its event names them all ("a,b,c"), as the logs and the causality analysis show it.
+    var names: std.ArrayList(u8) = .empty;
+    if (arena_active) |arena| {
+        for (system.nodes, taken.outage[1..][0..count_nodes]) |node, in| {
+            if (!in) continue;
+            if (names.items.len > 0) names.append(arena, ',') catch {};
+            names.appendSlice(arena, node.name) catch {};
+        }
+    }
+    taken.node = names.items;
+    sdk.event("fault", taken);
 }
 
 // Durability points ---------------------------------------------------------------------------
@@ -1844,6 +1933,8 @@ const Request = struct {
     /// disk.
     failure: nodes.DiskFailure = .errors,
     delay_ms: u32 = 50,
+    /// outage: the nodes that lose power (none named: every node that allows crashes).
+    nodes: []const []const u8 = &.{},
     /// durable_crash and sync_stall: one durability point in `one_in` is picked.
     one_in: u32 = 1,
     after_sync: bool = false,
@@ -1930,6 +2021,16 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
             applied.permanent = true;
         },
         .custom => applied.program = request.program,
+        .outage => {
+            for (system.nodes, 1..) |node, index| applied.outage[index] = node.faults.crash and
+                request.nodes.len == 0;
+            for (request.nodes) |name| {
+                const index = endpoint_index(system, name) orelse return error.UnknownNode;
+                if (index == 0) return error.UnknownNode; // The runner has no power to lose.
+                applied.outage[index] = true;
+            }
+            if (std.mem.count(bool, &applied.outage, &.{true}) < 2) return error.FewerThanTwoNodes;
+        },
         .durable_crash, .sync_stall => {
             applied.one_in = @max(request.one_in, 1);
             applied.after_sync = request.after_sync;

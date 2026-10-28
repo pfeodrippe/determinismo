@@ -1992,13 +1992,16 @@ fn check_mutate(context: *Context) !void {
 
 /// Disk faults (Antithesis's restarts that keep synced changes, or lose all): a node writes
 /// one file synced and one not; a crash keeps the first and loses the second, a wipe loses
-/// both, in every timeline (and the timeline replays exactly).
+/// both, in every timeline (and the timeline replays exactly). An outage takes both durable
+/// nodes down at once, each keeping only what it synced.
 fn check_disk(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const common = [_][]const u8{
         "--program", program, "--profile", "durable", "--scenario", "disk", "--seed", "1",
     };
-    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "3" }));
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "disk-events" });
+    std.Io.Dir.cwd().deleteTree(context.io, events) catch {};
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "3", "--events-dir", events }));
     const passes = has_lines(report, &.{
         "3 branches, 0 with failing properties",
         "PASS always                hit in    3/3 branches, failing in    0  a crash keeps what " ++
@@ -2008,6 +2011,11 @@ fn check_disk(context: *Context) !void {
         "PASS always                hit in    3/3 branches, failing in    0  a disk works again " ++
             "after its faults",
     });
+    const outage_passes = has_lines(report, &.{
+        "PASS always                hit in    3/3 branches, failing in    0  an outage takes its " ++
+            "nodes down at once, each keeping only what it synced",
+    });
+    const outages = try query_count(context, &.{ events, "event=fault details.kind=outage" });
     var branches: [3]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -2019,12 +2027,14 @@ fn check_disk(context: *Context) !void {
     }
     expect_all(context, &.{
         .{ "every disk property passes in all 3 timelines", passes },
+        .{ "an outage's property passes in all 3 timelines", outage_passes },
+        .{ "the outage is logged as one fault", outages > 0 },
         .{ "a timeline replays exactly", same },
     }, "disk: a crash keeps what was synced and loses the rest, a wipe loses both; dropped " ++
-        "writes vanish, refused ones fail, a slow disk is slow, and it works again; a timeline " ++
-        "replays exactly", .{});
-    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
-        "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
+        "writes vanish, refused ones fail, a slow disk is slow, and it works again; an outage " ++
+        "takes two nodes down at once, each keeping what it synced; a timeline replays exactly", .{});
+    if (!passes or !outage_passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "fault_failed", "fault_skipped", "fault_heal_failed", "fault_inject_refused", "det-nodes",
     }) catch ""});
 }
 

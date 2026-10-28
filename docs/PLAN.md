@@ -266,6 +266,16 @@ event hashing, the guest module.
 - Resume for tree runs (serve's default): record each timeline's summary; on resume, judge the
   recorded generations again from them (no node making), and make nodes, by replay along the
   path, only for timelines still to run.
+- Correlated power losses (2026-10-28): `outage`, several nodes losing power at once (all, or
+  a group of two or more), beside one node's crash. Galera's run 58 could not lose a committed
+  transaction without it: Jepsen's loss needs the nodes to crash together. Galera's hunt again
+  with it next.
+- RabbitMQ 4.1.4 (2026-10-28, examples/rabbitmq): a quorum queue under Jepsen's queue checks
+  (confirmed messages dequeued, no phantoms, no refused ones), power losses at durability
+  points among the faults. Its first two timelines found, blind, a node that never boots again
+  after a power loss soon after its first boot (its feature_flags file written without a sync,
+  then empty: `case_clause {ok,[]}`); enqueues are noted before they are sent, and the drain
+  leaves out a node that stays down. A hunt next.
 - Jepsen, blind: Redis-Raft #52 (crashes alone: the `crashes` profile, 60 s timelines, to rerun);
   MongoDB 4.2.6 sharded: SERVER-48307 found (2 of the first 89 timelines, both its forms);
   ScyllaDB 4.2.rc3 (examples/scylla: LWT list-append, Jepsen's configuration, own CQL client)

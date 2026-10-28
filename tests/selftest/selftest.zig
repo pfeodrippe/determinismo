@@ -22,7 +22,7 @@
 //!   disk       (profile "durable") the echo node's disk under a crash and a wipe: what it synced
 //!              survives a crash, what it did not is lost, a wipe loses both (with a second
 //!              durable node beside it); then disk faults asked for: lost writes, failing
-//!              writes, a slow disk, and the disk afterwards
+//!              writes, a slow disk, and the disk afterwards; then an outage of both nodes
 //!   durability (profile "durable") faults at the echo node's durability points: a stall holds
 //!              its syncs; a crash at a sync loses the write when it comes before it, and keeps
 //!              it when it comes just after
@@ -428,7 +428,33 @@ fn disk_faults(context: *System.Context) !void {
     try sdk.retry(100, 100, answers, .{witness.address});
     try crash_and_wipe(&echo);
     try disk_failures(&echo);
+    try outage(&.{ &echo, &witness });
     sdk.stop_faults(0);
+}
+
+/// An outage of `group`: each node wrote one file synced and one not just before, and after it
+/// each has only the first: all lost power (the fault's event says at the same moment).
+fn outage(group: []const *const sdk.Node) !void {
+    var names: [2][]const u8 = undefined;
+    assert(group.len == names.len);
+    var written = true;
+    for (group, &names) |node, *name| {
+        name.* = node.name;
+        written = written and synced_write(node, "/data/outage-synced");
+        const status = node.exec(&.{ "/bin/det-selftest-node", "unsynced", "/data/outage-unsynced" }) catch 1;
+        written = written and status == 0;
+    }
+    const fault_ms = 1000;
+    sdk.fault(.{ .kind = "outage", .nodes = &names, .duration_ms = fault_ms });
+    sdk.sleep_ms(fault_ms + 100);
+    var kept = true;
+    for (group) |node| {
+        try sdk.retry(100, 100, answers, .{node.address});
+        kept = kept and file_present(node, "/data/outage-synced") and
+            !file_present(node, "/data/outage-unsynced");
+    }
+    sdk.always(written and kept, "an outage takes its nodes down at once, each keeping only " ++
+        "what it synced", .{ .written = written, .kept = kept });
 }
 
 /// The echo node wrote one file synced and one not (DET_DURABLE). After a crash the first is
