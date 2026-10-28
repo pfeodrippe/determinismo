@@ -353,8 +353,8 @@ pub const Owner = struct {
         if (request.kind == .disk) owner.disk_write(vm, socket, &request, moment_ns);
         if (request.vtime_ns < moment_ns) linux.exit_group(1);
         owner.snapshot.capture_memory(vm.memory, vm.memory_fd) catch linux.exit_group(1);
-        // Running on to a later moment is a VM run: on a CPU of the host's pool, alone on its
-        // core (cpus.zig: two VMs on sibling hyperthreads perturb each other's clocks).
+        // Running on to a later moment is a VM run: on a CPU of the host's pool (cpus.zig), never
+        // two VMs on one hardware thread.
         var pool: cpus.Pool = undefined;
         const cpu: ?cpus.Held = if (request.vtime_ns != moment_ns) cpu: {
             pool.open() catch linux.exit_group(1);

@@ -126,8 +126,11 @@ event hashing, the guest module.
     replay exactly (four replays on CPUs 0, 18, 1 and 19 of a 39 s and a 382 s YugabyteDB
     timeline: every one the same through its last tape checkpoint). They had been excluded for
     Kafka divergences that were, by the evidence, the same guest TLB dependence (150-branch
-    spurious faults). `serve.sh --siblings on` (DETERMINISMO_SMT=1) uses them once every core
-    is busy; its first hunt (Kafka, seed 12) checks it with its own replays.
+    spurious faults). Kafka too, where the divergence was first seen: three timelines, four
+    replays each on CPUs 0, 18, 1 and 19, every one the same. Siblings are the default now
+    (each core's first thread first; `--siblings off`, DETERMINISMO_SMT=0, for one per core):
+    a VM with a busy sibling runs at about 0.7x, a core does about 1.4x. Hunts keep checking
+    it with their own replays.
   - Saving a ladder by replay: 9 moments of a YugabyteDB timeline took 25 minutes on an earlier
     build; with the exit fixes, run 18 (srv3) saved 10 moments over 85 virtual seconds in 88 s,
     the replay's own pace. Open: a ladder once stopped after 2 of 9 moments (timeline 5 of run

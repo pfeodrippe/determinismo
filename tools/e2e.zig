@@ -1172,8 +1172,9 @@ fn check_builtin_properties(context: *Context) !void {
 }
 
 /// One timeline run at once by more processes than the host has cores (they queue for the CPU
-/// pool's cores): the same history in each. VMs on a core's sibling hyperthreads perturbed each
-/// other's retired-branch counters, and VMs outside the pool ran anywhere (2026-10-27).
+/// pool's hardware threads, both hyperthreads of a core busy): the same history in each. VMs on
+/// sibling hyperthreads once parted (the guest kernel's TLB dependence, fixed since), and VMs
+/// outside the pool ran anywhere (2026-10-27).
 fn check_concurrent(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });

@@ -12,7 +12,7 @@
 #   confined to its share by the kernel (cgroup cpusets: systemd's AllowedCPUs). Kept in
 #   /etc/determinismo/reserved-cores for the next start. Default 0: runs may take every core.
 #   --siblings on|off: VMs on a core's second hyperthread too, once every core's first is busy
-#   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default off.
+#   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default on.
 set -euo pipefail
 user=${1:?usage: $0 <user> start|stop [--reserved-cores N]}
 action=${2:?usage: $0 <user> start|stop [--reserved-cores N]}
@@ -52,8 +52,8 @@ case $siblings_given in
   "") ;;
   *) echo "error: --siblings takes on or off" >&2; exit 2 ;;
 esac
-smt=0
-[ "$(cat "$siblings_config" 2>/dev/null || echo off)" = on ] && smt=1
+smt=1
+[ "$(cat "$siblings_config" 2>/dev/null || echo on)" = off ] && smt=0
 read -r own_cpus run_cpus < <(python3 - "$reserved" <<'PY'
 import sys
 
