@@ -1247,6 +1247,23 @@ fn failures_analyze(server: *Server, id: u32) !void {
     // restart visits every run once: it analyzed runs stopped hours before).
     if (run.status != null or run.stopped) return;
     if (busy or !room) return;
+    // The analyses on disk: one running (an earlier server's, whose jobs this one never had)
+    // makes it wait; the properties they analyze (whoever asked) are done.
+    var analyzed: std.StringHashMapUnmanaged(void) = .empty;
+    for (try causality_indices(server, id)) |index| {
+        const pid_name = try print(server, "causality-{d}.pid", .{index});
+        if (run_file(server, id, pid_name)) |text| {
+            if (process_alive(server, text, "causality")) return;
+        } else |_| {}
+        const name = try print(server, "causality-{d}.jsonl", .{index});
+        const output = run_file(server, id, name) catch continue;
+        const header_end = std.mem.indexOfScalar(u8, output, '\n') orelse output.len;
+        const Header = struct { causality: struct { property: []const u8 = "" } };
+        const header = std.json.parseFromSliceLeaky(Header, server.arena, output[0..header_end], .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        try analyzed.put(server.arena, header.causality.property, {});
+    }
     const rows = rows: {
         var connection = try run_connect(server, id);
         defer connection.close();
@@ -1259,6 +1276,7 @@ fn failures_analyze(server: *Server, id: u32) !void {
     const directory = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "snapshots" });
     for (rows) |row| {
         // Once per property: its first failing timeline can change as earlier ones are ingested.
+        if (analyzed.contains(row.property)) continue;
         const marker = try print(server, "{s}/analyzed-{x:0>16}", .{ directory, std.hash.Wyhash.hash(0, row.property) });
         if (std.Io.Dir.cwd().access(server.io, marker, .{})) |_| continue else |_| {}
         try std.Io.Dir.cwd().createDirPath(server.io, directory);
