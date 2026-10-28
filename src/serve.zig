@@ -783,8 +783,9 @@ pub const RunRequest = struct {
     retroactive: []const []const u8 = &.{},
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
-    /// Branches at varying CPU speeds (and so their replays too).
-    cpu_modulation: bool = false,
+    /// Branches at varying CPU speeds (and so their replays too): explore's default when the
+    /// request does not say; runs from before it was had none (their request.json: false).
+    cpu_modulation: bool = true,
     /// The guest's memory, instead of the server's (explore's --memory-mib): for systems of
     /// several large nodes. Kept in the run's machine arguments, so its replays boot the same.
     memory_mib: ?u32 = null,
@@ -1728,7 +1729,7 @@ fn system_arguments(
     if ((asked.program == null) == (asked.compose == null)) return error.BadRequest;
     if (asked.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (asked.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
-    if (asked.cpu_modulation) try argv.append(arena, "--cpu-modulation");
+    try argv.append(arena, if (asked.cpu_modulation) "--cpu-modulation" else "--no-cpu-modulation");
     // They change the system (what its nodes allow): runs and their replays both.
     if (asked.faults) |kinds| try argv.appendSlice(arena, &.{ "--faults", kinds });
     if (asked.no_faults) |names| try argv.appendSlice(arena, &.{ "--no-faults", names });

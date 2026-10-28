@@ -1128,8 +1128,13 @@ fn io_in(vm: *VM, port: u16, bytes: []u8) !void {
 pub fn moment(vm: *VM) !Events.Moment {
     if (!vm.deterministic) return .{ .vtime_ns = 0, .branches = 0 };
     const state = try vm.det_state();
+    // With CPU modulation, the time the next exit adds to the guest's clock for the branches
+    // run since the last one (modulate): none at the guest's own exits, which add it first; at a
+    // moment's stop, between them, the moment is that much later than the clock reads (a rewind
+    // read 180 us early, a deadline 1.7 us).
+    const owed_tsc = if (vm.modulation) |m| m.owed_milli(state.branches, vm.tsc_per_branch) / 1000 else 0;
     return .{
-        .vtime_ns = @divFloor(state.tsc, tsc_per_ns),
+        .vtime_ns = @divFloor(state.tsc + owed_tsc, tsc_per_ns),
         .branches = vm.branches_offset + state.branches,
     };
 }

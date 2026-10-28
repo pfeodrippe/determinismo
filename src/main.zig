@@ -101,7 +101,8 @@ const usage =
     \\                            [--resume]   (with --record: continue that run, its recorded
     \\                            timelines skipped; the same inputs, seed and branching; a tree
     \\                            without a strategy, from its timelines' summaries)
-    \\                            [--cpu-modulation]   (branches run at varying speeds)
+    \\                            [--no-cpu-modulation]   (branches at one speed: they run at
+    \\                            varying speeds by default, as Antithesis's with faults)
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
     \\                            by a replay and compare them, to check holders; slower)
     \\                            [--data <dir>]   (the host's runs, where this one goes:
@@ -263,7 +264,11 @@ const Arguments = struct {
     from_snapshot: ?[]const u8 = null,
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    /// Branches at varying speeds (VM.Modulation): on by default for explorations, as
+    /// Antithesis turns it on with faults (the Raft POC's double vote needed it); a run keeps
+    /// whether it had it (request.json), and its replays and tapes follow.
     cpu_modulation: bool = false,
+    cpu_modulation_given: ?bool = null,
     /// Remake every tree node an in-run snapshot made (holders.zig) by a replay, and print how
     /// the two differ in what the guest can see ("verify ... DIFFERENT"): a check of holders.
     verify_holders: bool = false,
@@ -1288,7 +1293,8 @@ fn command_explore(
         const header = try tape.parse(source, scratch, overrides);
         if (header.inputs != exploration.inputs) {
             std.debug.print("[determinismo] the tape was recorded with inputs {x:0>16}; " ++
-                "these are {x:0>16} (kernel, initramfs, command line or disks differ)\n", .{
+                "these are {x:0>16} (kernel, initramfs, command line, disks or CPU modulation " ++
+                "differ: runs before 2026-10-28 had none, --no-cpu-modulation)\n", .{
                 header.inputs, exploration.inputs,
             });
             return error.TapeInputsDiffer;
@@ -3886,7 +3892,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--cpu-modulation")) {
-            arguments.cpu_modulation = true;
+            arguments.cpu_modulation_given = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--no-cpu-modulation")) {
+            arguments.cpu_modulation_given = false;
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--verify-holders")) {
@@ -3951,6 +3961,7 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.save_directory != null or arguments.rewind_ms != null;
         if (elsewhere or arguments.branching == .tree) return error.Usage;
     }
+    arguments.cpu_modulation = arguments.cpu_modulation_given orelse (arguments.command == .explore);
     arguments.cmdline_given = arguments.cmdline;
     if (arguments.deterministic) {
         const parts = [_][]const u8{ arguments.cmdline, VM.cmdline_deterministic };

@@ -1380,7 +1380,7 @@ fn check_core_dump(context: *Context, program: []const u8) !void {
 fn check_cpu_modulation(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const system = [_][]const u8{ "--program", program, "--scenario", "bank", "--seed", "7" };
-    const plain = try explore(context, &(system ++ [_][]const u8{ "--branches", "8" }));
+    const plain = try explore(context, &(system ++ [_][]const u8{ "--branches", "8", "--no-cpu-modulation" }));
     const modulated = try explore(context, &(system ++ [_][]const u8{
         "--branches", "8", "--cpu-modulation",
     }));
@@ -1488,9 +1488,10 @@ fn check_tree(context: *Context) !void {
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
     const tapes = try std.fmt.allocPrint(arena, "{s}/tree-tapes", .{context.scratch});
     const record = try std.fmt.allocPrint(arena, "{s}/tree.jsonl", .{context.scratch});
+    // Without CPU modulation (on by default): the check below has it.
     const common = [_][]const u8{
-        "--program",   program, "--scenario", "bank", "--seed", "5", "--branches", "64",
-        "--branching", "tree",
+        "--program",   program, "--scenario",          "bank", "--seed", "5", "--branches", "64",
+        "--branching", "tree",  "--no-cpu-modulation",
     };
     const one = try explore(context, &(common ++ [_][]const u8{
         "--jobs", "1", "--tape-dir", tapes, "--record", record, "--verify-holders",
@@ -1502,7 +1503,7 @@ fn check_tree(context: *Context) !void {
     const count = parse_branches(one, &sequential);
     const parallel_count = parse_branches(many, &parallel);
     // Past the first generations planned (all from the setup snapshot), the tree deepens.
-    const deep = try deepest_replays(context, program, record, tapes, sequential[0..count], &.{});
+    const deep = try deepest_replays(context, program, record, tapes, sequential[0..count], &.{"--no-cpu-modulation"});
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
     // from their parents' start would make, which the deepest timeline's lone replay checks.
     // Holders are made only with 16 GB available (holders.zig): beside a hunt of large VMs
@@ -1551,7 +1552,7 @@ fn check_tree(context: *Context) !void {
         strategy_record,
         strategy_tapes,
         steered_branches[0..steered_count],
-        &.{},
+        &.{"--no-cpu-modulation"},
     );
     expect_all(context, &.{
         .{ "64 timelines", steered_count == 64 },

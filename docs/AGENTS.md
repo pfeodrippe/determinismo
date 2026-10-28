@@ -134,8 +134,10 @@ use them in other repositories.
   link that allows degradation carries a baseline (a small delay with jitter, rare drops) for
   the whole run, as Antithesis's baseline latency; faults end by returning links to it.
   Durable disks have a baseline too (`disk_baseline`: 0 to 2 ms per I/O, per timeline).
-  `--cpu-modulation` (MCP and HTTP `cpu_modulation`) makes branches run at varying speeds: other
-  interleavings of the same seed; pass it to replays of such a run too (tapes refuse without).
+  Branches run at varying speeds by default (CPU modulation, as Antithesis's with faults: other
+  interleavings of the same seed); `--no-cpu-modulation` (MCP and HTTP `cpu_modulation: false`)
+  turns it off. A run keeps its setting and serve's replays follow it; a replay by hand of a run
+  without it needs `--no-cpu-modulation` (its tape refuses otherwise).
 - Exit status of explore: 0 every property passed, 3 some failed, anything else an error.
 - Built-in properties come with every system (Antithesis's defaults): nodes do not exit
   unexpectedly (0, SIGKILL and SIGTERM are expected), the guest finishes its scenario, no process

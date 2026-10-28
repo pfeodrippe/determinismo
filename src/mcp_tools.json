@@ -35,7 +35,7 @@
         },
         "cpu_modulation": {
           "type": "boolean",
-          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere; replays need it too"
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
         },
         "branches": {
           "type": "integer",
@@ -92,7 +92,7 @@
         },
         "cpu_modulation": {
           "type": "boolean",
-          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere; replays need it too"
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
         },
         "branch": {
           "type": "integer",
@@ -152,7 +152,7 @@
         },
         "cpu_modulation": {
           "type": "boolean",
-          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere; replays need it too"
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
         },
         "from_branch": {
           "type": "integer"
@@ -318,7 +318,7 @@
         },
         "cpu_modulation": {
           "type": "boolean",
-          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere; replays need it too"
+          "description": "Branches run at varying CPU speeds (decisions), so preemption lands elsewhere: on by default (as Antithesis with faults); false turns it off; replays need the run's setting too"
         },
         "branch": {
           "type": "integer"

@@ -31,7 +31,8 @@ const Arguments = struct {
     scenario: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     seed: u64 = 0,
-    cpu_modulation: bool = false,
+    /// Null: explore's default (on).
+    cpu_modulation: ?bool = null,
     branches: ?u32 = null,
     time_budget: ?[]const u8 = null,
     /// How long each timeline's drivers run (virtual time); replays need the same.
@@ -184,7 +185,7 @@ fn tool_call(
     if (arguments.program) |program| try argv.appendSlice(arena, &.{ "--program", program });
     if (arguments.compose) |compose| try argv.appendSlice(arena, &.{ "--compose", compose });
     try argv.appendSlice(arena, &.{ "--seed", try number(arena, arguments.seed) });
-    if (arguments.cpu_modulation) try argv.append(arena, "--cpu-modulation");
+    if (arguments.cpu_modulation) |on| try argv.append(arena, if (on) "--cpu-modulation" else "--no-cpu-modulation");
     if (arguments.scenario) |scenario| try argv.appendSlice(arena, &.{ "--scenario", scenario });
     if (arguments.profile) |profile| try argv.appendSlice(arena, &.{ "--profile", profile });
     if (arguments.timeline) |length| try argv.appendSlice(arena, &.{ "--timeline", length });
