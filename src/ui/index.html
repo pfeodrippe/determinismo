@@ -301,9 +301,25 @@ function stateBadge(name) {
   return `<span class="badge ${kind}">${escape(name)}</span>`;
 }
 
-async function runOpen(id) {
+// A run's views, each its own page (#<id>/<view>), as Antithesis splits its results: the
+// report (findings, environment, utilization, properties), the Logs Explorer (search, the
+// multiverse tree, logs), the explorer's output, the notebook. Only the open one is drawn and
+// kept up to date: one page holding all of them (the tree alone 100,000 SVG elements in a run of
+// 2,500 timelines) was busy 70% of the time with its refreshes.
+const views = [["report", "Report"], ["explorer", "Logs explorer"], ["output", "Output"], ["notebook", "Notebook"]];
+function routeOf(hash) {
+  const [id, view] = hash.replace(/^#/, "").split("/");
+  return { id: Number(id), view: views.some(([name]) => name === view) ? view : "report" };
+}
+function routeSet() {
+  const hash = `#${state.runId}${state.view === "report" ? "" : "/" + state.view}`;
+  if (location.hash !== hash) history.replaceState(null, "", hash);
+}
+
+async function runOpen(id, view) {
   state.runId = id;
-  if (location.hash !== `#${id}`) history.replaceState(null, "", `#${id}`);
+  if (view) state.view = view;
+  routeSet();
   // Never the previous run's page under this run's name: a placeholder until it loads.
   if (!state.run || state.run.id !== id) {
     state.run = null;
@@ -333,18 +349,17 @@ async function runRefresh() {
   if (state.view === "notebook" && $("#notebook")) return; // Never under the writer's cursor.
   // While the run goes on, what changes is updated in place (no flicker, no re-query of every
   // section); the tree, which queries every timeline's events, every 10 seconds.
-  const same = before && before.id === state.run.id && $("#stats-live");
+  const same = before && before.id === state.run.id && $("#run-times");
   if (same && before.state === "running" && state.run.state === "running") return liveUpdate();
   render();
 }
 
 function liveUpdate() {
-  $("#stats-live").outerHTML = statsHtml();
-  outputDraw();
   const times = $("#run-times");
   if (times) times.textContent = timesHtml();
-  $("#charts-live").outerHTML = chartsHtml();
-  discoveryDraw();
+  if ($("#stats-live")) $("#stats-live").outerHTML = statsHtml();
+  if ($("#charts-live")) { $("#charts-live").outerHTML = chartsHtml(); discoveryDraw(); }
+  outputDraw();
   const bar = $(".progress div");
   if (bar) bar.style.width = `${100 * progress()}%`;
   const properties = $("#properties");
@@ -357,7 +372,12 @@ function liveUpdate() {
   }
   const map = $("#map");
   if (map) $(".summary", map).textContent = `${state.run.branches.length} timelines from the setup snapshot`;
-  if (Date.now() - (state.treeDrawn || 0) > 10000) { state.treeDrawn = Date.now(); mapDraw(); }
+  // The tree again only when timelines finished since (and every 10 s at most).
+  if (map && Date.now() - (state.treeDrawn || 0) > 10000 && state.treeTimelines !== state.run.branches.length) {
+    state.treeDrawn = Date.now();
+    state.treeTimelines = state.run.branches.length;
+    mapDraw();
+  }
 }
 
 // Rendering -------------------------------------------------------------------------------
@@ -451,25 +471,28 @@ function render() {
     ${run.state !== "running" ? `<div style="display:flex;gap:8px">
       ${run.state === "stopped" || run.state === "interrupted" ? `<button id="run-resume" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="Continue this run where it ended: the timelines it has stay, the others run">Resume run</button>` : ""}
       ${run.request ? `<button id="run-again" style="margin-top:8px;font-size:12px;padding:2px 10px" data-tip="A new run as this one was asked for: the same system, scenario and options, the host's current build of the program, a fresh seed">Run again</button>` : ""}</div>` : ""}
-    <div class="tabs view-tabs"><button data-view="report" class="${state.view === "report" ? "on" : ""}">Report</button>
-      <button data-view="notebook" class="${state.view === "notebook" ? "on" : ""}">Notebook</button></div>`;
+    <div class="tabs view-tabs">${views.map(([name, label]) => `<button data-view="${name}" class="${state.view === name ? "on" : ""}">${label}</button>`).join("")}</div>`;
+  routeSet();
   if (state.view === "notebook") {
     $("#main").innerHTML = header + `<div id="notebook"></div>`;
     viewTabsWire();
     notebookOpen();
     return;
   }
-  $("#main").innerHTML = header + statsHtml() + chartsHtml() + `
+  const body = state.view === "explorer" ? `
+    ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
+    ${sectionHtml("map", "Multiverse tree", `${done} timelines from the setup snapshot`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
+    ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}`
+    : state.view === "output" ? `
+    ${sectionHtml("output", "Output", "what the explorer says, as it goes", `<pre id="output-body" class="mono muted" style="max-height:70vh;overflow:auto;margin:0;font-size:12px;white-space:pre-wrap">Loading…</pre>`, true)}`
+    : statsHtml() + chartsHtml() + `
     ${sectionHtml("findings", "Findings", run.state === "running" ? "when the run finishes" : "", `<div id="findings-body" class="muted">${run.state === "running" ? "Compared with the previous run of this system once this one finishes." : "Loading…"}</div>`, isOpen("findings"))}
     ${sectionHtml("environment", "Environment", environmentSummary(), environmentBody(), isOpen("environment"))}
     ${sectionHtml("utilization", "Utilization", utilizationSummary(), utilizationBody(), isOpen("utilization"))}
     ${sectionHtml("properties", "Properties", propertiesSummary(), propertiesBody(), isOpen("properties"))}
-    ${run.changed ? sectionHtml("changed", "Changed code", changedSummary(run.changed), changedBody(run.changed), isOpen("changed")) : ""}
-    ${sectionHtml("output", "Output", "what the explorer says, as it goes", `<pre id="output-body" class="mono muted" style="max-height:320px;overflow:auto;margin:0;font-size:12px;white-space:pre-wrap">Loading…</pre>`, isOpen("output"))}
-    ${sectionHtml("map", "Multiverse tree", `${done} timelines from the setup snapshot`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
-    ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
-    ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}
-  `;
+    ${run.changed ? sectionHtml("changed", "Changed code", changedSummary(run.changed), changedBody(run.changed), isOpen("changed")) : ""}`;
+  $("#main").innerHTML = header + body;
+  state.treeTimelines = undefined;
   viewTabsWire();
   document.querySelectorAll("section > header").forEach((header) => header.addEventListener("click", () => {
     const section = header.parentElement;
@@ -489,7 +512,7 @@ function render() {
   mapDraw();
   outputDraw();
   findingsLoad();
-  discoveryDraw();
+  if ($("#discovery")) discoveryDraw();
   logsWire();
 }
 
@@ -497,6 +520,7 @@ function viewTabsWire() {
   document.querySelectorAll(".view-tabs button").forEach((button) => button.addEventListener("click", () => {
     state.view = button.dataset.view;
     render();
+    window.scrollTo(0, 0);
   }));
   const resume = document.getElementById("run-resume");
   if (resume) resume.addEventListener("click", async () => {
@@ -1286,12 +1310,60 @@ async function mapDraw() {
     const zoomed = view.r0 > 0 || view.r1 < full.r1 || view.t0 > full.t0 || view.t1 < full.t1;
     container.innerHTML = treeSvg(model, view, Math.max(720, body.clientWidth - 4)) +
       (zoomed ? treeMinimap(model, view, full) : "");
-    container.querySelectorAll(".timeline, .mark, .fork").forEach((element) => element.addEventListener("click", (event) => {
+  };
+  // The row under the pointer: its line outlined, its tooltip shown; a click opens its logs.
+  const tip = document.getElementById("tip");
+  const rowAt = (event) => {
+    const { top, rowHeight, x0, x1, fan } = layout();
+    const box = container.getBoundingClientRect();
+    const px = event.clientX - box.left, py = event.clientY - box.top;
+    if (px < x0 - fan || px > x1 + 4) return null;
+    const i = Math.round(view.r0 + (py - top - rowHeight / 2) / rowHeight);
+    return i >= 0 && i < rows.length && Math.abs(top + (i - view.r0) * rowHeight + rowHeight / 2 - py) <= Math.max(rowHeight, 4) ? i : null;
+  };
+  let hovered = null;
+  container.addEventListener("mousemove", (event) => {
+    if (drag || event.target.closest("[data-tip]")) { if (hovered != null) { hovered = null; const h = container.querySelector(".row-hover"); if (h) h.setAttribute("d", ""); } return; }
+    const i = rowAt(event);
+    const outline = container.querySelector(".row-hover");
+    if (i !== hovered) {
+      hovered = i;
+      if (outline) outline.setAttribute("d", i != null && model.rowPaths ? model.rowPaths[i] || "" : "");
+      if (i == null) { tip.classList.remove("on"); container.style.cursor = "grab"; return; }
+      tip.innerHTML = timelineTip(rows[i].branch, rows[i].child && rows[i].child.id);
+      container.style.cursor = "pointer";
+    }
+    if (i != null) {
+      tip.classList.add("on"); // The page's tooltips hide it as the pointer crosses elements.
+      const pad = 14;
+      let left = event.clientX + pad, topPx = event.clientY + pad;
+      if (left + tip.offsetWidth > innerWidth - 8) left = event.clientX - tip.offsetWidth - pad;
+      if (topPx + tip.offsetHeight > innerHeight - 8) topPx = event.clientY - tip.offsetHeight - pad;
+      tip.style.left = Math.max(8, left) + "px";
+      tip.style.top = Math.max(8, topPx) + "px";
+    }
+  });
+  container.addEventListener("mouseleave", () => {
+    hovered = null;
+    tip.classList.remove("on");
+    const outline = container.querySelector(".row-hover");
+    if (outline) outline.setAttribute("d", "");
+  });
+  container.addEventListener("click", (event) => {
+    if (container.dataset.dragged) return; // A drag's end (the capture phase handler).
+    const element = event.target.closest(".mark, .fork");
+    if (element) {
       event.stopPropagation();
       if (element.dataset.run) { runOpen(Number(element.dataset.run)); return; }
       logsOpen(Number(element.dataset.branch), Number(element.dataset.vtime));
-    }));
-  };
+      return;
+    }
+    const i = rowAt(event);
+    if (i == null) return;
+    const row = rows[i];
+    if (row.child) { runOpen(row.child.id); return; }
+    logsOpen(row.branch.index, row.branch.vtime_ns);
+  });
   let loading = false;
   const faultsLoad = async () => {
     if (loading || state.mapFaults.run !== run.id) return;
@@ -1428,47 +1500,63 @@ function treeSvg(model, view, width) {
   const whole = view.r0 === 0 && view.r1 === rows.length && view.t0 <= rootNs;
   // The snapshot (the fan's root): at its place in time, or at the left edge when out of view.
   const rootPoint = { x: whole ? rootX : Math.max(x0 - fan, Math.min(x(rootNs), x1)), y: y((rows.length - 1) / 2) };
-  const color = (branch) => branch.failing.length ? "#f0506e" : "#3fbf7f";
   const stroke = Math.max(1, Math.min(1.8, rowHeight / 5));
-  const lines = rows.map((row, i) => {
-    if (!shown(i) && !(row.parentRow != null && shown(row.parentRow))) return "";
+  // Every timeline's line in one path per color (thousands of elements made big runs' pages
+  // busy redrawing them); the pointer finds its row (mapDraw), and model.rowPaths outlines it.
+  const paths = { pass: [], fail: [], fork: [] };
+  const rowPaths = [];
+  rows.forEach((row, i) => {
+    if (!shown(i) && !(row.parentRow != null && shown(row.parentRow))) return;
     const b = row.branch, yy = y(i), end = Math.min(x1, x(b.vtime_ns));
-    const tip = tipAttr(timelineTip(b, row.child && row.child.id));
-    const hit = `<line x1="${x0 - fan}" x2="${x1}" y1="${yy}" y2="${yy}" stroke="transparent" stroke-width="${Math.max(rowHeight, 4)}"/>`;
+    let d, kind = b.failing.length ? "fail" : "pass";
     if (row.child) {
       const fx = x(row.child.run.from_vtime_ms * 1e6), fy = y(row.parentRow);
-      return `<g class="timeline" data-run="${row.child.id}" style="cursor:pointer" ${tip}>
-        <path d="M${fx},${fy} C${fx + 24},${fy} ${fx + 16},${yy} ${fx + 40},${yy} L${Math.max(fx + 40, end)},${yy}" fill="none" stroke="#8f7cf7" stroke-opacity=".75" stroke-width="${stroke}"/>${hit}</g>`;
-    }
-    if (row.parentRow != null) {
+      d = `M${fx},${fy} C${fx + 24},${fy} ${fx + 16},${yy} ${fx + 40},${yy} L${Math.max(fx + 40, end)},${yy}`;
+      kind = "fork";
+    } else if (row.parentRow != null) {
       // Left its parent's line at the moment it diverged: everything before is shared.
       const fx = x(row.parent.vtime_ns), fy = y(row.parentRow);
-      return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip}>
-        <path d="M${fx},${fy} C${fx + 18},${fy} ${fx + 10},${yy} ${fx + 30},${yy} L${Math.max(fx + 30, end)},${yy}" fill="none" stroke="${color(b)}" stroke-opacity=".75" stroke-width="${stroke}"/>${hit}</g>`;
+      d = `M${fx},${fy} C${fx + 18},${fy} ${fx + 10},${yy} ${fx + 30},${yy} L${Math.max(fx + 30, end)},${yy}`;
+    } else {
+      const start = whole ? x0 : Math.max(x0, x(rootNs) + fan);
+      d = `M${rootPoint.x},${rootPoint.y} C${rootPoint.x + fan * 0.6},${rootPoint.y} ${start - fan * 0.4},${yy} ${start},${yy} L${Math.max(start, end)},${yy}`;
     }
-    const start = whole ? x0 : Math.max(x0, x(rootNs) + fan);
-    return `<g class="timeline" data-branch="${b.index}" data-vtime="${b.vtime_ns}" style="cursor:pointer" ${tip}>
-      <path d="M${rootPoint.x},${rootPoint.y} C${rootPoint.x + fan * 0.6},${rootPoint.y} ${start - fan * 0.4},${yy} ${start},${yy} L${Math.max(start, end)},${yy}" fill="none" stroke="${color(b)}" stroke-opacity=".65" stroke-width="${stroke}"/>${hit}</g>`;
-  }).join("");
+    paths[kind].push(d);
+    rowPaths[i] = d;
+  });
+  model.rowPaths = rowPaths;
+  const lines = `<path d="${paths.pass.join("")}" fill="none" stroke="#3fbf7f" stroke-opacity=".65" stroke-width="${stroke}"/>
+    <path d="${paths.fail.join("")}" fill="none" stroke="#f0506e" stroke-opacity=".75" stroke-width="${stroke}"/>
+    <path d="${paths.fork.join("")}" fill="none" stroke="#8f7cf7" stroke-opacity=".75" stroke-width="${stroke}"/>
+    <path class="row-hover" d="" fill="none" stroke="#e6e7eb" stroke-width="${stroke + 1}" pointer-events="none"/>`;
   const size = Math.max(3, Math.min(10, rowHeight * 0.75));
   // One mark per few pixels of a row and kind: marks that would overlap are not told apart, and
   // big runs have tens of thousands.
   const drawn = new Set();
+  // The marks shown, then drawn: each its own element (a tooltip, a click) up to marks_max, in
+  // one path per kind beyond (zooming in brings their details back).
+  const marks = [];
   const mark = (e, kind) => {
     const row = rowOf.get(e.branch);
-    if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) return "";
+    if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) return;
     // Before its branch point, an event is its ancestors': drawn on their lines.
     const parent = rows[row].parent;
-    if (parent && e.vtime_ns <= parent.vtime_ns) return "";
+    if (parent && e.vtime_ns <= parent.vtime_ns) return;
     const xx = x(e.vtime_ns), yy = y(row);
     const bucket = `${kind}:${row}:${Math.round(xx / 3)}`;
-    if (drawn.has(bucket)) return "";
+    if (drawn.has(bucket)) return;
     drawn.add(bucket);
-    const html = kind === "fault" ? faultTip(e, model.decisionFor(e)) : failureTip(e);
-    return kind === "fault"
-      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(html)}></rect>`
-      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2.5, size / 2)}" fill="#f0506e" style="cursor:pointer" ${tipAttr(html)}></circle>`;
+    marks.push({ e, kind, xx, yy });
   };
+  for (const e of model.faults) mark(e, "fault");
+  for (const e of model.firstFailures) mark(e, "failure");
+  const marks_max = 2000;
+  const markHtml = marks.length <= marks_max
+    ? marks.map(({ e, kind, xx, yy }) => kind === "fault"
+      ? `<rect class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" x="${xx - 1.25}" y="${yy - size / 2}" width="2.5" height="${size}" fill="#f0a650" style="cursor:pointer" ${tipAttr(faultTip(e, model.decisionFor(e)))}></rect>`
+      : `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(2.5, size / 2)}" fill="#f0506e" style="cursor:pointer" ${tipAttr(failureTip(e))}></circle>`).join("")
+    : `<path d="${marks.filter((m) => m.kind === "fault").map(({ xx, yy }) => `M${xx},${yy - size / 2}v${size}`).join("")}" stroke="#f0a650" stroke-width="2.5"/>
+      <path d="${marks.filter((m) => m.kind === "failure").map(({ xx, yy }) => `M${xx - 2},${yy}h4`).join("")}" stroke="#f0506e" stroke-width="${Math.max(2.5, size / 2)}" stroke-linecap="round"/>`;
   const branchPoints = model.points.filter((p) => shown(p.row) && inTime(p.vtime)).map((point) =>
     `<circle cx="${x(point.vtime)}" cy="${y(point.row)}" r="${Math.max(3, Math.min(6, rowHeight / 2))}" fill="#15161a" stroke="#e6e7eb" stroke-width="1.5" ${tipAttr(branchPointTip(point, point.why))}></circle>`).join("");
   const forkPoints = model.children.map((child) => {
@@ -1499,8 +1587,7 @@ function treeSvg(model, view, width) {
     ${forkedHere ? "" : `<text x="${snapshotX}" y="${rootPoint.y + 38}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(snapshotNs / 1e9).toFixed(2)}s</text>`}`;
   const zoomed = whole ? "" : `<text x="${x0 - fan}" y="16" fill="#9a9eab" font-size="10.5">zoomed: ${(view.t0 / 1e9).toFixed(3)}s to ${(view.t1 / 1e9).toFixed(3)}s · timelines ${Math.round(view.r0) + 1} to ${Math.round(view.r1)} of ${rows.length}</text>`;
   return `<svg width="${width}" height="${height}"><defs><clipPath id="tree-clip"><rect x="${x0 - fan}" y="0" width="${x1 - x0 + fan + 2}" height="${height}"/></clipPath></defs>
-    ${trunk}${zoomed}<g clip-path="url(#tree-clip)">${lines}${model.faults.map((e) => mark(e, "fault")).join("")}
-    ${model.firstFailures.map((e) => mark(e, "failure")).join("")}${branchPoints}${forkPoints}</g>${cut}${labels}${ticks}</svg>`;
+    ${trunk}${zoomed}<g clip-path="url(#tree-clip)">${lines}${markHtml}${branchPoints}${forkPoints}</g>${cut}${labels}${ticks}</svg>`;
 }
 
 // Search: conditions and temporal conditions over every timeline (src/query.zig).
@@ -1559,6 +1646,7 @@ function resultsHtml(output, results) {
 async function logsOpen(branch, vtime_ns) {
   state.logs = { branch, vtime_ns, events: null, filter: "" };
   state.open.add("logs");
+  if (state.view !== "explorer") { state.view = "explorer"; render(); }
   const section = $("#logs");
   section.classList.remove("closed");
   $(".summary", section).textContent = logsSummary();
@@ -1928,11 +2016,12 @@ $("#run-form").addEventListener("submit", async (event) => {
 
 runsRefresh();
 setInterval(runsRefresh, 5000);
-const fromHash = Number(location.hash.slice(1));
-if (fromHash) runOpen(fromHash);
+const fromHash = routeOf(location.hash);
+if (fromHash.id) runOpen(fromHash.id, fromHash.view);
 window.addEventListener("hashchange", () => {
-  const id = Number(location.hash.slice(1));
-  if (id && id !== state.runId) runOpen(id);
+  const route = routeOf(location.hash);
+  if (route.id && route.id !== state.runId) runOpen(route.id, route.view);
+  else if (route.id && route.view !== state.view) { state.view = route.view; render(); }
 });
 </script>
 </body>

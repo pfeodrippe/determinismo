@@ -59,7 +59,7 @@ change that moves it.
 
 | Antithesis | determinismo | Status |
 |---|---|---|
-| Triage report: environment, utilization, findings, properties | web UI (`determinismo serve`, at `/`): runs, live progress, findings, utilization, properties; text report, JSONL record (and Environment: the resolved system recorded with each run) | ✅ |
+| Triage report: environment, utilization, findings, properties | web UI (`determinismo serve`, at `/`), a run's views each its own page as Antithesis splits them (the report `#<id>`, the Logs Explorer `#<id>/explorer`, the explorer's output `#<id>/output`, the notebook `#<id>/notebook`; only the open one drawn and refreshed): runs, live progress, findings, utilization, properties; text report, JSONL record (and Environment: the resolved system recorded with each run) | ✅ |
 | Properties grouped (setup, efficiency, performance, correctness, SDK kinds, test composer), examples with passing/failing moments | grouped (determinismo's, always, sometimes, reachability), All/Passed/Failed, filter, failing and passing examples at their moments, each opening its logs | ✅ |
 | Findings across runs (new, ongoing, resolved, rare) | `GET /runs/<id>/findings` and the UI's Findings section: against the previous finished run of the same system and scenario; rare when one timeline showed it; resolved only when missing it by chance is under 5% ((1 - k/n)^m), else unseen | ✅ |
 | New behavior discovery curve | `GET /runs/<id>/discovery`, in the UI's Utilization: distinct behaviors (assertion outcomes, events, coverage) after each branch | ✅ |
@@ -81,7 +81,7 @@ change that moves it.
 | Logs Explorer search: fields, operators, preceded by / followed by within N seconds | `determinismo query`, HTTP `POST /runs/<id>/query`, MCP `query`: paths, `= != ~ !~ =~ !=~ < <= > >= ? !?` (`=~` a regular expression), and/or, (not) preceded/followed by, within | ✅ |
 | Event sets: matches, contains, filter, union, up_to(moment) | conditions, `or`, `--branch`, `--up-to-vtime` | ✅ |
 | Event sets: map, fold, with_last, with_next, intersect, difference | `determinismo events` (HTTP, MCP): a JSON pipeline of filter, exclude, with_last, with_next (timeouts), union, intersect, difference, narrow, and `through`: any program as map, flatmap and fold | ✅ |
-| Logs Explorer / multiverse map UI | web UI: search with temporal conditions, a timeline's logs up to a moment (with what it shares with its ancestors), the multiverse as a tree (shared prefixes, branch points, forks) with its faults and failures and tooltips saying why; run a command at any moment, fork from it | ✅ |
+| Logs Explorer / multiverse map UI | web UI, the run's Logs explorer view (`#<id>/explorer`; the tree's timelines drawn as one path per color and found under the pointer: a run of 2,935 timelines draws in about 900 SVG elements): search with temporal conditions, a timeline's logs up to a moment (with what it shares with its ancestors), the multiverse as a tree (shared prefixes, branch points, forks) with its faults and failures and tooltips saying why; run a command at any moment, fork from it | ✅ |
 
 ## Debugging (multiverse)
 
