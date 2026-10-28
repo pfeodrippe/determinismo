@@ -37,7 +37,7 @@ the same capabilities in each, in that language's idiom.
 | setup_complete, event | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Raw output (any JSON object) | `output` | `det_output` | `output` | `output` | `output` | `output` | `output` | `Output` | `Lifecycle.Output` |
 | Quiet periods, faults from the scenario | `stop_faults`, `fault` | ✓ | ✓ | ✓ | ✓ | `stopFaults`, `fault` | ✓ | `StopFaults`, `Fault` | `Lifecycle.StopFaults`, `Lifecycle.Fault` |
-| Code coverage for strategies | trace-pc-guard | trace-pc-guard (source lines with the binary in /symbols) | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`) | (Go's own `-cover`) | (not yet) |
+| Code coverage for strategies | trace-pc-guard | trace-pc-guard (source lines with the binary in /symbols) | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`) | none (a Go program built with Antithesis's instrumentor reports lines through libvoidstar) | (not yet) |
 | Outside determinismo: local output file, else stderr | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Outside determinismo (a local run, a unit test), randomness comes from the OS and events go to

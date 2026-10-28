@@ -10,7 +10,10 @@
 //   txn commit|abort <topic> <partition>:<value>... -> ok | aborted | fail <reason> | unknown <reason>
 //   create <topic> <partitions> <replicas>       -> ok | exists | error <reason>
 //   read <topic> <partition>                     -> values <value>,... | error <reason>
+//   stable <topic> <partition>                   -> stable | open <lso> <hw> | error <reason>
 //
+// `stable`: no transaction open in the partition (its last stable offset, where read_committed
+// readers stop, at its high watermark).
 // `fail`: the transaction certainly did not commit (it was aborted). `unknown`: it may have.
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -26,11 +29,14 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.AuthorizationException;
@@ -100,6 +106,8 @@ public final class KClient {
                     return create(words[1], Integer.parseInt(words[2]), Short.parseShort(words[3]));
                 case "read":
                     return read(new TopicPartition(words[1], Integer.parseInt(words[2])));
+                case "stable":
+                    return stable(new TopicPartition(words[1], Integer.parseInt(words[2])));
                 default:
                     return "error unknown command";
             }
@@ -178,6 +186,27 @@ public final class KClient {
                 if (e.getCause() instanceof TopicExistsException) return "exists";
                 return "error " + reason(e.getCause());
             }
+        }
+
+        /** Whether no transaction is open in the partition: its last stable offset at its high watermark. */
+        private String stable(TopicPartition partition) throws Exception {
+            Properties properties = new Properties();
+            properties.put("bootstrap.servers", bootstrap);
+            properties.put("request.timeout.ms", "5000");
+            properties.put("default.api.timeout.ms", "10000");
+            try (AdminClient admin = AdminClient.create(properties)) {
+                long stable = latest(admin, partition, IsolationLevel.READ_COMMITTED);
+                long high = latest(admin, partition, IsolationLevel.READ_UNCOMMITTED);
+                return stable >= high ? "stable" : "open " + stable + " " + high;
+            } catch (ExecutionException e) {
+                return "error " + reason(e.getCause());
+            }
+        }
+
+        private static long latest(AdminClient admin, TopicPartition partition, IsolationLevel level)
+                throws Exception {
+            return admin.listOffsets(Map.of(partition, OffsetSpec.latest()), new ListOffsetsOptions(level))
+                    .partitionResult(partition).get().offset();
         }
 
         /** Every committed value of a partition, from the beginning (read_committed). */

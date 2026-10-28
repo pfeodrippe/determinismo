@@ -44,6 +44,8 @@ const sends_max = 4;
 const abort_one_in = 5;
 const setup_attempts_max = 300;
 const read_attempts_max = 120;
+/// Waiting for every transaction to complete once faults stop: a minute, 500 ms apart.
+const stable_attempts_max = 120;
 /// A transaction's answer at most: the producer's own timeouts are 10 s (KClient.java).
 const timeout_ms = 30_000;
 const line_size_max = 512;
@@ -66,20 +68,29 @@ pub fn main(init: std.process.Init) !void {
 /// design (README), which would hide the rest too.
 /// `format-unsynced`: formatted as Kafka does it, that finding's profile.
 /// `unflushed`: Kafka's flushing as it comes, the lost writes above expected.
+/// `coverage`: the default's, on Java 25 with determinismo's coverage agent on the brokers'
+/// coordinators, replication and log (Dockerfile.coverage): new broker code is new behavior.
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "format-unsynced", "unflushed" }) |profile_name| {
+    inline for (.{ "default", "format-unsynced", "unflushed", "coverage" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
 
 fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
-    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/kafka/Dockerfile" };
+    const coverage = comptime std.mem.eql(u8, profile_name, "coverage");
+    const build: sdk.schema.Build = .{
+        .context = ".",
+        .dockerfile = if (coverage) "examples/kafka/Dockerfile.coverage" else "examples/kafka/Dockerfile",
+    };
     const format = if (comptime std.mem.eql(u8, profile_name, "format-unsynced")) profile_name else "synced";
     const flush = if (comptime std.mem.eql(u8, profile_name, "unflushed")) profile_name else "flushed";
     inline for (.{ "kafka-1", "kafka-2", "kafka-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush },
+            .command = if (coverage)
+                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush, "coverage" }
+            else
+                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush },
             // The controller's port: open at once. The broker's opens once the quorum formed,
             // which needs the nodes started after this one.
             .ready = .{ .tcp = controller_port },
@@ -90,12 +101,13 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
         .build = build,
         .command = &.{"client"},
         .ready = .{ .tcp = client_port },
+        // The client library's node, as Jepsen's clients: its links to the brokers are
+        // faulted (KAFKA-17754 needs an EndTxn delayed on its way to the coordinator), the
+        // drivers' calls into it are not, and it is never paused or slowed.
         .faults = .{
             .pause = false,
-            .isolate = false,
-            .partition = false,
+            .runner_links = false,
             .sync_stall = false,
-            .degrade = false,
             .throttle = false,
             .process_pause = false,
         },
@@ -103,6 +115,12 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
 }
 
 fn txn_scenario(s: *System.Scenario) void {
+    // Faults in bursts with quiet stretches between them, as Dgraph's and YugabyteDB's: under
+    // a fault every 10 to 300 ms for the whole driver phase (restarts, power losses and stops
+    // among them), JVM brokers that take seconds to start were never all up again, and 9
+    // timelines in 508 committed a transaction (run 56). Quiet stretches of up to 10 s were
+    // still shorter than a broker's restart and the quorum's election after a burst's kills.
+    s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
     s.setup("topic", topic_created);
     s.parallel_driver("txn", transactions);
     s.eventually("read", everything_read);
@@ -126,8 +144,22 @@ const Client = struct {
 
 // Setup -----------------------------------------------------------------------------------------
 
+/// The topic, and the transaction coordinators (Kafka creates their topic at the first producer's
+/// start): made before faults begin, which would otherwise keep that topic from ever forming when
+/// the brokers start slower (the coverage profile's agent), and no transaction would run.
 fn topic_created(context: *System.Context) !void {
     _ = try sdk.retry(setup_attempts_max, 500, topic_create, .{context});
+    _ = try sdk.retry(setup_attempts_max, 500, producer_start, .{context});
+}
+
+fn producer_start(context: *System.Context) !void {
+    var client: Client = undefined;
+    try client.open(context);
+    defer client.connection.close();
+    const reply = try client.request("hello setup", .{});
+    if (std.mem.eql(u8, reply, "ok")) return;
+    sdk.event("kafka_error", .{ .command = "hello", .reply = reply });
+    return error.NotStarted;
 }
 
 fn topic_create(context: *System.Context) !void {
@@ -161,7 +193,7 @@ fn transactions(context: *System.Context) !void {
     };
     if (!std.mem.eql(u8, hello, "ok")) {
         // No producer yet (the coordinator unavailable): nothing was sent.
-        sdk.sometimes(true, "a producer could not start", .{});
+        sdk.sometimes(true, "a producer could not start", .{ .reply = hello });
         return;
     }
     for (0..transactions_per_driver) |sequence| {
@@ -242,6 +274,25 @@ fn everything_read(context: *System.Context) !void {
     var read: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     const history: sdk.elle.History = .{};
     const process = sdk.elle.process_new();
+    // Read once no transaction is open: commit markers still on their way after the faults
+    // (a coordinator just back) would otherwise pass for lost writes (srv3, 2026-10-28: a
+    // read 11 s after faults stopped, markers landing during it). A transaction still open a
+    // minute on (the coordinator aborts those older than 10 s) hangs.
+    for (0..partitions) |partition| {
+        const stable = if (sdk.retry(stable_attempts_max, 500, partition_stable, .{ context, partition })) |_|
+            true
+        else |_|
+            false;
+        var client: Client = undefined;
+        const reply = if (stable) "stable" else if (client.open(context)) |_| reply: {
+            defer client.connection.close();
+            break :reply client.request("stable {s} {d}", .{ topic, partition }) catch "no answer";
+        } else |_| "no connection";
+        sdk.always(stable, "no transaction stays open once faults stop", .{
+            .partition = partition,
+            .reply = reply,
+        });
+    }
     for (0..partitions) |partition| {
         const unread = [_]sdk.elle.Mop{.{ .read = .{ .key = partition, .list = null } }};
         try history.invoke(arena, process, &unread);
@@ -317,6 +368,14 @@ fn transactions_parse(arena: std.mem.Allocator, log: []const u8) ![]const Transa
         try noted.append(arena, .{ .outcome = outcome, .values = values.items });
     }
     return noted.items;
+}
+
+fn partition_stable(context: *System.Context, partition: usize) !void {
+    var client: Client = undefined;
+    try client.open(context);
+    defer client.connection.close();
+    const reply = try client.request("stable {s} {d}", .{ topic, partition });
+    if (!std.mem.eql(u8, reply, "stable")) return error.Open;
 }
 
 fn partition_read(context: *System.Context, arena: std.mem.Allocator, partition: usize) ![]const u64 {

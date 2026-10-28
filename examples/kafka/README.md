@@ -37,6 +37,10 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   after formatting (the finding below would otherwise brick a broker in most timelines and hide
   the rest), and each write to disk before it counts (`log.flush.interval.messages=1`).
 - `format-unsynced`: formatted as Kafka does it (that finding's profile), writes flushed.
+- `coverage`: the default's, on Java 25 with determinismo's coverage agent on the brokers'
+  transaction path (the transaction coordinator, ReplicaManager, Partition, UnifiedLog):
+  each of their source lines reports itself the first time it runs, and the tree returns to
+  timelines that ran new broker code. The whole broker instrumented started 9 times slower.
 - `unflushed`: Kafka's flushing as it comes. Kafka leaves its log to the kernel's writeback and
   counts on its replicas: when every replica that took a write loses power before the kernel
   writes it back (30 s), the write is gone, though acknowledged. That is Kafka's design, and
@@ -54,7 +58,8 @@ one in five aborted on purpose. Each outcome is noted in the runner:
 - `f`: failed before its commit, then aborted;
 - `u`: unknown (its commit timed out, or no answer).
 
-Once faults stop, every partition is read from the beginning, `read_committed`:
+Once faults stop and every partition is stable (no transaction open), each is read from the
+beginning, `read_committed`:
 
 | Property | Breaks when |
 |---|---|
@@ -62,16 +67,42 @@ Once faults stop, every partition is read from the beginning, `read_committed`:
 | every write of a committed transaction is read | lost write |
 | a transaction's writes are read all or none | torn transaction |
 | no write is read twice | duplicate |
+| no transaction stays open once faults stop | a hanging transaction: a partition's last stable offset short of its high watermark a minute on |
 
 Elle checks the same history for read committed: each partition a list, each send an append,
 each partition's read once faults stop (as Jepsen's Kafka checker, Elle-based): transactions
 ordered one way in a partition and the other way in another (G0, G1c), aborted reads (G1a).
 
 Faults: the default ones (pauses, partitions, degraded links, sync stalls, throttling), plus
-restarts, power losses and graceful stops of the brokers. The client node gets none.
+restarts, power losses and graceful stops of the brokers. The client node stands for Jepsen's
+clients, which live in the test process: its links to the brokers are cut and degraded (a commit
+lost and retransmitted after its producer moved on is KAFKA-17754's way in), the drivers' calls
+into it are not (`runner_links = false`), and it is never paused or slowed. Until 2026-10-28 its
+links got no faults at all, and KAFKA-17754 had no way to happen but through broker pauses.
+
+Setup creates the topic and starts one producer before faults begin: Kafka creates the
+transaction coordinators' topic at the first producer's start, and under faults that can take
+the whole timeline (the coverage profile's slower brokers never got one).
 
 ## Status
 
+- 2026-10-28 (srv3): the hunts so far hardly ran the workload. Run 56 committed a transaction
+  in 9 of its 508 timelines (run 24: 10 of 327) and passed, a `sometimes` being satisfied by
+  one: brokers restarted, crashed or stopped every two seconds or so never came back up, and
+  KAFKA-17754 had no way in (no faults on the client's links). Now: faults in bursts with
+  quiet stretches of up to 30 s, a producer started in setup, the client's links to the
+  brokers faulted, the final read once every partition is stable, and runs flag a
+  `sometimes` that held in under 5% of the timelines (`rarely true`).
+- The same day, a timeline of the coverage profile failed "every write of a committed
+  transaction is read" and "... all or none": the two transactions that committed had their
+  commit markers written on two partitions of four 384 s later, 11 s after the faults
+  stopped, while the final read ran. Not a Kafka bug: the read did not wait, and the
+  coordinator had been sending those markers to its own broker in vain because determinismo's
+  isolation cut a node from its own address (its address was on its links only, all down). A
+  cut cable never does that: nodes now keep their address on `lo` too (e2e `inject` checks
+  that an isolated node reaches itself), and the read waits for stable partitions (a
+  transaction open a minute after faults stop fails "no transaction stays open once faults
+  stop").
 - Readiness is the controller's port (9093): the broker's opens only once the quorum formed,
   which needs the nodes started after a node.
 - First timelines (srv1): producers could not start under the first faults (transaction state

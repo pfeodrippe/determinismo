@@ -1,8 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# start.sh broker <id> [synced|format-unsynced] [flushed|unflushed]: one KRaft node (broker and
-# controller), its log in /data, formatted the first time (a fixed cluster id: every node the same
-# cluster); `flushed` forces each write to disk before it is acknowledged (README: Profiles).
+# start.sh broker <id> [synced|format-unsynced] [flushed|unflushed] [coverage]: one KRaft node
+# (broker and controller), its log in /data, formatted the first time (a fixed cluster id: every
+# node the same cluster); `flushed` forces each write to disk before it is acknowledged
+# (README: Profiles); `coverage` (Dockerfile.coverage's image) runs the broker with determinismo's
+# coverage agent on its coordinators, replication and log.
 # start.sh client: the client node on port 7000.
 set -e
 case "$1" in
@@ -40,6 +42,11 @@ PROPERTIES
     [ "${3:-}" = "format-unsynced" ] || sync /data/kafka/bootstrap.checkpoint /data/kafka
   fi
   export KAFKA_HEAP_OPTS="-Xms512m -Xmx512m"
+  # Each source line of these classes reports itself the first time it runs (a "coverage"
+  # event): the tree returns to timelines that ran new transaction code. Only the transaction
+  # path: instrumenting the whole broker (kafka.server, kafka.log, ...) made it start 9 times
+  # slower (15.6 s against 1.8 s of virtual time), and under faults it hardly ever served.
+  [ "${5:-}" != "coverage" ] || export KAFKA_OPTS="-javaagent:/opt/det/determinismo-coverage.jar=kafka.coordinator.transaction,org.apache.kafka.coordinator.transaction,kafka.server.ReplicaManager,kafka.cluster.Partition,kafka.log.UnifiedLog"
   exec /opt/kafka/bin/kafka-server-start.sh /tmp/server.properties
   ;;
 client)
