@@ -108,10 +108,30 @@ event hashing, the guest module.
     (`window_ns`): causality takes the window's end as the failure's moment.
   - e2e: every check names the conditions it failed and keeps its outputs; it copies the guest
     at its start (a deploy rewrote ~/guest under a running suite).
-  - Open: saving a ladder by replay is slow (each save hashes all of the guest's pages; a
-    YugabyteDB timeline's 9 moments took 25 minutes); a ladder once stopped after 2 of 9
-    moments (timeline 5 of run 2, an earlier build); a busy guest runs at 0.6-0.7 virtual
-    seconds per second.
+  - Determinism, YugabyteDB (2026-10-28): run 18's in-run replays parted in 3 of 6 timelines
+    (run 1's in 2 of 3), with every clock hazard at zero. Timeline 95 replayed exactly on the
+    reserved cores (2 of 2) and parted 1 in 3 beside the hunt, always at event 18432. The full
+    RDTSC log (`DETERMINISMO_RDTSC_LOG_CAP`) put it between two `sched_clock` reads right after
+    an event write (442 branches, or 3,337), and the instruction trace of that interval
+    (`DETERMINISMO_ITRACE_AT`) showed it: returning from the syscall, the recorded run's user
+    instruction faulted and waited for the mmap lock, held by another thread in the middle of
+    munmap or mprotect; the parted replay's went through a TLB entry that thread had changed
+    but not flushed yet. x86 Linux flushes when such an operation is done and may be preempted
+    before; whether another thread of the process still finds the entry depends on what the
+    host's activity evicted. Guest kernel patch 0004: every switch into an address space
+    flushes the TLB (the same process's threads included): no measurable cost (fresh
+    timelines beside the hunt: 0.89x virtual per wall second, 0.84x before). Run 19 (seed 8,
+    every timeline replayed beside run 18's hunt): every replay the same.
+  - Hyperthreads (2026-10-28): with the guest's TLB fixes, VMs on a core's two hyperthreads
+    replay exactly (four replays on CPUs 0, 18, 1 and 19 of a 39 s and a 382 s YugabyteDB
+    timeline: every one the same through its last tape checkpoint). They had been excluded for
+    Kafka divergences that were, by the evidence, the same guest TLB dependence (150-branch
+    spurious faults). `serve.sh --siblings on` (DETERMINISMO_SMT=1) uses them once every core
+    is busy; its first hunt (Kafka, seed 12) checks it with its own replays.
+  - Saving a ladder by replay: 9 moments of a YugabyteDB timeline took 25 minutes on an earlier
+    build; with the exit fixes, run 18 (srv3) saved 10 moments over 85 virtual seconds in 88 s,
+    the replay's own pace. Open: a ladder once stopped after 2 of 9 moments (timeline 5 of run
+    2, an earlier build).
 - Hosts (2026-10-27, night): srv2 was cancelled by mistake in Robot (its runs and ~/findings
   gone with it), srv1 hung and is being cancelled; a W-2295 twin of srv2 from the auction is
   next (infra/host/setup.sh builds its guest kernel itself). Waiting on it: the holders' memory
