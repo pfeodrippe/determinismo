@@ -91,6 +91,7 @@ fn results_parse(arena: std.mem.Allocator, text: []const u8) !Results {
         var words = std.mem.tokenizeScalar(u8, line, ' ');
         const index = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
         const verdict = words.next() orelse continue;
+        if (std.mem.eql(u8, verdict, "killed")) continue; // Not replayed.
         results.replayed += 1;
         if (std.mem.eql(u8, verdict, "same")) {
             results.same += 1;
@@ -315,13 +316,33 @@ fn replay_one(
     if (std.mem.eql(u8, replayed, recorded) and why.len == 0) {
         return std.fmt.allocPrint(arena, "{d} same {s}\n", .{ index, recorded });
     }
+    // Killed (SIGKILL: the host's OOM killer) before it ended: not replayed, which says nothing
+    // about determinism.
+    const killed = switch (result.term) {
+        .signal => |signal| signal == .KILL,
+        else => false,
+    };
+    if (killed and std.mem.eql(u8, replayed, "none") and why.len == 0) {
+        return std.fmt.allocPrint(arena, "{d} killed {s}\n", .{ index, recorded });
+    }
     // Its output beside the results (the last 256 KiB): where it parted, on what CPU, its
     // clock's hazards, without replaying it again.
     const log = try std.fmt.allocPrint(arena, "{s}/replay-{d}.log", .{ tapes, index });
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log, .data = result.stderr[result.stderr.len -| 256 << 10 ..] }) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log, .data = tail(result.stderr, 256 << 10) }) catch {};
     return std.fmt.allocPrint(arena, "{d} different {s} {s} {s}{s}{s}\n", .{
         index, recorded, replayed, why, if (hazards.len > 0) "; " else "", hazards,
     });
+}
+
+/// The last `size_max` bytes of `bytes` (all of them when shorter).
+fn tail(bytes: []const u8, size_max: usize) []const u8 {
+    return bytes[bytes.len -| size_max..];
+}
+
+test tail {
+    try std.testing.expectEqualStrings("cd", tail("abcd", 2));
+    try std.testing.expectEqualStrings("abcd", tail("abcd", 256 << 10));
+    try std.testing.expectEqualStrings("", tail("", 4));
 }
 
 fn append(path: []const u8, line: []const u8) void {
@@ -344,7 +365,7 @@ fn sleep_ns(ns: u64) void {
 test results_parse {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const results = try results_parse(arena.allocator(), "15 same ab\n31 different ab cd diverged\n47 same ef\n");
+    const results = try results_parse(arena.allocator(), "15 same ab\n31 different ab cd diverged\n47 same ef\n63 killed gh\n");
     try std.testing.expectEqual(3, results.replayed);
     try std.testing.expectEqual(2, results.same);
     try std.testing.expectEqual(31, results.first_different.?);
