@@ -101,7 +101,10 @@ backends, below: known crashes since), it failed:
   `SwitchToAllocatedSegment`), and aborted. The same abort, in the same function, is open
   upstream as #30325 (2026-02, 2.29, under kernel shutdowns): here after a process kill alone.
 - "the kernel kills no process for lack of memory" in 7: the VM's memory, filled by the WAL's
-  preallocated 64 MB segments (a node's disk is memory); 4 MB segments since.
+  preallocated 64 MB segments (a node's disk is memory): a replay of timeline 16 at 770 s, just
+  before its OOM kill, found 6.6 GB of the VM's 7.1 GB in its disks (Shmem) and 186 MB
+  available, the tablet servers' WALs 1.36 and 1.45 GB (72 tablets each), their data 483 MB.
+  4 MB segments since.
 
 ## Observed (1.3.1, not investigated further)
 
