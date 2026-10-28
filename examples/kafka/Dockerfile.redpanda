@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Redpanda (its current release), the brokers of the kafka-test's `redpanda` profile: Kafka's
+# protocol, so the same client node (Dockerfile's image) and checks. start.sh redpanda <id>, as
+# the image's own user (its data directory's owner).
+FROM docker.io/redpandadata/redpanda:v26.2.6
+USER root
+COPY examples/kafka/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+USER redpanda
+ENTRYPOINT ["/usr/local/bin/start.sh"]

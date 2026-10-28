@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# Kafka 4.4.0 as examples/kafka/Dockerfile.4.4 builds it, on a Java 25 runtime with determinismo's
+# coverage agent (sdk/java/DeterminismoCoverage, built on the JDK's class-file API: Java 24 or
+# later): the brokers report the source lines of their coordinators, replication and log as they
+# first run them (the `kafka-4.4-coverage` profile, start.sh's fifth argument).
+FROM docker.io/library/debian:bookworm-slim AS build
+ARG KAFKA_SHA512=f5ceba8a265ab6bb2d68362b1f6859a95e15d60ef92ba83b43fdf065b557dc18e98d6383c15b9977320e25b3a2c8b6f11decb17b0fa6c0f163423793a0eb95cb
+RUN apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      openjdk-17-jdk-headless ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL -o /tmp/kafka.tgz https://archive.apache.org/dist/kafka/4.4.0/kafka_2.13-4.4.0.tgz \
+ && echo "${KAFKA_SHA512}  /tmp/kafka.tgz" | sha512sum -c - \
+ && mkdir /opt/kafka && tar -xzf /tmp/kafka.tgz -C /opt/kafka --strip-components=1 \
+ && rm /tmp/kafka.tgz
+COPY examples/kafka/KClient.java /opt/kclient/KClient.java
+RUN javac -cp "/opt/kafka/libs/*" -d /opt/kclient /opt/kclient/KClient.java
+
+FROM docker.io/library/eclipse-temurin:25-jdk AS agent
+COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/
+RUN javac -d /sdk/classes /sdk/Determinismo.java /sdk/DeterminismoCoverage.java \
+ && printf 'Premain-Class: DeterminismoCoverage\n' > /sdk/manifest \
+ && jar cfm /sdk/determinismo-coverage.jar /sdk/manifest -C /sdk/classes .
+
+FROM docker.io/library/eclipse-temurin:25-jre
+COPY --from=build /opt/kafka /opt/kafka
+COPY --from=build /opt/kclient /opt/kclient
+COPY --from=agent /sdk/determinismo-coverage.jar /opt/det/determinismo-coverage.jar
+COPY examples/kafka/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh && mkdir -p /data
+ENTRYPOINT ["/usr/local/bin/start.sh"]

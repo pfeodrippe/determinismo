@@ -34,6 +34,7 @@ const System = sdk.System(Nodes);
 
 const client_port = 7000;
 const controller_port = 9093;
+const redpanda_rpc_port = 33145;
 const topic = "jepsen";
 const partitions = 4;
 const replicas = 3;
@@ -74,30 +75,52 @@ pub fn main(init: std.process.Init) !void {
 /// `unflushed`: Kafka's flushing as it comes, the lost writes above expected.
 /// `coverage`: the default's, on Java 25 with determinismo's coverage agent on the brokers'
 /// coordinators, replication and log (Dockerfile.coverage): new broker code is new behavior.
+/// `kafka-4.4`: the default's on Kafka 4.4.0, the latest release, brokers and client
+/// (Dockerfile.4.4: transactions v2). `kafka-4.4-coverage`: the same with the coverage agent, as
+/// `coverage` (Dockerfile.4.4.coverage): run 68, with it, found what run 67, without, did not.
+/// `redpanda`: Redpanda's brokers in Kafka's place (Dockerfile.redpanda).
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "format-unsynced", "unflushed", "coverage" }) |profile_name| {
+    inline for (.{ "default", "format-unsynced", "unflushed", "coverage", "kafka-4.4", "kafka-4.4-coverage", "redpanda" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
 
 fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
-    const coverage = comptime std.mem.eql(u8, profile_name, "coverage");
+    const coverage = comptime std.mem.eql(u8, profile_name, "coverage") or
+        std.mem.eql(u8, profile_name, "kafka-4.4-coverage");
+    // Redpanda speaks Kafka's protocol: its brokers in place of Kafka's, the same client and
+    // checks.
+    const redpanda = comptime std.mem.eql(u8, profile_name, "redpanda");
     const build: sdk.schema.Build = .{
         .context = ".",
-        .dockerfile = if (coverage) "examples/kafka/Dockerfile.coverage" else "examples/kafka/Dockerfile",
+        .dockerfile = if (comptime std.mem.eql(u8, profile_name, "kafka-4.4-coverage"))
+            "examples/kafka/Dockerfile.4.4.coverage"
+        else if (coverage)
+            "examples/kafka/Dockerfile.coverage"
+        else if (comptime std.mem.eql(u8, profile_name, "kafka-4.4"))
+            "examples/kafka/Dockerfile.4.4"
+        else
+            "examples/kafka/Dockerfile",
     };
+    const brokers_build: sdk.schema.Build = if (redpanda)
+        .{ .context = ".", .dockerfile = "examples/kafka/Dockerfile.redpanda" }
+    else
+        build;
     const format = if (comptime std.mem.eql(u8, profile_name, "format-unsynced")) profile_name else "synced";
     const flush = if (comptime std.mem.eql(u8, profile_name, "unflushed")) profile_name else "flushed";
     inline for (.{ "kafka-1", "kafka-2", "kafka-3" }, 1..) |name, id| {
+        const number = std.fmt.comptimePrint("{d}", .{id});
         profile.node(@field(System.Name, name), .{
-            .build = build,
-            .command = if (coverage)
-                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush, "coverage" }
+            .build = brokers_build,
+            .command = if (redpanda)
+                &.{ "redpanda", number }
+            else if (coverage)
+                &.{ "broker", number, format, flush, "coverage" }
             else
-                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), format, flush },
-            // The controller's port: open at once. The broker's opens once the quorum formed,
-            // which needs the nodes started after this one.
-            .ready = .{ .tcp = controller_port },
+                &.{ "broker", number, format, flush },
+            // The controller's port (Redpanda's RPC port): open at once. The broker's opens once
+            // the quorum formed, which needs the nodes started after this one.
+            .ready = .{ .tcp = if (redpanda) redpanda_rpc_port else controller_port },
             .faults = .{ .restart = true, .crash = true, .stop = true },
         });
     }
@@ -172,6 +195,11 @@ fn topic_create(context: *System.Context) !void {
     defer client.connection.close();
     const reply = try client.request("create {s} {d} {d}", .{ topic, partitions, replicas });
     if (std.mem.eql(u8, reply, "ok") or std.mem.eql(u8, reply, "exists")) return;
+    // Redpanda refused min.insync.replicas: created without it (its Raft majorities instead).
+    if (std.mem.startsWith(u8, reply, "ok without ")) {
+        sdk.event("kafka_topic", .{ .created = reply });
+        return;
+    }
     sdk.event("kafka_error", .{ .command = "create", .reply = reply });
     return error.NotCreated;
 }
@@ -287,15 +315,31 @@ fn everything_read(context: *System.Context) !void {
             true
         else |_|
             false;
+        // Open: its offsets, and the producers the partition's leader keeps (the one whose
+        // transaction started at the last stable offset is the one left open).
         var client: Client = undefined;
+        var producers: []const u8 = "";
         const reply = if (stable) "stable" else if (client.open(context)) |_| reply: {
             defer client.connection.close();
-            break :reply client.request("stable {s} {d}", .{ topic, partition }) catch "no answer";
+            const offsets = try arena.dupe(u8, client.request("stable {s} {d}", .{ topic, partition }) catch "no answer");
+            producers = try arena.dupe(u8, client.request("producers {s} {d}", .{ topic, partition }) catch "no answer");
+            break :reply offsets;
         } else |_| "no connection";
         sdk.always(stable, "no transaction stays open once faults stop", .{
             .partition = partition,
             .reply = reply,
+            .producers = producers,
         });
+        // Hanging: aborted as Kafka's operators would (KIP-664), and the partition read past it,
+        // so its writes count as aborted, not lost or torn: the rest is judged on its own (run
+        // 68's timeline 125 read up to the hanging transaction only, its 30 "lost" and 24
+        // "torn" writes past it). The hang is the property above's.
+        if (!stable) if (client.open(context)) |_| {
+            defer client.connection.close();
+            const aborted = client.request("abort-open {s} {d}", .{ topic, partition }) catch "no answer";
+            sdk.event("kafka_hanging_aborted", .{ .partition = partition, .reply = aborted });
+            _ = sdk.retry(stable_attempts_max, 500, partition_stable, .{ context, partition }) catch {};
+        } else |_| {};
     }
     for (0..partitions) |partition| {
         const unread = [_]sdk.elle.Mop{.{ .read = .{ .key = partition, .list = null } }};

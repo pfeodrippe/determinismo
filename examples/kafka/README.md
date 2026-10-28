@@ -37,6 +37,23 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   after formatting (the finding below would otherwise brick a broker in most timelines and hide
   the rest), and each write to disk before it counts (`log.flush.interval.messages=1`).
 - `format-unsynced`: formatted as Kafka does it (that finding's profile), writes flushed.
+- `kafka-4.4`: the default's on Kafka 4.4.0, the latest release (Dockerfile.4.4), brokers and
+  client: transactions v2 (KIP-890: the producer's epoch bumped at each transaction's end, the
+  partitions added by the leaders). Bugs found in 3.8.0 may be fixed there (KAFKA-18137, the
+  hanging transaction below, in 4.0.0); new ones are found in a current release.
+  `kafka-4.4-coverage`: the same with the coverage agent (Dockerfile.4.4.coverage), as
+  `coverage` below: run 68, with it, found the hanging transaction; run 67, without, did not.
+- `redpanda`: Redpanda v26.2.6 (Dockerfile.redpanda) as the brokers, under the same client and
+  checks: it speaks Kafka's protocol, transactions included. One shard and a gigabyte each, a
+  cluster formed from its three seeds, its log synced as Redpanda syncs it. Jepsen's Redpanda
+  21.10 analysis (2022) found duplicated and lost writes, inconsistent offsets and aborted reads
+  in transactions; 21.10 is no longer published (22.1.1 the oldest image). `--memory-mib 5120`.
+  start.sh sets production mode: the image's redpanda.yaml is in developer mode, in which rpk
+  starts Redpanda with `--unsafe-bypass-fsync=true`. The first smoke (run 83) ran so, and in one
+  timeline kafka-1's controller looped from 101.9 s on "State machine for
+  ntp={redpanda/controller/0} caught exception std::runtime_error (Reader cannot read before
+  start of the log 0 < 19)", millions of times (4 GB of events): not a finding, its fsyncs
+  bypassed; to look for again in production mode.
 - `coverage`: the default's, on Java 25 with determinismo's coverage agent on the brokers'
   transaction path (the transaction coordinator, ReplicaManager, Partition, UnifiedLog):
   each of their source lines reports itself the first time it runs, and the tree returns to
@@ -67,7 +84,7 @@ beginning, `read_committed`:
 | every write of a committed transaction is read | lost write |
 | a transaction's writes are read all or none | torn transaction |
 | no write is read twice | duplicate |
-| no transaction stays open once faults stop | a hanging transaction: a partition's last stable offset short of its high watermark a minute on |
+| no transaction stays open once faults stop | a hanging transaction: a partition's last stable offset short of its high watermark a minute on (its details name the partition's producers; the open one is then aborted, KIP-664, so the read past it judges the rest: a write the client saw committed and the abort removed counts as lost) |
 
 Elle checks the same history for read committed: each partition a list, each send an append,
 each partition's read once faults stop (as Jepsen's Kafka checker, Elle-based): transactions
@@ -135,8 +152,13 @@ the whole timeline (the coverage profile's slower brokers never got one).
   (`removeTransactionsForTxnTopicPartition(partition, epoch)`) removes the loading entry of
   the new epoch (39), never the one loading (38), so the load, reading nothing from a log
   kafka-2 did not lead (`getLogEndOffset` is -1 then), installed an empty cache for the
-  partition. From 1418 s that cache answered `t3506608`'s InitProducerId as a new
-  transactional id: producer id 20000, epoch 0, Empty; at 1419.96 s, its coordinator elected
+  partition. What the partition held then (a replay at 1418 s decoding it with
+  `kafka-dump-log.sh --transaction-log-decoder`, the same on kafka-1 and kafka-3): `t3506608`
+  Empty (producer 19000, epoch 0) at offset 46, Ongoing on `jepsen-1` at 47, PrepareCommit at
+  48 (the append the coordinator took for failed: written, then replicated), and PrepareAbort at
+  epoch 1 at 49 (a timeout rollback's): a load of it would have finished the abort. From 1418 s
+  the empty cache answered `t3506608`'s InitProducerId as a new transactional id: producer id
+  20000, epoch 0, Empty; at 1419.96 s, its coordinator elected
   at epoch 40, kafka-2 loaded the partition again and finished it: "Initialized transactionalId
   t3506608 with producerId 20000 and producer epoch 1". Producer 19000's transaction, Ongoing
   on `jepsen-1` since 1353.9 s, is in no coordinator's state any more: nothing will abort it.
@@ -147,6 +169,20 @@ the whole timeline (the coverage profile's slower brokers never got one).
   consequence, seen here, is not in its report. Related (read only): KAFKA-21349 (open:
   loads of records above the high watermark), KAFKA-18957 (open: hangs on 3.8.1 and 3.9.0),
   KAFKA-9307 (2019: a load left at a previous epoch).
+- Kafka 4.4.0 (`kafka-4.4` profile, smoke run 89, srv3, 2026-10-29, seed 1, 4 timelines):
+  KAFKA-20734 met blind in timeline 1. Partition 3 kept a transaction open 80 s after faults
+  stopped (last stable offset 76, high watermark 79; producer 10001 at epoch 3 holding offset
+  76), so "no transaction stays open once faults stop" failed. The coordinators' logs: at
+  479.19 s kafka-2, completing `t5256495`'s commit (producer 10001, epoch 4, transactions v2),
+  "Couldn't find leader endpoint for partitions Set(jepsen-3) while trying to send transaction
+  markers for t5256495, these partitions are likely deleted already and hence can be skipped",
+  then appended COMPLETE_COMMIT: the commit marker for jepsen-3 never written. kafka-3 (571.64 s)
+  and kafka-1 (574.7 s), coordinators after it, did the same. A partition without a leader for a
+  moment (faults) is taken for deleted: KAFKA-20734 ("Offline partition can cause loss of
+  transaction markers", 4.3.0, 4.4.0: `metadataCache.getPartitionLeaderEndpoint` returns None
+  for an offline partition since the KRaft metadata cache's rewrite), a blocker with its fix
+  merged and not yet released (2026-10-28). Not new; in the latest release, and found in the
+  second timeline of a four-timeline smoke.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the

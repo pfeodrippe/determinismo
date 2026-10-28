@@ -11,6 +11,11 @@
 //   create <topic> <partitions> <replicas>       -> ok | exists | error <reason>
 //   read <topic> <partition>                     -> values <value>,... | error <reason>
 //   stable <topic> <partition>                   -> stable | open <lso> <hw> | error <reason>
+//   producers <topic> <partition>                -> producers <id>:<epoch>:<open from|->,... | error <reason>
+//   abort-open <topic> <partition>               -> aborted <count> | error <reason>
+//
+// `abort-open`: the transactions its leader keeps open, aborted (KIP-664: Kafka's way out of a
+// hanging transaction), so a read past them judges the rest.
 //
 // `stable`: no transaction open in the partition (its last stable offset, where read_committed
 // readers stop, at its high watermark).
@@ -28,10 +33,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutionException;
+import org.apache.kafka.clients.admin.AbortTransactionSpec;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.admin.ProducerState;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -40,6 +47,7 @@ import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.AuthorizationException;
+import org.apache.kafka.common.errors.InvalidConfigurationException;
 import org.apache.kafka.common.errors.OutOfOrderSequenceException;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.TopicExistsException;
@@ -108,6 +116,10 @@ public final class KClient {
                     return read(new TopicPartition(words[1], Integer.parseInt(words[2])));
                 case "stable":
                     return stable(new TopicPartition(words[1], Integer.parseInt(words[2])));
+                case "producers":
+                    return producers(new TopicPartition(words[1], Integer.parseInt(words[2])));
+                case "abort-open":
+                    return abortOpen(new TopicPartition(words[1], Integer.parseInt(words[2])));
                 default:
                     return "error unknown command";
             }
@@ -180,7 +192,15 @@ public final class KClient {
             try (AdminClient admin = AdminClient.create(properties)) {
                 NewTopic newTopic = new NewTopic(topic, partitions, replicas)
                         .configs(Map.of("min.insync.replicas", "2"));
-                admin.createTopics(List.of(newTopic)).all().get();
+                try {
+                    admin.createTopics(List.of(newTopic)).all().get();
+                } catch (ExecutionException e) {
+                    // Redpanda has no min.insync.replicas (its Raft majorities are what it asks
+                    // for): without it there, said in the answer.
+                    if (!(e.getCause() instanceof InvalidConfigurationException)) throw e;
+                    admin.createTopics(List.of(new NewTopic(topic, partitions, replicas))).all().get();
+                    return "ok without min.insync.replicas";
+                }
                 return "ok";
             } catch (ExecutionException e) {
                 if (e.getCause() instanceof TopicExistsException) return "exists";
@@ -198,6 +218,55 @@ public final class KClient {
                 long stable = latest(admin, partition, IsolationLevel.READ_COMMITTED);
                 long high = latest(admin, partition, IsolationLevel.READ_UNCOMMITTED);
                 return stable >= high ? "stable" : "open " + stable + " " + high;
+            } catch (ExecutionException e) {
+                return "error " + reason(e.getCause());
+            }
+        }
+
+        /**
+         * The partition's producers as its leader keeps them (KIP-664's describeProducers): each
+         * id, epoch, and the offset its open transaction started at ("-" for none). What a
+         * transaction left open names: its producer and since when.
+         */
+        private String producers(TopicPartition partition) throws Exception {
+            Properties properties = new Properties();
+            properties.put("bootstrap.servers", bootstrap);
+            properties.put("request.timeout.ms", "5000");
+            properties.put("default.api.timeout.ms", "10000");
+            try (AdminClient admin = AdminClient.create(properties)) {
+                StringBuilder answer = new StringBuilder("producers");
+                String separator = " ";
+                for (ProducerState state : admin.describeProducers(List.of(partition))
+                        .partitionResult(partition).get().activeProducers()) {
+                    answer.append(separator).append(state.producerId()).append(':')
+                            .append(state.producerEpoch()).append(':')
+                            .append(state.currentTransactionStartOffset().isPresent()
+                                    ? String.valueOf(state.currentTransactionStartOffset().getAsLong())
+                                    : "-");
+                    separator = ",";
+                }
+                return answer.toString();
+            } catch (ExecutionException e) {
+                return "error " + reason(e.getCause());
+            }
+        }
+
+        /** Aborts every transaction the partition's leader keeps open (KIP-664). */
+        private String abortOpen(TopicPartition partition) throws Exception {
+            Properties properties = new Properties();
+            properties.put("bootstrap.servers", bootstrap);
+            properties.put("request.timeout.ms", "5000");
+            properties.put("default.api.timeout.ms", "10000");
+            try (AdminClient admin = AdminClient.create(properties)) {
+                int aborted = 0;
+                for (ProducerState state : admin.describeProducers(List.of(partition))
+                        .partitionResult(partition).get().activeProducers()) {
+                    if (state.currentTransactionStartOffset().isEmpty()) continue;
+                    admin.abortTransaction(new AbortTransactionSpec(partition, state.producerId(),
+                            (short) state.producerEpoch(), state.coordinatorEpoch().orElse(-1))).all().get();
+                    aborted++;
+                }
+                return "aborted " + aborted;
             } catch (ExecutionException e) {
                 return "error " + reason(e.getCause());
             }

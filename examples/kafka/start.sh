@@ -39,20 +39,49 @@ PROPERTIES
     # Kafka writes bootstrap.checkpoint without forcing it to disk, and reads it at every start:
     # a power loss before writeback leaves it empty and the node never starts (README). Made
     # durable here, unless asked to format as Kafka does (the format-unsynced profile).
-    [ "${3:-}" = "format-unsynced" ] || sync /data/kafka/bootstrap.checkpoint /data/kafka
+    # The whole filesystem: 4.x's format writes its files elsewhere (no bootstrap.checkpoint
+    # in /data/kafka), and a sync of a missing file failed every start.
+    [ "${3:-}" = "format-unsynced" ] || sync -f /data/kafka
   fi
   export KAFKA_HEAP_OPTS="-Xms512m -Xmx512m"
   # Each source line of these classes reports itself the first time it runs (a "coverage"
   # event): the tree returns to timelines that ran new transaction code. Only the transaction
   # path: instrumenting the whole broker (kafka.server, kafka.log, ...) made it start 9 times
   # slower (15.6 s against 1.8 s of virtual time), and under faults it hardly ever served.
-  [ "${5:-}" != "coverage" ] || export KAFKA_OPTS="-javaagent:/opt/det/determinismo-coverage.jar=kafka.coordinator.transaction,org.apache.kafka.coordinator.transaction,kafka.server.ReplicaManager,kafka.cluster.Partition,kafka.log.UnifiedLog"
+  # (UnifiedLog is Scala's kafka.log in 3.8.0, Java's storage module in 4.x: both named.)
+  [ "${5:-}" != "coverage" ] || export KAFKA_OPTS="-javaagent:/opt/det/determinismo-coverage.jar=kafka.coordinator.transaction,org.apache.kafka.coordinator.transaction,kafka.server.ReplicaManager,kafka.cluster.Partition,kafka.log.UnifiedLog,org.apache.kafka.storage.internals.log.UnifiedLog"
   exec /opt/kafka/bin/kafka-server-start.sh /tmp/server.properties
+  ;;
+redpanda)
+  # start.sh redpanda <id> (Dockerfile.redpanda's image): one Redpanda node of three, Kafka's
+  # protocol on 9092, one shard and a gigabyte. The cluster forms from its seeds (all three: no
+  # node is special, and none starts a cluster alone); its log in /var/lib/redpanda/data, synced
+  # as Redpanda syncs it (by default, before acknowledging).
+  id=$2
+  mkdir -p /etc/redpanda
+  cat > /etc/redpanda/.bootstrap.yaml <<BOOTSTRAP
+auto_create_topics_enabled: false
+default_topic_replications: 3
+default_topic_partitions: 4
+transaction_coordinator_replication: 3
+id_allocator_replication: 3
+group_initial_rebalance_delay: 0
+BOOTSTRAP
+  # The image's redpanda.yaml is in developer mode, in which rpk starts Redpanda with
+  # --unsafe-bypass-fsync=true: nothing synced, its durability untested (the first smoke ran so).
+  # Production mode, as deployments run it.
+  rpk redpanda mode production > /dev/null
+  exec rpk redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M --check=false \
+    --node-id "$id" \
+    --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr "PLAINTEXT://kafka-$id:9092" \
+    --rpc-addr 0.0.0.0:33145 --advertise-rpc-addr "kafka-$id:33145" \
+    --seeds kafka-1:33145,kafka-2:33145,kafka-3:33145 \
+    --set redpanda.empty_seed_starts_cluster=false
   ;;
 client)
   exec java -Xms128m -Xmx256m -cp "/opt/kclient:/opt/kafka/libs/*" KClient 7000 \
     kafka-1:9092,kafka-2:9092,kafka-3:9092
   ;;
 esac
-echo "usage: start.sh broker <id> | client" >&2
+echo "usage: start.sh broker <id> | redpanda <id> | client" >&2
 exit 2
