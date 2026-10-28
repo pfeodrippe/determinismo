@@ -44,12 +44,29 @@ print("; ".join("%s (%d of %d)" % (p["message"], p["timelines_true"], timelines)
   rare_said=$1
   [ -n "$said" ] && echo "$(date +%H:%M) run $1: rarely true, the workload may hardly progress: $said"
 }
+budget_over() { # <run id>: exit 0 once its time budget has passed: it starts no timeline
+  # more, and its last ones finish beside the next run (the CPU pool is shared): a Kafka hunt's
+  # straggler ran 15 minutes past its budget on one core while the other 15 waited (run 67)
+  python3 - "$data/runs/$1/request.json" <<'PY'
+import json, os, sys, time, re
+path = sys.argv[1]
+budget = (json.load(open(path)).get("time_budget") or "")
+match = re.fullmatch(r"(\d+)([smh])", budget)
+if not match: sys.exit(1)
+seconds = int(match[1]) * {"s": 1, "m": 60, "h": 3600}[match[2]]
+sys.exit(0 if time.time() - os.stat(path).st_mtime > seconds + 60 else 1)
+PY
+}
 wait_run() { # <run id>: until it has not run for 3 minutes running (a stop and a resume, or
-  # serve restarting, take seconds: not an end)
+  # serve restarting, take seconds: not an end), or its budget is over
   local idle=0
   while [ $idle -lt 3 ]; do
     if running "$1"; then
       idle=0
+      if budget_over "$1"; then
+        echo "$(date +%H:%M) run $1: its budget is over, the next starts beside its last timelines"
+        return
+      fi
       rare_check "$1"
       if plateaued "$1"; then
         echo "$(date +%H:%M) run $1: no new behavior lately, stopping it"
