@@ -1806,7 +1806,9 @@ async function actionRun(book, output, button) {
       downloads.set(name, URL.createObjectURL(blob));
       book.results.set(output.label, { bytes: blob.size, name });
     } else {
-      book.results.set(output.label, momentOutput(await api(`/runs/${book.runId}/${path}`, body)));
+      const text = await api(`/runs/${book.runId}/${path}`, body);
+      // A branch's steps come back whole: the notebook makes its moments and processes of them.
+      book.results.set(output.label, body.steps ? text : momentOutput(text));
     }
   } catch (error) { book.results.set(output.label, `error: ${error.message}`); }
   notebookEvaluate();

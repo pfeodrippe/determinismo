@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const query = @import("query.zig");
+const serve_api = @import("serve.zig");
 const event_sets = @import("event_sets.zig");
 const store = @import("store.zig");
 const duckdb = @import("duckdb.zig");
@@ -46,6 +47,8 @@ const Arguments = struct {
     tape: ?[]const u8 = null,
     at_vtime_ms: ?u64 = null,
     exec: ?[]const u8 = null,
+    /// replay: a branch grown from the moment step by step (serve's replay steps).
+    steps: []const serve_api.ReplayRequest.Step = &.{},
     @"continue": bool = false,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
@@ -209,10 +212,21 @@ fn tool_call(
                 try argv.appendSlice(arena, &.{ "--rewind-ms", try number(arena, ms) });
             }
         }
+        var script_path: ?[]const u8 = null;
         if (arguments.at_vtime_ms != null or arguments.until != null) {
             if (arguments.exec) |exec| try argv.appendSlice(arena, &.{ "--exec", exec });
+            if (arguments.steps.len > 0) {
+                if (arguments.exec != null) return error.ExecOrSteps;
+                var unique: u64 = 0;
+                std.Io.random(io, std.mem.asBytes(&unique));
+                const path = try std.fmt.allocPrint(arena, "/tmp/determinismo-steps-{x:0>16}.txt", .{unique});
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try serve_api.steps_script(arena, arguments.steps) });
+                try argv.appendSlice(arena, &.{ "--exec-script", path });
+                script_path = path;
+            }
             if (arguments.@"continue") try argv.append(arena, "--continue");
         }
+        defer if (script_path) |path| std.Io.Dir.cwd().deleteFile(io, path) catch {};
         const result = try std.process.run(arena, io, .{ .argv = argv.items });
         return guest_lines(arena, result.stderr);
     }

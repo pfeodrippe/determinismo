@@ -978,7 +978,7 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
     return 200;
 }
 
-const ReplayRequest = struct {
+pub const ReplayRequest = struct {
     branch: u32,
     at_vtime_ms: ?u64 = null,
     /// Or the moment is the first event matching this condition (query.zig).
@@ -986,7 +986,72 @@ const ReplayRequest = struct {
     /// With until: this long (virtual time) before the condition holds.
     rewind_ms: ?u64 = null,
     exec: ?[]const u8 = null,
+    /// Or a branch grown from the moment, step by step (Antithesis's advanced multiverse
+    /// debugging: bash commands run or run in the background, branch.wait, branch.wait_until):
+    /// each step's end is a moment, printed ("at moment"), the next step from it.
+    steps: []const Step = &.{},
+    /// After the steps (or the command): on to the timeline's end.
+    @"continue": bool = false,
+
+    pub const Step = struct {
+        /// A command, in the runner, or in `node` (as docker exec runs it); in the background
+        /// it runs beside the next steps.
+        exec: ?[]const u8 = null,
+        node: ?[]const u8 = null,
+        background: bool = false,
+        /// Run on this long (virtual time).
+        wait_ms: ?u64 = null,
+        /// Or until an event matches (query.zig), within timeout_ms unless 0.
+        until: ?[]const u8 = null,
+        timeout_ms: u64 = 0,
+    };
 };
+
+/// A replay's steps as explore's --exec-script lines (vm.zig: det:wait, det:until; det-agent:
+/// det:background).
+pub fn steps_script(arena: std.mem.Allocator, steps: []const ReplayRequest.Step) ![]const u8 {
+    var script: std.ArrayList(u8) = .empty;
+    for (steps) |step| {
+        if (step.wait_ms) |ms| {
+            try script.print(arena, "det:wait {d}\n", .{ms});
+        } else if (step.until) |condition| {
+            if (std.mem.indexOfScalar(u8, condition, '\n') != null) return error.BadRequest;
+            try script.print(arena, "det:until {d} {s}\n", .{ step.timeout_ms, condition });
+        } else if (step.exec) |command| {
+            if (std.mem.indexOfAny(u8, command, "\n\x00") != null) return error.BadRequest;
+            if (step.background) try script.appendSlice(arena, "det:background ");
+            if (step.node) |node| {
+                try script.print(arena, "det-nodes exec {s} sh -c {s}\n", .{ node, try shell_quote(arena, command) });
+            } else {
+                try script.print(arena, "{s}\n", .{command});
+            }
+        } else return error.BadRequest;
+    }
+    return script.items;
+}
+
+fn shell_quote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var quoted: std.ArrayList(u8) = .empty;
+    try quoted.append(arena, '\'');
+    for (text) |byte| {
+        if (byte == '\'') try quoted.appendSlice(arena, "'\\''") else try quoted.append(arena, byte);
+    }
+    try quoted.append(arena, '\'');
+    return quoted.items;
+}
+
+test steps_script {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const steps = [_]ReplayRequest.Step{
+        .{ .exec = "echo it's", .node = "redis" },
+        .{ .exec = "sleep 1; echo late", .background = true },
+        .{ .wait_ms = 500 },
+        .{ .until = "output.source=redis", .timeout_ms = 2000 },
+    };
+    try std.testing.expectEqualStrings("det-nodes exec redis sh -c 'echo it'\\''s'\n" ++
+        "det:background sleep 1; echo late\ndet:wait 500\ndet:until 2000 output.source=redis\n", try steps_script(arena_state.allocator(), &steps));
+}
 
 /// Replays one branch of a run (synchronously) and returns its output.
 fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.Writer) !u16 {
@@ -1027,6 +1092,18 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     if (asked.exec) |command| {
         if (moment) try argv.appendSlice(server.arena, &.{ "--exec", command });
     }
+    var script_path: ?[]const u8 = null;
+    if (asked.steps.len > 0) {
+        if (!moment or asked.exec != null) return error.BadRequest;
+        var unique: u64 = 0;
+        std.Io.random(server.io, std.mem.asBytes(&unique));
+        const path = try std.fmt.allocPrint(server.arena, "{s}/steps-{x:0>16}.txt", .{ try run_directory(server, run.id), unique });
+        try std.Io.Dir.cwd().writeFile(server.io, .{ .sub_path = path, .data = try steps_script(server.arena, asked.steps) });
+        try argv.appendSlice(server.arena, &.{ "--exec-script", path });
+        script_path = path;
+    }
+    defer if (script_path) |path| std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
+    if (asked.@"continue" and (asked.exec != null or asked.steps.len > 0)) try argv.append(server.arena, "--continue");
     const result = try std.process.run(server.arena, server.io, .{ .argv = argv.items });
     try out.writeAll(result.stdout);
     try out.writeAll(result.stderr);

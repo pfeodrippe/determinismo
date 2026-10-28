@@ -467,13 +467,15 @@ test meminfo_total {
 
 fn agent_wait() void {
     for (0..agent_wait_checks_max) |_| {
-        const result = linux.access(agent_busy_path, linux.F_OK);
-        if (linux.errno(result) != .SUCCESS) return;
+        const busy = linux.errno(linux.access(agent_busy_path, linux.F_OK)) == .SUCCESS;
+        const held = linux.errno(linux.access(agent_hold_path, linux.F_OK)) == .SUCCESS;
+        if (!busy and !held) return;
         nodes.sleep_ns(10 * std.time.ns_per_ms);
     }
 }
 
 const agent_busy_path = "/run/det-agent-busy"; // agent.zig's busy_path.
+const agent_hold_path = "/run/det-agent-hold"; // agent.zig's hold_path.
 
 fn reap_all() void {
     while (true) {

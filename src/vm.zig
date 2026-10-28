@@ -75,6 +75,15 @@ decision_source_size: u32,
 /// The event count at the last exec_done handled: later doorbells (with no event) keep exec_done
 /// as the last event, and must not finish the next command.
 exec_done_handled: u64,
+/// The last guest event was a background command's (det-agent's det:background): its start ends
+/// its step, its end ends none.
+exec_background: bool = false,
+/// A step of the moment's script that is the platform's, not the guest's, is under way
+/// (`det:wait <ms>`, `det:until <ms> <condition>`: multiverse debugging's branch.wait and
+/// wait_until): its end is a moment again (moment_arrive), and the next step follows.
+stepping: bool = false,
+/// The conditions of `det:until` steps.
+step_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 /// What the armed branch-count target is for.
 target_kind: Deadline.Kind,
 /// An in-run snapshot point (main.zig's holders): virtual time (TSC) where the run pauses for
@@ -863,9 +872,20 @@ fn moment_arrive(vm: *VM) !?Outcome {
     std.debug.print("[determinismo] at moment vtime={d}ns branches={d}\n", .{
         moment_now.vtime_ns, moment_now.branches,
     });
+    if (vm.stepping) {
+        vm.stepping = false;
+        return vm.steps_next();
+    }
     const commands = vm.moment_command orelse return .moment_reached;
     vm.moment_printing = true;
-    vm.moment_commands_rest = commands;
+    // Steps of the platform's: the guest's agent holds the timeline from its end meanwhile.
+    const stepped = std.mem.indexOf(u8, commands, step_wait) != null or
+        std.mem.indexOf(u8, commands, step_until) != null or
+        std.mem.indexOf(u8, commands, "det:background ") != null;
+    vm.moment_commands_rest = if (stepped)
+        try std.mem.concat(vm.step_arena.allocator(), u8, &.{ "det:hold\x00", commands, "\x00det:release" })
+    else
+        commands;
     try vm.moment_command_next();
     return null;
 }
@@ -875,9 +895,52 @@ fn moment_command_next(vm: *VM) !void {
     assert(vm.moment_commands_rest.len > 0);
     const rest = vm.moment_commands_rest;
     const end = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
-    vm.action_pending = rest[0..end];
+    const step = rest[0..end];
     vm.moment_commands_rest = if (end == rest.len) "" else rest[end + 1 ..];
+    if (std.mem.startsWith(u8, step, step_wait)) {
+        const ms = std.fmt.parseInt(u64, std.mem.trim(u8, step[step_wait.len..], " "), 10) catch
+            return error.BadStep;
+        return vm.step_arm(ms, null);
+    }
+    if (std.mem.startsWith(u8, step, step_until)) {
+        // "<timeout ms> <condition>": 0 for no timeout.
+        const text = std.mem.trimStart(u8, step[step_until.len..], " ");
+        const space = std.mem.indexOfScalar(u8, text, ' ') orelse return error.BadStep;
+        const ms = std.fmt.parseInt(u64, text[0..space], 10) catch return error.BadStep;
+        const condition = try vm.step_arena.allocator().create(query.Condition);
+        condition.* = try query.parse(vm.step_arena.allocator(), text[space + 1 ..]);
+        return vm.step_arm(ms, condition);
+    }
+    vm.action_pending = step;
     try vm.irq_pulse(irq_action);
+}
+
+const step_wait = "det:wait ";
+const step_until = "det:until ";
+
+/// Runs on from now: for `ms` of virtual time, or until an event matches `condition` (within
+/// `ms`, unless 0); the moment that ends it continues the script (moment_arrive).
+fn step_arm(vm: *VM, ms: u64, condition: ?*const query.Condition) !void {
+    assert(vm.moment_reached);
+    const now = try vm.moment();
+    const limited = condition == null or ms > 0;
+    vm.moment_tsc = if (limited) (now.vtime_ns + ms * std.time.ns_per_ms) * tsc_per_ns else null;
+    vm.until = condition;
+    vm.until_hit = false;
+    vm.moment_reached = false;
+    vm.stepping = true;
+    if (vm.target_branches != 0) try vm.target_set(0); // Re-armed at the next loop.
+}
+
+/// After a step: the next one, or the script's end (the run's end, unless it continues).
+fn steps_next(vm: *VM) !?Outcome {
+    if (vm.moment_commands_rest.len > 0) {
+        try vm.moment_command_next();
+        return null;
+    }
+    vm.moment_printing = false;
+    if (!vm.moment_continue) return .command_done;
+    return null;
 }
 
 /// Arms (or with 0 cancels, together with any soft deadline) the exact branch-count stop.
@@ -1087,13 +1150,18 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
             if (vm.until_hit and !vm.moment_reached) {
                 if (try vm.moment_arrive()) |outcome| return outcome;
             }
-            const command_finished = vm.events.last_event_is("exec_done") and
-                vm.events.count != vm.exec_done_handled;
+            // A step ends: a command's end, or a background command's start (its end ends none).
+            const step_ended = if (vm.exec_background)
+                vm.events.last_event_is("exec_start")
+            else
+                vm.events.last_event_is("exec_done");
+            const command_finished = step_ended and vm.events.count != vm.exec_done_handled and
+                vm.moment_reached and !vm.stepping;
             if (command_finished) vm.exec_done_handled = vm.events.count;
             if (command_finished and vm.moment_commands_rest.len > 0) {
                 try vm.moment_command_next();
             } else if (command_finished) {
-                if (vm.moment_reached and vm.moment_command != null) {
+                if (vm.moment_command != null) {
                     vm.moment_printing = false;
                     if (!vm.moment_continue) return .command_done;
                 }
@@ -1183,6 +1251,8 @@ fn handle_request(vm: *VM, address: u32) !void {
             while (lines.next()) |line| {
                 vm.decision_note(line, source);
                 try vm.events.emit(moment_now, line);
+                vm.exec_background = std.mem.startsWith(u8, line, "{\"event\":\"exec_") and
+                    std.mem.indexOf(u8, line, "\"background\":true") != null;
                 if (vm.faults_record_fd) |fd| if (std.mem.startsWith(u8, line, "{\"event\":\"fault\",")) {
                     _ = linux.write(fd, line.ptr, line.len);
                     _ = linux.write(fd, "\n", 1);

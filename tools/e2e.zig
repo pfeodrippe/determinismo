@@ -147,7 +147,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "pinned", check_pinned },                 .{ "saved", check_saved },
         .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
         .{ "ui", check_ui },                         .{ "runs", check_runs },
-        .{ "kubernetes", check_kubernetes },
+        .{ "kubernetes", check_kubernetes },         .{ "steps", check_steps },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -363,6 +363,58 @@ fn check_python_strategy(context: *Context) !void {
 
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
 /// spread over them): the workload survives faults, and a branch replays exactly.
+/// A branch grown from a moment step by step (Antithesis's advanced multiverse debugging):
+/// a command run to its end, one in the background (its output comes while the branch waits),
+/// a wait, a wait-until that holds and one that times out, each step's end a moment.
+fn check_steps(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
+    const script = try std.fs.path.join(arena, &.{ context.scratch, "steps.txt" });
+    const steps =
+        \\echo first
+        \\det:background sleep 0.2; echo background
+        \\det:wait 500
+        \\echo second
+        \\det:background sleep 0.1; echo third
+        \\det:until 2000 event=exec_output details.text~third
+        \\det:until 300 assert.message="no such assertion"
+        \\
+    ;
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = steps });
+    const violation = "assert.message=\"total balance is conserved\" assert.condition=false";
+    const report = try explore(context, &.{
+        "--program", program,   "--scenario",    "bank", "--seed", "3", "--branch", try bank_violating_branch(context),
+        "--until",   violation, "--exec-script", script,
+    });
+    const first = std.mem.indexOf(u8, report, "\"text\":\"first\\n\"");
+    const background = std.mem.indexOf(u8, report, "\"text\":\"background\\n\"");
+    const second = std.mem.indexOf(u8, report, "\"text\":\"second\\n\"");
+    const third = std.mem.indexOf(u8, report, "\"text\":\"third\\n\"");
+    const in_order = first != null and background != null and second != null and third != null and
+        first.? < background.? and background.? < second.? and second.? < third.?;
+    // The moments: the violation's, the wait's end, the two until steps' ends.
+    var moments: [8]u64 = undefined;
+    var count: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        const key = "[determinismo] at moment vtime=";
+        if (!std.mem.startsWith(u8, line, key) or count == moments.len) continue;
+        const end = std.mem.indexOfScalarPos(u8, line, key.len, 'n') orelse continue;
+        moments[count] = std.fmt.parseInt(u64, line[key.len..end], 10) catch continue;
+        count += 1;
+    }
+    const waited = count >= 2 and moments[1] >= moments[0] + 500 * std.time.ns_per_ms;
+    const timed_out = std.mem.indexOf(u8, report, "until: timed out") != null;
+    const background_done = std.mem.indexOf(u8, report, "\"status\":0,\"id\":2,\"background\":true") != null;
+    expect_all(context, &.{
+        .{ "the outputs in order: first, background (during the wait), second, third", in_order },
+        .{ "a moment at each step's end (4)", count == 4 },
+        .{ "the wait took 500 ms of virtual time", waited },
+        .{ "the background command ended on its own (status 0, id 2)", background_done },
+        .{ "a wait-until that never holds times out (the other held: once)", timed_out and std.mem.count(u8, report, "until: timed out") == 1 },
+    }, "steps: a branch from a moment, step by step ({d} moments)", .{count});
+}
+
 /// Kubernetes manifests imported (kubernetes.zig), as Antithesis runs them: a single-node K3s
 /// cluster with the manifests' images (one built here), deployed and ready before branching,
 /// the client image's test templates run in its pod; one timeline replays exactly.

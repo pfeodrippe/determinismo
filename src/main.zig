@@ -86,7 +86,10 @@ const usage =
     \\                            [--tape <branch.jsonl>]
     \\                            [--at-vtime-ms <ms>] [--until '<condition>' [--rewind-ms <ms>]]
     \\                            (both: the condition, or that time at the latest)
-    \\                            [--exec "<cmd>" | --exec-script <file>]
+    \\                            [--exec "<cmd>" | --exec-script <file>]   (a command a line, run
+    \\                            in turn; or a step: "det:background <cmd>" runs beside the
+    \\                            next ones, "det:wait <ms>" runs on, "det:until <ms> <condition>"
+    \\                            runs on until an event matches, <ms> at most (0: no limit))
     \\                            [--continue]   (after --exec, run on to the end)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--save-snapshots <dir> --save-at-ms <ms,ms,...>]   (with --tape

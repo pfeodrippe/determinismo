@@ -112,6 +112,33 @@
         "exec": {
           "type": "string"
         },
+        "steps": {
+          "type": "array",
+          "description": "Or a branch grown from the moment step by step (Antithesis's advanced multiverse debugging): each step one of {exec, node?, background?} (a command run to its end, or in the background beside the next steps), {wait_ms} (run on), {until, timeout_ms?} (run on until an event matches); each step's end is a moment",
+          "items": {
+            "type": "object",
+            "properties": {
+              "exec": {
+                "type": "string"
+              },
+              "node": {
+                "type": "string"
+              },
+              "background": {
+                "type": "boolean"
+              },
+              "wait_ms": {
+                "type": "integer"
+              },
+              "until": {
+                "type": "string"
+              },
+              "timeout_ms": {
+                "type": "integer"
+              }
+            }
+          }
+        },
         "continue": {
           "type": "boolean",
           "description": "After exec, let the branch run to its end (see the effects of the change)"

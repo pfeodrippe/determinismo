@@ -88,7 +88,7 @@
                      lines)]
     (str (str/join output) "\n" (str/join "\n" (filter #(str/starts-with? % "[branch") lines)))))
 
-(defn- perform [{:keys [path body download]}]
+(defn- perform [{:keys [path body download raw]}]
   (let [url (str (:api environment) "/runs/" (:run environment) "/" path)
         response (http/post url {:body (json/generate-string body) :throw false
                                  :headers {"Content-Type" "application/json"}
@@ -99,7 +99,7 @@
       (let [file (str "/tmp/determinismo-run-" (:run environment) "-" (last (str/split (:path body) #"/")))]
         (with-open [stream (java.io.FileOutputStream. file)] (.write stream ^bytes (:body response)))
         {:file file :bytes (count (:body response))})
-      (printed (:body response)))))
+      (if raw (:body response) (printed (:body response))))))
 
 (defn- action [label request]
   (if (:api environment)
@@ -136,6 +136,81 @@
   (let [body (merge (moment options) (select-keys options [:node :path]))]
     (action (str "extract " (json/generate-string body)) {:path "extract" :body body :download true})))
 
+(defn branch
+  "A branch from a moment of a timeline (Antithesis's moment.branch()), grown with bash,
+  bash-bg, wait and wait-until, then replayed by run-branch:
+  (-> (branch {:branch 0 :at_vtime_ms 1550})
+      (bash \"redis-cli get balance:0\" {:node \"redis\"})
+      (bash-bg \"redis-cli monitor\" {:node \"redis\"})
+      (wait 500)
+      (wait-until \"output.source=redis\" {:timeout_ms 2000})
+      run-branch)"
+  [options]
+  {:moment (moment options) :steps []})
+
+(defn bash
+  "A command run to its end (in :node, else in the runner): the branch goes on once it exits."
+  [branch command & [{:keys [node]}]]
+  (update branch :steps conj (cond-> {:exec command} node (assoc :node node))))
+
+(defn bash-bg
+  "A command run in the background (run_in_background): the branch goes on once it started."
+  [branch command & [{:keys [node]}]]
+  (update branch :steps conj (cond-> {:exec command :background true} node (assoc :node node))))
+
+(defn wait
+  "The branch runs on for ms of virtual time (branch.wait)."
+  [branch ms]
+  (update branch :steps conj {:wait_ms ms}))
+
+(defn wait-until
+  "The branch runs on until an event matches a condition, or timeout_ms passed (wait_until)."
+  [branch condition & [{:keys [timeout_ms]}]]
+  (update branch :steps conj (cond-> {:until condition} timeout_ms (assoc :timeout_ms timeout_ms))))
+
+(defn- branch-result
+  "A branch's replay as data: the moment each step ended at (:moments, the first the branch's
+  start), whether each wait-until's condition held (:timed-out, by step), and every command as a
+  process: its :id, :command, :background, :output, :exit-code, :started-ns, :ended-ns (nil
+  while it runs: (exited-by? process moment) as Antithesis's exited_by)."
+  [text]
+  (let [lines (str/split-lines text)
+        moments (vec (keep #(when-let [[_ vtime branches] (re-find #"\[determinismo\] at moment vtime=(\d+)ns branches=(\d+)" %)]
+                              {:vtime_ns (parse-long vtime) :branches (parse-long branches)})
+                           lines))
+        events (keep #(when-let [[_ at json] (re-find #"^\[guest @ (\d+)ns\] (\{\"event\":\"exec_.*)$" %)]
+                        (assoc (json/parse-string json true) :vtime_ns (parse-long at)))
+                     lines)
+        processes (reduce (fn [found {:keys [event details vtime_ns]}]
+                            (let [id (:id details)]
+                              (case event
+                                "exec_start" (assoc found id {:id id :command (:command details)
+                                                              :background (boolean (:background details))
+                                                              :started-ns vtime_ns :output ""})
+                                "exec_output" (update-in found [id :output] str (:text details))
+                                "exec_done" (update found id assoc :exit-code (:status details) :ended-ns vtime_ns)
+                                found)))
+                          (sorted-map) events)]
+    {:moments moments
+     :end (peek moments)
+     :timed-out (count (filter #(str/includes? % "until: timed out") lines))
+     :processes (vec (vals processes))
+     :replay (str/join "\n" (filter #(str/starts-with? % "[branch") lines))}))
+
+(defn exited-by?
+  "Whether a branch's process had exited at a moment (one of its :moments)."
+  [process moment]
+  (boolean (and (:ended-ns process) (<= (:ended-ns process) (:vtime_ns moment)))))
+
+(defn run-branch
+  "Replays a branch (when clicked; at once over nREPL): its moments and processes (branch-result)."
+  [branch]
+  (let [body (assoc (:moment branch) :steps (:steps branch))
+        done (action (str "branch " (json/generate-string body)) {:path "replay" :body body :raw true})]
+    (cond (string? done) (branch-result done)
+          (string? (:result done)) (assoc done :result (branch-result (:result done)))
+          :else done)))
+
 (defn result
   "What a clicked action returned (nil before it ran)."
   [action-or-label]
@@ -165,7 +240,8 @@
         {:outputs (conj @*outputs* {:type "error" :text (or (ex-message error) (str error))})
          :failed true}))))
 
-(def ^:private names '[run query events sql md replay stacks profile extract result])
+(def ^:private names '[run query events sql md replay stacks profile extract result
+                        branch bash bash-bg wait wait-until run-branch exited-by?])
 
 (defn -main [input-path]
   (let [input (json/parse-string (slurp input-path))]

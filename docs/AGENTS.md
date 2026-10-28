@@ -64,7 +64,12 @@ use them in other repositories.
    (explore returns `tape_dir`), or `explore --tape` on the command line.
 5. **Look at a moment**: replay with `at_vtime_ms` just before the first failure and an `exec`
    command, e.g. `det-nodes exec postgres psql -U postgres -c 'select ...'` or
-   `det-nodes exec redis redis-cli get key`. The output is identical on every replay.
+   `det-nodes exec redis redis-cli get key`. The output is identical on every replay. To watch
+   what happens next, grow a branch from the moment step by step (HTTP replay `steps`, the
+   notebook's `branch`/`bash`/`bash-bg`/`wait`/`wait-until`/`run-branch`, or `--exec-script`
+   lines): start a monitor in the background (`det:background redis-cli monitor`), let time
+   pass (`det:wait 500`) or wait for an event (`det:until 2000 <condition>`), run a command;
+   each step's end is a moment, and each command a process with its output and exit code.
 6. **Narrow down**: `causality` measures, at moments of the failing branch, how likely the
    failure was (futures forked there that fail): the bug was decided where the probability
    jumps; query the branch's events just before. `replay` with `until` stops at the first event
