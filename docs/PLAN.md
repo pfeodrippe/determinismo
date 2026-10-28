@@ -51,7 +51,7 @@ delivery, devices, CPUID and MSR filtering, branch counting), the decision strea
 partition, pause or crash is applied in the guest), snapshots and their restore, tapes and
 event hashing, the guest module.
 
-## Open issues (2026-10-27)
+## Open issues (2026-10-28)
 
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
@@ -61,6 +61,24 @@ event hashing, the guest module.
 - e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
 - UI: a minimap for thousands of timelines.
+- srv3 (2026-10-28, day), found and fixed:
+  - Language properties (a Go panic, ...) failed timelines but no run's properties, stats, UI or
+    queries showed them (Dgraph run 31: 159 timelines failing "no panics (Go)", every property
+    listed passing): the guest's output forwarder now asserts them, as events.
+  - Serve refused to replay runs started from a shell: their machine.json kept the command line
+    with --deterministic's part, which the replay added again (other inputs). Kept as given now;
+    17 runs repaired. `runs exec` takes `--until` and `--rewind-ms`. Quint run 32's same-seed
+    failure, replayed so: quint-co/quint#2036 (known); run 25's "internal error" was the
+    workload taking a specification's trace for a JavaScript stack frame.
+  - Dgraph run 31's explorer died an hour into its two, without a trace (no OOM kill, nothing in
+    its output). Not explained: serve now keeps how an explorer ended (`runs/<id>/exit`), a
+    holder pid of 0 or less is never signalled (kill(0) is the explorer's own group), and a
+    worker's summary counts only once read whole. Dgraph to explore again.
+  - Memory admission counts a tree's snapshot nodes (`nodes-<pid>` claims, up to half the
+    host per run); holders say when memory stops them.
+  - CPU modulation is on by default, as Antithesis's with faults (`--no-cpu-modulation`).
+  - The e2e checks that stop in bank's violating timeline find it (the TLB patch made the old
+    one keep its money).
 - srv3 (2026-10-27, night), found and fixed:
   - Nodes ran with the kernel's 1024 open files: YugabyteDB's tablet servers aborted on "Too many
     open files" in every timeline (run 1's 39 failures were that). det-init now gives Docker's
@@ -228,11 +246,12 @@ event hashing, the guest module.
    - Done: holders with CPU modulation (Antithesis turns modulation on with faults, and the Raft
      double vote is an interleaving): stops computed from the effective time, the modulation
      stepped at the guest's own exits only, and carried on in a holder's replay.
-   - Memory: runs on a host share its CPUs (src/cpus.zig) but not a memory budget; workers
-     waiting for a turn and holders keep their VMs' memory, so runs added for CPUs exhaust it
-     (srv2, 2026-10-26: about 1,000 explore processes, 0 GB available; stopping one run gave
-     back 14 GB). Next: the pool admits a VM only with its memory available (MemAvailable less
-     a reserve), and holders are given up oldest first when it runs short.
+   - Memory: done: a VM starts only within the host's claims (every VM's memory, and since
+     2026-10-28 every tree's snapshot nodes, `nodes-<pid>` claims) and with its memory available
+     now (MemAvailable less an 8 GB reserve); a run's nodes stop at half the host; holders are
+     made with 16 GB available and give themselves up below 8 GB; timelines the kernel kills
+     anyway run again (64 at most). Next: hyperthreads (DETERMINISMO_SMT, replays proven exact)
+     on again for one watched hunt, then by default.
    - A generation waits for its slowest timeline: with fifteen-minute Raft timelines (median
      216 s of wall time, slowest 476 s) one run leaves 47% of its workers idle. Meanwhile:
      several runs per machine fill each other's gaps. Next: larger generations (`--generation`,
