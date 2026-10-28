@@ -382,6 +382,21 @@ fn durability_faults(context: *System.Context) !void {
     try durable_crash_at(&echo, "/data/after", true);
     const after = file_present(&echo, "/data/after");
     sdk.always(after, "a crash just after a sync keeps the write", .{ .present = after });
+    // Two threads at durability points at once: one crash. A second, there, once switched the
+    // disk to dropping writes and failed, leaving it so: what was synced after was lost at the
+    // next crash (Kafka's run 67 on srv3, a false data loss).
+    sdk.fault(.{ .kind = "durable_crash", .node = echo.name, .one_in = 1, .duration_ms = 2000 });
+    sdk.sleep_ms(100);
+    _ = echo.exec(&.{ "/bin/det-selftest-node", "write2", "/data/two-a", "/data/two-b" }) catch 0;
+    sdk.sleep_ms(2000);
+    try sdk.retry(100, 100, answers, .{echo.address});
+    const kept_written = synced_write(&echo, "/data/kept");
+    sdk.fault(.{ .kind = "crash", .node = echo.name, .duration_ms = 500 });
+    sdk.sleep_ms(600);
+    try sdk.retry(100, 100, answers, .{echo.address});
+    const kept = file_present(&echo, "/data/kept");
+    sdk.always(kept_written and kept, "after a crash at two durability points at once, the disk " ++
+        "keeps what is synced", .{ .written = kept_written, .present = kept });
     sdk.stop_faults(0);
 }
 

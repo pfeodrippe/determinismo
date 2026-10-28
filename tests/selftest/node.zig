@@ -9,7 +9,8 @@
 //! With DET_DURABLE set, a first start writes /data/synced (synced: the file and its directory)
 //! and /data/unsynced (not synced): what crashes and wipes must keep and lose.
 //! `det-selftest-node write <path>` writes a file in /data and syncs it and its directory,
-//! exiting 1 if the disk refused (disk faults). `det-selftest-node ping <a.b.c.d>` exits 0 if
+//! exiting 1 if the disk refused (disk faults); `write2 <path> <path>` writes two at once, from
+//! two threads (two durability points together). `det-selftest-node ping <a.b.c.d>` exits 0 if
 //! the service at that address answers a line (a node reaching itself while isolated).
 const std = @import("std");
 const assert = std.debug.assert;
@@ -38,6 +39,12 @@ pub fn main(init: std.process.Init) !void {
     }
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "write")) {
         synced_write(arguments[2], "written\n") catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "write2")) {
+        const other = try std.Thread.spawn(.{}, synced_write_or_exit, .{arguments[3]});
+        synced_write(arguments[2], "written\n") catch linux.exit_group(1);
+        other.join();
         linux.exit_group(0);
     }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "custom-fault")) {
@@ -89,6 +96,10 @@ fn synced_write(path: [*:0]const u8, content: []const u8) !void {
     if (linux.errno(directory) != .SUCCESS) return error.Open;
     defer _ = linux.close(@intCast(directory));
     if (linux.errno(linux.fsync(@intCast(directory))) != .SUCCESS) return error.Fsync;
+}
+
+fn synced_write_or_exit(path: [*:0]const u8) void {
+    synced_write(path, "written\n") catch linux.exit_group(1);
 }
 
 fn file_create(path: [*:0]const u8, content: []const u8) !linux.fd_t {

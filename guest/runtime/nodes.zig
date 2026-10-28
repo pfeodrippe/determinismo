@@ -285,6 +285,11 @@ pub fn crash(name: []const u8) !void {
 pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) !void {
     var paths: Paths = undefined;
     try paths.init(name);
+    // Down already (a crash a moment ago, its layer unmounted): nothing to crash. A second crash
+    // there once switched the disk to dropping writes, failed, and left it so: every write after
+    // was lost at the next crash, and Kafka truncated the cluster to it (srv3 run 67, timeline
+    // 111: 92 committed transactions "lost").
+    if (!exists(paths.mounted)) return error.NodeDown;
     // Frozen first, all at once as the power goes: running on between the shutdown and the
     // kill, its processes would see their writes fail (a program that stops on a failed write
     // reports it), and exiting after it they would close files ext4 then writes back.
@@ -307,6 +312,8 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
     var mapper_buffer: [mapper_name_size]u8 = undefined;
     const mapper = try mapper_name(&mapper_buffer, name);
     if (loop) |number| {
+        // Marked while the disk drops writes, until its table is back (layer_mount checks).
+        try file_write(paths.dropping, "");
         var parameters_buffer: [64]u8 = undefined;
         try mapper_table(mapper, .{ .kind = "flakey", .parameters = try std.fmt.bufPrint(
             &parameters_buffer,
@@ -314,6 +321,16 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
             .{number},
         ) });
     }
+    // Failing past here, the disk gets its table back: never left dropping writes.
+    errdefer if (loop) |number| {
+        var record_buffer: [160]u8 = undefined;
+        var parameters_buffer: [64]u8 = undefined;
+        if (disk_table_now(&paths, number, &record_buffer, &parameters_buffer)) |table| {
+            if (mapper_table(mapper, table)) |_| {
+                _ = linux.unlink(paths.dropping);
+            } else |_| {}
+        } else |_| {}
+    };
     const fd = linux.open(paths.layer, directory_flags, 0);
     if (linux.errno(fd) != .SUCCESS) return error.OpenFailed;
     var flags: u32 = ext4_going_flags_nologflush;
@@ -327,6 +344,7 @@ pub fn crash_with(name: []const u8, frozen_begun: ?*const fn ([]const u8) void) 
         var record_buffer: [160]u8 = undefined;
         var parameters_buffer: [64]u8 = undefined;
         try mapper_table(mapper, try disk_table_now(&paths, number, &record_buffer, &parameters_buffer));
+        _ = linux.unlink(paths.dropping);
     }
     sdk.event("node_crash", .{ .node = name });
 }
@@ -375,6 +393,18 @@ fn layer_mount(paths: *const Paths, node: *const schema.Resolved) !void {
     if (!exists(paths.image)) try durable_image_create(paths.image);
     const loop = try loop_attach(paths);
     const minor = try mapper_attach(node.name, loop);
+    // A crash that never put the disk's table back leaves it dropping every write, read back
+    // from memory until the next crash loses them all: a false data loss, ours (a failed second
+    // crash did, srv3 2026-10-28). Put back here, and reported.
+    const dropping = exists(paths.dropping);
+    if (dropping) {
+        var name_buffer: [mapper_name_size]u8 = undefined;
+        var record_buffer: [160]u8 = undefined;
+        var parameters_buffer: [64]u8 = undefined;
+        try mapper_table(try mapper_name(&name_buffer, node.name), try disk_table_now(paths, loop, &record_buffer, &parameters_buffer));
+        _ = linux.unlink(paths.dropping);
+    }
+    sdk.always(!dropping, "a node's disk is never left dropping writes", .{ .node = node.name });
     var device_buffer: [32]u8 = undefined;
     const device = try print_z(&device_buffer, "/dev/dm-{d}", .{minor});
     try device_wait(device);
@@ -1044,7 +1074,7 @@ fn pid_read(name: []const u8) ?linux.pid_t {
 }
 
 const Paths = struct {
-    buffers: [12][path_size_max]u8 = undefined,
+    buffers: [13][path_size_max]u8 = undefined,
     directory: [:0]const u8 = "",
     lower: [:0]const u8 = "",
     /// The writable layer's mount (upper and work are in it), its disk image and loop device
@@ -1053,6 +1083,8 @@ const Paths = struct {
     image: [:0]const u8 = "",
     loop: [:0]const u8 = "",
     mounted: [:0]const u8 = "",
+    /// Present while a crash has the disk dropping writes (crash_with).
+    dropping: [:0]const u8 = "",
     upper: [:0]const u8 = "",
     work: [:0]const u8 = "",
     root: [:0]const u8 = "",
@@ -1078,6 +1110,7 @@ const Paths = struct {
         paths.image = try print_z(&b[9], state_root ++ "/{s}/disk.img", .{name});
         paths.loop = try print_z(&b[10], state_root ++ "/{s}/loop", .{name});
         paths.mounted = try print_z(&b[11], state_root ++ "/{s}/mounted", .{name});
+        paths.dropping = try print_z(&b[12], state_root ++ "/{s}/disk-dropping", .{name});
         paths.root = try print_z(&b[4], state_root ++ "/{s}/root", .{name});
         paths.pid = try print_z(&b[5], state_root ++ "/{s}/pid", .{name});
         paths.output = try print_z(&b[6], state_root ++ "/{s}/output.log", .{name});

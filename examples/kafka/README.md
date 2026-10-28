@@ -108,6 +108,15 @@ the whole timeline (the coverage profile's slower brokers never got one).
 - First timelines (srv1): producers could not start under the first faults (transaction state
   being created), and kafka-2 could not start again after power losses.
 
+- Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
+  committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
+  durable crash with two of kafka-3's threads at durability points crashed it twice; the
+  second crash found it down, failed (NotADurableDisk) after switching its disk to dropping
+  writes, and left it so. From 340.7 s kafka-3's writes went nowhere while it read them back
+  from memory; its power loss at 477.8 s took its log back to offset 152, it led, and the
+  others truncated to it. Fixed in determinismo (a node crashes once a fault; a crash never
+  leaves the disk dropping writes); runs 55, 56 and 67's data losses are not evidence.
+
 ### Found: a power loss after a clean shutdown deletes committed data (KAFKA-20979)
 
 Rediscovered blind, srv3, 2026-10-28: the second timeline of the coverage profile's first

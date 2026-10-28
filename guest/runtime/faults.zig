@@ -1220,6 +1220,9 @@ fn durable_listen() void {
         durable_lock_take();
         defer durable_lock.unlock();
         if (!durable_active[node[1]]) continue; // Its fault ended: disarmed, nothing parked.
+        // Crashed already during this fault (two of its threads were parked at durability
+        // points): it is down until the fault's end starts it again.
+        if (durable_crashed[node[1]]) continue;
         sdk.event("durable_crash", .{
             .node = node[0],
             .process = std.mem.sliceTo(&request.comm, 0),

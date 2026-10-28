@@ -694,6 +694,7 @@ const builtin = new Set(["test commands exit successfully", "no unexpected conta
   "peak memory usage stays under 95% of the machine's memory",
   "logging output stays under 200 MB per hour of virtual time", "host checks run to completion",
   "the fault injector started", "the fault injector never stalls",
+  "a node's disk is never left dropping writes",
   "timelines replay to their recorded history"]);
 // Also determinismo's: a crash named by its process, a language runtime's panic (Go, Rust, Java).
 const isBuiltin = (message) => builtin.has(message) || message.startsWith("no process crashes")

@@ -78,6 +78,14 @@ event hashing, the guest module.
   The `coverage` profile (Java 25, the agent on the transaction path) hunts next on the same
   seed and budget, for comparison. Rust SDK coverage lines: its coverage.c would need the C SDK's lookup copied
   in (a packaged crate cannot include sdk/c), later.
+- A false data loss, a platform bug (2026-10-28): a durable crash with two threads at
+  durability points crashed the node twice; the second failed after switching its disk to
+  drop writes and left it so, and the next crash lost everything written since (Kafka run 67,
+  timeline 111: 92 committed transactions). Fixed: one crash a fault, the table restored on
+  any failure, no crash of a node already down; selftest durability covers two durability
+  points at once. Runs with NotADurableDisk failures (55, 56, 58, 62, 64, 65, 67): their
+  durability failures are not evidence. Run 55's lost and torn Kafka transactions, put down
+  to hyperthreads, may be this instead.
 - Reserved cores need memory (2026-10-28): a Kafka hunt held all but 9 GiB of srv3's 125
   (VMs and holders), so the checks on the reserved cores ran one VM at a time (e2e parallel
   failed at 1.0 timelines at once; ui's causality analysis did not finish in 15 minutes).
