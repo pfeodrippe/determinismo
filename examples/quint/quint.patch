@@ -1,0 +1,105 @@
+diff --git a/evaluator/Cargo.toml b/evaluator/Cargo.toml
+index b16fe00..f424124 100644
+--- a/evaluator/Cargo.toml
++++ b/evaluator/Cargo.toml
+@@ -33,6 +33,8 @@ hipstr = { version = "0.8.0", features = ["serde"] }
+ num-bigint = { version = "0.4", features = ["rand"] }
+ num-traits = "0.2.19"
+ mimalloc = "0.1.48"
++# determinismo's SDK (sdk/rust): the evaluator's assertions.
++determinismo = { path = "../../sdk-rust" }
+ 
+ [dev-dependencies]
+ insta = {version = "1.22.0", features = ["yaml"]}
+diff --git a/evaluator/src/main.rs b/evaluator/src/main.rs
+index 741472c..255be5e 100644
+--- a/evaluator/src/main.rs
++++ b/evaluator/src/main.rs
+@@ -233,6 +233,15 @@ struct TestOutput {
+ /// `simulate-from-stdin`: Reads input from standard input (STDIN) and simulates
+ /// based on that input, used in the integration with the `quint` typescript tool.
+ fn main() -> eyre::Result<()> {
++    // determinismo: a panic is a bug, even where the simulator catches it to report its seed.
++    let previous = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        determinismo::unreachable!(
++            "the Rust evaluator never panics",
++            &determinismo::json!({ "panic": info.to_string() })
++        );
++        previous(info)
++    }));
+     let top_level: TopLevel = argh::from_env();
+ 
+     match top_level.command {
+diff --git a/evaluator/src/simulator.rs b/evaluator/src/simulator.rs
+index 39be365..b97960d 100644
+--- a/evaluator/src/simulator.rs
++++ b/evaluator/src/simulator.rs
+@@ -260,6 +260,13 @@ impl ParsedQuint {
+ 
+             match result {
+                 Ok(Ok(success)) => {
++                    // determinismo: a sample runs at most `steps` steps from its initial state.
++                    determinismo::always!(
++                        env.trace.len() <= steps + 1,
++                        "a trace has at most max-steps + 1 states",
++                        &determinismo::json!({ "states": env.trace.len(), "steps": steps })
++                    );
++                    determinismo::sometimes!(!success, "a sample violates an invariant");
+                     if env.trace.is_empty() {
+                         // Init failed
+                         trace_lengths.push(0);
+@@ -302,6 +309,13 @@ impl ParsedQuint {
+                                     None
+                                 })
+                                 .collect();
++                            // determinismo: the combined invariant failed, so one of them does
++                            // (evaluated again one by one, their errors set aside).
++                            determinismo::always!(
++                                !violated_invariants.is_empty(),
++                                "a violation names an invariant it violates",
++                                &determinismo::json!({ "invariants": self.invariants.len() })
++                            );
+                         }
+ 
+                         // Continue collecting violations until we have n_traces
+diff --git a/quint/src/cli.ts b/quint/src/cli.ts
+index 3dd31ab..03124a3 100755
+--- a/quint/src/cli.ts
++++ b/quint/src/cli.ts
+@@ -12,6 +12,7 @@
+ 
+ import os from 'os'
+ import yargs from 'yargs'
++import * as det from 'determinismo'
+ 
+ import {
+   CLIProcedure,
+@@ -489,4 +490,26 @@ async function main() {
+     .parse()
+ }
+ 
+-main()
++// determinismo: an exception out of a command is an internal error (Quint reports a
++// specification's errors itself, as values, with exit code 1).
++function internalError(error: unknown): void {
++  const err = error as { message?: unknown; stack?: unknown }
++  det.unreachable('quint never fails with an internal error', {
++    error: String(err?.message ?? error),
++    stack: String(err?.stack ?? '').slice(0, 2000),
++  })
++}
++process.on('uncaughtException', (error) => {
++  internalError(error)
++  throw error
++})
++process.on('unhandledRejection', (error) => {
++  internalError(error)
++  throw error
++})
++
++main().catch((error) => {
++  internalError(error)
++  process.exitCode = 2
++  console.error(error)
++})

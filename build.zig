@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "nrepl-test", .path = "examples/nrepl/nrepl_test.zig" },
         .{ .name = "clojure-libs-test", .path = "examples/clojure-libs/libs_test.zig" },
         .{ .name = "clojure-compiler-test", .path = "examples/clojure-compiler/compiler_test.zig" },
+        .{ .name = "quint-test", .path = "examples/quint/quint_test.zig" },
         .{ .name = "clojure-core-async-test", .path = "examples/clojure-core-async/async_test.zig" },
         .{ .name = "clojure-cli-repl-test", .path = "examples/clojure-cli-repl/cli_repl_test.zig" },
         .{ .name = "det-selftest", .path = "tests/selftest/selftest.zig" },
