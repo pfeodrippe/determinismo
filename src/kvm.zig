@@ -253,7 +253,9 @@ pub const DetState = extern struct {
     /// Entries where host work had cleared some of it, restored; and restorations that failed.
     xinuse_fixes: u64,
     xinuse_unfixed: u64,
-    reserved: [8]u64,
+    /// RDTSC exits KVM answered in its exit fastpath (the plain ones: no soft deadline reached).
+    fast_rdtscs: u64,
+    reserved: [7]u64,
 };
 
 comptime {

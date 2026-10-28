@@ -1,6 +1,6 @@
 SPDX-License-Identifier: GPL-2.0-only
 determinismo: deterministic execution for single-vCPU KVM guests (see ARCHITECTURE.md §4).
-Branch-count clock, in-kernel RDTSC, exact-count stops (PMU overflow + MTF), HLT to userspace.
+Branch-count clock, in-kernel RDTSC (fastpath), exact-count stops (PMU overflow + MTF), HLT to userspace.
 
 diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
 index 861d080..2939269 100644
@@ -49,7 +49,7 @@ index 3f83e36..f6185fc 100644
  
  struct kvm_x86_init_ops vt_init_ops __initdata = {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 84420bf..477f693 100644
+index 84420bf..4107a84 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -73,6 +73,8 @@
@@ -150,7 +150,7 @@ index 84420bf..477f693 100644
  	vmx_vcpu_pi_put(vcpu);
  
  	vmx_prepare_switch_to_host(to_vmx(vcpu));
-@@ -5924,9 +5997,428 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+@@ -5924,9 +5997,460 @@ static int handle_pause(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -348,6 +348,37 @@ index 84420bf..477f693 100644
 +	return vmx_det_reached(vcpu, now);
 +}
 +
++/*
++ * RDTSC exits are the hot path of a busy guest (172,000 a second in a YugabyteDB timeline, half
++ * its time outside the guest once timers had their slack): the plain ones are answered in the
++ * exit fastpath (interrupts still off), as single-steps are, at half the cost. Anything else
++ * goes through handle_rdtsc() and the slow path: a soft deadline reached (an exit to
++ * userspace), the counter overflowed or throttled (vmx_det_after_exit() starts the stepping or
++ * restarts it), stepping under way, tracing or logging.
++ */
++static fastpath_t vmx_det_fastpath_rdtsc(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 tsc;
++
++	if (!vmx->det.counter || vmx->det.stepping || READ_ONCE(vmx->det.overflowed))
++		return EXIT_FASTPATH_NONE;
++	if (unlikely(vmx->det.itrace || vmx->det.log))
++		return EXIT_FASTPATH_NONE;
++	if (unlikely(READ_ONCE(vmx->det.counter->hw.interrupts) == ~0ULL))
++		return EXIT_FASTPATH_NONE;
++	tsc = vmx_det_tsc(vmx, vmx_det_branches(vmx));
++	if (vmx->det.soft_tsc && tsc >= vmx->det.soft_tsc)
++		return EXIT_FASTPATH_NONE;
++	vmx->det.rdtsc_exits++;
++	vmx->det.fast_rdtscs++;
++	kvm_rax_write(vcpu, (u32)tsc);
++	kvm_rdx_write(vcpu, tsc >> 32);
++	if (!kvm_skip_emulated_instruction(vcpu))
++		return EXIT_FASTPATH_EXIT_USERSPACE;
++	return EXIT_FASTPATH_REENTER_GUEST;
++}
++
 +static int handle_rdtsc(struct kvm_vcpu *vcpu)
 +{
 +	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -470,6 +501,7 @@ index 84420bf..477f693 100644
 +		st.xinuse = vmx->det.xinuse;
 +		st.xinuse_fixes = vmx->det.xinuse_fixes;
 +		st.xinuse_unfixed = vmx->det.xinuse_unfixed;
++		st.fast_rdtscs = vmx->det.fast_rdtscs;
 +		return copy_to_user(argp, &st, sizeof(st)) ? -EFAULT : 0;
 +	}
 +	case KVM_DET_LOG_ENABLE: {
@@ -580,7 +612,7 @@ index 84420bf..477f693 100644
  }
  
  static int handle_invpcid(struct kvm_vcpu *vcpu)
-@@ -6109,6 +6601,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6109,6 +6633,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
@@ -588,7 +620,7 @@ index 84420bf..477f693 100644
  	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
-@@ -6620,6 +7113,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+@@ -6620,6 +7145,9 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
  
@@ -598,16 +630,18 @@ index 84420bf..477f693 100644
  	/*
  	 * Exit to user space when bus lock detected to inform that there is
  	 * a bus lock in guest.
-@@ -7273,6 +7769,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+@@ -7273,6 +7801,10 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
  		return handle_fastpath_preemption_timer(vcpu, force_immediate_exit);
  	case EXIT_REASON_HLT:
  		return handle_fastpath_hlt(vcpu);
 +	case EXIT_REASON_MONITOR_TRAP_FLAG:
 +		return vmx_det_fastpath_step(vcpu);
++	case EXIT_REASON_RDTSC:
++		return vmx_det_fastpath_rdtsc(vcpu);
  	default:
  		return EXIT_FASTPATH_NONE;
  	}
-@@ -7416,6 +7914,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7416,6 +7948,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  		vmx_set_interrupt_shadow(vcpu, 0);
  
  	kvm_load_guest_xsave_state(vcpu);
@@ -616,7 +650,7 @@ index 84420bf..477f693 100644
  
  	pt_guest_enter(vmx);
  
-@@ -7432,6 +7932,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+@@ -7432,6 +7966,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  
  	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
  	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
@@ -625,7 +659,7 @@ index 84420bf..477f693 100644
  
  	/* All fields are clean at this point */
  	if (kvm_is_using_evmcs()) {
-@@ -7503,6 +8005,11 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -7503,6 +8039,11 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
  	nested_vmx_free_vcpu(vcpu);
  	free_loaded_vmcs(vmx->loaded_vmcs);
  	free_page((unsigned long)vmx->ve_info);
@@ -638,10 +672,10 @@ index 84420bf..477f693 100644
  
  int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
-index a7e2de5..9215563 100644
+index a7e2de5..559ab0d 100644
 --- a/arch/x86/kvm/vmx/vmx.h
 +++ b/arch/x86/kvm/vmx/vmx.h
-@@ -363,6 +363,49 @@ struct vcpu_vmx {
+@@ -363,6 +363,50 @@ struct vcpu_vmx {
  
  	/* ve_info must be page aligned. */
  	struct vmx_ve_information *ve_info;
@@ -665,6 +699,7 @@ index a7e2de5..9215563 100644
 +		u64 soft_tsc;		/* exit at the first RDTSC at or past this (0: none) */
 +		u64 soft_exits;
 +		u64 fast_steps;		/* single-steps handled in the exit fastpath */
++		u64 fast_rdtscs;	/* RDTSC exits answered in the exit fastpath */
 +		u64 throttles;		/* counter stops by perf throttling, undone at the exit */
 +		u64 late_steps;		/* targets reached at an exit that replaced the MTF exit */
 +		u64 put_branches;	/* the count at the last vcpu_put */
@@ -746,7 +781,7 @@ index 99549df..9ab5bc3 100644
  	} else {
  		vcpu->run->exit_reason = reason;
 diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
-index 9222f5e..ac3e612 100644
+index 9222f5e..8627593 100644
 --- a/include/uapi/linux/kvm.h
 +++ b/include/uapi/linux/kvm.h
 @@ -183,6 +183,8 @@ struct kvm_xen_exit {
@@ -758,7 +793,7 @@ index 9222f5e..ac3e612 100644
  
  /* For KVM_EXIT_INTERNAL_ERROR */
  /* Emulate instruction failed. */
-@@ -1575,6 +1577,68 @@ struct kvm_create_guest_memfd {
+@@ -1575,6 +1577,69 @@ struct kvm_create_guest_memfd {
  
  #define KVM_PRE_FAULT_MEMORY	_IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory)
  
@@ -794,7 +829,8 @@ index 9222f5e..ac3e612 100644
 +	__u64 xinuse;		/* the guest's XINUSE (XGETBV 1) at its last exit */
 +	__u64 xinuse_fixes;	/* entries where host work had cleared some of it, restored */
 +	__u64 xinuse_unfixed;	/* restorations after which a bit was still clear */
-+	__u64 reserved[8];
++	__u64 fast_rdtscs;	/* RDTSC exits answered in the exit fastpath */
++	__u64 reserved[7];
 +};
 +
 +#define KVM_DET_ENABLE		_IOW(KVMIO, 0xf0, struct kvm_det_config)
