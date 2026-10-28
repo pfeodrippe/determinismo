@@ -134,7 +134,7 @@ fn limits_raise() void {
 /// /run/det/cores for `determinismo extract --file runner:/run/det/cores/...`.
 fn cores_setup() void {
     nodes.mkdir_all("/run/det/cores") catch {};
-    const pattern = "|" ++ bin ++ "det-core %P %e %s";
+    const pattern = "|" ++ bin ++ "det-core %P %I %e %s";
     nodes.file_write("/proc/sys/kernel/core_pattern", pattern) catch |err| {
         std.debug.print("[guest] core_pattern: {s}\n", .{@errorName(err)});
     };
@@ -301,8 +301,10 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
 ///
 /// A crash fails a property of its process ("no process crashes: postgres"): a system's known
 /// crash (YugabyteDB's YSQL backends on exit) then leaves another process's crash its own
-/// failing property, never one more failure of the same one. A timeline without any crash
-/// passes `crash_property`.
+/// failing property, never one more failure of the same one. The kernel's line names the
+/// crashing thread; det-core recorded its process (cores.zig: a YSQL backend's crash in its
+/// client's rpc_tp_Transact thread is postgres's). A timeline without any crash passes
+/// `crash_property`.
 const oom_property = "the kernel kills no process for lack of memory";
 const crash_property = "no process crashes (segfault, illegal instruction, ...)";
 const crash_property_prefix = "no process crashes: ";
@@ -313,6 +315,8 @@ const KernelProblem = enum { oom_kill, crash, kernel };
 
 fn kernel_check() void {
     var seen = std.EnumArray(KernelProblem, bool).initFill(false);
+    var crashes_buffer: [64 * 1024]u8 = undefined;
+    const crashes = read_text(crashes_path, &crashes_buffer);
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true };
     const fd = linux.open("/dev/kmsg", flags, 0);
     if (linux.errno(fd) == .SUCCESS) {
@@ -332,7 +336,7 @@ fn kernel_check() void {
             const property = switch (problem) {
                 .oom_kill => oom_property,
                 .crash => std.fmt.bufPrint(&crash_buffer, crash_property_prefix ++ "{s}", .{
-                    crash_process(record.text),
+                    crash_process_of(crashes, record.text),
                 }) catch crash_property,
                 .kernel => kernel_property,
             };
@@ -357,6 +361,37 @@ fn kmsg_record(record: []const u8) ?KmsgRecord {
     const rest = record[separator + 1 ..];
     const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
     return .{ .time_us = time_us, .text = rest[0..end] };
+}
+
+const crashes_path = "/run/det/crashes"; // cores.zig's.
+
+/// The process of a crash line: the one det-core recorded for its thread ("<tid> <process>"
+/// lines), else the name the line gives.
+fn crash_process_of(crashes: []const u8, text: []const u8) []const u8 {
+    const tid = crash_thread(text) orelse return crash_process(text);
+    var lines = std.mem.tokenizeScalar(u8, crashes, '\n');
+    while (lines.next()) |line| {
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const recorded = std.fmt.parseInt(u32, line[0..space], 10) catch continue;
+        if (recorded == tid and space + 1 < line.len) return line[space + 1 ..];
+    }
+    return crash_process(text);
+}
+
+/// The thread id in "prog[42]: ..." and "traps: prog[42] ...".
+fn crash_thread(text: []const u8) ?u32 {
+    const open = std.mem.indexOfScalar(u8, text, '[') orelse return null;
+    const close = std.mem.indexOfScalarPos(u8, text, open, ']') orelse return null;
+    return std.fmt.parseInt(u32, text[open + 1 .. close], 10) catch null;
+}
+
+test crash_process_of {
+    const crashes = "5471 postgres\n812 yb-tserver\n";
+    const line = "rpc_tp_Transact[5471]: segfault at 0 ip 00007f5766f6db19 sp 00007f572affce70 error 4";
+    try std.testing.expectEqualStrings("postgres", crash_process_of(crashes, line));
+    try std.testing.expectEqualStrings("yb-tserver", crash_process_of(crashes, "traps: rpc_worker[812] general protection fault"));
+    try std.testing.expectEqualStrings("other", crash_process_of(crashes, "other[9]: segfault at 0 ip 0"));
+    try std.testing.expectEqualStrings("yb-tserver", crash_process_of(crashes, "yb-tserver: tablet-bootstra: potentially unexpected fatal signal 6."));
 }
 
 /// The process a crash line names: "prog[42]: segfault at ...", "traps: prog[42] general

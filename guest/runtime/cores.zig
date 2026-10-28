@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! det-core <pid> <command name> <signal>: the kernel's core dump handler (det-init sets
-//! core_pattern to it). It keeps the core of a crashed process, from any node, in
+//! det-core <pid> <thread id> <command name> <signal>: the kernel's core dump handler (det-init
+//! sets core_pattern to it). It keeps the core of a crashed process, from any node, in
 //! /run/det/cores/<node>-<command>-<pid>.core and emits a `core_dump` event naming it, so that
 //! `determinismo extract --file runner:<path>` takes it out at any later moment of the timeline,
 //! for gdb and the like. A core past cores_size_max keeps its notes (registers, mappings) and
@@ -17,6 +17,9 @@ const linux = std.os.linux;
 const sdk = @import("determinismo");
 
 const cores_directory = "/run/det/cores";
+/// "<thread id> <process name>" per crash: the kernel's crash line names the thread
+/// ("rpc_tp_Transact[5471]: segfault ..."), det-init's crash property the process (init.zig).
+pub const crashes_path = "/run/det/crashes";
 const cores_size_max = 256 * 1024 * 1024;
 /// All of a timeline's cores.
 const cores_total_max = 512 * 1024 * 1024;
@@ -29,11 +32,17 @@ const pt_load = 1;
 
 pub fn main(init: std.process.Init) !u8 {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
-    if (arguments.len != 4) return 2;
+    if (arguments.len != 5) return 2;
     const pid = std.fmt.parseInt(linux.pid_t, arguments[1], 10) catch return 2;
-    const signal = std.fmt.parseInt(u32, arguments[3], 10) catch return 2;
+    const tid = std.fmt.parseInt(linux.pid_t, arguments[2], 10) catch return 2;
+    const signal = std.fmt.parseInt(u32, arguments[4], 10) catch return 2;
     var command_buffer: [name_size_max]u8 = undefined;
-    const command = sanitized(&command_buffer, arguments[2]);
+    const command = sanitized(&command_buffer, arguments[3]);
+    // The process's name: its first thread's (a YSQL backend's crash in its client's thread
+    // is a crash of postgres).
+    var process_buffer: [name_size_max]u8 = undefined;
+    const process = process_name(pid, &process_buffer) orelse command;
+    crash_record(tid, process);
     var node_buffer: [name_size_max]u8 = undefined;
     const node = node_of(pid, &node_buffer);
     var path_buffer: [256]u8 = undefined;
@@ -53,6 +62,8 @@ pub fn main(init: std.process.Init) !u8 {
     sdk.event("core_dump", .{
         .node = node,
         .pid = pid,
+        .tid = tid,
+        .process = process,
         .command = command,
         .signal = signal,
         .path = path,
@@ -322,6 +333,31 @@ fn node_from_cgroup(text: []const u8, buffer: *[name_size_max]u8) []const u8 {
 }
 
 /// Letters, digits, '.', '_' and '-' kept, anything else '_': a file name piece.
+/// /proc/<pid>/comm: the process's first thread's name.
+fn process_name(pid: linux.pid_t, buffer: *[name_size_max]u8) ?[]const u8 {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/comm", .{pid}, 0) catch return null;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var raw: [name_size_max]u8 = undefined;
+    const size = linux.read(@intCast(fd), &raw, raw.len);
+    if (linux.errno(size) != .SUCCESS or size == 0) return null;
+    const name = std.mem.trimEnd(u8, raw[0..size], "\n");
+    if (name.len == 0) return null;
+    return sanitized(buffer, name);
+}
+
+fn crash_record(tid: linux.pid_t, process: []const u8) void {
+    var line_buffer: [name_size_max + 16]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, "{d} {s}\n", .{ tid, process }) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = linux.open(crashes_path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), line.ptr, line.len); // One write: atomic under O_APPEND.
+}
+
 fn sanitized(buffer: *[name_size_max]u8, text: []const u8) []const u8 {
     const size = @min(text.len, buffer.len);
     for (text[0..size], buffer[0..size]) |byte, *out| {
