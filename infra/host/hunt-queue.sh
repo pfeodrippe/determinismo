@@ -93,9 +93,24 @@ start() { # <request JSON, or a file of it>: its run's id, once serve takes it (
   done
   echo "$id"
 }
+summary() { # <run id>: one line of what the run found, once it is over
+  curl -s --max-time 60 localhost:7878/runs/$1 | python3 -c '
+import sys, json, urllib.request
+run = json.load(sys.stdin)
+stats = run.get("stats") or {}
+properties = json.load(urllib.request.urlopen("http://localhost:7878/runs/%d/properties" % run["id"], timeout=60))
+failing = ["%s (%d)" % (p["message"], p.get("timelines_failing") or 0) for p in properties if p.get("status") == "failing"]
+summary = run.get("summary") or {}
+busy = " %.1f of %d workers" % (summary["at_once"], summary["workers"]) if summary.get("workers") else ""
+print("%d timelines,%s failing: %s" % (stats.get("timelines") or 0, busy, "; ".join(failing) or "nothing"))
+' 2>/dev/null
+}
 for request in "$@"; do
   wait_run "$current"
+  [ -n "${started_any:-}" ] && echo "$(date +%H:%M) run $current: $(summary "$current")"
   current=$(start "$request")
+  started_any=1
   echo "$(date +%H:%M) started run $current: $request"
 done
 wait_run "$current"
+echo "$(date +%H:%M) run $current: $(summary "$current")"
