@@ -108,6 +108,32 @@ the whole timeline (the coverage profile's slower brokers never got one).
 - First timelines (srv1): producers could not start under the first faults (transaction state
   being created), and kafka-2 could not start again after power losses.
 
+### Found: a power loss after a clean shutdown deletes committed data (KAFKA-20979)
+
+Rediscovered blind, srv3, 2026-10-28: the second timeline of the coverage profile's first
+smoke test (`--profile coverage --seed 1 --branches 2`, timeline 1; run 66 in the store),
+failing "every write of a committed transaction is read": 30 of its 304 committed transactions
+were never read, every partition stable. It replays exactly. At moments of it:
+- kafka-1 is stopped gracefully at 150.3 s and shuts down cleanly (153.1 s), then loses power
+  at 153.8 s (a `crash`: its disk keeps what was synced);
+- started again, it finds the clean-shutdown file and skips recovery (175.9 s); its
+  `jepsen-0/00000000000000000000.timeindex` is 10,485,756 bytes (the preallocated size) and
+  reads `timestamp: 0 offset: 0`, beside a 2,587-byte segment;
+- at 213.5 s: `Deleting segment LogSegment(baseOffset=0, size=2587, ...,
+  largestRecordTimestamp=0) due to log retention time 604800000ms breach`, for every
+  partition (log start offsets 36, 50, 37, 32);
+- kafka-1 leads the four partitions at the end: what both other replicas hold below those
+  offsets, committed transactions among it, is gone from what consumers read, and the
+  followers delete it after it.
+
+The mechanism is KAFKA-20979's ("Potential data loss caused by time index truncation", fixed
+in 4.4.0 and 4.3.2, reported on 4.1.0 and 4.3.0): a clean shutdown flushes the time index at
+its preallocated, zero-filled size, then trims it with `setLength()` and never syncs the
+trim. A power loss before writeback leaves the zero-filled index, which a clean start
+trusts; a segment under 4 KB has no index entries of its own (`index.interval.bytes`), so
+its largest timestamp reads 0 and time retention deletes it. Kafka 3.8.0 has it too.
+Related: KAFKA-19200 (indexes not sanity-checked at startup), KAFKA-13773, KAFKA-10207.
+
 ### Found: a power loss soon after `kafka-storage format` bricks the node
 
 The first hour on srv2 (`--seed 11`, exact replays) failed "nodes do not exit unexpectedly" in

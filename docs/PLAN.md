@@ -61,6 +61,23 @@ event hashing, the guest module.
 - e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
 - UI: a minimap for thousands of timelines.
+- Kafka (2026-10-28): the hunts hardly ran the workload. Run 56 committed in 9 of 508
+  timelines and passed (a sometimes needs one): brokers killed every two seconds never came
+  back. KAFKA-17754 had no way in either (it needs an EndTxn delayed on its way to the
+  coordinator, and the client node's links were never faulted). Fixed: `Faults.runner_links`
+  (client links faulted, the drivers' calls spared), bursts with quiet stretches up to 30 s, a
+  producer started in setup, the final read once every partition is stable (new property: no
+  transaction stays open once faults stop), and runs flag a sometimes held in under 5% of the
+  timelines ("rarely true"). A default timeline now commits ~460 transactions. Found on the
+  way, in the platform: isolation cut a node from its own address (fixed: the address on lo),
+  which stalled Kafka's commit markers and made a false "torn transactions". The `coverage`
+  profile (Java 25, the agent on the transaction path) to compare with the default on the same
+  seed and budget. Rust SDK coverage lines: its coverage.c would need the C SDK's lookup copied
+  in (a packaged crate cannot include sdk/c), later.
+- verify: a replay that could not start said "replayed nothing" (the 17:05 hyperthreads
+  experiment: 64 refused, TapeInputsDiffer, its script missing serve's --cpu-modulation and
+  pin). It prints how the replay ended now, and `verify --run <dir>` takes a run's options as
+  serve's replays do.
 - srv3 (2026-10-28, day), found and fixed:
   - Language properties (a Go panic, ...) failed timelines but no run's properties, stats, UI or
     queries showed them (Dgraph run 31: 159 timelines failing "no panics (Go)", every property
