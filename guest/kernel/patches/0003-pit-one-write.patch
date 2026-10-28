@@ -1,0 +1,33 @@
+--- a/drivers/clocksource/i8253.c
++++ b/drivers/clocksource/i8253.c
+@@ -20,6 +20,15 @@
+ DEFINE_RAW_SPINLOCK(i8253_lock);
+ EXPORT_SYMBOL(i8253_lock);
+ 
++/*
++ * determinismo: both bytes of a count in one 16-bit write, which its VMM takes as the low byte
++ * then the high byte. Each port access is an exit to the VMM, and pit_next_event() runs at every
++ * timer reprogram (thousands a second in a busy guest). Set by the VMM (det_pit_word=1); a real
++ * PIT, or KVM's, needs the two writes.
++ */
++static bool det_pit_word;
++core_param(det_pit_word, det_pit_word, bool, 0444);
++
+ #ifdef CONFIG_CLKSRC_I8253
+ /*
+  * Since the PIT overflows every tick, its not very useful
+@@ -172,8 +181,12 @@
+ static int pit_next_event(unsigned long delta, struct clock_event_device *evt)
+ {
+ 	raw_spin_lock(&i8253_lock);
+-	outb_p(delta & 0xff , PIT_CH0);	/* LSB */
+-	outb_p(delta >> 8 , PIT_CH0);		/* MSB */
++	if (det_pit_word) {
++		outw(delta, PIT_CH0);
++	} else {
++		outb_p(delta & 0xff , PIT_CH0);	/* LSB */
++		outb_p(delta >> 8 , PIT_CH0);		/* MSB */
++	}
+ 	raw_spin_unlock(&i8253_lock);
+ 
+ 	return 0;

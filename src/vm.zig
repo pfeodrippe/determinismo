@@ -274,9 +274,11 @@ pub const determinism_abi: u32 = 1;
 /// TSC (virtualized by KVM) the only clocksource, and the boot seed the RNG's only entropy. No
 /// I/O delay: the dummy write to port 0x80 after each slow port access (the PIT's, the PIC's,
 /// on every timer tick) only waits on real hardware, and here each was an exit to the VMM: a
-/// quarter of a busy YugabyteDB guest's (75,000 in 6 s, srv3 2026-10-27).
+/// quarter of a busy YugabyteDB guest's (75,000 in 6 s, srv3 2026-10-27). And a PIT count in
+/// one 16-bit write, not two (the guest kernel's det_pit_word, guest/kernel/patches): one exit
+/// per timer reprogram.
 pub const cmdline_deterministic = "nolapic_timer hpet=disable clocksource=tsc tsc=reliable " ++
-    "random.trust_bootloader=on random.trust_cpu=off io_delay=none";
+    "random.trust_bootloader=on random.trust_cpu=off io_delay=none det_pit_word=1";
 
 /// QEMU's isa-debug-exit convention: a guest write of v to this port ends the run with status v.
 pub const port_debug_exit: u16 = 0x501;
@@ -1013,8 +1015,9 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
     switch (port) {
         RTC.port_index, RTC.port_data => vm.rtc.write(port, bytes[0]),
         PIT.port_mode => vm.pit.write_mode(bytes[0], try vm.now_tsc()),
-        PIT.port_channel_0 => {
-            const loaded = vm.pit.write_count(bytes[0], try vm.now_tsc());
+        // A 16-bit write is a count's low byte then its high byte (det_pit_word).
+        PIT.port_channel_0 => for (bytes) |byte| {
+            const loaded = vm.pit.write_count(byte, try vm.now_tsc());
             if (loaded and vm.target_branches != 0) try vm.target_set(0); // Re-armed next loop.
         },
         port_doorbell => {
