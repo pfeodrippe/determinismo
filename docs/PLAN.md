@@ -127,10 +127,12 @@ event hashing, the guest module.
     timeline: every one the same through its last tape checkpoint). They had been excluded for
     Kafka divergences that were, by the evidence, the same guest TLB dependence (150-branch
     spurious faults). Kafka too, where the divergence was first seen: three timelines, four
-    replays each on CPUs 0, 18, 1 and 19, every one the same. Siblings are the default now
-    (each core's first thread first; `--siblings off`, DETERMINISMO_SMT=0, for one per core):
-    a VM with a busy sibling runs at about 0.7x, a core does about 1.4x. Hunts keep checking
-    it with their own replays.
+    replays each on CPUs 0, 18, 1 and 19, every one the same; Dgraph's hunt with them, its
+    first 7 replays the same. A VM with a busy sibling runs at about 0.7x, a core does about
+    1.4x. But twice the VMs outgrew memory: admission claims each VM's guest, not its in-run
+    snapshots and holders, and from 40 minutes in the host ran out (53 Dgraph timelines
+    killed). Off by default again (`--siblings on`, DETERMINISMO_SMT=1) until admission
+    counts snapshots and holders. Next: that accounting.
   - Fault injector deadlock (2026-10-28, Kafka run 24, 1 timeline of 68): no fault for the
     last 69 s of timeline 63, a crashed node never started again, an isolation never ended.
     Found by replaying the timeline to 60 s and dumping det-faults' threads and /proc/locks:
