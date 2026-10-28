@@ -94,6 +94,8 @@ dialog { background: var(--panel); color: var(--text); border: 1px solid var(--l
 dialog::backdrop { background: rgba(0,0,0,.55); }
 dialog form { display: grid; gap: 10px; }
 dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+/* Inputs in a row of columns shrink with them: their own width would widen the dialog. */
+dialog label, dialog input, dialog select { min-width: 0; }
 pre.output { background: #101114; border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
 .empty { color: var(--muted); padding: 30px; text-align: center; }
 .view-tabs { margin: 14px 0 0; }
