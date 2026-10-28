@@ -111,6 +111,14 @@
 (defn- moment [options]
   (select-keys options [:branch :at_vtime_ms :until :rewind_ms]))
 
+(defn- fresh-seed
+  "A branch's own randomness from its moment on, as Antithesis's branches diverge from their
+  timeline: a seed from the branch's moment and steps (the same branch replays the same), or
+  the one given (:seed); :same-future keeps the timeline's randomness."
+  [options moment steps]
+  (when-not (:same-future options)
+    (or (:seed options) (Math/abs (long (hash [moment steps]))))))
+
 (def ^:private profiler "/opt/determinismo/bin/det-profile")
 
 (defn replay
@@ -138,7 +146,9 @@
 
 (defn branch
   "A branch from a moment of a timeline (Antithesis's moment.branch()), grown with bash,
-  bash-bg, wait and wait-until, then replayed by run-branch:
+  bash-bg, wait and wait-until, then replayed by run-branch. Its future is its own (new
+  randomness from the moment, the same each time it runs; :seed n for another, :same-future true
+  for the timeline's):
   (-> (branch {:branch 0 :at_vtime_ms 1550})
       (bash \"redis-cli get balance:0\" {:node \"redis\"})
       (bash-bg \"redis-cli monitor\" {:node \"redis\"})
@@ -146,7 +156,7 @@
       (wait-until \"output.source=redis\" {:timeout_ms 2000})
       run-branch)"
   [options]
-  {:moment (moment options) :steps []})
+  {:moment (moment options) :steps [] :options (select-keys options [:seed :same-future])})
 
 (defn bash
   "A command run to its end (in :node, else in the runner): the branch goes on once it exits."
@@ -205,10 +215,24 @@
 (defn run-branch
   "Replays a branch (when clicked; at once over nREPL): its moments and processes (branch-result)."
   [branch]
-  (let [body (assoc (:moment branch) :steps (:steps branch))
+  (let [seed (fresh-seed (:options branch) (:moment branch) (:steps branch))
+        body (cond-> (assoc (:moment branch) :steps (:steps branch)) seed (assoc :fresh_seed seed))
         done (action (str "branch " (json/generate-string body)) {:path "replay" :body body :raw true})]
     (cond (string? done) (branch-result done)
           (string? (:result done)) (assoc done :result (branch-result (:result done)))
+          :else done)))
+
+(defn containers
+  "The nodes (containers) as of a moment, as Antithesis's environment.containers.list: name,
+  state, pid, address and image: (containers {:branch 0 :at_vtime_ms 1550})."
+  [options]
+  (let [body (assoc (moment options) :exec "det-nodes list")
+        parse (fn [text]
+                (->> (:processes (branch-result text)) first :output str/split-lines
+                     (keep #(try (json/parse-string % true) (catch Exception _ nil))) vec))
+        done (action (str "containers " (json/generate-string body)) {:path "replay" :body body :raw true})]
+    (cond (string? done) (parse done)
+          (string? (:result done)) (assoc done :result (parse (:result done)))
           :else done)))
 
 (defn result

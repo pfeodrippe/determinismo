@@ -22,6 +22,10 @@ const background_action = "det:background ";
 /// timeline from its end (det-init waits for hold_path, as for busy_path) until it releases it.
 const hold_action = "det:hold";
 const release_action = "det:release";
+/// A fresh future from the moment (VM.Options.fresh_seed): the kernel's generator reseeded from
+/// a platform decision (now drawn from the new seed), so what processes draw afresh differs from
+/// the timeline's too, and the fault injector perturbs at once, as at a tree's branch point.
+const reseed_action = "det:reseed";
 pub const hold_path = "/run/det-agent-hold";
 
 const action_size_max = sdk.message_size_max;
@@ -56,6 +60,12 @@ pub fn main() !void {
             continue;
         }
         background_reap();
+        if (std.mem.eql(u8, action, reseed_action)) {
+            kernel_reseed();
+            faults.branch_request("");
+            done(0, 0, false); // Not a command: id 0.
+            continue;
+        }
         if (std.mem.eql(u8, action, hold_action) or std.mem.eql(u8, action, release_action)) {
             if (std.mem.eql(u8, action, hold_action)) {
                 const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true };
@@ -81,6 +91,25 @@ pub fn main() !void {
         }
         run(action, actions, false);
     }
+}
+
+/// The guest kernel's random generator reseeded from a platform decision (composer.zig's
+/// kernel_reseed, at setup_complete, does the same for every timeline).
+fn kernel_reseed() void {
+    const rnd_add_entropy = 0x40085203; // _IOW('R', 3, int[2])
+    const rnd_reseed_crng = 0x5207; // _IO('R', 7)
+    const seed_size = 32;
+    var request: extern struct { bits: i32, size: i32, bytes: [seed_size]u8 } = .{
+        .bits = seed_size * 8,
+        .size = seed_size,
+        .bytes = undefined,
+    };
+    sdk.random_bytes(&request.bytes);
+    const fd = linux.open("/dev/urandom", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.ioctl(@intCast(fd), rnd_add_entropy, @intFromPtr(&request));
+    _ = linux.ioctl(@intCast(fd), rnd_reseed_crng, 0);
 }
 
 /// Commands started so far: each one's id.

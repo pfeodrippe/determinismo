@@ -50,6 +50,8 @@ const Arguments = struct {
     /// replay: a branch grown from the moment step by step (serve's replay steps).
     steps: []const serve_api.ReplayRequest.Step = &.{},
     @"continue": bool = false,
+    /// replay: a fresh future from the moment (explore's --fresh-seed).
+    fresh_seed: ?u64 = null,
     from_branch: ?u32 = null,
     from_vtime_ms: ?u64 = null,
     until: ?[]const u8 = null,
@@ -227,6 +229,9 @@ fn tool_call(
                 script_path = path;
             }
             if (arguments.@"continue") try argv.append(arena, "--continue");
+            if (arguments.fresh_seed) |seed| {
+                try argv.appendSlice(arena, &.{ "--fresh-seed", try std.fmt.allocPrint(arena, "{d}", .{seed}) });
+            }
         }
         defer if (script_path) |path| std.Io.Dir.cwd().deleteFile(io, path) catch {};
         const result = try std.process.run(arena, io, .{ .argv = argv.items });

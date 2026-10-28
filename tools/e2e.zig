@@ -523,6 +523,46 @@ fn check_steps(context: *Context) !void {
         .{ "the background command ended on its own (status 0, id 2)", background_done },
         .{ "a wait-until that never holds times out (the other held: once)", timed_out and std.mem.count(u8, report, "until: timed out") == 1 },
     }, "steps: a branch from a moment, step by step ({d} moments)", .{count});
+    try check_steps_fresh(context, program, violation);
+}
+
+/// A branch's own future (--fresh-seed, Antithesis's branches): the guest kernel's randomness
+/// a second after the moment differs from the timeline's and between seeds, and is the same for
+/// the same seed.
+fn check_steps_fresh(context: *Context, program: []const u8, violation: []const u8) !void {
+    const arena = context.arena;
+    const script = try std.fs.path.join(arena, &.{ context.scratch, "fresh.txt" });
+    try std.Io.Dir.cwd().writeFile(context.io, .{
+        .sub_path = script,
+        .data = "det:wait 1000\nhead -c 8 /dev/urandom | od -An -tx1\n",
+    });
+    const branch = try bank_violating_branch(context);
+    var drawn: [4][]const u8 = undefined;
+    const seeds = [_]?[]const u8{ null, "1", "1", "2" };
+    for (seeds, &drawn) |seed, *bytes| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{
+            "--program", program,   "--scenario",    "bank", "--seed", "3", "--branch", branch,
+            "--until",   violation, "--exec-script", script,
+        });
+        if (seed) |value| try argv.appendSlice(arena, &.{ "--fresh-seed", value });
+        bytes.* = exec_output_last(try explore(context, argv.items));
+    }
+    expect_all(context, &.{
+        .{ "each branch printed its bytes", drawn[0].len > 0 and drawn[1].len > 0 and drawn[3].len > 0 },
+        .{ "a fresh future is not the timeline's", !std.mem.eql(u8, drawn[0], drawn[1]) },
+        .{ "the same seed, the same future", std.mem.eql(u8, drawn[1], drawn[2]) },
+        .{ "another seed, another future", !std.mem.eql(u8, drawn[1], drawn[3]) },
+    }, "steps: a branch's own future (--fresh-seed): {s} | {s} | {s} | {s}", .{ drawn[0], drawn[1], drawn[2], drawn[3] });
+}
+
+/// The text of a report's last exec_output event (a command's output at a moment).
+fn exec_output_last(report: []const u8) []const u8 {
+    const at = std.mem.lastIndexOf(u8, report, "\"event\":\"exec_output\"") orelse return "";
+    const text = std.mem.indexOfPos(u8, report, at, "\"text\":\"") orelse return "";
+    const start = text + "\"text\":\"".len;
+    const end = std.mem.indexOfScalarPos(u8, report, start, '"') orelse return "";
+    return std.mem.trim(u8, report[start..end], " \\n");
 }
 
 /// Kubernetes manifests imported (kubernetes.zig), as Antithesis runs them: a single-node K3s

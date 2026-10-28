@@ -70,6 +70,9 @@ use them in other repositories.
    lines): start a monitor in the background (`det:background redis-cli monitor`), let time
    pass (`det:wait 500`) or wait for an event (`det:until 2000 <condition>`), run a command;
    each step's end is a moment, and each command a process with its output and exit code.
+   Add `--fresh-seed <n>` (HTTP and MCP `fresh_seed`; the notebook's branches by default) for
+   the branch's own future: new randomness from the moment, as Antithesis's branches, the same
+   for the same seed; without it the branch keeps the timeline's.
 6. **Narrow down**: `causality` measures, at moments of the failing branch, how likely the
    failure was (futures forked there that fail): the bug was decided where the probability
    jumps; query the branch's events just before. `replay` with `until` stops at the first event

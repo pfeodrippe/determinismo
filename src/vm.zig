@@ -53,6 +53,7 @@ moment_command: ?[]const u8,
 moment_reached: bool,
 /// Keep running after the command at the moment finished (instead of ending the run there).
 moment_continue: bool,
+fresh_seed: ?u64,
 /// The moment can also be the first event matching a condition (`--until`, as Antithesis's
 /// wait_until), the instant the guest emits it.
 until: ?*const query.Condition,
@@ -189,6 +190,9 @@ pub const Options = struct {
     moment_command: ?[]const u8 = null,
     /// After the command at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    /// From the moment on, decisions from this seed and no tape: the branch's own future (the
+    /// guest's agent reseeds the kernel's generator first: det:reseed).
+    fresh_seed: ?u64 = null,
     /// The run begins at a branch point (init_from_snapshot of a node: a moment of another
     /// timeline): the guest agent hears of it before the guest runs again (det:branch), and the
     /// fault injector perturbs the branch at once (guest/runtime/faults.zig). Every run from a
@@ -404,6 +408,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .moment_command = options.moment_command,
         .moment_reached = false,
         .moment_continue = options.moment_continue,
+        .fresh_seed = options.fresh_seed,
         .until = options.until,
         .until_hit = false,
         .moment_printing = false,
@@ -876,7 +881,15 @@ fn moment_arrive(vm: *VM) !?Outcome {
         vm.stepping = false;
         return vm.steps_next();
     }
-    const commands = vm.moment_command orelse return .moment_reached;
+    const given = vm.moment_command orelse return .moment_reached;
+    // A fresh future: the timeline's randomness and tape end here, the guest's kernel generator
+    // reseeded from the new seed, and the fault injector told, as at a tree's branch point.
+    const commands = if (vm.fresh_seed) |seed| blk: {
+        vm.decisions.seed = seed;
+        vm.overrides = null;
+        std.debug.print("[determinismo] a fresh future from here (seed {d})\n", .{seed});
+        break :blk try std.mem.concat(vm.step_arena.allocator(), u8, &.{ "det:reseed\x00", given });
+    } else given;
     vm.moment_printing = true;
     // Steps of the platform's: the guest's agent holds the timeline from its end meanwhile.
     const stepped = std.mem.indexOf(u8, commands, step_wait) != null or

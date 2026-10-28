@@ -998,6 +998,9 @@ pub const ReplayRequest = struct {
     steps: []const Step = &.{},
     /// After the steps (or the command): on to the timeline's end.
     @"continue": bool = false,
+    /// A fresh future from the moment (explore's --fresh-seed): the branch's own randomness, as
+    /// Antithesis's branches diverge from their timeline; without it, the timeline's.
+    fresh_seed: ?u64 = null,
 
     pub const Step = struct {
         /// A command, in the runner, or in `node` (as docker exec runs it); in the background
@@ -1110,6 +1113,10 @@ fn run_replay(server: *Server, run: *const Run, body: []const u8, out: *std.Io.W
     }
     defer if (script_path) |path| std.Io.Dir.cwd().deleteFile(server.io, path) catch {};
     if (asked.@"continue" and (asked.exec != null or asked.steps.len > 0)) try argv.append(server.arena, "--continue");
+    if (asked.fresh_seed) |seed| {
+        if (asked.exec == null and asked.steps.len == 0) return error.BadRequest;
+        try argv.appendSlice(server.arena, &.{ "--fresh-seed", try print(server, "{d}", .{seed}) });
+    }
     const result = try std.process.run(server.arena, server.io, .{ .argv = argv.items });
     try out.writeAll(result.stdout);
     try out.writeAll(result.stderr);

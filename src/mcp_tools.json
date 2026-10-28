@@ -147,6 +147,10 @@
           "type": "boolean",
           "description": "After exec, let the branch run to its end (see the effects of the change)"
         },
+        "fresh_seed": {
+          "type": "integer",
+          "description": "With exec or steps: from the moment on, randomness from this seed (the guest kernel's generator reseeded): the branch's own future, as Antithesis's branches diverge from their timeline. Without it the branch keeps its timeline's randomness"
+        },
         "compose": {
           "type": "string",
           "description": "A Compose file instead of a test program"

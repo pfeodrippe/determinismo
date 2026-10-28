@@ -94,6 +94,9 @@ const usage =
     \\                            next ones, "det:wait <ms>" runs on, "det:until <ms> <condition>"
     \\                            runs on until an event matches, <ms> at most (0: no limit))
     \\                            [--continue]   (after --exec, run on to the end)
+    \\                            [--fresh-seed <n>]   (with --exec: from the moment on,
+    \\                            randomness from n, the guest kernel's generator reseeded:
+    \\                            the branch's own future, as Antithesis's branches)
     \\                            [--from-branch <index> --from-vtime-ms <ms> [--from-exec "<cmd>"]]
     \\                            [--save-snapshots <dir> --save-at-ms <ms,ms,...>]   (with --tape
     \\                            or --branch: the replay saved to disk at those moments, each
@@ -273,6 +276,10 @@ const Arguments = struct {
     from_snapshot: ?[]const u8 = null,
     /// After --exec at the moment, run on to the end of the timeline.
     moment_continue: bool = false,
+    /// From the moment on, randomness from this seed instead of the timeline's (and the guest
+    /// kernel's generator reseeded): the branch's own future, as Antithesis's branches diverge
+    /// from their timeline at once.
+    fresh_seed: ?u64 = null,
     /// Branches at varying speeds (VM.Modulation): on by default for explorations, as
     /// Antithesis turns it on with faults (the Raft POC's double vote needed it); a run keeps
     /// whether it had it (request.json), and its replays and tapes follow.
@@ -1868,6 +1875,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         options.moment_vtime_ns = if (moment_ms) |ms| ms * std.time.ns_per_ms else place.horizon_ns;
         options.moment_command = branches.arguments.moment_command;
         options.moment_continue = branches.arguments.moment_continue;
+        options.fresh_seed = branches.arguments.fresh_seed;
         options.until = branches.arguments.until;
         // Saving to disk: the replay goes just past the last moment saved.
         const save_at_ms = branches.arguments.save_at_ms;
@@ -3977,6 +3985,8 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         return error.Usage;
     }
     if (arguments.rewind_ms != null and arguments.until == null) return error.Usage;
+    // A fresh future begins with the commands at the moment (det:reseed first).
+    if (arguments.fresh_seed != null and !commands) return error.Usage;
     try branching_resolve(&arguments, moment or commands);
     if (arguments.rewind_ms != null and arguments.strategy_command != null) return error.Usage;
     if (!arguments.generation_given) {
@@ -4156,6 +4166,8 @@ fn parse_option(
         arguments.rewind_ms = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec")) {
         arguments.moment_command = value;
+    } else if (eql(u8, flag, "--fresh-seed")) {
+        arguments.fresh_seed = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, flag, "--exec-script")) {
         arguments.moment_script_path = value;
     } else if (eql(u8, flag, "--until")) {
