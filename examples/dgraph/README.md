@@ -49,6 +49,36 @@ That run's program had no pacing yet (a fault every 10 to 300 ms); its tapes rep
 first paced run (srv1, seed 1, timeline 1) panicked 15 times, every one this stack. The zeros'
 own rebalancer (every 10 s) moves tablets too: no tablet mover is needed for it.
 
+## Found: a replica replaying its log loses a predicate's index (blind, run 37)
+
+Not in Jepsen's report, and no issue in Dgraph's tracker names it. The workload's schema is one
+`/alter` (`key_0: int @index(int) @upsert . type_0: string @index(exact) . amount_0: int . ...`),
+one Raft proposal of group 1 (`start_ts:3`). `applyMutations` (`worker/draft.go`) applies its
+schema updates in order and returns at the first error. After a tablet in it has moved away
+(`key_0` to group 2), an alpha that restarts and replays its log meets that proposal again:
+`runSchemaMutation` refuses `key_0` (`Tablet isn't being served by this group. Tablet:
+group_id:2 predicate:"key_0"`), so every update after it is skipped. That includes `type_0`'s
+index, although group 1 still serves `type_0`.
+
+Run 37 (srv3, seed 2, tree, CPU modulation), timeline 175: every alpha restarted at about
+240 s, and dg1 and dg2 both logged that refusal at 240.8 s. From 247.8 s to the end, dg2
+answered every `eq(type_0, ...)` query with `Attribute type_0 is not indexed`, through the
+recovery check after faults stopped (`every alpha reads the accounts once faults stop` failed
+at 372.3 s after 120 attempts). A replay of the timeline to 365 s, asking each alpha
+(`runs exec 37 175 365 --node dg1 ...`):
+
+- Zero's tablet map: `type_0` in group 1.
+- `schema(pred: [type_0])`: dg1 and dg3 `string, index, [exact]`; dg2, dg4 and dg5 `string`,
+  no index.
+- `eq(type_0, "account")`: answered by dg1, dg3, dg4 and dg5 (the last two ask group 1); dg2,
+  a replica of group 1 without the index, refuses it.
+
+So the replicas of one group disagree on a predicate's schema, and the one without the index
+answers queries with an error until something sets the schema again (dg1 kept its index from
+its stored schema; later predicate moves set other predicates' schema again, but no move of
+`type_0` succeeded). The loop is the same on main today: `runSchemaMutation` takes all the
+updates and returns at the first predicate the group does not serve, before the rest.
+
 ## The system
 
 - Five nodes, each a zero and an alpha (Jepsen's five), three replicas of each group: two groups
