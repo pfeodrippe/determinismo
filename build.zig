@@ -36,6 +36,19 @@ pub fn build(b: *std.Build) void {
     });
     duckdb_link(b, exe.root_module, duckdb);
     b.installArtifact(exe);
+    // Compiled, not linked: no DuckDB needed (its functions are declared in src/duckdb.zig), so
+    // any machine checks the code in seconds (`zig build check`), a Mac included.
+    const check_exe = b.addExecutable(.{
+        .name = "determinismo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "determinismo", .module = sdk }},
+        }),
+    });
+    check_exe.root_module.link_libc = true;
+    b.step("check", "Compile determinismo without linking it (no DuckDB needed)").dependOn(&check_exe.step);
 
     // A small Redis client, shared by the examples and the plain workload.
     const resp = b.createModule(.{
