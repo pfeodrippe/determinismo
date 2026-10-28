@@ -647,6 +647,10 @@ fn run_route(
         if (eql(u8, request.method, "POST")) return causality_start(server, run, request.body, out);
         const index_text = parts.next() orelse return causality_list(server, run, out);
         const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
+        if (parts.next()) |verb| {
+            if (eql(u8, verb, "stop") and eql(u8, request.method, "POST")) return causality_stop(server, run, index, out);
+            return error.NotFound;
+        }
         return causality_show(server, run, index, out);
     }
     // The rest is the run's events database's.
@@ -1224,7 +1228,8 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
 /// in the background: `background_jobs` futures at once, no CPU priority over the hunt), so
 /// that its curve is there, or on its way, when someone looks; its moments stay on disk for
 /// `snapshots_keep_ns` (a failing timeline's ladder, the explorer's, makes it start at once).
-/// One analysis of a run at a time; `snapshots/analyzed-<timeline>` says it was started.
+/// A running run's, one analysis at a time, once per property: `snapshots/analyzed-<the
+/// property's hash>` says it was started (`POST /runs/<id>/causality/<n>/stop` stops one).
 fn failures_analyze(server: *Server, id: u32) !void {
     if (!server.options.failure_analysis) return;
     const shared = server.shared;
@@ -1238,6 +1243,9 @@ fn failures_analyze(server: *Server, id: u32) !void {
     const room = shared.job_count < jobs_max;
     shared.unlock();
     const run = found orelse return;
+    // A running run's: a finished one's failures were there to analyze while it ran (a serve
+    // restart visits every run once: it analyzed runs stopped hours before).
+    if (run.status != null or run.stopped) return;
     if (busy or !room) return;
     const rows = rows: {
         var connection = try run_connect(server, id);
@@ -1250,7 +1258,8 @@ fn failures_analyze(server: *Server, id: u32) !void {
     };
     const directory = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "snapshots" });
     for (rows) |row| {
-        const marker = try print(server, "{s}/analyzed-{d}", .{ directory, row.branch });
+        // Once per property: its first failing timeline can change as earlier ones are ingested.
+        const marker = try print(server, "{s}/analyzed-{x:0>16}", .{ directory, std.hash.Wyhash.hash(0, row.property) });
         if (std.Io.Dir.cwd().access(server.io, marker, .{})) |_| continue else |_| {}
         try std.Io.Dir.cwd().createDirPath(server.io, directory);
         const asked: CausalityRequest = .{ .branch = row.branch, .property = row.property };
@@ -1326,6 +1335,18 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
         try out.writeAll(line);
     }
     try out.writeAll("]}");
+}
+
+/// Stops an analysis, and its futures: it runs in a session of its own (spawn), its futures in its
+/// process group. What it found so far stays.
+fn causality_stop(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
+    const pid_name = try print(server, "causality-{d}.pid", .{index});
+    const text = run_file(server, run.id, pid_name) catch return error.NotFound;
+    if (!process_alive(server, text, "causality")) return error.NotRunning;
+    const pid = std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return error.NotFound;
+    if (linux.errno(linux.kill(-pid, .TERM)) != .SUCCESS) return error.NotRunning;
+    try out.print("{{\"id\":{d},\"stopped\":true}}\n", .{index});
+    return 200;
 }
 
 fn causality_show(server: *Server, run: *const Run, index: u32, out: *std.Io.Writer) !u16 {
