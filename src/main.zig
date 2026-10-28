@@ -24,6 +24,7 @@ const merge = @import("merge.zig");
 const script = @import("script.zig");
 const tla = @import("tla.zig");
 const query = @import("query.zig");
+const runs_cli = @import("runs_cli.zig");
 const cpus = @import("cpus.zig");
 const checks = @import("checks.zig");
 const causality = @import("causality.zig");
@@ -112,6 +113,12 @@ const usage =
     \\       determinismo merge   <results.jsonl>...   (the records of an exploration's shards)
     \\       determinismo script  <events.jsonl>       (a branch's shape, for --script)
     \\       determinismo tla     --spec <Spec.tla> --events <events.jsonl> [--tla2tools <jar>]
+    \\       determinismo runs    list | show <id> | properties <id> [--details] |
+    \\                            logs <id> <timeline> <seconds> | search <id> '<condition>' |
+    \\                            exec <id> <timeline> <seconds> --node <node> '<command>' |
+    \\                            start (--program | --compose) <path> [...] | stop <id>
+    \\                            [--url http://host:port]   (serve's runs from a terminal,
+    \\                            as Antithesis's Snouty: see runs_cli.zig)
     \\       determinismo query   <events-dir> '<condition>' [temporal conditions] (see query.zig)
     \\       determinismo events  <events-dir> '<pipeline>' (event sets, see event_sets.zig)
     \\       determinismo causality <options> --branch <n> --property '<message>' [--points <k>]
@@ -384,6 +391,8 @@ fn command_tool(
         event_sets.run(arena, io, rest)
     else if (eql(u8, name, "tla"))
         tla.check(arena, io, rest)
+    else if (eql(u8, name, "runs"))
+        runs_cli.run(arena, io, rest)
     else
         return null;
     return result catch |err| {
@@ -4117,6 +4126,7 @@ test {
     _ = @import("tla.zig");
     _ = @import("guest_memory.zig");
     _ = @import("query.zig");
+    _ = @import("runs_cli.zig");
     _ = @import("duckdb.zig");
     _ = @import("store.zig");
     _ = @import("cpus.zig");

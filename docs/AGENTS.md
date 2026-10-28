@@ -13,8 +13,22 @@ Tools: `describe`, `explore`, `replay`, `fork`, `query`, `events`, `causality`, 
 `src/mcp_tools.json`). Every exploration is a run of the host's, in its run store
 (`~/.determinismo`, src/runs.zig), with its record, events and tapes: people follow it in
 `determinismo serve`'s web UI however it was started (explore prints its run's number and
-directory). Without MCP, use `determinismo query` and `determinismo events` on a run's
-directory, or the HTTP API (`determinismo serve`).
+directory). Without MCP, use `determinismo runs` (serve's runs from a shell, as Antithesis's
+Snouty), `determinismo query` and `determinismo events` on a run's directory, or the HTTP API
+(`determinismo serve`):
+
+```
+determinismo runs list
+determinismo runs show 24
+determinismo runs properties 24 --details        # failing ones with their first examples
+determinismo runs logs 24 63 120.5               # timeline 63 up to 120.5 s (ancestors too)
+determinismo runs search 24 'event=fault details.node="kafka-1"' --limit 20
+determinismo runs exec 24 63 58 --node kafka-1 'cat /proc/net/route'
+determinismo runs start --program zig-out/bin/bank-test --scenario bank --time-budget 1h
+determinismo runs stop 24
+```
+
+`--url http://host:port` or `DETERMINISMO_URL` for a serve elsewhere (127.0.0.1:7878 by default).
 
 ## Skills
 
