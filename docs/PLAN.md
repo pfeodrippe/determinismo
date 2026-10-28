@@ -60,9 +60,55 @@ event hashing, the guest module.
   written but not run yet; long-term archive later (QUESTIONS.md).
 - e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
-- UI: a minimap for thousands of timelines. Written, to check in a browser on the next host: the
-  progress bar and the Wall time of an elastic run (no --jobs) from the explorer's start, not
-  its timelines' wall times added up ("1.8 h wall").
+- UI: a minimap for thousands of timelines.
+- srv3 (2026-10-27, night), found and fixed:
+  - Nodes ran with the kernel's 1024 open files: YugabyteDB's tablet servers aborted on "Too many
+    open files" in every timeline (run 1's 39 failures were that). det-init now gives Docker's
+    1048576. Earlier hunts (Kafka, Dgraph) ran under the same limit: their findings to recheck.
+  - A crash fails "no process crashes: <process>": a known crash (YugabyteDB's YSQL backends on
+    exit) no longer hides another.
+  - The tree's scheduler is a pull queue: a generation is the next `size` timelines to finish,
+    recorded and judged again on resume; cores were busy 78% (12.5 of 16) with fixed index
+    generations, 100% since. The tree's shape now follows finishing order; every timeline still
+    replays exactly from its seed and path.
+  - Branch points: a run from a node signals det-faults (det-agent's det:branch), which ends the
+    pacing's quiet stretch and draws a fault at once, aimed at the node behind the snapshot's
+    newest behavior (a fault involving it, when any does: `fault.branch_aim`). Every run from a
+    node has it (timelines, node replays, chained replays alike); causality's futures do not.
+  - Busy guests: 19% of a YugabyteDB VM's time was outside the guest (perf kvm, srv3, 15 s):
+    single-steps 4.76M x 0.31 us = 1.50 s; port I/O 226k x 3.13 us = 0.71 s (userspace PIT and
+    port 0x80 ~5 us, the in-kernel PIC ~1 us); RDTSC 704k x 0.52 us = 0.37 s; the rest 0.23 s.
+    Each exit is as cheap as VMX allows (a bhyve-like hypervisor pays the same); their number
+    is the cost. Hard stops (a timer no clock read caught within the slack) were ~920/s, each
+    ~440 single-steps (the 128-branch margin). The guest took ~5,400 timer interrupts a second
+    (hrtimers), each two PIT writes and a stop. Done: `io_delay=none` (a third of the I/O exits
+    were the port 0x80 delay); the clock state read once per exit (several ioctls each).
+    Measured (a fresh timeline each, same seed): slack 1 ms 0.99x vs 0.62x at 100 us (now the
+    default); `highres=off` 0.87x; the margin stays 128 (skid up to 65 branches: margin 64
+    overshot once, 32 4,172 times, and an overshoot is another timeline). Done too: the PIT
+    count in one 16-bit write (guest kernel patch 0003, `det_pit_word=1`): one exit per timer
+    reprogram, not two.
+  - First failures are analyzed at once: serve starts causality (background, `--jobs 4`) on each
+    property's first failing timeline.
+  - Deadlock found by the tree e2e on a pool of two CPUs: the explorer waited for a holder that
+    waited for a CPU, both CPUs held by a node maker and a holder blocked writing answers (1.3 MB
+    snapshots) the explorer had not read yet. Makers and holders now give their CPU back before
+    answering. Checks and benchmarks run on the run cores (`systemd-run -p AllowedCPUs=...`)
+    when no hunt does: a session's pool is two CPUs.
+  - Failure ladders: the first failing timeline of each property has its holders written to disk
+    (b<timeline>-<ms>, each diffed against the one before) as it is judged; causality starts
+    from them (its first moments snap to saved ones).
+  - Causality: the failure's moment from the run's events (no `--until` replay, which never saw
+    host checks' failures, Elle's), CPU priority over hunts, futures from one coarse-first
+    queue over every moment, each updating its moment's point as it lands. Elle's history now
+    records each operation's time, and its failures say when their anomalies formed
+    (`window_ns`): causality takes the window's end as the failure's moment.
+  - e2e: every check names the conditions it failed and keeps its outputs; it copies the guest
+    at its start (a deploy rewrote ~/guest under a running suite).
+  - Open: saving a ladder by replay is slow (each save hashes all of the guest's pages; a
+    YugabyteDB timeline's 9 moments took 25 minutes); a ladder once stopped after 2 of 9
+    moments (timeline 5 of run 2, an earlier build); a busy guest runs at 0.6-0.7 virtual
+    seconds per second.
 - Hosts (2026-10-27, night): srv2 was cancelled by mistake in Robot (its runs and ~/findings
   gone with it), srv1 hung and is being cancelled; a W-2295 twin of srv2 from the auction is
   next (infra/host/setup.sh builds its guest kernel itself). Waiting on it: the holders' memory
