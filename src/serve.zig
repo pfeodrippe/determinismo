@@ -802,9 +802,17 @@ pub const RunRequest = struct {
     priority: bool = false,
 };
 
-/// The environment a run's explorer starts with.
-fn run_environment(asked: *const RunRequest) []const []const u8 {
-    return if (asked.priority) &.{"DETERMINISMO_CPU_PRIORITY=1"} else &.{};
+/// The environment a run's explorer starts with: its priority, and serve's own choice of
+/// hyperthreads (DETERMINISMO_SMT, serve.sh's `--siblings`), which the CPU pool reads (cpus.zig).
+/// Explorers start with a fresh environment: without it, `--siblings on` reached no run started
+/// here (srv3, 2026-10-28).
+fn run_environment(arena: std.mem.Allocator, asked: *const RunRequest) ![]const []const u8 {
+    var environment: std.ArrayList([]const u8) = .empty;
+    if (asked.priority) try environment.append(arena, "DETERMINISMO_CPU_PRIORITY=1");
+    if (std.c.getenv("DETERMINISMO_SMT")) |value| {
+        try environment.append(arena, try std.fmt.allocPrint(arena, "DETERMINISMO_SMT={s}", .{std.mem.span(value)}));
+    }
+    return environment.items;
 }
 
 fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
@@ -843,7 +851,7 @@ fn run_create(server: *Server, body: []const u8, out: *std.Io.Writer) !u16 {
     const argv = try explore_arguments(server, &asked, directory, machine);
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
     // Its explorer holds the run's pid file (runs.zig): how a restarted server finds it running.
-    const pid = try spawn(server.arena, argv, output, run_environment(&asked), .fresh);
+    const pid = try spawn(server.arena, argv, output, try run_environment(server.arena, &asked), .fresh);
     pid_note(server, directory, pid);
     runs_insert(shared, .{ .id = id, .pid = pid });
     try out.print("{{\"id\":{d}}}\n", .{id});
@@ -1322,7 +1330,7 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     // Its moments saved with the run: a later analysis of the timeline starts from them.
     const snapshots = try std.fs.path.join(server.arena, &.{ try run_directory(server, run.id), "snapshots" });
     // The run's API for planners: this server, at its first address.
-    const listen_first = server.options.listen[0 .. std.mem.indexOfScalar(u8, server.options.listen, ',') orelse server.options.listen.len];
+    const listen_first = listen_address(server);
     try argv.appendSlice(server.arena, &.{
         "--branch",      try print(server, "{d}", .{asked.branch}),
         "--property",    asked.property,
@@ -1915,7 +1923,7 @@ fn run_resume(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
     try argv.appendSlice(server.arena, try explore_arguments(server, &asked, directory, machine));
     try argv.append(server.arena, "--resume");
     const output = try std.fs.path.join(server.arena, &.{ directory, "output.log" });
-    const pid = try spawn(server.arena, argv.items, output, run_environment(&asked), .appended);
+    const pid = try spawn(server.arena, argv.items, output, try run_environment(server.arena, &asked), .appended);
     const stopped_path = try std.fs.path.join(server.arena, &.{ directory, "stopped" });
     std.Io.Dir.cwd().deleteFile(server.io, stopped_path) catch {};
     run.* = .{ .id = id, .pid = pid };
@@ -2234,8 +2242,8 @@ fn nrepl_start(server: *Server, id: u32, out: *std.Io.Writer) !u16 {
         const environment = [_][]const u8{
             try print(server, "DETERMINISMO={s}", .{server.options.self}),
             try print(server, "DETERMINISMO_RECORD={s}/record.jsonl", .{directory}),
-            try print(server, "DETERMINISMO_SERVE=http://{s}", .{server.options.listen}),
-            try print(server, "DETERMINISMO_API=http://{s}", .{server.options.listen}),
+            try print(server, "DETERMINISMO_SERVE=http://{s}", .{listen_address(server)}),
+            try print(server, "DETERMINISMO_API=http://{s}", .{listen_address(server)}),
             try print(server, "DETERMINISMO_RUN={d}", .{run.id}),
         };
         const log = try std.fs.path.join(arena, &.{ directory, "nrepl.log" });
@@ -2264,7 +2272,7 @@ fn notebook_evaluate(
     try environment.put("DETERMINISMO", server.options.self);
     const record = try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
     try environment.put("DETERMINISMO_RECORD", record);
-    const serve_url = try print(server, "http://{s}", .{server.options.listen});
+    const serve_url = try print(server, "http://{s}", .{listen_address(server)});
     try environment.put("DETERMINISMO_SERVE", serve_url);
     try environment.put("DETERMINISMO_RUN", try print(server, "{d}", .{run.id}));
     try environment.put("PATH", "/usr/local/bin:/usr/bin:/bin");
@@ -2352,6 +2360,13 @@ fn run_file(server: *Server, id: u32, name: []const u8) ![]const u8 {
     const path = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), name });
     const limit: std.Io.Limit = .limited(response_size_max);
     return std.Io.Dir.cwd().readFileAlloc(server.io, path, server.arena, limit);
+}
+
+/// The first of the addresses serve listens on (`--listen a,b`): the one its own tools call (a
+/// notebook's queries went to "http://127.0.0.1:7878,100.120.48.124:7878/...": srv3).
+fn listen_address(server: *const Server) []const u8 {
+    const addresses = server.options.listen;
+    return addresses[0 .. std.mem.indexOfScalar(u8, addresses, ',') orelse addresses.len];
 }
 
 fn print(server: *Server, comptime format: []const u8, arguments: anytype) ![]const u8 {
