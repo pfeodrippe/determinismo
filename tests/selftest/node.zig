@@ -9,7 +9,8 @@
 //! With DET_DURABLE set, a first start writes /data/synced (synced: the file and its directory)
 //! and /data/unsynced (not synced): what crashes and wipes must keep and lose.
 //! `det-selftest-node write <path>` writes a file in /data and syncs it and its directory,
-//! exiting 1 if the disk refused (disk faults).
+//! exiting 1 if the disk refused (disk faults). `det-selftest-node ping <a.b.c.d>` exits 0 if
+//! the service at that address answers a line (a node reaching itself while isolated).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -31,6 +32,10 @@ pub fn main(init: std.process.Init) !void {
         linux.exit_group(if (found) 0 else 1);
     }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "ping")) {
+        const address = std.Io.net.Ip4Address.parse(arguments[2], port) catch linux.exit_group(2);
+        linux.exit_group(if (ping(address.bytes)) 0 else 1);
+    }
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "write")) {
         synced_write(arguments[2], "written\n") catch linux.exit_group(1);
         linux.exit_group(0);
@@ -146,4 +151,25 @@ fn serve(client: linux.fd_t) void {
         for (buffer[0..size]) |*byte| byte.* = std.ascii.toUpper(byte.*);
     }
     _ = linux.write(client, buffer[0..size].ptr, size);
+}
+
+/// Whether the service at `address` answers "ping" within a second.
+fn ping(address: [4]u8) bool {
+    const socket = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(socket);
+    defer _ = linux.close(fd);
+    const timeout = linux.timeval{ .sec = 1, .usec = 0 };
+    const option = std.mem.asBytes(&timeout);
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, option.ptr, option.len);
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, option.ptr, option.len);
+    const target = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(address) };
+    if (linux.errno(linux.connect(fd, @ptrCast(&target), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        return false;
+    }
+    _ = linux.write(fd, "ping\n", 5);
+    var reply: [16]u8 = undefined;
+    const size = linux.read(fd, &reply, reply.len);
+    if (linux.errno(size) != .SUCCESS) return false;
+    return std.mem.eql(u8, reply[0..size], "ping\n");
 }

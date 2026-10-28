@@ -1206,6 +1206,11 @@ fn network_connect(
 ) !void {
     try netlink.in_namespace_of(pid, netlink.Socket.link_set, .{ "lo", .up });
     const address = try address_now(node);
+    // Its own address on lo too, first: the kernel reaches a local address through the route of
+    // the interface that holds it, and with it on its links alone, an isolated node (every link
+    // down) could not reach itself. A cut cable never does that: Kafka's transaction
+    // coordinator, isolated, failed to send its commit markers to its own broker for minutes.
+    try netlink.in_namespace_of(pid, netlink.Socket.address_add, .{ "lo", address });
     const self = Endpoint{ .name = node.name, .address = address, .pid = pid };
     try link_create(self, .{
         .name = schema.runner_name,

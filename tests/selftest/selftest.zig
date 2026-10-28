@@ -504,8 +504,9 @@ fn inject(s: *System.Scenario) void {
 }
 
 /// In a quiet period (no drawn faults; requested ones still apply), the driver asks for a
-/// pause, a graceful stop and a partition from the runner to the node: each takes the node
-/// away for a while, then it answers again.
+/// pause, a graceful stop, a partition from the runner to the node and its isolation: each
+/// takes the node away for a while, then it answers again. Isolated, it still reaches itself
+/// at its own address, as a host whose cables are cut does.
 fn faults_on_request(context: *System.Context) !void {
     const echo = context.nodes.echo.?;
     sdk.stop_faults(600 * std.time.ns_per_s);
@@ -527,6 +528,18 @@ fn faults_on_request(context: *System.Context) !void {
     });
     sdk.sleep_ms(100);
     sdk.always(!answering(echo.address), "an injected one-way partition cuts the node off", .{});
+    try sdk.retry(100, 100, answers, .{echo.address});
+    sdk.fault(.{ .kind = "isolate", .node = echo.name, .duration_ms = 1500 });
+    sdk.sleep_ms(100);
+    sdk.always(!answering(echo.address), "an injected isolation cuts the node off", .{});
+    var own: [15]u8 = undefined;
+    const own_address = std.fmt.bufPrint(&own, "{d}.{d}.{d}.{d}", .{
+        echo.address[0], echo.address[1], echo.address[2], echo.address[3],
+    }) catch unreachable;
+    const itself = echo.exec(&.{ "/bin/det-selftest-node", "ping", own_address }) catch 255;
+    sdk.always(itself == 0, "an isolated node still reaches itself at its own address", .{
+        .status = itself,
+    });
     try sdk.retry(100, 100, answers, .{echo.address});
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
