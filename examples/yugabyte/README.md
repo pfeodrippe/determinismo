@@ -30,6 +30,9 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   for a tablet server, 512 MB for a master (Jepsen's 2 GB each: three nodes share the machine;
   1 GB masters ended long timelines in OOM kills). Each process starts again when it exits, as
   Jepsen's nemesis restarted the ones it killed.
+- WAL segments of 4 MB (`--log_segment_size_mb 4`, 64 by default): a node's disk lives in the
+  VM's memory, and each tablet preallocates its next segment whole and keeps its segments
+  300 s; with 64 MB segments, run 77 ended 7 of 64 timelines in OOM kills.
 - Readiness is the master's port: YSQL waits on a quorum of masters, which needs the nodes
   started after.
 
@@ -97,7 +100,8 @@ backends, below: known crashes since), it failed:
   not open its active one, `wal-000000051`: "No such file or directory" (`log.cc:1068`, in
   `SwitchToAllocatedSegment`), and aborted. The same abort, in the same function, is open
   upstream as #30325 (2026-02, 2.29, under kernel shutdowns): here after a process kill alone.
-- "the kernel kills no process for lack of memory" in 7: the VMs' memory, not YugabyteDB's.
+- "the kernel kills no process for lack of memory" in 7: the VM's memory, filled by the WAL's
+  preallocated 64 MB segments (a node's disk is memory); 4 MB segments since.
 
 ## Observed (1.3.1, not investigated further)
 

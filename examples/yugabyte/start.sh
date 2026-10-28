@@ -18,7 +18,9 @@ ip=$(address "$self")
 masters=
 for node in $nodes; do masters=${masters:+$masters,}$(address "$node"):7100; done
 mkdir -p /data/master /data/tserver
-common=(--yb_num_shards_per_tserver 4 --logtostderr --minloglevel 1)
+# WAL segments of 4 MB, not 64: a node's disk is guest memory, and each tablet preallocates its
+# next segment whole (fallocate), kept 300 s: long timelines ended in OOM kills (run 77).
+common=(--yb_num_shards_per_tserver 4 --logtostderr --minloglevel 1 --log_segment_size_mb 4)
 
 # A stop, seen by the supervising subshells too.
 stopping=/tmp/start.stopping
