@@ -74,6 +74,20 @@ outcome: here it had committed, and a later read saw its write. Current Yugabyte
 through `HandleYBStatus`, which gives each status its own SQLSTATE: fixed since, in code that
 no longer exists.
 
+## Hunt run 77 (srv3, 2026-10-28, seed 3, in progress)
+
+Kills, stops and pauses, no power losses (the log is not synced by default). In its first 16
+timelines, Elle found:
+- timeline 15: G2-item at serializable, an anti-dependency cycle between two committed append
+  transactions (166.6 s and 190.0 s), after pauses of the nodes' processes: #2125's other
+  trigger was paused masters. Which processes were paused, the fault events did not say then
+  (they name the process since); not yet claimed as #2125.
+- timeline 9: incompatible-order on key 38: one read `[…160]`, a later one `[…193, …208,
+  …209]`. Appends only concatenate to a row (or insert it when there is none), so the row that
+  held 160 vanished and was inserted again: a lost committed insert.
+The run had no outage: kill outages (every node killed at once, #2125's first trigger) came
+after it.
+
 ## Observed (1.3.1, not investigated further)
 
 - YSQL backends segfault as they exit, in `yb::rpc::ThreadPool::Impl::Shutdown()`, popping a
