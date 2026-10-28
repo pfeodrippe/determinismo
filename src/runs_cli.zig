@@ -12,8 +12,10 @@
 //!                                                     ancestors' included (a tree's timeline
 //!                                                     begins inside them)
 //!   runs search <id> '<condition>' [--limit <n>] [--count]   (query.zig's conditions)
-//!   runs exec <id> <timeline> <seconds> --node <node> '<command>'   a command at that moment
-//!                                                     of a replay (--node runner: the runner's)
+//!   runs exec <id> <timeline> (<seconds> | --until '<condition>' [--rewind-ms n])
+//!             --node <node> '<command>'               a command at that moment of a replay
+//!                                                     (--node runner: the runner's), the
+//!                                                     run's own inputs (memory, faults, ...)
 //!   runs start (--program <path> | --compose <path>) [--scenario s] [--seed n] [--branches n]
 //!                                    [--time-budget 2h] [--memory-mib n] [--verify-replays n]
 //!   runs stop <id>
@@ -378,17 +380,30 @@ fn exec(client: *const Client, out: *std.Io.Writer, rest: []const []const u8) !u
     if (rest.len < 4) return error.Usage;
     const id = try run_id(rest);
     const timeline = try std.fmt.parseInt(u32, rest[1], 10);
-    const at_ns = try seconds_ns(rest[2]);
+    var at_ns: ?u64 = null;
+    var until: ?[]const u8 = null;
+    var rewind_ms: ?u64 = null;
     var node: []const u8 = "runner";
     var command: ?[]const u8 = null;
-    var index: usize = 3;
+    var index: usize = 2;
     while (index < rest.len) : (index += 1) {
-        if (std.mem.eql(u8, rest[index], "--node") and index + 1 < rest.len) {
-            node = rest[index + 1];
+        const flag = rest[index];
+        const value = if (index + 1 < rest.len) rest[index + 1] else null;
+        if (std.mem.eql(u8, flag, "--node") and value != null) {
+            node = value.?;
             index += 1;
-        } else command = rest[index];
+        } else if (std.mem.eql(u8, flag, "--until") and value != null) {
+            until = value.?;
+            index += 1;
+        } else if (std.mem.eql(u8, flag, "--rewind-ms") and value != null) {
+            rewind_ms = try std.fmt.parseInt(u64, value.?, 10);
+            index += 1;
+        } else if (at_ns == null and until == null and index == 2) {
+            at_ns = try seconds_ns(flag);
+        } else command = flag;
     }
     const asked = command orelse return error.Usage;
+    if ((at_ns == null) == (until == null)) return error.Usage; // A moment, one way.
     // In a node as docker exec runs it; the runner's directly.
     const shell = if (std.mem.eql(u8, node, "runner"))
         asked
@@ -396,9 +411,11 @@ fn exec(client: *const Client, out: *std.Io.Writer, rest: []const []const u8) !u
         try std.fmt.allocPrint(client.arena, "det-nodes exec {s} sh -c {s}", .{ node, try shell_quote(client.arena, asked) });
     const body = try std.fmt.allocPrint(client.arena, "{f}", .{std.json.fmt(.{
         .branch = timeline,
-        .at_vtime_ms = at_ns / std.time.ns_per_ms,
+        .at_vtime_ms = if (at_ns) |ns| ns / std.time.ns_per_ms else null,
+        .until = until,
+        .rewind_ms = rewind_ms,
         .exec = shell,
-    }, .{})});
+    }, .{ .emit_null_optional_fields = false })});
     const text = try client.call("POST", try std.fmt.allocPrint(client.arena, "/runs/{d}/replay", .{id}), body);
     // The replay's output: what the command printed (exec_output events), in order.
     var printed = false;

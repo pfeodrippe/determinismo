@@ -24,11 +24,16 @@ determinismo runs properties 24 --details        # failing ones with their first
 determinismo runs logs 24 63 120.5               # timeline 63 up to 120.5 s (ancestors too)
 determinismo runs search 24 'event=fault details.node="kafka-1"' --limit 20
 determinismo runs exec 24 63 58 --node kafka-1 'cat /proc/net/route'
+determinismo runs exec 32 9 --until 'assert.message="..." assert.condition=false' --rewind-ms 5000 \
+  --node quint 'ps -eo etime,args'               # 5 s before timeline 9's violation
 determinismo runs start --program zig-out/bin/bank-test --scenario bank --time-budget 1h
 determinismo runs stop 24
 ```
 
 `--url http://host:port` or `DETERMINISMO_URL` for a serve elsewhere (127.0.0.1:7878 by default).
+A replay through `runs exec` takes the run's own inputs (its kernel, initramfs, command line,
+memory, faults, tape): prefer it to an `explore` command line put together by hand, which the
+tape refuses when anything differs.
 
 ## Skills
 
