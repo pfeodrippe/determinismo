@@ -2330,8 +2330,17 @@ fn check_lines(context: *Context) !void {
     const every = try std.fmt.allocPrint(arena, "ran in   16/16 timelines  {s}:13-15", .{file});
     const never = try std.fmt.allocPrint(arena, "NEVER RAN  {s}:22-23", .{file});
     const coverage = try run_kept(context, &.{ "grep", "-rlF", "\"name\":\"line /src/client/maze.c:", events });
+    // The same with determinismo's C SDK instead of libvoidstar.
+    const sdk_events = try std.fmt.allocPrint(arena, "{s}/lines-sdk", .{context.scratch});
+    _ = try explore(context, &.{
+        "--compose",    "tests/antithesis-compat/c/compose.yaml", "--scenario", "maze_sdk",
+        "--seed",       "1",                                      "--branches", "4",
+        "--events-dir", sdk_events,
+    });
+    const sdk_coverage = try run_kept(context, &.{ "grep", "-rlF", "\"name\":\"line /src/client/maze_sdk.c:", sdk_events });
     expect_all(context, &.{
         .{ "the C program's coverage is source lines", coverage.stdout.len > 0 },
+        .{ "with determinismo's C SDK too", sdk_coverage.stdout.len > 0 },
         .{ "main's first lines ran in every timeline", std.mem.indexOf(u8, report, every) != null },
         .{ "the solved maze's lines never ran", std.mem.indexOf(u8, report, never) != null },
     }, "lines: C instrumented for Antithesis reports source lines, and a targeted run sees them", .{});
