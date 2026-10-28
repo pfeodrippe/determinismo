@@ -27,7 +27,8 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 - `start.sh` passes Jepsen's flags: masters with the initial system catalog snapshot and
   `--load_balancer_max_concurrent_adds 10`; tablet servers with YSQL's PostgreSQL proxy on
   5433 and `--rpc_slow_query_threshold_ms 1000`; four shards per tablet server; 1 GB of memory
-  each (Jepsen's 2: three nodes share the machine). Each process starts again when it exits, as
+  for a tablet server, 512 MB for a master (Jepsen's 2 GB each: three nodes share the machine;
+  1 GB masters ended long timelines in OOM kills). Each process starts again when it exits, as
   Jepsen's nemesis restarted the ones it killed.
 - Readiness is the master's port: YSQL waits on a quorum of masters, which needs the nodes
   started after.
@@ -59,6 +60,20 @@ tablet server at 41.3 s of virtual time with `mvcc.cc:340] Check failed: result 
 enforced_min_time`: a read's safe time below the minimum the tablet enforces. Known upstream as
 [#2571](https://github.com/yugabyte/yugabyte-db/issues/2571) (October 2019, 1.3, closed).
 
+## Found: committed transactions reported as serialization failures (G1a)
+
+Run 18 (srv3, 2026-10-28, seed 7, 215 timelines): Elle found G1a, aborted reads, with dirty
+updates, in three timelines (44, 47, 94): a transaction read an element appended by one its
+client had seen fail. In timeline 47, a stop fault sent yb3 SIGTERM at 371.23 s; its YSQL
+backend, shutting down, could not schedule a COMMIT's status update (`Failed to schedule ...
+UpdateTransaction`), the YugabyteDB client logged `transaction.cc:326] Abort of committed
+transaction`, and the client got `ERROR: Error during commit: Aborted: ...` with SQLSTATE 40001.
+In 1.3.1, `YBCHandleCommitError` (pg_yb_utils.c) reports every commit error as 40001, a
+serialization failure, which tells a client the transaction was rolled back, whatever its
+outcome: here it had committed, and a later read saw its write. Current YugabyteDB commits
+through `HandleYBStatus`, which gives each status its own SQLSTATE: fixed since, in code that
+no longer exists.
+
 ## Observed (1.3.1, not investigated further)
 
 - YSQL backends segfault as they exit, in `yb::rpc::ThreadPool::Impl::Shutdown()`, popping a
@@ -66,6 +81,9 @@ enforced_min_time`: a read's safe time below the minimum the tablet enforces. Kn
   (`cds::gc::dhp::thread_hp_storage::alloc`, `dhp.h:134`; libyrpc.so+0xe9a67), the kernel's
   `segfault at 0 ... in libyrpc.so`. Each such death restarts the node's backends.
 - Tablet servers segfault (exit 139) within seconds of a node stop and a partition.
+- The same exit crash in a backend's YugabyteDB client threads (`rpc_tp_Transact`, in
+  `yb::HostPort::ParseStrings`, net_util.cc:249, a destroyed flag string; `pggate_ybclient`):
+  run 18 named them as properties of their own until crash properties named the process.
 
 Both are in a release from 2019, in code that has changed much since; neither names an issue
 in YugabyteDB's tracker.
