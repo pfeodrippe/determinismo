@@ -270,7 +270,7 @@ pub fn line_write(writer: *std.Io.Writer, process: u64, kind: Kind, mops: []cons
 }
 
 test line_write {
-    var buffer: [256]u8 = undefined;
+    var buffer: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     const asked = [_]Mop{ .{ .append = .{ .key = 3, .value = 17 } }, .{ .read = .{ .key = 4 } } };
     try line_write(&writer, 7, .invoke, &asked, 5);
