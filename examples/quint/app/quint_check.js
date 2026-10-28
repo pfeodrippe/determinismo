@@ -60,7 +60,9 @@ async function quint(args, input) {
 /** What no Quint command may print: an internal error's traces (a JavaScript exception, a Rust
  * panic), as opposed to the errors Quint reports about a specification. */
 const INTERNAL = [
-  /\bat [\w$.<>]+ \(.*:\d+:\d+\)/, // A JavaScript stack frame.
+  // A JavaScript stack frame: in a .js or .ts file, or Node's own; not the trace of a
+  // specification's runtime error (`at transfer(...) (/src/.../bank.qnt:193:7)`, run 25).
+  /\bat [^\n]*\((?:[^()\n]*\.(?:[cm]?js|ts)|node:[\w/.:-]+):\d+:\d+\)/,
   /\b(TypeError|RangeError|ReferenceError|SyntaxError|InternalError): /,
   /Maximum call stack size exceeded/,
   /panicked at /,
