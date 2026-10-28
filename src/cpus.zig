@@ -123,9 +123,11 @@ pub const Pool = struct {
         std.sort.insertion(u32, order[0..pool.count], pool, sibling_after);
         const cpus = pool.cpus;
         const fds = pool.fds;
+        const priority_fds = pool.priority_fds;
         for (order[0..pool.count], 0..) |from, to| {
             pool.cpus[to] = cpus[from];
             pool.fds[to] = fds[from];
+            pool.priority_fds[to] = priority_fds[from];
         }
     }
 

@@ -351,10 +351,10 @@ pub const Owner = struct {
         // Running on to a later moment is a VM run: on a CPU of the host's pool, alone on its
         // core (cpus.zig: two VMs on sibling hyperthreads perturb each other's clocks).
         var pool: cpus.Pool = undefined;
-        if (request.vtime_ns != moment_ns) {
+        const cpu: ?cpus.Held = if (request.vtime_ns != moment_ns) cpu: {
             pool.open() catch linux.exit_group(1);
-            _ = pool.take();
-        }
+            break :cpu pool.take();
+        } else null;
         const node = if (request.vtime_ns == moment_ns)
             owner.snapshot
         else
@@ -366,6 +366,9 @@ pub const Owner = struct {
                 request.vtime_ns,
                 owner.point,
             ) catch linux.exit_group(1);
+        // Its CPU back before the answer, which the explorer may read after another's, one
+        // waiting for a CPU (main.zig's node_make_start).
+        if (cpu) |held| pool.give(held);
         fd_pass.send(socket, node.memory_fd) catch linux.exit_group(1);
         if (!write_all(socket, std.mem.asBytes(node))) linux.exit_group(1);
         linux.exit_group(0);

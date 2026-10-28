@@ -3131,10 +3131,10 @@ fn node_make_start(
     if (pid == 0) {
         child_dies_with(explorer);
         close(pair[0]);
-        // A replay to the node's moment: on a CPU of the host's (cpus.zig), until it exits.
+        // A replay to the node's moment: on a CPU of the host's (cpus.zig), until it is made.
         var pool: cpus.Pool = undefined;
         pool.open() catch linux.exit_group(1);
-        _ = pool.take();
+        const cpu = pool.take();
         const parent = making.parent;
         const at = making.back.vtime_ns;
         var from = parent.snapshot;
@@ -3156,6 +3156,10 @@ fn node_make_start(
             });
             linux.exit_group(1);
         };
+        // Its CPU back before the answer: the explorer may read another's first, one waiting for
+        // a CPU (a pool of two, both held by makers writing to an explorer reading a third that
+        // waited for one: an e2e deadlocked, srv3 2026-10-28).
+        pool.give(cpu);
         fd_pass.send(pair[1], snapshot.memory_fd) catch linux.exit_group(1);
         // Everything else is plain data, or set up before the fork (the same in the explorer).
         write_all(pair[1], std.mem.asBytes(snapshot));
