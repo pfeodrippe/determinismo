@@ -34,7 +34,16 @@ pub const stop_faults_path = "/opt/determinismo/bin/det-stop-faults";
 const platform_environment = [_][:0]const u8{
     "DETERMINISMO_STOP_FAULTS=" ++ stop_faults_path,
     "ANTITHESIS_STOP_FAULTS=" ++ stop_faults_path,
+    "ANTITHESIS_OUTPUT_DIR=" ++ sink_directory,
 };
+/// Antithesis's output sink in every node (ANTITHESIS_OUTPUT_DIR): what is written to files
+/// there becomes events (det-sinks, sinks.zig).
+pub const sink_directory = "/run/antithesis";
+
+/// A node's sink directory, as the runner sees it.
+pub fn sink_path(buffer: []u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, state_root ++ "/{s}/root" ++ sink_directory, .{name});
+}
 const poll_interval_ns = 10 * std.time.ns_per_ms;
 const ready_attempts_max = 6000; // 60 s of virtual time.
 const stop_attempts_max = 3000;
@@ -1429,6 +1438,8 @@ const Launch = struct {
             const data: ?[*:0]const u8 = if (target.data) |d| d.ptr else null;
             try mount(target.fs, path, target.fs, target.flags, data);
         }
+        // Antithesis's output sink (ANTITHESIS_OUTPUT_DIR).
+        try mkdir_all(try print_z(&buffer, "{s}" ++ sink_directory, .{launch.root}));
         // The platform's binaries and the fault injector's control FIFO, read-only.
         const platform = try print_z(&buffer, "{s}/opt/determinismo", .{launch.root});
         try mkdir_all(platform);

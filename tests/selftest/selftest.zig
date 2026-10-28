@@ -79,6 +79,8 @@ pub fn main(init: std.process.Init) !void {
             .controller = @import("controller.zig").scenario,
             .maze = maze,
             .records = records_scenario,
+            .ending = ending_scenario,
+            .sinks = sinks_scenario,
         },
         .checks = .{ .squares = squares_check },
     });
@@ -204,6 +206,83 @@ fn steady(s: *System.Scenario) void {
     s.first("entropy", entropy);
     s.parallel_driver("ping", ping);
     s.finally("ping_after", ping);
+}
+
+/// Antithesis's output sink (ANTITHESIS_OUTPUT_DIR): files written there in a node become
+/// events (det-sinks). Written here from the runner, through the node's root (the echo node runs
+/// no shell); its processes see the variable.
+fn sinks_scenario(s: *System.Scenario) void {
+    s.singleton_driver("sink_write", sink_write);
+}
+
+fn sink_write(_: *System.Context) !void {
+    const sink = "/run/det/nodes/echo/root/run/antithesis";
+    const assertion = "{\"antithesis_assert\":{\"hit\":true,\"must_hit\":true,\"assert_type\":\"always\"," ++
+        "\"display_type\":\"Always\",\"message\":\"a sink assertion\",\"condition\":true," ++
+        "\"id\":\"a sink assertion\",\"location\":{},\"details\":{}}}\n";
+    try sink_append(sink ++ "/sdk.jsonl", assertion);
+    try sink_append(sink ++ "/debug.log", "hello sink\n");
+    try sink_append(sink ++ "/data.bin", "\x00\x01\x02");
+    // The node's main process has the variable (Antithesis sets it in every container).
+    const pid = nodes_pid_of("echo") orelse return error.NoEcho;
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/environ", .{pid}, 0);
+    var environment: [8192]u8 = undefined;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.NoEnviron;
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), &environment, environment.len);
+    if (linux.errno(size) != .SUCCESS) return error.NoEnviron;
+    const set = std.mem.indexOf(u8, environment[0..size], "ANTITHESIS_OUTPUT_DIR=/run/antithesis") != null;
+    sdk.always(set, "nodes have ANTITHESIS_OUTPUT_DIR", .{});
+    // det-sinks looks every 50 ms: the timeline goes on a little.
+    const pause_long = linux.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&pause_long, null);
+}
+
+fn sink_append(path: [:0]const u8, data: []const u8) !void {
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return error.SinkOpen;
+    defer _ = linux.close(@intCast(fd));
+    if (linux.errno(linux.write(@intCast(fd), data.ptr, data.len)) != .SUCCESS) return error.SinkWrite;
+}
+
+/// A node's main process (det-nodes records it), as the runner sees it.
+fn nodes_pid_of(name: []const u8) ?linux.pid_t {
+    var path_buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/run/det/nodes/{s}/pid", .{name}, 0) catch return null;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [32]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, buffer[0..size], " \n"), 10) catch null;
+}
+
+/// Antithesis's endings: an eventually command kills the drivers still running (here, ones
+/// that sleep far past the driver phase); a finally one waits for them, and runs only when every
+/// command ran to completion.
+fn ending_scenario(s: *System.Scenario) void {
+    s.parallel_driver("sleeper", sleeper);
+    s.eventually("after_kill", ending_eventually);
+    s.finally("after_all", ending_finally);
+}
+
+fn sleeper(_: *System.Context) !void {
+    sdk.event("sleeper_start", .{});
+    const long = linux.timespec{ .sec = 30, .nsec = 0 };
+    _ = linux.nanosleep(&long, null);
+    sdk.event("sleeper_done", .{});
+}
+
+fn ending_eventually(_: *System.Context) !void {
+    sdk.reachable("an eventually command ran", .{});
+}
+
+fn ending_finally(_: *System.Context) !void {
+    sdk.reachable("a finally command ran", .{});
 }
 
 fn quiet_scenario(s: *System.Scenario) void {

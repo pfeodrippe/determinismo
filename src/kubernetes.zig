@@ -93,6 +93,8 @@ pub const ready_script =
     \\# container of the workload given the Antithesis SDK's output, then every Deployment,
     \\# StatefulSet and DaemonSet rolled out and every running pod ready.
     \\export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    \\# The pods' output as events, each line named after its pod (det-podlogs detaches itself).
+    \\/opt/determinismo/bin/det-podlogs
     \\manifests=
 ++ manifests_directory ++
     \\

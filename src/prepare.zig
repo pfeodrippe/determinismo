@@ -374,6 +374,10 @@ fn kubernetes_describe(context: Context, directory: []const u8) !schema.Descript
     std.sort.insertion([]const u8, files.items, {}, string_before);
     if (files.items.len == 0) return error.NoManifests;
     var hasher = std.hash.Wyhash.init(0);
+    // What the context is made of besides them: a change to its scripts or K3s makes another.
+    for ([_][]const u8{ kubernetes.ready_script, kubernetes.exec_script, kubernetes.k3s_image }) |part| {
+        hasher.update(part);
+    }
     for (files.items) |path| {
         const text = try cwd.readFileAlloc(context.io, path, arena, .limited(16 << 20));
         try contents.append(arena, text);

@@ -143,14 +143,15 @@ fn lines_split(batch: *Batch, stream: *Stream, bytes: []const u8) void {
     }
 }
 
-/// Events waiting to be sent, one JSON object per line, as the platform splits them.
-const Batch = struct {
+/// Events waiting to be sent, one JSON object per line, as the platform splits them (det-podlogs
+/// sends a Kubernetes node's pods' output through it too).
+pub const Batch = struct {
     source: []const u8,
     device: ?linux.fd_t,
     buffer: [sdk.message_size_max]u8 = undefined,
     size: usize = 0,
 
-    fn line(batch: *Batch, stream: []const u8, text: []const u8) void {
+    pub fn line(batch: *Batch, stream: []const u8, text: []const u8) void {
         batch.event(.{ .output = .{ .source = batch.source, .stream = stream, .text = text } });
         const property = language_property(text) orelse return;
         batch.event(.{ .assert = .{
@@ -173,7 +174,16 @@ const Batch = struct {
         batch.size += bytes.len;
     }
 
-    fn flush(batch: *Batch) void {
+    /// A JSON line sent as it is (an Antithesis sink's `.jsonl` line: an event of its own).
+    pub fn raw(batch: *Batch, json_line: []const u8) void {
+        if (json_line.len + 1 > batch.buffer.len) return;
+        if (batch.size + json_line.len + 1 > batch.buffer.len) batch.flush();
+        @memcpy(batch.buffer[batch.size..][0..json_line.len], json_line);
+        batch.buffer[batch.size + json_line.len] = '\n';
+        batch.size += json_line.len + 1;
+    }
+
+    pub fn flush(batch: *Batch) void {
         defer batch.size = 0;
         const fd = batch.device orelse return;
         if (batch.size == 0) return;

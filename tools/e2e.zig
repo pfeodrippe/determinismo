@@ -148,6 +148,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
         .{ "ui", check_ui },                         .{ "runs", check_runs },
         .{ "kubernetes", check_kubernetes },         .{ "steps", check_steps },
+        .{ "ending", check_ending },                 .{ "sinks", check_sinks },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -363,6 +364,68 @@ fn check_python_strategy(context: *Context) !void {
 
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
 /// spread over them): the workload survives faults, and a branch replays exactly.
+/// Antithesis's output sink (ANTITHESIS_OUTPUT_DIR): a node's .jsonl lines are events (an
+/// Antithesis SDK's assertion), other files' lines output, .bin files' bytes output in base64.
+fn check_sinks(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fmt.allocPrint(arena, "{s}/sinks", .{context.scratch});
+    const report = try explore(context, &.{
+        "--program", program, "--scenario", "sinks", "--seed", "1", "--branches", "2", "--events-dir", events,
+    });
+    const grep = struct {
+        fn found(c: *Context, pattern: []const u8, directory: []const u8) bool {
+            const result = run_kept(c, &.{ "grep", "-rlF", pattern, directory }) catch return false;
+            return result.stdout.len > 0;
+        }
+    }.found;
+    expect_all(context, &.{
+        .{ "the node has ANTITHESIS_OUTPUT_DIR", std.mem.indexOf(u8, report, "nodes have ANTITHESIS_OUTPUT_DIR") != null and
+            std.mem.indexOf(u8, report, "FAIL always                hit in    2/2 branches, failing in    2  nodes have") == null },
+        .{ "a .jsonl line is an event (an Antithesis SDK assertion)", grep(context, "\"message\":\"a sink assertion\"", events) },
+        .{ "a text file's line is output under the node and the file", grep(context, "\"source\":\"echo\",\"stream\":\"debug.log\",\"text\":\"hello sink\"", events) },
+        .{ "a .bin file's bytes are output in base64", grep(context, "\"stream\":\"data.bin\",\"text\":\"AAEC\"", events) },
+    }, "sinks: what nodes write to ANTITHESIS_OUTPUT_DIR is events", .{});
+}
+
+/// Antithesis's endings (det-composer): an eventually command kills the commands still running
+/// (drivers sleeping past the driver phase), and their ends are no failures; a finally command
+/// waits for every command to end on its own.
+fn check_ending(context: *Context) !void {
+    const arena = context.arena;
+    const program = try std.fs.path.join(arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fmt.allocPrint(arena, "{s}/ending", .{context.scratch});
+    const report = try explore(context, &.{
+        "--program", program, "--scenario", "ending", "--seed", "1", "--branches", "8", "--events-dir", events,
+    });
+    // Per timeline (by the assertions' evaluations, not their catalog's declarations): eventually
+    // ones killed the sleepers still running (fewer finished than started: with one driver at a
+    // time, the earlier ones finish); finally ones killed none.
+    const script = try std.fmt.allocPrint(arena,
+        \\cd {s}; e=0; f=0; bad=0
+        \\for t in branch-*.jsonl; do
+        \\  if grep -q 'an eventually command ran","condition":true' $t; then e=$((e+1))
+        \\    grep -q '"killed":true' $t || bad=$((bad+1))
+        \\    [ $(grep -c sleeper_done $t) -lt $(grep -c sleeper_start $t) ] || bad=$((bad+1))
+        \\  elif grep -q 'a finally command ran","condition":true' $t; then f=$((f+1)); grep -q '"killed":true' $t && bad=$((bad+1))
+        \\  fi
+        \\done; echo "$e $f $bad"
+    , .{events});
+    const counted = try run_kept(context, &.{ "sh", "-c", script });
+    var words = std.mem.tokenizeAny(u8, counted.stdout, " \n");
+    const eventually = std.fmt.parseInt(u32, words.next() orelse "0", 10) catch 0;
+    const finally = std.fmt.parseInt(u32, words.next() orelse "0", 10) catch 0;
+    const wrong = std.fmt.parseInt(u32, words.next() orelse "1", 10) catch 1;
+    const exits = std.mem.indexOf(u8, report, "FAIL always") == null or
+        std.mem.indexOf(u8, report, "test commands exit successfully  (e.g.") == null;
+    expect_all(context, &.{
+        .{ "timelines ending with an eventually command", eventually > 0 },
+        .{ "timelines ending with a finally command", finally > 0 },
+        .{ "eventually killed the running drivers, finally none", wrong == 0 },
+        .{ "a killed command is no failing exit", exits },
+    }, "ending: {d} eventually (drivers killed), {d} finally (all ran to completion)", .{ eventually, finally });
+}
+
 /// A branch grown from a moment step by step (Antithesis's advanced multiverse debugging):
 /// a command run to its end, one in the background (its output comes while the branch waits),
 /// a wait, a wait-until that holds and one that times out, each step's end a moment.
@@ -438,6 +501,8 @@ fn check_kubernetes(context: *Context) !void {
     const passing = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
     // Faults on single pods (Faults.pods), each naming its pod.
     const pod_faults = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhoE '\"kind\":\"pod_[a-z]+\"' {s} | sort | uniq -c | tr -s ' \\n' ' '", .{explored}) });
+    // The pods' own output, named after them (det-podlogs): Redis says it is ready.
+    const pod_output = try run_kept(context, &.{ "grep", "-rl", "\"source\":\"redis-0\"", explored });
     // A pod fault that could not be applied or undone (the pod picked, its address, its
     // namespace): none.
     const pod_failures = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rh 'fault_failed\\|fault_heal_failed' {s} | grep -c kubernetes || true", .{explored}) });
@@ -459,6 +524,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "no property failed", passing },
         .{ "a timeline replays exactly", same },
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
+        .{ "the pods' output as events named after them (redis-0)", pod_output.stdout.len > 0 },
         .{ "no fault of the K3s node or its pods failed to apply or heal", std.mem.eql(u8, std.mem.trim(u8, pod_failures.stdout, " \n"), "0") },
     }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
         "pod faults: {s}", .{std.mem.trim(u8, pod_faults.stdout[0..@min(pod_faults.stdout.len, 120)], "\n")});

@@ -77,6 +77,9 @@ const Composer = struct {
     faults: bool = false,
     faults_pid: ?linux.pid_t = null,
     faults_control: ?linux.fd_t = null,
+    /// Commands that did not run to completion (a signal ended them: a fault's, or the
+    /// composer's): a timeline with any runs no finally command.
+    interrupted: u32 = 0,
 
     fn kind_count(composer: *const Composer, kind: Kind) u32 {
         var count: u32 = 0;
@@ -122,8 +125,13 @@ const Composer = struct {
         return null;
     }
 
-    /// Waits for one running command to exit and reports how it ended.
+    /// Waits for one running command to exit and reports how it ended (`killed`: by the
+    /// composer itself, as an eventually command begins).
     fn wait_one(composer: *Composer) void {
+        composer.wait_one_ended(false);
+    }
+
+    fn wait_one_ended(composer: *Composer, killed: bool) void {
         assert(composer.running_count > 0);
         for (0..running_max + 1) |_| { // The injector may exit first, at most once.
             var status: i32 = 0;
@@ -136,7 +144,10 @@ const Composer = struct {
             }
             for (composer.running[0..composer.running_count], 0..) |entry, index| {
                 if (entry.pid != pid) continue;
-                report_exit(entry.command, @bitCast(status));
+                const bits: u32 = @bitCast(status);
+                const signaled = bits & 0x7f != 0 or (bits >> 8) & 0xff >= 128;
+                if (signaled or killed) composer.interrupted += 1;
+                report_exit(entry.command, bits, killed);
                 composer.running[index] = composer.running[composer.running_count - 1];
                 composer.running_count -= 1;
                 return;
@@ -176,6 +187,16 @@ const Composer = struct {
     fn wait_all(composer: *Composer) void {
         while (composer.running_count > 0) composer.wait_one();
         assert(composer.running_count == 0);
+    }
+
+    /// Every running command killed, with whatever it started (its process group: commands
+    /// lead their own), as Antithesis does when an eventually command begins.
+    fn kill_all(composer: *Composer) void {
+        for (composer.running[0..composer.running_count]) |entry| {
+            _ = linux.kill(-entry.pid, .KILL);
+            _ = linux.kill(entry.pid, .KILL); // Before it made its group, if it had not yet.
+        }
+        while (composer.running_count > 0) composer.wait_one_ended(true);
     }
 
     fn run_to_completion(composer: *Composer, command: *const Command) void {
@@ -236,10 +257,14 @@ pub fn main(init: std.process.Init) !void {
     } else {
         run_drivers(&composer);
     }
-    composer.wait_all();
+    // The ending, as Antithesis's: an eventually command kills every command still running
+    // (and the faults stop); a finally one waits for them to end on their own, and runs only
+    // if every command ran to completion; or neither.
+    const ending = ending_pick(&composer);
+    if (ending == .eventually) composer.kill_all() else composer.wait_all();
     composer.faults_stop();
     sdk.event("faults_phase", .{ .state = "stop" });
-    run_ending(&composer);
+    run_ending(&composer, ending);
     checks_stream(&system);
     sdk.event("composer_done", .{ .commands_started = composer.started_count });
 }
@@ -456,14 +481,25 @@ fn timeline_length_ns() ?u64 {
 }
 
 /// At most one eventually command (which stops everything else) or one finally command.
-fn run_ending(composer: *Composer) void {
-    assert(composer.running_count == 0);
+const Ending = enum { eventually, finally, none };
+
+fn ending_pick(composer: *const Composer) Ending {
     const eventually = composer.kind_count(.eventually) > 0;
     const finally = composer.kind_count(.finally) > 0;
-    if (eventually and (!finally or sdk.random_below(2) == 0)) {
-        composer.run_to_completion(composer.pick(.eventually));
-    } else if (finally) {
-        composer.run_to_completion(composer.pick(.finally));
+    if (eventually and (!finally or sdk.random_below(2) == 0)) return .eventually;
+    return if (finally) .finally else .none;
+}
+
+fn run_ending(composer: *Composer, ending: Ending) void {
+    assert(composer.running_count == 0);
+    switch (ending) {
+        .eventually => composer.run_to_completion(composer.pick(.eventually)),
+        .finally => if (composer.interrupted == 0) {
+            composer.run_to_completion(composer.pick(.finally));
+        } else {
+            sdk.event("finally_skipped", .{ .interrupted = composer.interrupted });
+        },
+        .none => {},
     }
 }
 
@@ -485,6 +521,7 @@ fn spawn(arguments: []const [*:0]const u8) linux.pid_t {
     const result = linux.fork();
     assert(linux.errno(result) == .SUCCESS);
     if (result == 0) {
+        _ = linux.setpgid(0, 0); // Its own group: killed with what it starts (kill_all).
         var argv: [spawn_arguments_max:null]?[*:0]const u8 = @splat(null);
         for (arguments, 0..) |argument, index| argv[index] = argument;
         _ = linux.execve(arguments[0], &argv, &environment);
@@ -534,7 +571,11 @@ fn command_property(buffer: *[256]u8, what: []const u8, name: []const u8) []cons
         buffer[0..0];
 }
 
-fn report_exit(command: *const Command, status: u32) void {
+fn report_exit(command: *const Command, status: u32, killed: bool) void {
+    if (killed) { // The composer's doing (an eventually command began), not the command's.
+        sdk.event("command_exit", .{ .command = command.name, .killed = true });
+        return;
+    }
     const exited = status & 0x7f == 0;
     if (exited) {
         var buffer: [256]u8 = undefined;

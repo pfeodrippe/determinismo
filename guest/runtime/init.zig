@@ -47,12 +47,19 @@ pub fn main(init: std.process.Init) !void {
     kernel_check();
     memory_check();
     agent_wait();
+    // The sinks' last look (what the nodes wrote last), then it ends.
+    if (sinks_pid) |pid| {
+        _ = linux.kill(pid, .TERM);
+        _ = wait_for(pid);
+    }
     sdk.lifecycle("guest_done", .{ .status = status });
     reap_all();
     _ = linux.sync();
     _ = linux.reboot(.MAGIC1, .MAGIC2, .RESTART, null);
     unreachable;
 }
+
+var sinks_pid: ?linux.pid_t = null;
 
 fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
     if (!disk_mount()) {
@@ -65,6 +72,8 @@ fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
         for (system.nodes, names) |node, *name| name.* = node.name;
         node_names = names;
     } else |_| {}
+    // Antithesis's output sinks in the nodes, as events, until the timeline ends.
+    sinks_pid = spawn(&.{bin ++ "det-sinks"});
     const pid_up = spawn(&.{ bin ++ "det-nodes", "up" });
     const status_up = wait_for(pid_up);
     if (status_up != 0) {
