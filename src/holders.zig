@@ -191,6 +191,8 @@ pub const Owner = struct {
     last_ns: ?u64 = null,
     /// Holders made so far (each one's socket number).
     made: u32 = 0,
+    /// Whether it said that memory stopped its holders (once a timeline).
+    short_said: bool = false,
     /// The last hold point (the holder forked there keeps it): inside an idle skip or not.
     point: VM.Hold.Point = .{ .idle = false },
     kept: [per_timeline_max + 1]Held = undefined,
@@ -262,7 +264,14 @@ pub const Owner = struct {
         owner.armed_new = false;
         owner.last_ns = moment;
         try owner.arm(vm, moment + owner.period(), false); // The next, unless one is new first.
-        if (cpus.memory_available() < make_available_min) return;
+        const available = cpus.memory_available();
+        if (available < make_available_min) {
+            // Said once a timeline: its nodes are then made by replays (checks read it).
+            if (!owner.short_said) std.debug.print("[determinismo] holders: none made, {d} GB " ++
+                "available ({d} needed)\n", .{ available >> 30, make_available_min >> 30 });
+            owner.short_said = true;
+            return;
+        }
         // Not once host checks' inputs arrived (the timeline's end): their bytes are in this
         // worker's buffer, and a node goes to any worker with its state, not that buffer's
         // content. A replay makes such a node right.

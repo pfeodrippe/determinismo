@@ -1491,12 +1491,10 @@ fn check_tree(context: *Context) !void {
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
     // from their parents' start would make, which the deepest timeline's lone replay checks.
     // Holders are made only with 16 GB available (holders.zig): beside a hunt of large VMs
-    // there is not, and replays make every node.
-    const room = holders_room(context);
-    const held = !room or (held_nodes(one) > 0 and held_nodes(many) > 0);
+    // there may not be, and replays make the nodes (the run says so).
+    const held = holders_made(one) and holders_made(many);
     // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
-    const verified = (!room or std.mem.indexOf(u8, one, "ns: the same") != null) and
-        std.mem.indexOf(u8, one, "DIFFERENT") == null;
+    const verified = holders_verified(one);
     expect_all(context, &.{
         .{ "64 timelines with one worker", count == 64 },
         .{ "64 timelines with four", parallel_count == 64 },
@@ -1570,13 +1568,12 @@ fn check_tree(context: *Context) !void {
         modulated_branches[0..modulated_count],
         &.{"--cpu-modulation"},
     );
-    const modulated_verified = (!room or std.mem.indexOf(u8, modulated, "ns: the same") != null) and
-        std.mem.indexOf(u8, modulated, "DIFFERENT") == null;
+    const modulated_verified = holders_verified(modulated);
     expect_all(context, &.{
         .{ "64 timelines", modulated_count == 64 },
         .{ "the tree deepens", modulated_deep.depth >= 1 },
         .{ "the deepest replays alone from its tape", modulated_deep.replays },
-        .{ "in-run snapshots made nodes", !room or held_nodes(modulated) > 0 },
+        .{ "in-run snapshots made nodes", holders_made(modulated) },
         .{ "each such node is the one a replay makes", modulated_verified },
     }, "tree with cpu modulation: {d} timelines, up to {d} deep; " ++
         "#{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the one a " ++
@@ -1590,18 +1587,21 @@ fn check_tree(context: *Context) !void {
 
 /// The tree's nodes made from in-run snapshots, over its generations ("(n from in-run
 /// snapshots)" in each generation's line).
-/// Whether the host has room for holders (16 GB available, holders.zig's make_available_min);
-/// says so when it has not.
-fn holders_room(context: *Context) bool {
-    const text = std.Io.Dir.cwd().readFileAlloc(context.io, "/proc/meminfo", context.arena, .limited(1 << 16)) catch return true;
-    const key = "MemAvailable:";
-    const at = std.mem.indexOf(u8, text, key) orelse return true;
-    var words = std.mem.tokenizeAny(u8, text[at + key.len ..], " \n");
-    const kib = std.fmt.parseInt(u64, words.next() orelse return true, 10) catch return true;
-    const room = kib >= 16 << 20;
-    if (!room) std.debug.print("SKIP tree: nodes from in-run snapshots ({d} GB available: holders " ++
-        "need 16, a hunt beside the check has the rest)\n", .{kib >> 20});
-    return room;
+/// Whether in-run snapshots made nodes, or the run said memory stopped them (holders need
+/// 16 GB available, holders.zig's make_available_min: a hunt beside the check may hold the rest).
+fn holders_made(report: []const u8) bool {
+    if (held_nodes(report) > 0) return true;
+    const short = std.mem.indexOf(u8, report, "holders: none made") != null;
+    if (short) std.debug.print("SKIP tree: nodes from in-run snapshots (memory stopped them)\n", .{});
+    return short;
+}
+
+/// Whether each node an in-run snapshot made is the one a replay makes (--verify-holders):
+/// one at least compared, none different; none to compare when memory stopped them.
+fn holders_verified(report: []const u8) bool {
+    if (std.mem.indexOf(u8, report, "DIFFERENT") != null) return false;
+    if (std.mem.indexOf(u8, report, "ns: the same") != null) return true;
+    return held_nodes(report) == 0 and std.mem.indexOf(u8, report, "holders: none made") != null;
 }
 
 fn held_nodes(report: []const u8) u64 {
