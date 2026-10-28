@@ -714,11 +714,20 @@ fn mapper_attach(node: []const u8, loop: u32) !u32 {
     return @intCast((dev & 0xff) | ((dev >> 12) & 0xfff00));
 }
 
-/// Loads `target` over the whole disk and swaps it in.
+/// Loads `target` over the whole disk and swaps it in. One process at a time: a load fills the
+/// device's inactive slot and the resume swaps it in, so two interleaved (the fault injector's
+/// disk baseline and a scenario's crash of the node) swapped one's table in twice, and the
+/// other's resume found none (MapperFailed; the disk self-test, srv3 2026-10-28).
 fn mapper_table(name: []const u8, target: MapperTarget) !void {
+    const lock = linux.open(mapper_lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(lock) != .SUCCESS) return error.MapperLock;
+    defer _ = linux.close(@intCast(lock));
+    while (linux.errno(linux.flock(@intCast(lock), std.posix.LOCK.EX)) == .INTR) {}
     _ = try mapper_call(dm_table_load, name, 0, target);
     _ = try mapper_call(dm_dev_suspend, name, dm_skip_lockfs_flag, null);
 }
+
+const mapper_lock_path = "/run/det-mapper.lock";
 
 fn mapper_call(command: u8, name: []const u8, flags: u32, target: ?MapperTarget) !u64 {
     const control = linux.open("/dev/mapper/control", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
