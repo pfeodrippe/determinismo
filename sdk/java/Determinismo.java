@@ -57,6 +57,16 @@ public final class Determinismo {
     return bytes;
   }
 
+  /** A double in [0, 1) from 53 random bits: a platform decision. */
+  public static double random() {
+    return (randomLong() >>> 11) * 0x1.0p-53;
+  }
+
+  /** Antithesis's name for {@link #randomLong}. */
+  public static long getRandom() {
+    return randomLong();
+  }
+
   public static long randomLong() {
     byte[] bytes = randomBytes(8);
     long value = 0;
@@ -124,12 +134,33 @@ public final class Determinismo {
    */
   public static void declare(String kind, String message) {
     if (!declared.add(kind + '\u0000' + message)) return;
+    // Outside determinismo, listed (catalogAssertions) but not announced.
+    if (device == null) return;
     emit("{\"assert\":{\"type\":" + quote(kind) + ",\"message\":" + quote(message)
         + ",\"hit\":false}}");
   }
 
   private static final java.util.Set<String> declared =
-      java.util.concurrent.ConcurrentHashMap.newKeySet();
+      java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
+
+  /**
+   * The assertions declared so far (the catalog agent's, the Clojure SDK's macros', declare's):
+   * each a {kind, message} pair.
+   */
+  public static java.util.List<String[]> catalogAssertions() {
+    java.util.List<String[]> listed = new java.util.ArrayList<>();
+    synchronized (declared) {
+      for (String entry : declared) listed.add(entry.split("\u0000", 2));
+    }
+    return listed;
+  }
+
+  /** Writes the catalog, one JSON object a line ({"kind","message"}): for review or CI. */
+  public static void catalogWrite(java.io.PrintStream out) {
+    for (String[] entry : catalogAssertions()) {
+      out.println("{\"kind\":" + quote(entry[0]) + ",\"message\":" + quote(entry[1]) + "}");
+    }
+  }
 
   // Guidance assertions: the compared values in the details, and a guidance event telling
   // strategies how far the timeline is from the interesting outcome (an always violated, a
@@ -171,6 +202,28 @@ public final class Determinismo {
   public static void sometimesLessThanOrEqual(double left, double right, String message,
       String details) {
     compare(false, left <= right, right - left, left, right, message, details);
+  }
+
+  // Antithesis's names.
+
+  public static void alwaysGreaterThanOrEqualTo(double left, double right, String message,
+      String details) {
+    alwaysGreaterThanOrEqual(left, right, message, details);
+  }
+
+  public static void alwaysLessThanOrEqualTo(double left, double right, String message,
+      String details) {
+    alwaysLessThanOrEqual(left, right, message, details);
+  }
+
+  public static void sometimesGreaterThanOrEqualTo(double left, double right, String message,
+      String details) {
+    sometimesGreaterThanOrEqual(left, right, message, details);
+  }
+
+  public static void sometimesLessThanOrEqualTo(double left, double right, String message,
+      String details) {
+    sometimesLessThanOrEqual(left, right, message, details);
   }
 
   /** At least one of the named conditions holds, every time (all evaluated by the caller). */
@@ -331,6 +384,11 @@ public final class Determinismo {
     emit("{\"event\":" + quote(name) + ",\"details\":" + orEmpty(details) + "}");
   }
 
+  /** Antithesis's name for {@link #event}. */
+  public static void sendEvent(String name, String details) {
+    event(name, details);
+  }
+
   /**
    * A fault now, from the scenario: {@code fault("{\"kind\":\"pause\",\"node\":\"db\"}")}
    * (as det-faults inject takes it). Applied, logged and undone like a drawn one; only while the
@@ -400,7 +458,7 @@ public final class Determinismo {
   private static synchronized void emit(String line) {
     byte[] bytes = line.getBytes(StandardCharsets.UTF_8);
     if (device == null) {
-      System.err.println(line);
+      localOutput().println(line);
       return;
     }
     try {
@@ -408,6 +466,33 @@ public final class Determinismo {
     } catch (IOException e) {
       System.err.println(line);
     }
+  }
+
+  private static java.io.PrintStream localOutput;
+
+  /**
+   * Outside determinismo: the file DETERMINISMO_SDK_LOCAL_OUTPUT (or Antithesis's
+   * ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else stderr.
+   */
+  private static java.io.PrintStream localOutput() {
+    if (localOutput != null) return localOutput;
+    localOutput = System.err;
+    String path = System.getenv("DETERMINISMO_SDK_LOCAL_OUTPUT");
+    if (path == null || path.isEmpty()) path = System.getenv("ANTITHESIS_SDK_LOCAL_OUTPUT");
+    if (path != null && !path.isEmpty()) {
+      try {
+        localOutput = new java.io.PrintStream(new java.io.FileOutputStream(path, true), true,
+            StandardCharsets.UTF_8);
+      } catch (IOException unwritable) {
+        localOutput = System.err;
+      }
+    }
+    return localOutput;
+  }
+
+  /** Any JSON object as an event of its own (the protocol's raw form: docs/SDKS.md). */
+  public static void output(String json) {
+    emit(json);
   }
 
   private static String orEmpty(String details) {

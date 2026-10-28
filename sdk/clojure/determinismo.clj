@@ -5,8 +5,10 @@
   It wraps the JVM SDK (sdk/java/Determinismo.java, compiled with your code): inside
   determinismo everything goes through /dev/determinismo (events are recorded with their moment;
   random values are platform decisions, steerable by strategies and replayed by tapes); outside
-  it, randomness comes from SecureRandom and events go to stderr. Details are maps (or any data),
-  written as JSON: keywords and symbols as strings, other collections as arrays.
+  it, randomness comes from SecureRandom and events go to the file DETERMINISMO_SDK_LOCAL_OUTPUT
+  (or Antithesis's ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else to stderr.
+  Details are maps (or any data), written as JSON: keywords and symbols as strings, other
+  collections as arrays. The same API as the other SDKs (docs/SDKS.md).
 
     (require '[determinismo :as det])
     (det/always (= 1000 (total)) \"total balance is conserved\" {:total (total)})
@@ -175,6 +177,24 @@
   ([name] (event name nil))
   ([name data] (Determinismo/event name (details-json data))))
 
+(defn output
+  "Any map as an event of its own (the protocol's raw form: docs/SDKS.md)."
+  [data]
+  (Determinismo/output (json data)))
+
+(defn catalog-assertions
+  "The assertions declared so far (the macros', DeterminismoCatalog's, declare's): maps of
+  :kind and :message."
+  []
+  (mapv (fn [^"[Ljava.lang.String;" entry] {:kind (aget entry 0) :message (aget entry 1)})
+        (Determinismo/catalogAssertions)))
+
+(defn catalog-write
+  "Writes the catalog to stdout, one JSON object a line: what a program checks, for review or
+  CI."
+  []
+  (Determinismo/catalogWrite System/out))
+
 (defn fault
   "A fault now, from the scenario: (fault {:kind \"pause\" :node \"db\" :duration_ms 2000}),
   (fault {:kind \"partition_groups\" :groups [[\"runner\" \"a\"] [\"b\"]]}). Applied, logged
@@ -196,6 +216,11 @@
 ;; Every draw is a platform decision: strategies steer it, tapes replay it.
 
 (defn random-long [] (Determinismo/randomLong))
+
+(defn random-float
+  "A double in [0, 1) from 53 random bits: a platform decision."
+  []
+  (Determinismo/random))
 
 (defn random-below
   "A uniformly random integer in [0, n)."

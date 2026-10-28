@@ -70,11 +70,13 @@ public final class DeterminismoCatalog {
     switch (method) {
       case "always": case "alwaysSome": case "alwaysGreaterThan":
       case "alwaysGreaterThanOrEqual": case "alwaysLessThan": case "alwaysLessThanOrEqual":
+      case "alwaysGreaterThanOrEqualTo": case "alwaysLessThanOrEqualTo":
         return "always";
       case "alwaysOrUnreachable": return "always_or_unreachable";
       case "sometimes": case "sometimesAll": case "sometimesGreaterThan":
       case "sometimesGreaterThanOrEqual": case "sometimesLessThan":
       case "sometimesLessThanOrEqual":
+      case "sometimesGreaterThanOrEqualTo": case "sometimesLessThanOrEqualTo":
         return "sometimes";
       case "reachable": return "reachable";
       case "unreachable": return "unreachable";
