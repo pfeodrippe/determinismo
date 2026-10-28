@@ -55,7 +55,9 @@ fi
 ln -sfn "$duckdb" "$opt/duckdb"
 
 mkdir -p "$opt/tla"
+# v1.8.0 is a prerelease its project republishes under the same tag (2026-10-26 23:14 UTC): a
+# changed checksum is that, never a reason to skip the check; pin the new jar after a look.
 fetch https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
-  d15655eeaff4b3f7b3d65c46b838bc0f35d131b2ef4b1e473689b62c98d4726f "$opt/tla/tla2tools.jar"
+  78f7e2c6bf9a8b65eda665a23e94431255587e0b43a834a4e2af1723562d9b4a "$opt/tla/tla2tools.jar"
 
 echo "zig $("$opt/zig/zig" version), $("$opt/bb/bb" --version), duckdb v2.0.0, tla2tools v1.8.0"
