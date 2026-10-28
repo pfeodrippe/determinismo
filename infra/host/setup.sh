@@ -6,20 +6,25 @@
 # the build, an end-to-end check, and serve (a unit). Idempotent: run it again after a failure,
 # or to update (which stops serve and its runs first).
 # Usage: infra/host/setup.sh <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>]
+#                             [--reserved-cores N]
 #   --guest-from: the guest kernel and module copied from that host instead of built here, so
 #   every host runs the same guest (the same run inputs, for replays across hosts).
+#   --reserved-cores: N cores for your own sessions, the rest for runs (serve.sh); kept for the
+#   next setup or update. Default: as before, or 0 (runs take every core).
 set -euo pipefail
 
-ip=${1:?usage: $0 <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>]}
+ip=${1:?usage: $0 <ip> [--user <user>] [--hostname <name>] [--guest-from <user@host>] [--reserved-cores N]}
 shift
 user=det
 hostname=determinismo
 guest_from=
+reserved=
 while [ $# -gt 0 ]; do
   case $1 in
     --user) user=$2 ;;
     --hostname) hostname=$2 ;;
     --guest-from) guest_from=$2 ;;
+    --reserved-cores) reserved=$2 ;;
     *) echo "error: unknown option $1" >&2; exit 2 ;;
   esac
   shift 2
@@ -57,8 +62,9 @@ if [ -n "$guest_from" ]; then
     | ssh "${ssh_opts[@]}" "$user@$ip" 'mkdir -p ~/guest && tar -C ~/guest -x'
 fi
 
-ssh "${ssh_opts[@]}" "$user@$ip" bash -s <<'EOF'
+ssh "${ssh_opts[@]}" "$user@$ip" bash -s -- "$reserved" <<'EOF'
 set -euo pipefail
+reserved=${1:-}
 cd ~/determinismo
 echo "== serve stopped (and its runs): the build and KVM change under them"
 sudo infra/host/serve.sh "$USER" stop
@@ -82,6 +88,6 @@ zig-out/bin/det-initramfs --bin zig-out/bin --module ~/guest/det_guest.ko \
 echo "== end-to-end check"
 ~/opt/zig/zig build e2e -Drelease -Donly=bank
 echo "== serve"
-sudo infra/host/serve.sh "$USER" start
+sudo infra/host/serve.sh "$USER" start ${reserved:+--reserved-cores "$reserved"}
 EOF
 echo "== $ip is a determinismo host ($user@$ip)"

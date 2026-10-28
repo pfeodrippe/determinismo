@@ -208,6 +208,11 @@ sudo infra/host/serve.sh det start        # serve as a unit (stop: its runs stop
 To update a host's build without stopping its runs (the VMM, the guest runtime, the examples;
 not the KVM patch or the tools, which need `setup.sh`): `infra/host/update.sh <ip>`.
 
+Runs take every core by default. `--reserved-cores N` (on `setup.sh` or `serve.sh`, kept for the
+next start) keeps N cores, with their hyperthreads, for your own sessions: builds, checks and
+benchmarks run there, and serve and every run it starts (hunts) get the rest, each confined to its
+share by the kernel. A check never waits for a hunt, and a hunt never gives a core to one.
+
 Every exploration is one of the host's runs, however it is started: `determinismo explore`
 claims a directory in the host's run store (`--data`, else `$DETERMINISMO_DATA`, else
 `~/.determinismo`), with its record, events, tapes and output, and `determinismo serve` shows
