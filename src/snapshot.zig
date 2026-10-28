@@ -598,6 +598,7 @@ fn pointer_count(comptime T: type) comptime_int {
 fn complete_pending_io(vm: *VM) !void {
     vm.run.immediate_exit = 1;
     defer vm.run.immediate_exit = 0;
+    vm.state_cached = null;
     const result = kvm.ioctl(vm.vcpu_fd, kvm.RUN, 0);
     if (result) |_| return error.ImmediateExitIgnored else |err| switch (err) {
         error.Interrupted => {},

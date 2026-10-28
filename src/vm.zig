@@ -101,6 +101,10 @@ blocks: [disks_max]VirtioBlock,
 block_count: u32,
 /// Branch count at which KVM stops the vCPU for the PIT deadline (0: none).
 target_branches: u64,
+/// The clock's state at this exit, read once (DET_GET_STATE, an ioctl, read up to five times
+/// an exit before): it changes only as the guest runs or the VMM adds time (DET_ADD_TSC,
+/// DET_ENABLE), which clear it.
+state_cached: ?kvm.DetState = null,
 /// The armed soft stop (a clock reading, timer_arm), 0 for none.
 soft_tsc: u64,
 decisions: Decisions,
@@ -260,9 +264,12 @@ const VM = @This();
 pub const determinism_abi: u32 = 1;
 
 /// Kernel parameters the deterministic machine needs: the PIT is the only clock-event device, the
-/// TSC (virtualized by KVM) the only clocksource, and the boot seed the RNG's only entropy.
+/// TSC (virtualized by KVM) the only clocksource, and the boot seed the RNG's only entropy. No
+/// I/O delay: the dummy write to port 0x80 after each slow port access (the PIT's, the PIC's,
+/// on every timer tick) only waits on real hardware, and here each was an exit to the VMM: a
+/// quarter of a busy YugabyteDB guest's (75,000 in 6 s, srv3 2026-10-27).
 pub const cmdline_deterministic = "nolapic_timer hpet=disable clocksource=tsc tsc=reliable " ++
-    "random.trust_bootloader=on random.trust_cpu=off";
+    "random.trust_bootloader=on random.trust_cpu=off io_delay=none";
 
 /// QEMU's isa-debug-exit convention: a guest write of v to this port ends the run with status v.
 pub const port_debug_exit: u16 = 0x501;
@@ -428,6 +435,7 @@ fn det_enable(vm: *VM, options: *const Options, start: struct { tsc_base: u64 })
         .margin_branches = options.margin_branches,
     };
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ENABLE, @intFromPtr(&config));
+    vm.state_cached = null;
     assert((try vm.det_state()).tsc == start.tsc_base);
     try vm.rdtsc_log_enable();
 }
@@ -562,6 +570,7 @@ fn run_loop(vm: *VM) !Outcome {
             continue;
         }
         if (vm.deterministic) try vm.timer_arm();
+        vm.state_cached = null; // The guest runs.
         _ = kvm.ioctl(vm.vcpu_fd, kvm.RUN, 0) catch |err| switch (err) {
             error.Interrupted => {
                 vm.stats.exits.getPtr(.intr).* += 1;
@@ -625,9 +634,11 @@ fn run_loop(vm: *VM) !Outcome {
 
 pub fn det_state(vm: *VM) !kvm.DetState {
     assert(vm.deterministic);
+    if (vm.state_cached) |state| return state;
     var state: kvm.DetState = undefined;
     _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_GET_STATE, @intFromPtr(&state));
     assert(state.tsc >= state.branches * vm.tsc_per_branch);
+    vm.state_cached = state;
     return state;
 }
 
@@ -728,6 +739,7 @@ fn modulate(vm: *VM) !void {
     var extra_tsc = owed / 1000;
     if (extra_tsc > 0) {
         _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&extra_tsc));
+        vm.state_cached = null;
         // A soft stop is a clock reading: it moves with the clock, to where timer_arm would put
         // it now (and does, after a hold point re-arms it: the timeline is the same either way).
         if (vm.soft_tsc != 0) try vm.soft_set(vm.soft_tsc + extra_tsc);
@@ -840,6 +852,7 @@ fn idle_skip(vm: *VM) !Idle {
         if (deadline.tsc > state.tsc) {
             var skipped_tsc = deadline.tsc - state.tsc;
             _ = try kvm.ioctl(vm.vcpu_fd, kvm.DET_ADD_TSC, @intFromPtr(&skipped_tsc));
+            vm.state_cached = null;
             vm.stats.idle_tsc += skipped_tsc;
         }
         if (vm.target_branches != 0) try vm.target_set(0);
