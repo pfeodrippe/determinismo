@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The maze in Rust with determinismo's Rust SDK (feature `coverage`, rustc's trace-pc-guard),
+# the unstripped binary in /symbols: its coverage is source lines, for targeted runs.
+#   determinismo explore ... --compose tests/antithesis-compat/rust/compose.yaml --scenario maze_rust
+# The client's build context is the repository root, as the other compat projects'.
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/rust/client/Dockerfile
+    command: [sleep, infinity]

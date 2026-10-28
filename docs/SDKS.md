@@ -37,7 +37,7 @@ the same capabilities in each, in that language's idiom.
 | setup_complete, event | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Raw output (any JSON object) | `output` | `det_output` | `output` | `output` | `output` | `output` | `output` | `Output` | `Lifecycle.Output` |
 | Quiet periods, faults from the scenario | `stop_faults`, `fault` | ✓ | ✓ | ✓ | ✓ | `stopFaults`, `fault` | ✓ | `StopFaults`, `Fault` | `Lifecycle.StopFaults`, `Lifecycle.Fault` |
-| Code coverage for strategies | trace-pc-guard | trace-pc-guard (source lines with the binary in /symbols) | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`) | none (a Go program built with Antithesis's instrumentor reports lines through libvoidstar) | (not yet) |
+| Code coverage for strategies | trace-pc-guard | trace-pc-guard (source lines with the binary in /symbols) | sys.monitoring | the coverage agent | (Java's) | V8 precise coverage | trace-pc-guard (feature `coverage`; source lines with the binary in /symbols) | none (a Go program built with Antithesis's instrumentor reports lines through libvoidstar) | (not yet) |
 | Outside determinismo: local output file, else stderr | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Outside determinismo (a local run, a unit test), randomness comes from the OS and events go to
@@ -50,7 +50,11 @@ Code coverage, for strategies that keep timelines reaching new code: C and Zig w
 feature `coverage` and `RUSTFLAGS="-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3
 -C llvm-args=-sanitizer-coverage-trace-pc-guard"`, building with `--target <triple>`; Python
 (3.12+) with `coverage_start()`; the JVM with the coverage agent; Node.js with `coverageStart()`.
-Each edge, line or block reports itself once, the first time a process runs it.
+Each edge, line or block reports itself once, the first time a process runs it. Native code
+(C, C++, Rust) whose unstripped binary is in the image's `/symbols` reports the source lines of
+its edges, for targeted runs (`--changed`): keep the debug information (`-g`; for Rust, a
+release profile with `debug = true` and `strip = false`: Cargo strips it by default since 1.77,
+whatever `RUSTFLAGS` ask).
 
 ## Antithesis's SDKs
 

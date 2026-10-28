@@ -2340,12 +2340,21 @@ fn check_lines(context: *Context) !void {
         "--events-dir", sdk_events,
     });
     const sdk_coverage = try run_kept(context, &.{ "grep", "-rlF", "\"name\":\"line /src/client/maze_sdk.c:", sdk_events });
+    // And with the Rust SDK (feature coverage: its trace-pc-guard callbacks in C).
+    const rust_events = try std.fmt.allocPrint(arena, "{s}/lines-rust", .{context.scratch});
+    _ = try explore(context, &.{
+        "--compose",    "tests/antithesis-compat/rust/compose.yaml", "--scenario", "maze_rust",
+        "--seed",       "1",                                         "--branches", "4",
+        "--events-dir", rust_events,
+    });
+    const rust_coverage = try run_kept(context, &.{ "grep", "-rlE", "\"name\":\"line [^\"]*src/main.rs:[0-9]+", rust_events });
     expect_all(context, &.{
         .{ "the C program's coverage is source lines", coverage.stdout.len > 0 },
         .{ "with determinismo's C SDK too", sdk_coverage.stdout.len > 0 },
+        .{ "and its Rust SDK", rust_coverage.stdout.len > 0 },
         .{ "main's first lines ran in every timeline", std.mem.indexOf(u8, report, every) != null },
         .{ "the solved maze's lines never ran", std.mem.indexOf(u8, report, never) != null },
-    }, "lines: C instrumented for Antithesis reports source lines, and a targeted run sees them", .{});
+    }, "lines: C instrumented for Antithesis reports source lines, and a targeted run sees them; so do the C and Rust SDKs' coverage", .{});
     if (std.mem.indexOf(u8, report, every) == null) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
         "changed code", "ran in", "NEVER", "source lines",
     }) catch ""});
