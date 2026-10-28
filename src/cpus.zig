@@ -85,6 +85,9 @@ pub const Pool = struct {
     /// Whether a claim must also find its memory available now (tests of the claims' own
     /// accounting turn it off: beside a hunt, half the host is never available).
     available_counts: bool = true,
+    /// The pool's directory (its CPU, priority and nodes files).
+    directory_buffer: [64]u8 = undefined,
+    directory_size: usize = 0,
 
     /// Opens the pool of the CPUs this process may run on.
     pub fn open(pool: *Pool) !void {
@@ -99,6 +102,8 @@ pub const Pool = struct {
             try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-{d}", .{linux.getuid()}, 0);
         const made = linux.mkdir(directory, 0o700);
         if (linux.errno(made) != .SUCCESS and linux.errno(made) != .EXIST) return error.PoolDirectory;
+        @memcpy(pool.directory_buffer[0..directory.len], directory);
+        pool.directory_size = directory.len;
         errdefer pool.close();
         const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
         const bits = @bitSizeOf(@TypeOf(available[0]));
@@ -233,6 +238,7 @@ pub const Pool = struct {
             var claim: [8]u8 = @splat(0);
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
+        claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
         return fits(claimed, bytes, total, if (pool.available_counts) memory_available() else 0);
     }
 
@@ -432,6 +438,70 @@ test "pinned, a process still counts and pools the CPUs it was given" {
     var mask: linux.cpu_set_t = undefined;
     _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mask);
     try std.testing.expectEqualSlices(usize, &given(), &mask); // Unpinned when given back.
+}
+
+/// What processes hold outside their VMs' claims (a tree explorer's in-run snapshots, the
+/// setup's among them, gigabytes each): `nodes-<pid>` in the pool's directory, its bytes, counted
+/// while its process holds its lock. Unclaimed, they filled a host whose VMs fit their claims
+/// (Dgraph hunts, srv3 2026-10-28: 20 GB of nodes beside 96 GB of VMs).
+var nodes_fd: ?linux.fd_t = null;
+
+/// Sets this process's nodes claim (the bytes of the snapshots it holds).
+pub fn nodes_claim(bytes: u64) void {
+    const fd = nodes_fd orelse opened: {
+        var buffer: [96]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&buffer, "/tmp/determinismo-cpus-{d}/nodes-{d}", .{
+            linux.getuid(), linux.getpid(),
+        }, 0) catch return;
+        const result = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(result) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(result);
+        _ = linux.flock(fd, std.posix.LOCK.EX);
+        nodes_fd = fd;
+        break :opened fd;
+    };
+    const value = std.mem.toBytes(bytes);
+    _ = linux.pwrite(fd, &value, value.len, 0);
+}
+
+/// Every live process's nodes claim, in bytes; a dead process's file is removed.
+fn nodes_claimed(directory: []const u8) u64 {
+    if (directory.len == 0) return 0;
+    var path_buffer: [128]u8 = undefined;
+    const directory_z = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{directory}, 0) catch return 0;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const opened = linux.open(directory_z, flags, 0);
+    if (linux.errno(opened) != .SUCCESS) return 0;
+    const dir: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(dir);
+    var total: u64 = 0;
+    var entries: [8192]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(dir, &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) break;
+        var at: usize = 0;
+        while (at < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
+            at += entry.reclen;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            if (!std.mem.startsWith(u8, name, "nodes-")) continue;
+            const name_z: [*:0]const u8 = @ptrCast(&entry.name);
+            const file = linux.openat(dir, name_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(file) != .SUCCESS) continue;
+            const fd: linux.fd_t = @intCast(file);
+            defer _ = linux.close(fd);
+            if (linux.errno(linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB)) == .SUCCESS) {
+                // Nobody holds it: its process is gone, or has just made it (not locked yet).
+                var proc_buffer: [32]u8 = undefined;
+                const proc = std.fmt.bufPrintSentinel(&proc_buffer, "/proc/{s}", .{name["nodes-".len..]}, 0) catch continue;
+                if (linux.errno(linux.access(proc, std.posix.F_OK)) != .SUCCESS) _ = linux.unlinkat(dir, name_z, 0);
+                continue;
+            }
+            var value: [8]u8 = @splat(0);
+            if (linux.pread(fd, &value, value.len, 0) == value.len) total += std.mem.bytesToValue(u64, &value);
+        }
+    }
+    return total;
 }
 
 /// Whether `bytes` more fit: within the claims (the VMs holding CPUs, each its guest's size) and

@@ -2173,6 +2173,7 @@ fn explore_tree(
         });
         state.next_index += 1;
     }
+    nodes_claim_refresh(&state); // The setup snapshot's, from the start.
     var batch: Batch = .{ .items = try arena.alloc(Summary, size), .scratch = try arena.alloc(Summary, 1) };
     batch.summaries = .{ .items = batch.items };
     if (state.resumed) |resumed| try tree_rejudge(context, vm, options, branches, &state, &batch, resumed);
@@ -2633,7 +2634,32 @@ const TreeState = struct {
     resumed: ?*const Resumed = null,
     /// Timelines killed before they finished (and queued again).
     kills: u32 = 0,
+    /// Returns whose node was not made: the run's nodes held half the host's memory.
+    nodes_skipped: u32 = 0,
+    /// The memory of the snapshots it holds (nodes_claim_refresh).
+    nodes_bytes: u64 = 0,
 };
+
+/// The memory of the snapshots the tree holds (the setup's, and each node with timelines still
+/// to serve), claimed for the host's admission (cpus.nodes_claim): VMs wait while it fills it.
+fn nodes_claim_refresh(state: *TreeState) void {
+    var bytes: u64 = snapshot_bytes(state.setup);
+    var iterator = state.users.keyIterator();
+    while (iterator.next()) |snapshot| {
+        if (snapshot.* != state.setup) bytes += snapshot_bytes(snapshot.*);
+    }
+    state.nodes_bytes = bytes;
+    cpus.nodes_claim(bytes);
+}
+
+/// The memory a snapshot's memfd holds (its pages written, not its size).
+fn snapshot_bytes(snapshot: *const Snapshot) u64 {
+    if (snapshot.memory_fd < 0) return 0;
+    var stat: linux.Statx = undefined;
+    const result = linux.statx(snapshot.memory_fd, "", linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stat);
+    if (linux.errno(result) != .SUCCESS) return 0;
+    return stat.blocks * 512;
+}
 
 /// Killed timelines a run takes before it ends (a host that keeps killing them).
 const kills_max = 64;
@@ -2783,6 +2809,9 @@ fn tree_judge(
     // The nodes are made at once, each replay in a child process (`state.jobs` at a time); then
     // their branches are numbered in the returns' order, as if made one after the other.
     const makings = try arena.alloc(NodeMaking, returns.len);
+    const total = cpus.memory_total();
+    const nodes_cap = if (total == 0) std.math.maxInt(u64) / 2 else (total -| cpus.memory_reserve_bytes) / 2;
+    var nodes_pending: u64 = 0; // The nodes being made, each its VM's size at most.
     var making_count: u32 = 0;
     var finished: u32 = 0;
     var held: u32 = 0;
@@ -2826,6 +2855,15 @@ fn tree_judge(
             held += 1;
             continue;
         };
+        // A node made by a replay holds a copy of its VM's memory, gigabytes, claimed once made
+        // (nodes_claim_refresh): VMs wait while nodes fill memory. Up to half the host's, so
+        // that VMs always have room to serve them; past it, the return is not made (as when
+        // making fails). A holder's node is the holder's memory already.
+        if (state.nodes_bytes + nodes_pending + cpus.claim_bytes > nodes_cap) {
+            state.nodes_skipped += 1;
+            continue;
+        }
+        nodes_pending += cpus.claim_bytes;
         // A strategy's decisions in the parent are in its tape: replayed to the moment.
         const overrides = if (deciding_strategy(exploration)) try tape_overrides(
             context,
@@ -2902,6 +2940,11 @@ fn tree_judge(
     // These timelines served their start snapshots (a snapshot goes with its last timeline;
     // the setup snapshot is everyone's: never freed).
     for (plan.items) |entry| node_served(state, entry.snapshot);
+    nodes_claim_refresh(state);
+    if (state.nodes_skipped > 0) {
+        std.debug.print("[determinismo] {d} returns not made so far: the run's nodes held half " ++
+            "the host's memory\n", .{state.nodes_skipped});
+    }
     // As many planned as judged: the rest start over from the setup snapshot.
     while (state.next_index < state.total and state.queue.items.len - planned_before < done.len) : (state.next_index += 1) {
         try queue_push(arena, state, .{
