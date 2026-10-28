@@ -48,6 +48,9 @@ fn transfers(s: *System.Scenario) void {
   may end the driver phase and kill drivers mid-call, and an operation that applied but was
   noted only after its answer is neither acknowledged nor unknown (an etcd counter came out one
   over in 83 timelines). Invoked without an outcome counts as unknown.
+- A node's disk is the VM's memory (snapshots hold it): size what the system writes and keeps
+  for long timelines (preallocated segments, retention, log files), or OOM kills end them
+  (YugabyteDB's 64 MB WAL segments, preallocated per tablet: `--log_segment_size_mb 4`).
 
 ## Assertions in the service
 
