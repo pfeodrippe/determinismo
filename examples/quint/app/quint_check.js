@@ -252,12 +252,15 @@ async function checkSimulate() {
     const internal = internalError(run.stdout + run.stderr);
     det.always(internal === null, "a simulation never fails with an internal error", { spec: spec.file, backend, internal });
   }
-  det.always(first.code === second.code && stable(first.stdout) === stable(second.stdout),
-    "a simulation is the same for the same seed", {
-      spec: spec.file, backend, seed,
-      first: { code: first.code, stdout: first.stdout.slice(0, 1500) },
-      second: { code: second.code, stdout: second.stdout.slice(0, 1500) },
-    });
+  const [a, b] = [stable(first.stdout), stable(second.stdout)];
+  let at = 0; // Where the two outputs part: each shown around it.
+  while (at < a.length && at < b.length && a[at] === b[at]) at++;
+  const around = (text) => text.slice(Math.max(0, at - 300), at + 700);
+  det.always(first.code === second.code && a === b, "a simulation is the same for the same seed", {
+    spec: spec.file, backend, seed, command: ["quint", ...args].join(" "), differ_at: at,
+    first: { code: first.code, length: a.length, around: around(a), stderr: first.stderr.slice(-500) },
+    second: { code: second.code, length: b.length, around: around(b), stderr: second.stderr.slice(-500) },
+  });
   det.sometimes(first.code === 0, "a simulation finds no violation", { backend });
   det.sometimes(first.code === 1, "a simulation reports something", { backend });
 }

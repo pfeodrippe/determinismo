@@ -50,3 +50,15 @@ Smaller: the Rust evaluator's `replaceAt` error says `Out of bounds, replaceAt($
 template never filled in), and `slice(1, -1)`'s error shows the -1 as 18446744073709551615.
 `range(i, j)` with `i > j` differs between the backends (`[3, 2]` and `[]`), but builtin.qnt says
 it is undefined, so the generator never asks.
+
+## Found blind
+
+- **`quint run`'s output loses its end on a pipe** (known: quint-co/quint#2036, open).
+  "a simulation is the same for the same seed" failed in timeline 9 of the first `simulate`
+  exploration (srv3 run 32, seed 2: 1 of 14 timelines): two runs of
+  `quint run --backend typescript --seed=7948780212723771334 --max-samples=41 --max-steps=18
+  cryptography/utxo/utxo.qnt` printed different outputs, both with status 0. Replayed with
+  `runs exec 32 9 --until ... --rewind-ms 5000` for the command, then outside determinismo: one
+  of five runs on the host lost its last 273 bytes (the `[ok]` line, the statistics and the seed
+  to reproduce with). `outputResult` (cliCommands.ts) calls `process.exit` right after
+  `console.log`, and Node writes to a pipe asynchronously: what is still queued is dropped.
