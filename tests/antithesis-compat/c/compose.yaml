@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The maze in C, built as Antithesis builds C (clang's trace-pc-guard, libvoidstar, /symbols):
+# its coverage is source lines, for targeted runs (--changed) and strategies.
+#   determinismo explore ... --compose tests/antithesis-compat/c/compose.yaml --scenario maze
+# The client's build context is the repository root, as the other compat projects'.
+services:
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis-compat/c/client/Dockerfile
+    command: [sleep, infinity]

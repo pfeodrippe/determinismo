@@ -149,7 +149,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "ui", check_ui },                         .{ "runs", check_runs },
         .{ "kubernetes", check_kubernetes },         .{ "steps", check_steps },
         .{ "ending", check_ending },                 .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },
+        .{ "dotnet", check_dotnet },                 .{ "lines", check_lines },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -2260,6 +2260,32 @@ fn check_changed_commit(context: *Context, file: []const u8) !void {
         .{ "lines 23-24 ran in every timeline", std.mem.indexOf(u8, report, both) != null },
         .{ "line 17 is one of them", std.mem.indexOf(u8, report, first) != null },
     }, "changed: a targeted run by a commit of a repository fetched by its URL", .{});
+}
+
+/// C built as Antithesis builds it (clang's trace-pc-guard, linked against libvoidstar, the binary
+/// in /symbols): its edges are reported as source lines (a table of its DWARF the host made when
+/// preparing the image), so a targeted run sees which of a diff's lines ran.
+fn check_lines(context: *Context) !void {
+    const arena = context.arena;
+    const events = try std.fmt.allocPrint(arena, "{s}/lines", .{context.scratch});
+    const report = try explore(context, &.{
+        "--compose",  "tests/antithesis-compat/c/compose.yaml", "--scenario",   "maze",
+        "--seed",     "1",                                      "--branches",   "16",
+        "--changed",  "tests/changed/c-maze.diff",              "--events-dir", events,
+        "--pipeline", "1",
+    });
+    const file = "tests/antithesis-compat/c/client/maze.c";
+    const every = try std.fmt.allocPrint(arena, "ran in   16/16 timelines  {s}:13-15", .{file});
+    const never = try std.fmt.allocPrint(arena, "NEVER RAN  {s}:22-23", .{file});
+    const coverage = try run_kept(context, &.{ "grep", "-rlF", "\"name\":\"line /src/client/maze.c:", events });
+    expect_all(context, &.{
+        .{ "the C program's coverage is source lines", coverage.stdout.len > 0 },
+        .{ "main's first lines ran in every timeline", std.mem.indexOf(u8, report, every) != null },
+        .{ "the solved maze's lines never ran", std.mem.indexOf(u8, report, never) != null },
+    }, "lines: C instrumented for Antithesis reports source lines, and a targeted run sees them", .{});
+    if (std.mem.indexOf(u8, report, every) == null) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
+        "changed code", "ran in", "NEVER", "source lines",
+    }) catch ""});
 }
 
 /// libvoidstar.so, Antithesis's native library, in a node: Python (musl) loads it with ctypes,

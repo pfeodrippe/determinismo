@@ -73,7 +73,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   there (`det-nodes list`); a crash's core dump is
   kept (`core_dump` event) for `extract --file runner:/run/det/cores/...` and gdb.
 - **Coverage-guided exploration**: strategies see behavior (events, with the process behind each
-  event and decision) and code coverage (C and Zig edges, Python and JVM lines); `mutate` keeps
+  event and decision) and code coverage (Python, JVM and Go lines; C, C++ and Rust built for Antithesis as lines when
+  their symbols are in /symbols, else edges; Zig edges); `mutate` keeps
   timelines that reach something new and changes the decisions of the process that got there
   (it solves a 1-in-10000 maze in about 100 branches, in Python or Java under faults in about
   200), and parallel workers share one corpus.

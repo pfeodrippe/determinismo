@@ -14,6 +14,7 @@ const assert = std.debug.assert;
 const schema = @import("determinismo").schema;
 const compose = @import("compose.zig");
 const kubernetes = @import("kubernetes.zig");
+const source_lines = @import("lines.zig");
 
 pub const Options = struct {
     /// The test program (its `--describe`), or else a Compose file whose services become the
@@ -317,7 +318,8 @@ fn image_disk(
         .{id},
     ) });
     const tests = try std.fmt.allocPrint(context.arena, "{s}.tests", .{disk});
-    if (exists(context, disk) and exists(context, tests)) return disk;
+    const lines_note = try std.fmt.allocPrint(context.arena, "{s}.lines-{d}", .{ disk, source_lines.format_version });
+    if (exists(context, disk) and exists(context, tests) and exists(context, lines_note)) return disk;
     std.debug.print("[determinismo] flattening {s} into {s}\n", .{ reference, disk });
     const container = std.mem.trim(u8, try tool(context, &.{
         "podman", "create", "--quiet", reference,
@@ -332,8 +334,61 @@ fn image_disk(
         .sub_path = tests,
         .data = try executables_of(context.arena, listing),
     });
+    // Source lines of its instrumented native code, in the image (a disk made before lacks them).
+    const made = try symbol_lines(context, tar, listing, disk);
+    if (made > 0 and exists(context, disk)) try std.Io.Dir.cwd().deleteFile(context.io, disk);
     if (!exists(context, disk)) try erofs_build(context, disk, &.{ "--tar=f", tar });
+    try std.Io.Dir.cwd().writeFile(context.io, .{
+        .sub_path = lines_note,
+        .data = try std.fmt.allocPrint(context.arena, "{d}\n", .{made}),
+    });
     return disk;
+}
+
+/// Tables of source lines (lines.zig) of the image's ELF files under /symbols, Antithesis's place
+/// for the symbols of instrumented code, appended to its export: how many were made.
+fn symbol_lines(context: Context, tar: []const u8, listing: []const u8, disk: []const u8) !usize {
+    var members: std.ArrayList([]const u8) = .empty;
+    var rows = std.mem.tokenizeScalar(u8, listing, '\n');
+    while (rows.next()) |row| {
+        if (row.len < 10 or row[0] != '-') continue; // Regular files.
+        var fields = std.mem.tokenizeScalar(u8, row, ' ');
+        for (0..5) |_| _ = fields.next();
+        const member = fields.rest();
+        const path = std.mem.trimStart(u8, member, "./");
+        if (!std.mem.startsWith(u8, path, "symbols/")) continue;
+        if (std.mem.startsWith(u8, path, source_lines.tables_directory ++ "/")) continue;
+        try members.append(context.arena, member);
+    }
+    if (members.items.len == 0) return 0;
+    const cwd = std.Io.Dir.cwd();
+    const staging = try std.fmt.allocPrint(context.arena, "{s}.symbols", .{disk});
+    cwd.deleteTree(context.io, staging) catch {};
+    defer cwd.deleteTree(context.io, staging) catch {};
+    const tables = try path_join(context, &.{ staging, source_lines.tables_directory });
+    try cwd.createDirPath(context.io, tables);
+    var extract: std.ArrayList([]const u8) = .empty;
+    try extract.appendSlice(context.arena, &.{ "tar", "-xf", tar, "-C", staging });
+    try extract.appendSlice(context.arena, members.items);
+    _ = try tool(context, extract.items);
+    var made: usize = 0;
+    for (members.items) |member| {
+        var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const path = try path_join(context, &.{ staging, member });
+        const gpa = std.heap.smp_allocator;
+        const table = (source_lines.of(gpa, scratch.allocator(), context.io, path) catch null) orelse continue;
+        try cwd.writeFile(context.io, .{
+            .sub_path = try path_join(context, &.{ tables, table.name }),
+            .data = table.bytes,
+        });
+        std.debug.print("[determinismo] source lines of /{s}: {d} bytes\n", .{
+            std.mem.trimStart(u8, member, "./"), table.bytes.len,
+        });
+        made += 1;
+    }
+    if (made > 0) _ = try tool(context, &.{ "tar", "-rf", tar, "-C", staging, source_lines.tables_directory });
+    return made;
 }
 
 /// The names of the program's (or Compose file's) profiles.

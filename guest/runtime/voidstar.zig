@@ -14,8 +14,10 @@
 //!                                a "coverage" event, as a source line when the module's symbol
 //!                                table (/symbols/<name>) says
 //!   __sanitizer_cov_trace_pc_guard[_init]
-//!                                clang's trace-pc-guard callbacks (C and C++ built for Antithesis
-//!                                link against this library): an "edge <n>" event per edge
+//!                                clang's trace-pc-guard callbacks (C, C++ and Rust built for
+//!                                Antithesis link against this library): each edge's source line
+//!                                ("line <file>:<n>") when the image's /symbols has the module's
+//!                                DWARF (a table the host made: src/lines.zig), else "edge <n>"
 //!
 //! It runs inside the system's processes, whatever their libc: no libc, system calls only, and
 //! it never stops a program (an event that cannot be written is dropped).
@@ -233,10 +235,20 @@ export fn __sanitizer_cov_trace_pc_guard_init(start: [*]u32, stop: [*]u32) void 
     for (start[0..count], 0..) |*guard, index| guard.* = first + @as(u32, @intCast(index));
 }
 
-/// Each edge once (its guard then 0), as the C SDK's.
+/// Each edge once (its guard then 0), as the C SDK's: as the source line its call is on, when
+/// known.
 export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
     const edge = @atomicRmw(u32, guard, .Xchg, 0, .monotonic);
     if (edge == 0) return;
+    if (native_place(@returnAddress())) |place| {
+        var line_buffer: [512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&line_buffer);
+        writer.writeAll("{\"event\":\"coverage\",\"details\":{\"name\":\"line ") catch return;
+        json_escaped(&writer, place.file) catch return;
+        writer.print(":{d}\"}}}}", .{place.line}) catch return;
+        emit(writer.buffered());
+        return;
+    }
     var buffer: [80]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
@@ -244,4 +256,268 @@ export fn __sanitizer_cov_trace_pc_guard(guard: *u32) void {
         .{edge},
     ) catch return;
     emit(message);
+}
+
+// Source lines of native modules (trace-pc-guard) ---------------------------------------------
+
+/// A table's format: src/lines.zig's.
+const lines_magic = "DETLINES";
+const lines_directory = "/symbols/.determinismo/";
+const LinesRow = extern struct { address: u64, line: u32, file: u32 };
+const natives_max = 256;
+
+/// One mapped file of the process (or an anonymous range: no table), and its table of lines.
+const Native = struct {
+    low: usize,
+    high: usize,
+    /// Its load address less its ELF addresses: the table's address of a code address.
+    bias: usize = 0,
+    rows: []align(1) const LinesRow = &.{},
+    strings: []const u8 = "",
+
+    fn place(native: *const Native, pc: usize) ?Place {
+        if (native.rows.len == 0 or pc <= native.bias) return null;
+        const address: u64 = pc - native.bias - 1; // The call, not the return address.
+        var low: usize = 0;
+        var high: usize = native.rows.len;
+        while (low < high) { // The last row at or before the address.
+            const middle = low + (high - low) / 2;
+            if (native.rows[middle].address <= address) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        const found = native.rows[low - 1];
+        if (found.line == 0) return null; // Past a sequence's end: no line.
+        if (found.file >= native.strings.len) return null;
+        const file = std.mem.sliceTo(native.strings[found.file..], 0);
+        return .{ .file = file, .line = found.line };
+    }
+};
+
+const Place = struct { file: []const u8, line: u32 };
+
+var natives: [natives_max]Native = undefined;
+var native_count = std.atomic.Value(u32).init(0);
+var natives_lock = std.atomic.Value(bool).init(false);
+
+/// The source line of a code address, if its module has a table.
+fn native_place(pc: usize) ?Place {
+    if (find_native(native_count.load(.acquire), pc)) |native| return native.place(pc);
+    // A module not seen yet: one thread reads the process's maps. A lock held too long (by a
+    // thread a fork left behind) is not waited for: the edge stays a number.
+    var spins: u32 = 0;
+    while (natives_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        spins += 1;
+        if (spins == 1 << 22) return null;
+        std.atomic.spinLoopHint();
+    }
+    defer natives_lock.store(false, .release);
+    const count = native_count.load(.acquire);
+    if (find_native(count, pc)) |native| return native.place(pc);
+    if (count == natives_max) return null;
+    natives[count] = native_load(pc) orelse return null;
+    native_count.store(count + 1, .release);
+    return natives[count].place(pc);
+}
+
+fn find_native(count: u32, pc: usize) ?*const Native {
+    for (natives[0..count]) |*native| {
+        if (pc >= native.low and pc < native.high) return native;
+    }
+    return null;
+}
+
+/// The mapped file holding `pc`: its range, load bias and table (none for an anonymous range).
+fn native_load(pc: usize) ?Native {
+    var path_buffer: [256]u8 = undefined;
+    var path: []const u8 = "";
+    var native: Native = .{ .low = 0, .high = 0 };
+    var maps = Maps.open() orelse return null;
+    while (maps.next()) |mapping| {
+        if (pc < mapping.start or pc >= mapping.end) continue;
+        native = .{ .low = mapping.start, .high = mapping.end };
+        if (mapping.path.len == 0 or mapping.path[0] != '/' or mapping.path.len > path_buffer.len) break;
+        @memcpy(path_buffer[0..mapping.path.len], mapping.path);
+        path = path_buffer[0..mapping.path.len];
+        break;
+    }
+    maps.close();
+    if (native.high == 0) return null;
+    if (path.len == 0) return native; // Anonymous (JIT) code: remembered, so not looked up again.
+    // All of the file's mappings, and the one with its start (its ELF header).
+    var header: ?usize = null;
+    maps = Maps.open() orelse return native;
+    while (maps.next()) |mapping| {
+        if (!std.mem.eql(u8, mapping.path, path)) continue;
+        native.low = @min(native.low, mapping.start);
+        native.high = @max(native.high, mapping.end);
+        if (mapping.offset == 0 and header == null) header = mapping.start;
+    }
+    maps.close();
+    const start = header orelse return native;
+    const elf = elf_of(start, native) orelse return native;
+    native.bias = elf.bias;
+    var name_buffer: [128]u8 = undefined;
+    const name = if (elf.build_id.len > 0 and elf.build_id.len * 2 <= name_buffer.len)
+        std.fmt.bufPrint(&name_buffer, "{x}", .{elf.build_id}) catch return native
+    else
+        std.fmt.bufPrint(&name_buffer, "name-{s}", .{std.fs.path.basename(path)}) catch return native;
+    lines_table_load(&native, name);
+    return native;
+}
+
+const Elf = struct { bias: usize, build_id: []const u8 };
+
+/// The ELF header at `start` (a module's first mapping): its load bias and GNU build ID.
+fn elf_of(start: usize, native: Native) ?Elf {
+    const header_size = @sizeOf(std.elf.Elf64_Ehdr);
+    if (start + header_size > native.high) return null;
+    const bytes: [*]const u8 = @ptrFromInt(start);
+    if (!std.mem.eql(u8, bytes[0..4], std.elf.MAGIC)) return null;
+    if (bytes[std.elf.EI.CLASS] != std.elf.ELFCLASS64) return null;
+    const header = std.mem.bytesToValue(std.elf.Elf64_Ehdr, bytes[0..header_size]);
+    const entry_size = @sizeOf(std.elf.Elf64.Phdr);
+    const headers_end = start + header.e_phoff + header.e_phnum * entry_size;
+    if (header.e_phentsize != entry_size or headers_end > native.high) return null;
+    var bias: usize = 0;
+    if (header.e_type == .DYN) {
+        // A position-independent module: loaded where its first segment's page landed.
+        var lowest: u64 = std.math.maxInt(u64);
+        for (0..header.e_phnum) |index| {
+            const at = start + header.e_phoff + index * entry_size;
+            const segment = std.mem.bytesToValue(std.elf.Elf64.Phdr, @as([*]const u8, @ptrFromInt(at))[0..entry_size]);
+            if (segment.type == .LOAD) lowest = @min(lowest, segment.vaddr);
+        }
+        if (lowest == std.math.maxInt(u64)) return null;
+        bias = start -% std.mem.alignBackward(u64, lowest, std.heap.page_size_min);
+    }
+    var build_id: []const u8 = "";
+    for (0..header.e_phnum) |index| {
+        const at = start + header.e_phoff + index * entry_size;
+        const segment = std.mem.bytesToValue(std.elf.Elf64.Phdr, @as([*]const u8, @ptrFromInt(at))[0..entry_size]);
+        if (segment.type != .NOTE) continue;
+        const notes_start = bias +% segment.vaddr;
+        if (notes_start < native.low or notes_start + segment.filesz > native.high) continue;
+        const notes = @as([*]const u8, @ptrFromInt(notes_start))[0..segment.filesz];
+        if (note_build_id(notes)) |id| {
+            build_id = id;
+            break;
+        }
+    }
+    return .{ .bias = bias, .build_id = build_id };
+}
+
+/// NT_GNU_BUILD_ID's bytes among notes (src/lines.zig's note_build_id).
+fn note_build_id(notes: []const u8) ?[]const u8 {
+    var at: usize = 0;
+    while (at + 12 <= notes.len) {
+        const name_size = std.mem.readInt(u32, notes[at..][0..4], .little);
+        const description_size = std.mem.readInt(u32, notes[at + 4 ..][0..4], .little);
+        const kind = std.mem.readInt(u32, notes[at + 8 ..][0..4], .little);
+        const name_start = at + 12;
+        const description_start = name_start + std.mem.alignForward(usize, name_size, 4);
+        if (description_start + description_size > notes.len) return null;
+        if (kind == std.elf.NT_GNU_BUILD_ID and std.mem.eql(u8, notes[name_start..][0..name_size], "GNU\x00")) {
+            return notes[description_start..][0..description_size];
+        }
+        at = description_start + std.mem.alignForward(usize, description_size, 4);
+    }
+    return null;
+}
+
+/// Maps the module's table of lines, if the image has one.
+fn lines_table_load(native: *Native, name: []const u8) void {
+    var path_buffer: [256]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, lines_directory ++ "{s}", .{name}, 0) catch return;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    const file_end = linux.lseek(@intCast(fd), 0, linux.SEEK.END);
+    if (linux.errno(file_end) != .SUCCESS) return;
+    const size: usize = file_end;
+    const head = lines_magic.len + 8;
+    if (size < head) return;
+    const table = map(size, @intCast(fd)) orelse return;
+    if (!std.mem.eql(u8, table[0..lines_magic.len], lines_magic)) return;
+    const count = std.mem.readInt(u64, table[lines_magic.len..][0..8], .little);
+    if (count > (size - head) / @sizeOf(LinesRow)) return;
+    const rows_end = head + count * @sizeOf(LinesRow);
+    native.rows = std.mem.bytesAsSlice(LinesRow, table[head..rows_end]);
+    native.strings = table[rows_end..];
+}
+
+/// The process's mappings (/proc/self/maps), one at a time: a mapping's path is valid until
+/// the next.
+const Maps = struct {
+    fd: linux.fd_t,
+    buffer: [4096]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+
+    const Mapping = struct { start: usize, end: usize, offset: u64, path: []const u8 };
+
+    fn open() ?Maps {
+        const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) return null;
+        return .{ .fd = @intCast(fd) };
+    }
+
+    fn close(maps: *Maps) void {
+        _ = linux.close(maps.fd);
+    }
+
+    fn next(maps: *Maps) ?Mapping {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, maps.buffer[maps.start..maps.end], '\n')) |size| {
+                const line = maps.buffer[maps.start..][0..size];
+                maps.start += size + 1;
+                if (parse(line)) |mapping| return mapping;
+                continue;
+            }
+            const rest = maps.end - maps.start;
+            std.mem.copyForwards(u8, maps.buffer[0..rest], maps.buffer[maps.start..maps.end]);
+            maps.start = 0;
+            maps.end = if (rest == maps.buffer.len) 0 else rest; // A line too long: dropped.
+            const result = linux.read(maps.fd, maps.buffer[maps.end..].ptr, maps.buffer.len - maps.end);
+            if (linux.errno(result) != .SUCCESS or result == 0) return null;
+            maps.end += result;
+        }
+    }
+
+    /// "start-end perms offset device inode   path".
+    fn parse(line: []const u8) ?Mapping {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const range = fields.next() orelse return null;
+        _ = fields.next() orelse return null; // Permissions.
+        const offset_text = fields.next() orelse return null;
+        _ = fields.next() orelse return null; // Device.
+        _ = fields.next() orelse return null; // Inode.
+        const path = std.mem.trim(u8, fields.rest(), " ");
+        const dash = std.mem.indexOfScalar(u8, range, '-') orelse return null;
+        return .{
+            .start = std.fmt.parseInt(usize, range[0..dash], 16) catch return null,
+            .end = std.fmt.parseInt(usize, range[dash + 1 ..], 16) catch return null,
+            .offset = std.fmt.parseInt(u64, offset_text, 16) catch return null,
+            .path = path,
+        };
+    }
+};
+
+test "Maps.parse" {
+    const mapping = Maps.parse("7f0000001000-7f0000003000 r-xp 00001000 08:01 1234   /usr/lib/x.so").?;
+    try std.testing.expectEqual(@as(usize, 0x7f0000001000), mapping.start);
+    try std.testing.expectEqual(@as(u64, 0x1000), mapping.offset);
+    try std.testing.expectEqualStrings("/usr/lib/x.so", mapping.path);
+    try std.testing.expectEqualStrings("", Maps.parse("7f0000001000-7f0000003000 rw-p 00000000 00:00 0").?.path);
+}
+
+test "Native.place" {
+    const rows = [_]LinesRow{
+        .{ .address = 0x1000, .line = 10, .file = 0 },
+        .{ .address = 0x1010, .line = 12, .file = 0 },
+    };
+    const native: Native = .{ .low = 0, .high = 1 << 40, .bias = 0x7f0000000000, .rows = &rows, .strings = "/src/maze.c\x00" };
+    try std.testing.expectEqual(@as(u32, 10), native.place(0x7f0000001005).?.line);
+    try std.testing.expectEqual(@as(u32, 12), native.place(0x7f0000001011).?.line);
+    try std.testing.expectEqualStrings("/src/maze.c", native.place(0x7f0000001011).?.file);
+    try std.testing.expectEqual(@as(?Place, null), native.place(0x7f0000000fff));
 }

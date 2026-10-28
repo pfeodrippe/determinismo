@@ -490,7 +490,8 @@ places, and assertions carry no location.
    `changed`); by commit, range or release of the system's repository, local or fetched by its
    URL (`--changed-repository`, 2026-10-28; the UI's New run form). Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
    no timeline reaches yet, faults aimed around it, and which properties the timelines that ran
-   it checked; C and Zig edges mapped back to lines.
+   it checked; our C and Zig SDKs' edges mapped back to lines (code built for Antithesis, C, C++
+   and Rust through libvoidstar and /symbols, reports lines since 2026-10-28: e2e `lines`).
 4. **More languages.** Rust (an SDK crate over the C ABI, LLVM's coverage for edges), Go (an
    SDK of our own; Antithesis's Go SDK and instrumentor already work, through libvoidstar),
    JavaScript (an SDK; V8's coverage).

@@ -4287,6 +4287,7 @@ test {
     _ = @import("causality.zig");
     _ = @import("mutate.zig");
     _ = @import("changed.zig");
+    _ = @import("lines.zig");
     _ = @import("extract.zig");
     _ = @import("event_sets.zig");
     _ = @import("profile.zig");

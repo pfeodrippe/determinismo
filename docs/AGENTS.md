@@ -115,7 +115,8 @@ use them in other repositories.
 - Verbose systems: `explore --retroactive 'Applied block'` leaves such output lines out of the
   events (queries stay fast); replay a timeline (`--branch`, its tape) to see them.
 - Targeted runs: `explore --changed <diff file | git range>` aims the tree at a change's lines
-  (line coverage: Python, the JVM, Go built with Antithesis's instrumentor) and reports which
+  (line coverage: Python, the JVM, Go built with Antithesis's instrumentor, and C, C++ or Rust
+  built for Antithesis with the binary in the image's /symbols) and reports which
   hunks ran in how many timelines and which never did (`{"changed":...}` in the record). With
   `--changed-repository <directory | URL>` the range is in the system's repository: a commit
   alone is that commit's change, `a..b` a range, `v1.6.0..v1.7.0` a release.

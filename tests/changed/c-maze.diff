@@ -1,0 +1,17 @@
+A change to the C maze, for the e2e "lines" check: hunks of the new file, matched to the source
+lines libvoidstar reports for its trace-pc-guard edges. The first runs in every timeline, the
+second only where the maze is solved (never, in a run this short).
+--- a/tests/antithesis-compat/c/client/maze.c
++++ b/tests/antithesis-compat/c/client/maze.c
+@@ -13,3 +13,3 @@
+-int main() {
+-    int found = 0;
+-    if (digit() == 7) {
++int main(void) {
++    unsigned found = 0;
++    if (digit() == 7) {
+@@ -22,2 +22,2 @@
+-                    puts("solved");
+-                    return 2;
++                    puts("maze: solved");
++                    return 1;
