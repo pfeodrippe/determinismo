@@ -262,11 +262,13 @@ const timelinesKept = new Map(); // Run id -> its timelines, by index.
 // (120 ms from a laptop to a server across an ocean), and in turn they added up to seconds.
 async function runFetch(id) {
   let kept = timelinesKept.get(id);
-  const [info, properties, fetched, discovery, failures] = await Promise.all([
+  // Not the failures: the tree's alone, fetched by it when timelines finished since (a long
+  // running run's take seconds of its database each time it changes).
+  const [info, properties, fetched, discovery] = await Promise.all([
     apiJson(`/runs/${id}`), apiJson(`/runs/${id}/properties`),
     apiJson(kept ? `/runs/${id}/timelines?offset=${kept.length}` : `/runs/${id}/timelines`),
-    apiJson(`/runs/${id}/discovery`).catch(() => null),
-    api(`/runs/${id}/failures`).then(lines).catch(() => null)]);
+    apiJson(`/runs/${id}/discovery`).catch(() => null)]);
+  const failures = null;
   const total = info.stats && info.stats.timelines;
   if (!kept) kept = fetched;
   // Fewer than kept: the run's database was made again; all of them anew.

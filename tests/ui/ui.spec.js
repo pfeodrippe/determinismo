@@ -49,10 +49,12 @@ test("a failing property's causality analysis, to its end, and again after a rel
   // Every point drawn, with its interval.
   await expect(result.locator("circle")).toHaveCount(latest.points.length);
   await expect(result.locator("polygon")).toHaveCount(1);
-  // A point opens the logs up to its moment.
+  // A point opens the logs up to its moment, in the Logs explorer.
   await result.locator("circle").first().click();
+  await expect(page).toHaveURL(/#1\/explorer$/);
   await expect(page.locator("#logs .summary")).toContainText(`branch ${branch}`);
-  // After a reload the analysis is there, without another.
+  // After a reload of the report the analysis is there, without another.
+  await page.goto("/#1");
   await page.reload();
   const again = await propertyOpen(page);
   await expect(again.locator(".causality-result circle")).toHaveCount(latest.points.length);
@@ -61,8 +63,40 @@ test("a failing property's causality analysis, to its end, and again after a rel
 });
 
 test("the map marks the run's failures", async ({ page }) => {
-  await page.goto("/#1");
+  await page.goto("/#1/explorer");
   await expect(page.locator("#map-body circle.mark").first()).toBeVisible();
+});
+
+test("a run's views are pages of their own, each drawing only itself", async ({ page }) => {
+  await page.goto("/#1");
+  await expect(page.locator("section#properties")).toBeVisible();
+  await expect(page.locator("section#map")).toHaveCount(0);
+  await page.locator('.view-tabs button[data-view="explorer"]').click();
+  await expect(page).toHaveURL(/#1\/explorer$/);
+  await expect(page.locator("section#map")).toBeVisible();
+  await expect(page.locator("section#properties")).toHaveCount(0);
+  await page.locator('.view-tabs button[data-view="output"]').click();
+  await expect(page).toHaveURL(/#1\/output$/);
+  await expect(page.locator("#output-body")).toContainText("[determinismo]");
+  // A view's URL opens it.
+  await page.goto("/#2/explorer");
+  await expect(page.locator("#main h2")).toContainText("Run 2");
+  await expect(page.locator("section#map")).toBeVisible();
+});
+
+test("the tree's timelines: a row's tooltip under the pointer, its logs on a click", async ({ page }) => {
+  await page.goto("/#1/explorer");
+  const tree = page.locator("#map-body .tree");
+  await expect(tree.locator("svg")).toBeVisible();
+  // The timelines are a few paths, not an element each.
+  expect(await tree.locator("svg path").count()).toBeLessThan(50);
+  const box = await tree.boundingBox();
+  // The first row, near the right of the plot (inside every timeline's line).
+  const y = box.y + 34 + 3;
+  await page.mouse.move(box.x + box.width * 0.6, y);
+  await expect(page.locator("#tip")).toContainText("Timeline #");
+  await page.mouse.click(box.x + box.width * 0.6, y);
+  await expect(page.locator("#logs .summary")).toContainText("branch");
 });
 
 test("a running run's page asks only for the timelines it does not have", async ({ page }) => {

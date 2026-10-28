@@ -962,9 +962,15 @@ fn check_ui(context: *Context) !void {
         .stderr_limit = .limited(16 << 20),
     });
     const passed = result.term.success();
-    expect(context, passed, "ui: the run page in a browser (Playwright): runs by URL, a " ++
-        "causality analysis from the page to its end, the map's failures, a running run's " ++
-        "refreshes, a run stopped and resumed from its page", .{});
+    // Playwright's summary ("8 passed (6.2m)"): how many tests ran.
+    const summary = if (std.mem.indexOf(u8, result.stdout, " passed (")) |at| blk: {
+        const start = (std.mem.lastIndexOfScalar(u8, result.stdout[0..at], '\n') orelse 0);
+        const end = std.mem.indexOfScalarPos(u8, result.stdout, at, '\n') orelse result.stdout.len;
+        break :blk std.mem.trim(u8, result.stdout[start..end], " \n");
+    } else "no summary";
+    expect(context, passed, "ui: the run page in a browser (Playwright, {s}): runs and their views by " ++
+        "URL, a causality analysis from the page to its end, the map's failures, the tree's rows " ++
+        "under the pointer, a running run's refreshes, a run stopped and resumed from its page", .{summary});
     if (!passed) std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
 }
 
