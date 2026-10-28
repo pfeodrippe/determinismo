@@ -264,9 +264,13 @@ async function runFetch(id) {
   let kept = timelinesKept.get(id);
   // Not the failures: the tree's alone, fetched by it when timelines finished since (a long
   // running run's take seconds of its database each time it changes).
+  // A run whose events cannot be read (its --events-dir deleted, or another run's since) still
+  // opens, saying so, instead of loading forever.
+  let eventsError = null;
+  const events = (promise, empty) => promise.catch((error) => { eventsError = eventsError || error.message; return empty; });
   const [info, properties, fetched, discovery] = await Promise.all([
-    apiJson(`/runs/${id}`), apiJson(`/runs/${id}/properties`),
-    apiJson(kept ? `/runs/${id}/timelines?offset=${kept.length}` : `/runs/${id}/timelines`),
+    apiJson(`/runs/${id}`), events(apiJson(`/runs/${id}/properties`), []),
+    events(apiJson(kept ? `/runs/${id}/timelines?offset=${kept.length}` : `/runs/${id}/timelines`), []),
     apiJson(`/runs/${id}/discovery`).catch(() => null)]);
   const failures = null;
   const total = info.stats && info.stats.timelines;
@@ -275,7 +279,7 @@ async function runFetch(id) {
   else if (total != null && kept.length > total) kept = await apiJson(`/runs/${id}/timelines`);
   else if (fetched.length) kept = kept.concat(fetched).sort((a, b) => a.index - b.index);
   timelinesKept.set(id, kept);
-  return { ...info, branches: kept, properties, discovery, failures };
+  return { ...info, branches: kept, properties, discovery, failures, eventsError };
 }
 // Runs forked from moments of others, kept once they ended: subtrees in the tree.
 const details = new Map();
@@ -436,6 +440,7 @@ function statsHtml() {
   if (each) notes.push(`${duration(each)} a timeline`);
   // Running now, from the explorer's own status (a tree's).
   if (run.state === "running" && run.progress) notes.push(`<b>${run.progress.running.length} running</b>`);
+  if (run.eventsError) notes.push(`<span class="fail-text" title="${escape(run.eventsError)}">its events could not be read (hover for why)</span>`);
   return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), notes.join(" · "))}
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
@@ -629,6 +634,18 @@ function environmentBody() {
       <td>${escape(faults(node))}</td></tr>`).join("")}</table>`;
 }
 
+// How busy a tree's workers were: timelines running at once on average, of how many, and how
+// long their VMs waited for the host's memory (the explorer's status while it runs, its summary
+// after). A hunt whose CPUs sit idle says so here.
+function atOnce(run) {
+  const live = run.state === "running" ? run.progress : null;
+  const known = live && live.workers ? { workers: live.workers, at_once: live.at_once, memory_s: live.memory_wait_s }
+    : run.summary && run.summary.workers ? { workers: run.summary.workers, at_once: run.summary.at_once, memory_s: (run.summary.memory_wait_ns || 0) / 1e9 }
+    : null;
+  if (!known) return "–";
+  const share = Math.round(100 * known.at_once / known.workers);
+  return `${known.at_once.toFixed(1)} of ${known.workers} workers (${share}%)` + (known.memory_s >= 1 ? ` · VMs waited ${Math.round(known.memory_s)} s for memory` : "");
+}
 function utilizationSummary() {
   const vtime = state.run.branches.reduce((sum, branch) => sum + branch.vtime_ns, 0);
   return `${(vtime / 1e9).toFixed(1)} virtual seconds explored`;
@@ -643,6 +660,7 @@ function utilizationBody() {
     ["Branches", `${run.branches.length} of ${(run.run || {}).branches || "?"}`],
     ["Virtual time", seconds(vtime)],
     ["Wall time", seconds(wall)],
+    ["Timelines at once", atOnce(run)],
     ["Virtual per wall (one core)", run.summary && run.summary.vtime_per_wall
       ? run.summary.vtime_per_wall.toFixed(2) + "×" : "–"],
     ["Exact stops", run.summary ? `largest skid ${run.summary.skid_max} branches, ${run.summary.overshoots} overshoots` : "–"],
@@ -694,7 +712,7 @@ const builtin = new Set(["test commands exit successfully", "no unexpected conta
   "peak memory usage stays under 95% of the machine's memory",
   "logging output stays under 200 MB per hour of virtual time", "host checks run to completion",
   "the fault injector started", "the fault injector never stalls",
-  "a node's disk is never left dropping writes",
+  "a node's disk is never left dropping writes", "faults leave nothing behind once they stop",
   "timelines replay to their recorded history"]);
 // Also determinismo's: a crash named by its process, a language runtime's panic (Go, Rust, Java).
 const isBuiltin = (message) => builtin.has(message) || message.startsWith("no process crashes")
@@ -942,6 +960,17 @@ async function causalityFaults(property, analysis) {
     analysis.faults = await query({ condition: "event=fault", branch: analysis.branch,
       up_to_vtime: analysis.of.failure_ms / 1000 + 1, limit: 5000 });
   } catch { analysis.faults = []; }
+  // The code the timeline first ran (coverage events: each line, edge or block once, the first
+  // time a process runs it) inside each jump: the code that decided the bug. A window each (a
+  // Kafka timeline with the coverage agent reports 70,000 lines and more).
+  const points = [...analysis.points].sort((a, b) => a.vtime_ms - b.vtime_ms);
+  analysis.coverage = [];
+  for (const jump of causalityJumps(points)) {
+    try {
+      analysis.coverage.push(...await query({ branch: analysis.branch, limit: 5000,
+        condition: `event=coverage vtime>${jump.a.vtime_ms / 1000} vtime<=${jump.b.vtime_ms / 1000}` }));
+    } catch { /* none for this window */ }
+  }
   causalityDraw(property);
 }
 function causalityDraw(property) {
@@ -974,6 +1003,34 @@ function causalityDraw(property) {
   }));
   const whole = box.querySelector("[data-zoom-reset]");
   if (whole) whole.addEventListener("click", () => zoom(null));
+  // Stacks at a jump's end: which node, then every thread's stack there (det-profile, in a
+  // replay to the moment): the code the timeline was in as the bug became likely.
+  box.querySelectorAll("[data-stacks-ms]").forEach((link) => link.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = link.closest(".clickable[data-vtime]") || link.parentElement;
+    const nodes = (((state.run.run || {}).system || {}).nodes || []).map((node) => node.name);
+    let panel = row.querySelector(".causality-stacks");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.className = "causality-stacks";
+      panel.style.margin = "4px 0 4px 44px";
+      panel.addEventListener("click", (inner) => inner.stopPropagation());
+      row.appendChild(panel);
+    }
+    panel.innerHTML = `<span class="muted">stacks of </span>${nodes.map((name) =>
+      `<button data-node="${escape(name)}">${escape(name)}</button>`).join(" ")}<pre class="mono" hidden style="max-height:320px;overflow:auto;font-size:11px"></pre>`;
+    panel.querySelectorAll("[data-node]").forEach((button) => button.addEventListener("click", async () => {
+      const output = panel.querySelector("pre");
+      const ms = Number(link.dataset.stacksMs);
+      output.hidden = false;
+      output.textContent = `Replaying to ${seconds(ms * 1e6)} for ${button.dataset.node}'s stacks…`;
+      try {
+        const text = await api(`/runs/${state.runId}/replay`, { branch: analysis.branch, at_vtime_ms: ms,
+          exec: `/opt/determinismo/bin/det-profile ${button.dataset.node} --stacks` });
+        output.textContent = momentOutput(text);
+      } catch (error) { output.textContent = error.message; }
+    }));
+  }));
   const svg = box.querySelector("svg.causality-chart");
   if (!svg) return;
   const at = (event) => {
@@ -999,6 +1056,20 @@ function causalityJumps(points) {
     if (Math.abs(b.probability - a.probability) >= 0.2) jumps.push({ a, b });
   }
   return jumps;
+}
+// The source lines a window's coverage events name ("line <file>:<n>"; edges and blocks without
+// one are left out), each file once with its lines: "Partition.scala:145,146,150".
+function codeFirstRun(events) {
+  const files = new Map();
+  for (const event of events) {
+    const name = ((event.event || {}).details || {}).name || "";
+    const match = /^line (.*):(\d+)$/.exec(name);
+    if (!match) continue;
+    const file = match[1].split("/").pop();
+    if (!files.has(file)) files.set(file, []);
+    files.get(file).push(match[2]);
+  }
+  return [...files].map(([file, numbers]) => `${file}:${numbers.slice(0, 8).join(",")}${numbers.length > 8 ? "…" : ""}`);
 }
 function faultName(event) {
   const d = (event.event && event.event.details) || {};
@@ -1068,8 +1139,9 @@ function causalityChart(analysis) {
   // Jumps: the window, a line where it ends, the faults injected in it.
   const jumps = causalityJumps(points);
   const faults = analysis.faults || [];
-  const named = jumps.map((jump) => ({ ...jump, faults: faults.filter((event) =>
-    event.vtime_ns > jump.a.vtime_ms * 1e6 && event.vtime_ns <= jump.b.vtime_ms * 1e6) }));
+  const inside = (jump) => (event) => event.vtime_ns > jump.a.vtime_ms * 1e6 && event.vtime_ns <= jump.b.vtime_ms * 1e6;
+  const named = jumps.map((jump) => ({ ...jump, faults: faults.filter(inside(jump)),
+    code: codeFirstRun((analysis.coverage || []).filter(inside(jump))) }));
   named.forEach((jump, i) => {
     const xa = xs(jump.a.vtime_ms), xb = xs(jump.b.vtime_ms);
     const label = jump.faults.length ? jump.faults.slice(0, 2).map(faultName).join(", ") + (jump.faults.length > 2 ? ` +${jump.faults.length - 2}` : "")
@@ -1100,10 +1172,12 @@ function causalityChart(analysis) {
     <span style="color:#f0506e">┆</span> the failure</div>`;
   const list = named.length ? `<div class="causality-jumps">${named.map((jump) => `<div class="clickable" data-vtime="${jump.b.vtime_ms * 1e6}">
       <a class="clickable" data-zoom-from="${jump.a.vtime_ms}" data-zoom-to="${jump.b.vtime_ms}">zoom</a>
+      <a class="clickable" data-stacks-ms="${jump.b.vtime_ms}" title="Every thread's stack in a node at ${seconds(jump.b.vtime_ms * 1e6)} (a replay to there)">stacks</a>
       <span class="mono">${seconds(jump.a.vtime_ms * 1e6)} → ${seconds(jump.b.vtime_ms * 1e6)}</span>
       ${(jump.a.probability * 100).toFixed(0)}% → ${(jump.b.probability * 100).toFixed(0)}%:
       ${jump.faults.length ? jump.faults.map((event) => `${escape(faultName(event))} <span class="muted">at ${seconds(event.vtime_ns)}</span>`).join(", ")
-        : analysis.faults ? `<span class="muted">no fault injected: look at the logs</span>` : `<span class="muted">…</span>`}</div>`).join("")}</div>`
+        : analysis.faults ? `<span class="muted">no fault injected: look at the logs</span>` : `<span class="muted">…</span>`}
+      ${jump.code.length ? `<div class="muted mono" style="font-size:11px;margin-left:44px">code first run here: ${jump.code.slice(0, 6).map(escape).join(", ")}${jump.code.length > 6 ? ` +${jump.code.length - 6} more` : ""}</div>` : ""}</div>`).join("")}</div>`
     : analysis.done ? (points[points.length - 1].probability === 0
       ? `<div class="t-fail">Even the futures from the failure's moment never failed: the analysis did not reproduce the failure (a property judged at the timeline's end from a moment too early, or one its futures cannot see). Its points say nothing about where the bug was decided.</div>`
       : `<div class="muted">No jump: the bug was ${points[0].probability >= 0.5 ? "already likely" : "unlikely until the very end"} at every moment analyzed.</div>`) : "";

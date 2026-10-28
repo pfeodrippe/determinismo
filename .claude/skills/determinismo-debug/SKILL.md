@@ -21,7 +21,9 @@ Every timeline replays exactly, so a failure is evidence, not flakiness. Follow
    `determinismo extract` for files and core dumps.
 5. **Find where it was decided**: `determinismo causality` forks futures at moments of the
    branch; the failure probability jumps where the bug was decided. Query the events just
-   before that moment.
+   before that moment, the code first run inside the jump (`event=coverage`), and every
+   thread's stack at its end (`--at-vtime-ms T --exec '/opt/determinismo/bin/det-profile
+   <node> --stacks'`, or `determinismo stacks`).
 6. **Try a change at a moment**: `--exec ... --continue`, or `fork` with `--exec` to explore
    many futures of the changed system (a patch through a REPL, a setting, `inject` a binary).
 7. **Verify a fix by exploring again** with the same seed and more branches. An old branch's

@@ -118,16 +118,18 @@ const Effect = struct { with: u32 = 0, with_failing: u32 = 0 };
 /// A fault event's name, as the page names faults: its kind (a degradation's flavor too), its
 /// node, and its peer ("partition kafka-2↔runner"); null for another line.
 fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
-    const Line = struct { details: struct {
-        kind: []const u8 = "",
-        node: []const u8 = "",
-        peer: []const u8 = "",
-        flavor: ?[]const u8 = null,
-        /// A pod fault's pod (Kubernetes): it names the fault, not the node it runs in; a
-        /// partition's other pod too.
-        pod: []const u8 = "",
-        peer_pod: []const u8 = "",
-    } };
+    const Line = struct {
+        details: struct {
+            kind: []const u8 = "",
+            node: []const u8 = "",
+            peer: []const u8 = "",
+            flavor: ?[]const u8 = null,
+            /// A pod fault's pod (Kubernetes): it names the fault, not the node it runs in; a
+            /// partition's other pod too.
+            pod: []const u8 = "",
+            peer_pod: []const u8 = "",
+        },
+    };
     const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch return null;
     const fault = parsed.details;
     if (fault.kind.len == 0) return null;
@@ -288,6 +290,7 @@ pub fn run(
         try out.print("by moment:\n", .{});
         for (points) |point| try point_text(out, point);
     }
+    try decided_print(&analysis, out, request.json);
     try out.flush();
     return 0;
 }
@@ -809,7 +812,9 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
     return request;
 }
 
-const Failure = struct { snapshot_ms: u64, failure_ms: u64 };
+/// When the property first failed; and the timeline's events up to there (`--events` of the
+/// replay that found it, null when the failure was known: serve's report has the run's events).
+const Failure = struct { snapshot_ms: u64, failure_ms: u64, events: ?[]const u8 = null };
 
 /// Replays the branch until the property's first failure (`--until`).
 fn failure_find(
@@ -827,7 +832,12 @@ fn failure_find(
     } else try argv.appendSlice(arena, &.{
         "--branch", try std.fmt.allocPrint(arena, "{d}", .{request.branch}), "--until", until,
     });
+    // Its events too: what ran in each jump (decided_print).
+    const events_path = try std.fmt.allocPrint(arena, "/tmp/determinismo-causality-{d}.events.jsonl", .{std.os.linux.getpid()});
+    try argv.appendSlice(arena, &.{ "--events", events_path });
+    defer std.Io.Dir.cwd().deleteFile(io, events_path) catch {};
     const result = try std.process.run(arena, io, .{ .argv = argv.items });
+    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, arena, .limited(1 << 30)) catch null;
     const snapshot_s = number_after(result.stderr, "snapshot at setup_complete: vtime=") orelse
         return error.NoSnapshot;
     // The last moment: a tree's branch replays along its path first (a moment per ancestor).
@@ -835,7 +845,83 @@ fn failure_find(
     return .{
         .snapshot_ms = @trunc(snapshot_s * 1000),
         .failure_ms = @trunc(moment_ns / std.time.ns_per_ms),
+        .events = events,
     };
+}
+
+/// Where it was decided: each jump of `jump_min` or more between neighboring moments, with the
+/// faults injected in it and the code first run there (coverage events naming source lines),
+/// from the timeline's events (text, or with --json a final {"decided": [...]} line).
+fn decided_print(analysis: *Analysis, out: *std.Io.Writer, json: bool) !void {
+    const events = analysis.failure.events orelse return;
+    const arena = analysis.arena;
+    const points = analysis.points.items;
+    std.mem.sort(Point, points, {}, point_earlier);
+    const Line = struct { vtime_ns: u64 = 0, event: std.json.Value = .null };
+    const Jump = struct {
+        from_ms: u64,
+        to_ms: u64,
+        from: f64,
+        to: f64,
+        faults: std.ArrayList([]const u8) = .empty,
+        code: std.ArrayList([]const u8) = .empty,
+    };
+    var jumps: std.ArrayList(Jump) = .empty;
+    for (points[0..points.len -| 1], points[@min(1, points.len)..]) |a, b| {
+        const pa = wilson(a.failing, a.futures).probability;
+        const pb = wilson(b.failing, b.futures).probability;
+        if (@abs(pb - pa) < analysis.request.jump_min) continue;
+        try jumps.append(arena, .{ .from_ms = a.vtime_ms, .to_ms = b.vtime_ms, .from = pa, .to = pb });
+    }
+    if (jumps.items.len == 0) return;
+    var lines = std.mem.tokenizeScalar(u8, events, '\n');
+    while (lines.next()) |text| {
+        if (std.mem.indexOf(u8, text, "\"event\":\"fault\"") == null and
+            std.mem.indexOf(u8, text, "\"event\":\"coverage\"") == null) continue;
+        const line = std.json.parseFromSliceLeaky(Line, arena, text, .{ .ignore_unknown_fields = true }) catch continue;
+        if (line.event != .object) continue;
+        const name = line.event.object.get("event") orelse continue;
+        const details = line.event.object.get("details") orelse continue;
+        if (name != .string or details != .object) continue;
+        const ms = line.vtime_ns / std.time.ns_per_ms;
+        for (jumps.items) |*jump| {
+            if (ms <= jump.from_ms or ms > jump.to_ms) continue;
+            if (std.mem.eql(u8, name.string, "fault")) {
+                const kind = details.object.get("kind") orelse break;
+                const node = details.object.get("node") orelse break;
+                if (kind != .string or node != .string) break;
+                try jump.faults.append(arena, try std.fmt.allocPrint(arena, "{s} {s} at {d}ms", .{ kind.string, node.string, ms }));
+            } else {
+                const label = details.object.get("name") orelse break;
+                if (label != .string or !std.mem.startsWith(u8, label.string, "line ")) break;
+                try jump.code.append(arena, label.string["line ".len..]);
+            }
+            break;
+        }
+    }
+    if (json) {
+        const Out = struct { from_ms: u64, to_ms: u64, from: f64, to: f64, faults: []const []const u8, code: []const []const u8 };
+        const out_jumps = try arena.alloc(Out, jumps.items.len);
+        for (jumps.items, out_jumps) |jump, *item| item.* = .{
+            .from_ms = jump.from_ms,
+            .to_ms = jump.to_ms,
+            .from = jump.from,
+            .to = jump.to,
+            .faults = jump.faults.items,
+            .code = jump.code.items,
+        };
+        try out.print("{f}\n", .{std.json.fmt(.{ .decided = out_jumps }, .{})});
+        return;
+    }
+    try out.print("where it was decided:\n", .{});
+    for (jumps.items) |jump| {
+        try out.print("  {d}ms -> {d}ms  {d:.0}% -> {d:.0}%\n", .{ jump.from_ms, jump.to_ms, jump.from * 100, jump.to * 100 });
+        if (jump.faults.items.len == 0) try out.print("    no fault injected: the program's own course\n", .{});
+        for (jump.faults.items) |fault| try out.print("    fault {s}\n", .{fault});
+        const shown = @min(jump.code.items.len, 12);
+        for (jump.code.items[0..shown]) |code| try out.print("    first run {s}\n", .{code});
+        if (jump.code.items.len > shown) try out.print("    ... {d} more lines first run\n", .{jump.code.items.len - shown});
+    }
 }
 
 /// A failing evaluation of the property (declarations, `hit` false, are not): an always kind

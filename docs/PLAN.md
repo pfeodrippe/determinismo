@@ -76,8 +76,9 @@ event hashing, the guest module.
   Hunt run 67 (default, seed 17): commits in 50 of its first 87 timelines; Elle's failures
   were G0 alone (Jepsen's known Kafka behavior), now `allowed` in the check and reported apart.
   The `coverage` profile (Java 25, the agent on the transaction path) hunts next on the same
-  seed and budget, for comparison. Rust SDK coverage lines: its coverage.c would need the C SDK's lookup copied
-  in (a packaged crate cannot include sdk/c), later.
+  seed and budget, for comparison. Rust SDK coverage lines: its coverage.c has the C SDK's
+  lookup, copied (a packaged crate cannot include sdk/c); a Rust maze in
+  tests/antithesis-compat/rust (release builds need `debug = true`, `strip = false`).
 - A false data loss, a platform bug (2026-10-28): a durable crash with two threads at
   durability points crashed the node twice; the second failed after switching its disk to
   drop writes and left it so, and the next crash lost everything written since (Kafka run 67,
@@ -86,11 +87,23 @@ event hashing, the guest module.
   points at once. Runs with NotADurableDisk failures (55, 56, 58, 62, 64, 65, 67): their
   durability failures are not evidence. Run 55's lost and torn Kafka transactions, put down
   to hyperthreads, may be this instead.
+- Faults leave nothing behind (2026-10-28): when the injector stops, every node is checked as
+  the kernel has it (cgroup frozen, a thread stopped, its disk dropping writes) and the
+  injector's own state (a durability point armed, links down): built-in property "faults leave
+  nothing behind once they stop". Two false findings came from effects outliving faults today.
+- Worker utilization (2026-10-28): Kafka hunt run 67's 16 workers ran 8.8 timelines at once by
+  their wall times; trees now integrate timelines running over the loop's wall time and print,
+  record (summary: workers, at_once, memory_wait_ns) and show it live (status.json, the UI's
+  Utilization). Next: from the next hunts, whether the idle share is memory (memory_wait) or
+  the tree's own waits, and act on it.
 - Reserved cores need memory (2026-10-28): a Kafka hunt held all but 9 GiB of srv3's 125
   (VMs and holders), so the checks on the reserved cores ran one VM at a time (e2e parallel
   failed at 1.0 timelines at once; ui's causality analysis did not finish in 15 minutes).
   Runs now leave 6 GiB per reserved core free (DETERMINISMO_SESSIONS_MEMORY_MIB, set by
-  serve.sh), holders included; branch lines show `memory_wait=` when a VM waited for memory,
+  serve.sh), holders included, but only while a session's VM waits for memory (it holds the
+  pool's `memory-priority` shared): held back always, it would have kept holders from being
+  made (run 67 made none in 180 of its 207 timelines, at 15 GB available of the 16 they want,
+  and replayed its returns' nodes instead, minutes each, while most workers waited); branch lines show `memory_wait=` when a VM waited for memory,
   and the parallel check skips, saying so, when its VMs mostly waited.
 - verify: a replay that could not start said "replayed nothing" (the 17:05 hyperthreads
   experiment: 64 refused, TapeInputsDiffer, its script missing serve's --cpu-modulation and
@@ -536,7 +549,11 @@ places, and assertions carry no location.
 2. **Causality down to code.** Causality analysis finds the moment a failure became likely; add
    what ran there: the lines first reached between the last moment with a low probability and
    the jump, and every thread's stack at that moment (det-profile), so the report names the
-   code that decided the bug, not only when.
+   code that decided the bug, not only when. Done in the UI (2026-10-28): each jump lists the
+   code first run in it (its coverage events' lines) and takes every thread's stacks in a node
+   at its end (a replay with det-profile); agents get both from `query` and `replay` (AGENTS.md,
+   the determinismo-debug skill); `determinismo causality` prints each jump's faults and code
+   first run ("where it was decided", `{"decided":[...]}` with --json).
 3. **Targeted runs from a diff.** Done: `explore --changed <diff file | git range>` (CLI, serve,
    MCP) matches the hunks to line coverage (Python, the JVM, Go through Antithesis's
    instrumentor and libvoidstar), returns first to timelines that ran changed code, just after
@@ -560,9 +577,11 @@ places, and assertions carry no location.
 
 - The tree's generation barrier: gone (a pull queue: a generation is the next `size`
   timelines to finish; cores 100% busy, 2026-10-27).
-- One host, many runs (cpus.zig): one CPU pool for every run, each core's first thread before
-  any second hyperthread (both by default since 2026-10-28: a core with two VMs does about 1.4x);
-  memory admission by claims and by what is available now.
+- One host, many runs (cpus.zig): one CPU pool for every run, a core's first thread only
+  (hyperthreads off again since 2026-10-28: a Kafka hunt with them replayed 7 of 9 checked
+  timelines; the experiment to find what a sibling perturbs is queued, `verify --run`); memory
+  admission by claims and by what is available now, the sessions' room held back while one of
+  their VMs waits.
 - Busy guests: about 0.85-1x virtual per wall second now (0.3-0.6 before the exit work of
   2026-10-27: `io_delay=none`, one PIT write, a 1 ms timer slack, RDTSC in KVM's fastpath).
   Remaining exits: PIC port I/O, single-steps for hard stops.

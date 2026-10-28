@@ -82,7 +82,7 @@
   },
   {
     "name": "replay",
-    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out. Instead of at_vtime_ms, until stops at the first event matching a condition (the query tool's syntax), as Antithesis's wait_until.",
+    "description": "Replay one branch exactly; optionally stop at a virtual time and run a shell command in the guest there (e.g. det-nodes exec <node> <command>). With continue, the branch runs on after the command, so a change made there (data, configuration, code through a REPL) plays out. Instead of at_vtime_ms, until stops at the first event matching a condition (the query tool's syntax), as Antithesis's wait_until. Every thread's stack in a node there: exec \"/opt/determinismo/bin/det-profile <node> --stacks\".",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -344,7 +344,7 @@
   },
   {
     "name": "causality",
-    "description": "Causality analysis (as Antithesis's): how likely a property's failure was at moments of a branch where it failed. Finds the first failure in the branch, then at several moments from the snapshot to it forks many futures and counts how many fail. Jumps in probability mark where the timeline made the bug likely: query the branch's events just before each jump.",
+    "description": "Causality analysis (as Antithesis's): how likely a property's failure was at moments of a branch where it failed. Finds the first failure in the branch, then at several moments from the snapshot to it forks many futures and counts how many fail. Jumps in probability mark where the timeline made the bug likely: query the branch's events just before each jump. At a jump, replay to its end with exec \"/opt/determinismo/bin/det-profile <node> --stacks\" for the code each thread was in, and query the coverage events inside it for the code first run there.",
     "inputSchema": {
       "type": "object",
       "properties": {

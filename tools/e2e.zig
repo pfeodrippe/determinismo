@@ -1117,8 +1117,9 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "certain at the failure", curve.latest.probability == 1 },
         .{ "each within its 90% interval", curve.bounded },
         .{ "the futures' faults counted (a faults line each round)", effects },
+        .{ "where it was decided: each jump with its faults and code first run (a decided line)", std.mem.indexOf(u8, result.stdout, "{\"decided\":[{") != null },
     }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
-        "({d:.2}), each within its 90% interval", .{ curve.moments, curve.latest.probability });
+        "({d:.2}), each within its 90% interval, where it was decided", .{ curve.moments, curve.latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
     var verdict_argv: std.ArrayList([]const u8) = .empty;
     try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });

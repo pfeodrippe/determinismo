@@ -75,7 +75,10 @@ use them in other repositories.
    for the same seed; without it the branch keeps the timeline's.
 6. **Narrow down**: `causality` measures, at moments of the failing branch, how likely the
    failure was (futures forked there that fail): the bug was decided where the probability
-   jumps; query the branch's events just before. `replay` with `until` stops at the first event
+   jumps; query the branch's events just before, and inside the jump the code first run there
+   (`event=coverage`: each line once, the first time a process runs it; the UI lists them per
+   jump) and every thread's stack at its end (`replay` with `exec` "/opt/determinismo/bin/det-profile
+   <node> --stacks"; the UI's "stacks" on a jump). `replay` with `until` stops at the first event
    matching a condition (its first violation, say) to look there, and with `rewind_ms` that long
    before it. `fork` from any moment
    explores its futures.
