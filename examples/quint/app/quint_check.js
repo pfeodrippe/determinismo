@@ -31,15 +31,30 @@ const EXAMPLES = process.env.QUINT_EXAMPLES || "/src/quint/examples";
 const MANIFEST = JSON.parse(fs.readFileSync(process.env.QUINT_MANIFEST || "/app/manifest.json", "utf8"));
 const TIMEOUT_MS = 120000;
 
+/** Quint processes at once: each is a Node.js CLI (and a Rust evaluator under it), hundreds of
+ * MB; parallel drivers asking at once filled a 4 GB machine, and the kernel's OOM killer took
+ * this service (Quint's first run inside determinismo, srv3 run 21). The others wait. */
+const QUINT_AT_ONCE = 2;
+let quintRunning = 0;
+const quintWaiting = [];
+
 /** Runs quint with `args` (stdin from `input`): { code, stdout, stderr }, never throwing. */
-function quint(args, input) {
-  return new Promise((resolve) => {
-    const child = execFile(QUINT, args, { timeout: TIMEOUT_MS, maxBuffer: 64 << 20 }, (error, stdout, stderr) => {
-      const code = error ? (typeof error.code === "number" ? error.code : error.killed ? "timeout" : "error") : 0;
-      resolve({ code, stdout, stderr });
+async function quint(args, input) {
+  if (quintRunning === QUINT_AT_ONCE) await new Promise((resolve) => quintWaiting.push(resolve));
+  quintRunning += 1;
+  try {
+    return await new Promise((resolve) => {
+      const child = execFile(QUINT, args, { timeout: TIMEOUT_MS, maxBuffer: 64 << 20 }, (error, stdout, stderr) => {
+        const code = error ? (typeof error.code === "number" ? error.code : error.killed ? "timeout" : "error") : 0;
+        resolve({ code, stdout, stderr });
+      });
+      if (input !== undefined) child.stdin.end(input);
     });
-    if (input !== undefined) child.stdin.end(input);
-  });
+  } finally {
+    quintRunning -= 1;
+    const next = quintWaiting.shift();
+    if (next) next();
+  }
 }
 
 /** What no Quint command may print: an internal error's traces (a JavaScript exception, a Rust

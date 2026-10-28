@@ -19,6 +19,11 @@ const System = sdk.System(Nodes);
 
 const port = 7200;
 const requests_per_driver = 4;
+/// A check runs quint up to four times, two minutes each at most, after the service's queue
+/// (two quint processes at once): with the TCP client's default second, every check read as
+/// unavailable while the service went on working on it, quint processes piled up, and the
+/// kernel's OOM killer took the service (run 21, srv3). Waiting is virtual time: free.
+const check_timeout_ms = 10 * std.time.ms_per_min;
 
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{ .describe = describe, .scenarios = .{
@@ -63,7 +68,9 @@ fn Check(comptime commands: []const []const u8) type {
             const request = std.fmt.bufPrint(&request_buffer, "{s}\n", .{command}) catch
                 unreachable;
             var reply_buffer: [512]u8 = undefined;
-            const reply = try sdk.tcp.request_line(address, port, request, &reply_buffer);
+            const reply = try sdk.tcp.request_line_with(address, port, request, &reply_buffer, .{
+                .timeout_ms = check_timeout_ms,
+            });
             // An error reply is a check that threw (the reply says what); what failed is in the
             // service's own assertions.
             const ok = std.mem.eql(u8, reply, "ok");

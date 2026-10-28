@@ -156,8 +156,20 @@ pub const Connection = struct {
 /// One request on a new connection, and the first line of the reply, copied into `reply`: what
 /// line protocols need.
 pub fn request_line(address: [4]u8, port: u16, request: []const u8, reply: []u8) ![]const u8 {
+    return request_line_with(address, port, request, reply, .{});
+}
+
+/// request_line with options: a longer timeout for a request the server works on for seconds
+/// (the default second makes it "unavailable", and the server goes on working for nobody).
+pub fn request_line_with(
+    address: [4]u8,
+    port: u16,
+    request: []const u8,
+    reply: []u8,
+    options: Options,
+) ![]const u8 {
     var connection: Connection = undefined;
-    try connection.open(address, port, .{});
+    try connection.open(address, port, options);
     defer connection.close();
     try connection.write_all(request);
     const line = try connection.read_line();
