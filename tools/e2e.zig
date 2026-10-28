@@ -635,9 +635,10 @@ fn check_ui(context: *Context) !void {
             sleep_ms(200);
         }
     }
-    // serve started the analysis of run 1's first failure on its own, as soon as it found it.
+    // Run 1's first failure is on disk as soon as it was found: the explorer's ladder (its
+    // holders) or serve's save of it.
     const snapshots = try std.fs.path.join(arena, &.{ data, "runs", "1", "snapshots" });
-    var analyzed: []const u8 = "";
+    var saved_log: []const u8 = "";
     for (0..600) |_| {
         var dir = cwd.openDir(context.io, snapshots, .{ .iterate = true }) catch {
             sleep_ms(500);
@@ -646,22 +647,16 @@ fn check_ui(context: *Context) !void {
         defer dir.close(context.io);
         var iterator = dir.iterate();
         while (try iterator.next(context.io)) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "analyzed-")) continue;
+            if (!std.mem.startsWith(u8, entry.name, "failure-")) continue;
             const path = try std.fs.path.join(arena, &.{ snapshots, entry.name });
-            analyzed = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 20)) catch "";
+            const text = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 20)) catch "";
+            if (std.mem.indexOf(u8, text, "saved") != null) saved_log = text;
         }
-        if (analyzed.len > 0) break;
+        if (saved_log.len > 0) break;
         sleep_ms(500);
     }
-    const analysis = try std.fs.path.join(arena, &.{ data, "runs", "1", "causality-0.jsonl" });
-    const analysis_started = if (cwd.access(context.io, analysis, .{})) |_| true else |_| false;
-    expect_all(context, &.{
-        .{ "a timeline marked analyzed", analyzed.len > 0 },
-        .{ "its analysis is causality 0", std.mem.startsWith(u8, analyzed, "causality 0:") },
-        .{ "causality-0.jsonl exists", analysis_started },
-    }, "ui: serve analyzed run 1's first failure on its own as soon as it found it ({s})", .{
-        std.mem.trimEnd(u8, analyzed, "\n"),
-    });
+    expect(context, saved_log.len > 0, "ui: run 1's first failure is on disk as soon as it was " ++
+        "found (the explorer's ladder or serve's save)", .{});
     // The third runs while the tests look at it (on one CPU: the analysis needs the rest).
     const running = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
         "\"seed\":5,\"branches\":100000,\"jobs\":1,\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});

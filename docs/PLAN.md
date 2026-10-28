@@ -88,8 +88,10 @@ event hashing, the guest module.
     overshot once, 32 4,172 times, and an overshoot is another timeline). Done too: the PIT
     count in one 16-bit write (guest kernel patch 0003, `det_pit_word=1`): one exit per timer
     reprogram, not two.
-  - First failures are analyzed at once: serve starts causality (background, `--jobs 4`) on each
-    property's first failing timeline.
+  - First failures on disk at once: the explorer's ladder (the timeline's holders), or, when no
+    holders could be made (a big system's memory), serve's save-only replay on one CPU; an
+    analysis from the page starts from them. (Analyzing every first failure automatically, beside
+    the hunt, was tried and dropped: four cores of the hunt for curves nobody may look at.)
   - Deadlock found by the tree e2e on a pool of two CPUs: the explorer waited for a holder that
     waited for a CPU, both CPUs held by a node maker and a holder blocked writing answers (1.3 MB
     snapshots) the explorer had not read yet. Makers and holders now give their CPU back before
