@@ -66,6 +66,11 @@ pub fn random_below(count: u64) u64 {
     return value;
 }
 
+/// A float in [0, 1) from 53 random bits.
+pub fn random_float() f64 {
+    return @as(f64, @floatFromInt(random_u64() >> 11)) / @as(f64, 1 << 53);
+}
+
 /// A named decision among options, for strategies that reason about what they steer (which
 /// fault, which account, which node): the platform sees the name and the options' names, then
 /// picks the index, a decision like any other (replayed, steerable).
@@ -88,14 +93,29 @@ pub fn random_below_named(name: []const u8, count: u64) u64 {
 /// lives as long as the program (a literal); up to 64 points. Where it is true, take a rare path
 /// the real system can take too (a pause, a retry), never one it cannot.
 pub fn buggify(name: []const u8) bool {
-    if (device_get() != .fd) return false;
+    const value = buggify_draw(name) orelse return false;
+    return value % 4 == 0;
+}
+
+/// At a buggify point, a pause of up to 9 ms one evaluation in 32 while the point is active
+/// (rarer than buggify: pause points sit on hot paths).
+pub fn buggify_pause(name: []const u8) void {
+    const value = buggify_draw(name) orelse return;
+    if (value % 32 != 0) return;
+    const ms = (value >> 8) % 10;
+    if (ms > 0) sleep_ms(ms);
+}
+
+/// The next draw of `name`'s generator, while the point is active.
+fn buggify_draw(name: []const u8) ?u64 {
+    if (device_get() != .fd) return null;
     var now_spec: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &now_spec); // Virtual time inside determinismo.
     const now_ns: u64 = @intCast(now_spec.sec * std.time.ns_per_s + now_spec.nsec);
     const point = for (buggify_points[0..buggify_point_count]) |*known| {
         if (std.mem.eql(u8, known.name, name)) break known;
     } else blk: {
-        if (buggify_point_count == buggify_points.len) return false;
+        if (buggify_point_count == buggify_points.len) return null;
         const added = &buggify_points[buggify_point_count];
         buggify_point_count += 1;
         added.* = .{ .name = name, .until_ns = 0, .state = 0 };
@@ -107,11 +127,11 @@ pub fn buggify(name: []const u8) bool {
         point.state = if (random_below_named(label, 4) == 0) random_u64() | 1 else 0;
         point.until_ns = now_ns + 2 * std.time.ns_per_s;
     }
-    if (point.state == 0) return false;
+    if (point.state == 0) return null;
     point.state ^= point.state >> 12; // xorshift64*
     point.state ^= point.state << 25;
     point.state ^= point.state >> 27;
-    return (point.state *% 0x2545F4914F6CDD1D) % 4 == 0;
+    return point.state *% 0x2545F4914F6CDD1D;
 }
 
 /// Buggify points' state for the current stretch: the generator, 0 when inactive.
@@ -528,8 +548,65 @@ fn catalog_first() bool {
 /// `sometimes` declared and never reached (or never true) in any timeline fails, as an
 /// `always` never hit does. Assertions with literal messages are declared already.
 pub fn declare(comptime kind: []const u8, message: []const u8) void {
-    declare_runtime(kind, message);
+    if (declared_count < declared_assertions.len and message.len <= 255) {
+        const known = &declared_assertions[declared_count];
+        known.kind = kind;
+        @memcpy(known.message[0..message.len], message);
+        known.message_size = @intCast(message.len);
+        declared_count += 1;
+    }
+    if (device_get() == .fd) declare_runtime(kind, message);
 }
+
+/// One assertion the program declares.
+pub const CatalogAssertion = struct { kind: []const u8, message: []const u8 };
+
+/// The program's assertions: its call sites (the det_catalog section), then those declared at
+/// run time (up to 64).
+pub const CatalogIterator = struct {
+    at: usize,
+    declared: u32 = 0,
+
+    pub fn next(iterator: *CatalogIterator) ?CatalogAssertion {
+        const stop = @intFromPtr(&__stop_det_catalog);
+        while (iterator.at + @sizeOf(CatalogEntry) <= stop) {
+            const entry: *const CatalogEntry = @ptrFromInt(iterator.at);
+            if (entry.magic != catalog_magic) {
+                iterator.at += @alignOf(CatalogEntry);
+                continue;
+            }
+            iterator.at += @sizeOf(CatalogEntry);
+            if (entry.message_size == 0) continue; // The sentinel.
+            return .{ .kind = std.mem.span(entry.kind), .message = entry.message[0..entry.message_size] };
+        }
+        if (iterator.declared == declared_count) return null;
+        const known = &declared_assertions[iterator.declared];
+        iterator.declared += 1;
+        return .{ .kind = known.kind, .message = known.message[0..known.message_size] };
+    }
+};
+
+pub fn catalog_assertions() CatalogIterator {
+    std.mem.doNotOptimizeAway(&catalog_sentinel);
+    return .{ .at = std.mem.alignForward(usize, @intFromPtr(&__start_det_catalog), @alignOf(CatalogEntry)) };
+}
+
+/// Writes the catalog to `fd`, one JSON object a line (`{"kind","message"}`): what a program
+/// checks, for review or CI.
+pub fn catalog_write(fd: linux.fd_t) void {
+    var iterator = catalog_assertions();
+    while (iterator.next()) |assertion| {
+        var buffer: [message_size_max]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        json_write(&writer, assertion);
+        writer.writeByte('\n') catch continue;
+        _ = linux.write(fd, writer.buffered().ptr, writer.buffered().len);
+    }
+}
+
+const DeclaredAssertion = struct { kind: []const u8, message: [256]u8, message_size: u8 };
+var declared_assertions: [64]DeclaredAssertion = undefined;
+var declared_count: u32 = 0;
 
 fn declare_runtime(kind: []const u8, message: []const u8) void {
     assert(message.len > 0);
@@ -718,12 +795,51 @@ fn emit_raw(message: []const u8) void {
             assert(result == message.len);
         },
         .local => {
-            const stderr = 2;
-            _ = linux.write(stderr, message.ptr, message.len);
-            _ = linux.write(stderr, "\n", 1);
+            const fd = local_output_fd();
+            _ = linux.write(fd, message.ptr, message.len);
+            _ = linux.write(fd, "\n", 1);
         },
         .unopened => unreachable,
     }
+}
+
+/// Outside determinismo: the file DETERMINISMO_SDK_LOCAL_OUTPUT (or Antithesis's
+/// ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else stderr. From
+/// /proc/self/environ: the SDK needs no libc.
+var local_output: ?linux.fd_t = null;
+
+fn local_output_fd() linux.fd_t {
+    if (local_output) |fd| return fd;
+    const stderr = 2;
+    local_output = stderr;
+    var environ_buffer: [32 * 1024]u8 = undefined;
+    const environ_fd = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(environ_fd) != .SUCCESS) return stderr;
+    defer _ = linux.close(@intCast(environ_fd));
+    const size = linux.read(@intCast(environ_fd), &environ_buffer, environ_buffer.len);
+    if (linux.errno(size) != .SUCCESS) return stderr;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "DETERMINISMO_SDK_LOCAL_OUTPUT=", "ANTITHESIS_SDK_LOCAL_OUTPUT=" }) |key| {
+        var entries = std.mem.splitScalar(u8, environ_buffer[0..size], 0);
+        while (entries.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry, key) or entry.len == key.len) continue;
+            const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{entry[key.len..]}, 0) catch continue;
+            const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+            const fd = linux.open(path, flags, 0o644);
+            if (linux.errno(fd) != .SUCCESS) continue;
+            local_output = @intCast(fd);
+            return local_output.?;
+        }
+    }
+    return stderr;
+}
+
+/// Any JSON value as an event of its own (the protocol's raw form: docs/SDKS.md).
+pub fn output(value: anytype) void {
+    var buffer: [message_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    json_write(&writer, value);
+    emit_raw(writer.buffered());
 }
 
 /// Code coverage for strategies: build the program with `sanitize_coverage_trace_pc_guard` set
@@ -808,4 +924,33 @@ test "rng and prng draw (from the OS outside determinismo)" {
     try std.testing.expect(value < 10);
     var generator = prng();
     try std.testing.expect(generator.random().intRangeLessThan(u32, 0, 10) < 10);
+}
+
+test "the catalog lists declared assertions; raw output, buggify_pause and random_float run" {
+    declare("sometimes", "declared in a test");
+    var iterator = catalog_assertions();
+    var found = false;
+    while (iterator.next()) |assertion| {
+        if (std.mem.eql(u8, assertion.message, "declared in a test")) found = true;
+    }
+    try std.testing.expect(found);
+    // Into a pipe of the test's own: a test's stdout is the build runner's protocol.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    catalog_write(fds[1]);
+    const kept = local_output;
+    defer local_output = kept;
+    local_output = fds[1];
+    output(.{ .custom = 1 });
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(fds[0], &buffer, buffer.len);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(size));
+    const written = buffer[0..size];
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"message\":\"declared in a test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "{\"custom\":1}") != null);
+    buggify_pause("anywhere"); // Outside determinismo: no pause.
+    try std.testing.expect(random_float() < 1.0);
 }
