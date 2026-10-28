@@ -204,6 +204,10 @@ pre.output { background: #101114; border: 1px solid var(--line); border-radius: 
       Priority: its VMs take CPUs before other runs' (a check beside a hunt)</label>
     <label>Branching<select name="branching"><option value="tree">Tree: also from moments of earlier timelines that reached new behaviors</option>
       <option value="flat">Flat: every timeline from the setup snapshot</option></select></label>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <label data-tip="A targeted run: the tree returns first to timelines that ran these lines, and the run says which ran and which never did (needs line coverage: Python, the JVM, Go built with Antithesis's instrumentor)">Changed code (optional)<input name="changed" placeholder="a commit, a..b, v1.6.0..v1.7.0, or a diff file"></label>
+      <label data-tip="Where the commit or range is: the system's repository, a URL (fetched by the server) or a directory on the server. Empty: the server's working directory">Repository<input name="changed_repository" placeholder="https://github.com/org/system"></label>
+    </div>
     <label>Strategy (optional; it plans its own branches, so the branching is flat)<input name="strategy" placeholder="det-strategy-mutate --sync-dir /tmp/corpus   or   @my-strategy --flag"></label>
     <label>Or upload one (any executable or script with a #! line; it runs on the server)
       <input type="file" id="strategy-file"></label>
@@ -1897,7 +1901,7 @@ $("#run-form").addEventListener("submit", async (event) => {
   if (form.get("seed")) request.seed = Number(form.get("seed")); // Else a fresh one.
   if (form.get("repeat")) request.repeat = true;
   if (form.get("branches")) request.branches = Number(form.get("branches"));
-  for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline"]) if (form.get(key)) request[key] = form.get(key);
+  for (const key of ["scenario", "profile", "strategy", "time_budget", "timeline", "changed", "changed_repository"]) if (form.get(key)) request[key] = form.get(key);
   request.branching = request.strategy ? "flat" : form.get("branching");
   if (form.get("jobs")) request.jobs = Number(form.get("jobs"));
   for (const key of ["memory_mib", "verify_replays"]) if (form.get(key)) request[key] = Number(form.get(key));

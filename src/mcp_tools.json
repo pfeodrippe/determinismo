@@ -65,6 +65,10 @@
           "type": "string",
           "description": "A targeted run: a diff file or git range (on the machine running determinismo) whose changed lines the tree explores first; the result says which hunks ran in how many timelines, and which never ran"
         },
+        "changed_repository": {
+          "type": "string",
+          "description": "Where changed's range is: a repository's directory on the machine running determinismo, or its URL (fetched into the cache). With it, changed is a commit (that commit's change), a range a..b, or releases v1.6.0..v1.7.0"
+        },
         "retroactive": {
           "type": "array",
           "items": {

@@ -50,21 +50,23 @@ pub const Change = struct {
     }
 };
 
-/// The hunks of a diff file, or of `git diff -U0 <range>` in the working directory (only the
-/// changed lines, no context) when no such file exists.
-pub fn read(arena: std.mem.Allocator, io: std.Io, source: []const u8) !Change {
+/// The hunks of a diff file, or of `git diff -U0 <range>` (only the changed lines, no context):
+/// in the working directory when no such file exists, or in `repository` when one is given (a
+/// directory, or a URL fetched into `cache`), where a single revision is that commit's change.
+pub fn read(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    repository: ?[]const u8,
+    cache: []const u8,
+) !Change {
     const cwd = std.Io.Dir.cwd();
-    const patch = cwd.readFileAlloc(io, source, arena, .limited(64 << 20)) catch |err| blk: {
+    const patch = if (repository) |where| blk: {
+        const directory = try repository_directory(arena, io, where, cache);
+        break :blk try git_diff(arena, io, directory, try revisions(arena, source), source);
+    } else cwd.readFileAlloc(io, source, arena, .limited(64 << 20)) catch |err| blk: {
         if (err != error.FileNotFound) return err;
-        const result = try std.process.run(arena, io, .{
-            .argv = &.{ "git", "diff", "-U0", source },
-        });
-        if (result.term != .exited or result.term.exited != 0) {
-            std.debug.print("[determinismo] --changed {s}: no such diff file, and git diff " ++
-                "failed: {s}\n", .{ source, result.stderr });
-            return error.Usage;
-        }
-        break :blk result.stdout;
+        break :blk try git_diff(arena, io, ".", source, source);
     };
     const found = try mutate.hunks(arena, patch);
     if (found.len == 0) {
@@ -74,6 +76,76 @@ pub fn read(arena: std.mem.Allocator, io: std.Io, source: []const u8) !Change {
     const timelines = try arena.alloc(u32, found.len);
     @memset(timelines, 0);
     return .{ .hunks = found, .timelines = timelines };
+}
+
+fn git_diff(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+    range: []const u8,
+    source: []const u8,
+) ![]const u8 {
+    const result = try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", directory, "diff", "-U0", range },
+    });
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("[determinismo] --changed {s}: git diff {s} in {s} failed: {s}\n", .{
+            source, range, directory, result.stderr,
+        });
+        return error.Usage;
+    }
+    return result.stdout;
+}
+
+/// A range as git diff takes it (`a..b`, `a...b`, `c^!`), or a single revision: that commit's
+/// change (`<revision>^!`), a release's tag or a commit's hash.
+fn revisions(arena: std.mem.Allocator, given: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, given, "..") != null) return given;
+    if (std.mem.indexOfScalar(u8, given, '^') != null) return given;
+    return std.fmt.allocPrint(arena, "{s}^!", .{given});
+}
+
+/// A repository's directory: as given, or for a URL (`https://`, `ssh://`, `file://`, `git@`)
+/// a bare clone in the cache without file contents (git fetches those a diff needs), fetched
+/// again for new commits and tags.
+fn repository_directory(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    where: []const u8,
+    cache: []const u8,
+) ![]const u8 {
+    const url = std.mem.indexOf(u8, where, "://") != null or std.mem.startsWith(u8, where, "git@");
+    if (!url) return where;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(where, &digest, .{});
+    const name = std.fmt.bytesToHex(digest[0..8], .lower);
+    const directory = try std.fmt.allocPrint(arena, "{s}/repositories/{s}", .{ cache, &name });
+    const cwd = std.Io.Dir.cwd();
+    const cloned = if (cwd.access(io, directory, .{})) |_| true else |_| false;
+    const argv: []const []const u8 = if (cloned) &.{
+        "git",     "-C",                 directory, "fetch",                      "--quiet", "--tags",
+        "--force", "--filter=blob:none", "origin",  "+refs/heads/*:refs/heads/*",
+    } else &.{ "git", "clone", "--quiet", "--bare", "--filter=blob:none", where, directory };
+    if (!cloned) try cwd.createDirPath(io, std.fs.path.dirname(directory).?);
+    const result = try std.process.run(arena, io, .{ .argv = argv });
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("[determinismo] --changed-repository {s}: git {s} failed: {s}\n", .{
+            where, argv[if (cloned) 3 else 1], result.stderr,
+        });
+        if (!cloned) return error.Usage;
+        // Fetched before: what it has may be enough (a released tag, an old commit).
+    }
+    return directory;
+}
+
+test revisions {
+    const arena = std.testing.allocator;
+    try std.testing.expectEqualStrings("v1.6.0..v1.7.0", try revisions(arena, "v1.6.0..v1.7.0"));
+    try std.testing.expectEqualStrings("main...feature", try revisions(arena, "main...feature"));
+    try std.testing.expectEqualStrings("abc^!", try revisions(arena, "abc^!"));
+    const commit = try revisions(arena, "4c8f61ac");
+    defer arena.free(commit);
+    try std.testing.expectEqualStrings("4c8f61ac^!", commit);
 }
 
 test "a coverage line falls in a hunk of the same file" {

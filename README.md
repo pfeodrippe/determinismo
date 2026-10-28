@@ -279,7 +279,10 @@ of the spec; it reports the first state the spec cannot reach
 ([examples/clojure-bank/tla](examples/clojure-bank/tla)).
 
 Targeted runs: `--changed <diff file | git range>` aims the exploration at a change's lines and
-says which of them ran, in how many timelines, and which never did.
+says which of them ran, in how many timelines, and which never did. With
+`--changed-repository <directory | URL>` the range is the system's own: a commit
+(`--changed 4c8f61ac`), a range (`a..b`) or a release (`v1.6.0..v1.7.0`), the repository fetched
+by its URL into the cache (also in the UI's New run form, HTTP and MCP).
 
 Mutation testing: give mutants as profiles (`--profile default,mutant` or `--profile all`) and
 see which ones the tests catch; or apply a runtime mutant after setup with `--from-exec`, so

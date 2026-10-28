@@ -59,6 +59,8 @@ const Arguments = struct {
     futures: u32 = 16,
     /// explore: a targeted run, aimed at a diff file's or git range's changed lines.
     changed: ?[]const u8 = null,
+    /// explore: where the range is (a repository's directory or URL).
+    changed_repository: ?[]const u8 = null,
     /// explore: output lines with these texts are left out of its events (replays write them).
     retroactive: []const []const u8 = &.{},
     /// mutate: a JSON lines file of mutants, {"name", "node", "patch"} each.
@@ -248,6 +250,9 @@ fn tool_call(
         try argv.appendSlice(arena, &.{ "--generation", try number(arena, size) });
     }
     if (arguments.changed) |source| try argv.appendSlice(arena, &.{ "--changed", source });
+    if (arguments.changed_repository) |where| {
+        try argv.appendSlice(arena, &.{ "--changed-repository", where });
+    }
     for (arguments.retroactive) |text| try argv.appendSlice(arena, &.{ "--retroactive", text });
     if (arguments.branches != null or arguments.time_budget == null) {
         const branches = try number(arena, arguments.branches orelse 16);

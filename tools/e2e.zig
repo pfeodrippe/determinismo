@@ -2228,6 +2228,38 @@ fn check_changed(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
         "changed code", "ran in", "NEVER", "tree:",
     }) catch ""});
+    try check_changed_commit(context, file);
+}
+
+/// A targeted run by commit: the same three lines as a commit of a repository fetched by its
+/// URL (--changed-repository), the commit named alone (that commit's change).
+fn check_changed_commit(context: *Context, file: []const u8) !void {
+    const arena = context.arena;
+    const repository = try std.fmt.allocPrint(arena, "{s}/changed-repository", .{context.scratch});
+    const script = try std.fmt.allocPrint(arena,
+        \\set -e; source=$(pwd)/{1s}; rm -rf {0s}; mkdir -p {0s}/$(dirname {1s}); cd {0s}
+        \\git init -q; cp "$source" {1s}; sed -i '17s/$/  # before/;23s/$/  # before/;24s/$/  # before/' {1s}
+        \\git add -A; git -c user.name=e2e -c user.email=e2e@localhost commit -qm before
+        \\cp "$source" {1s}; git -c user.name=e2e -c user.email=e2e@localhost commit -qam after
+        \\git rev-parse HEAD
+    , .{ repository, file });
+    const made = try run_kept(context, &.{ "sh", "-c", script });
+    const commit = std.mem.trim(u8, made.stdout, " \n");
+    const url = try std.fmt.allocPrint(arena, "file://{s}", .{repository});
+    const report = try explore(context, &.{
+        "--compose",            "tests/antithesis-compat/python/compose.yaml", "--scenario", "maze",
+        "--seed",               "1",                                           "--branches", "16",
+        "--changed",            commit,                                        "--pipeline", "1",
+        "--changed-repository", url,
+    });
+    const both = try std.fmt.allocPrint(arena, "ran in   16/16 timelines  {s}:23-24", .{file});
+    const first = try std.fmt.allocPrint(arena, "{s}:17-17", .{file});
+    expect_all(context, &.{
+        .{ "the repository was made", made.term == .exited and made.term.exited == 0 and commit.len == 40 },
+        .{ "the commit's two hunks", std.mem.indexOf(u8, report, "of 2 hunks ran") != null },
+        .{ "lines 23-24 ran in every timeline", std.mem.indexOf(u8, report, both) != null },
+        .{ "line 17 is one of them", std.mem.indexOf(u8, report, first) != null },
+    }, "changed: a targeted run by a commit of a repository fetched by its URL", .{});
 }
 
 /// libvoidstar.so, Antithesis's native library, in a node: Python (musl) loads it with ctypes,

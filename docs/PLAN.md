@@ -487,7 +487,8 @@ places, and assertions carry no location.
    MCP) matches the hunks to line coverage (Python, the JVM, Go through Antithesis's
    instrumentor and libvoidstar), returns first to timelines that ran changed code, just after
    they did, and reports which hunks ran in how many timelines and which never ran (e2e
-   `changed`). Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
+   `changed`); by commit, range or release of the system's repository, local or fetched by its
+   URL (`--changed-repository`, 2026-10-28; the UI's New run form). Left: distance to the changed lines (directed fuzzing, as AFLGo does) for code
    no timeline reaches yet, faults aimed around it, and which properties the timelines that ran
    it checked; C and Zig edges mapped back to lines.
 4. **More languages.** Rust (an SDK crate over the C ABI, LLVM's coverage for edges), Go (an

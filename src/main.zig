@@ -79,6 +79,9 @@ const usage =
     \\                            [--changed <diff file | git range>]   (a targeted run: the tree
     \\                            returns first to timelines that ran changed lines, and says
     \\                            which hunks ran and which never did)
+    \\                            [--changed-repository <directory | URL>]   (where the range
+    \\                            is: a commit, a.b, v1.6.0..v1.7.0; a URL is fetched into the
+    \\                            cache; one revision is that commit's change)
     \\                            [--branching tree|flat]   (tree, the default: also from moments
     \\                            of earlier branches that reached new behaviors; replay one by
     \\                            its tape)
@@ -242,6 +245,8 @@ const Arguments = struct {
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
+    /// Where --changed's range is: a repository's directory or URL (else the working directory).
+    changed_repository: ?[]const u8 = null,
     /// A timeline's ceiling of virtual time: one that has not finished by then ends as hung.
     timeline_limit_ns: ?u64 = std.time.ns_per_hour,
     /// Retroactive logging: output lines with these texts are left out of an exploration's
@@ -668,6 +673,7 @@ fn run_request_write(
         .jobs = arguments.jobs,
         .strategy = arguments.strategy_command,
         .changed = arguments.changed,
+        .changed_repository = arguments.changed_repository,
         .retroactive = arguments.retroactive[0..arguments.retroactive_count],
         .from_branch = arguments.from_branch,
         .from_vtime_ms = arguments.from_vtime_ms,
@@ -1528,6 +1534,11 @@ fn jobs_count(arguments: *const Arguments) u32 {
 /// branch, shards, a moment): then flat; asked for a tree, an error.
 fn branching_resolve(arguments: *Arguments, at_moment: bool) !void {
     if (arguments.changed != null and arguments.branching != .tree) return changed_needs_tree();
+    if (arguments.changed_repository != null and arguments.changed == null) {
+        std.debug.print("[determinismo] --changed-repository says where --changed's range is: " ++
+            "give the range too (a commit, a..b, v1.6.0..v1.7.0)\n", .{});
+        return error.Usage;
+    }
     if (arguments.branching != .tree) return;
     // A strategy in a tree (asked for): its parents are replayed with their tapes.
     if (arguments.branching_given and arguments.strategy_command != null) {
@@ -2151,7 +2162,13 @@ fn explore_tree(
         break :ladders made;
     } else null else null;
     const change: ?changed.Change = if (branches.arguments.changed) |source|
-        try changed.read(arena, context.io, source)
+        try changed.read(
+            arena,
+            context.io,
+            source,
+            branches.arguments.changed_repository,
+            branches.arguments.cache_directory,
+        )
     else
         null;
     var state: TreeState = .{
@@ -4069,6 +4086,8 @@ fn parse_option(
         arguments.retroactive_count += 1;
     } else if (eql(u8, flag, "--changed")) {
         arguments.changed = value;
+    } else if (eql(u8, flag, "--changed-repository")) {
+        arguments.changed_repository = value;
     } else if (eql(u8, flag, "--horizon")) {
         arguments.horizon_ns = try duration_parse(value);
         arguments.horizon_text = value;

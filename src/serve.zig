@@ -780,6 +780,9 @@ pub const RunRequest = struct {
     strategy: ?[]const u8 = null,
     /// A targeted run: a diff file or git range on the server (explore's --changed).
     changed: ?[]const u8 = null,
+    /// Where the range is: a repository's directory on the server or its URL
+    /// (explore's --changed-repository).
+    changed_repository: ?[]const u8 = null,
     /// Retroactive logging (explore's --retroactive): output lines with these texts are left
     /// out of the run's events; replays write them.
     retroactive: []const []const u8 = &.{},
@@ -889,6 +892,9 @@ fn explore_arguments(
         try argv.appendSlice(server.arena, &.{ "--jobs", try print(server, "{d}", .{jobs}) });
     }
     if (asked.changed) |source| try argv.appendSlice(server.arena, &.{ "--changed", source });
+    if (asked.changed_repository) |where| {
+        try argv.appendSlice(server.arena, &.{ "--changed-repository", where });
+    }
     if (asked.verify_replays) |every| {
         try argv.appendSlice(server.arena, &.{ "--verify-replays", try print(server, "{d}", .{every}) });
     }
