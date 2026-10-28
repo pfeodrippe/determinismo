@@ -122,8 +122,10 @@ fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
         node: []const u8 = "",
         peer: []const u8 = "",
         flavor: ?[]const u8 = null,
-        /// A pod fault's pod (Kubernetes): it names the fault, not the node it runs in.
+        /// A pod fault's pod (Kubernetes): it names the fault, not the node it runs in; a
+        /// partition's other pod too.
         pod: []const u8 = "",
+        peer_pod: []const u8 = "",
     } };
     const parsed = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true }) catch return null;
     const fault = parsed.details;
@@ -134,8 +136,8 @@ fn fault_label(arena: std.mem.Allocator, line: []const u8) !?[]const u8 {
         fault.flavor orelse "",
         if (fault.node.len > 0) " " else "",
         if (fault.pod.len > 0) fault.pod else fault.node,
-        if (fault.peer.len > 0) "↔" else "",
-        fault.peer,
+        if (fault.peer.len > 0 or fault.peer_pod.len > 0) "↔" else "",
+        if (fault.peer_pod.len > 0) fault.peer_pod else fault.peer,
     });
 }
 
@@ -150,6 +152,8 @@ test fault_label {
     try std.testing.expectEqual(null, try fault_label(arena, "not json"));
     const pod = "{\"event\":\"fault\",\"details\":{\"kind\":\"pod_kill\",\"node\":\"kubernetes\",\"pod\":\"redis-7c9-x2k\"}}";
     try std.testing.expectEqualStrings("pod_kill redis-7c9-x2k", (try fault_label(arena, pod)).?);
+    const pods = "{\"event\":\"fault\",\"details\":{\"kind\":\"pod_partition\",\"node\":\"kubernetes\",\"pod\":\"redis-0\",\"peer_pod\":\"client-7\"}}";
+    try std.testing.expectEqualStrings("pod_partition redis-0↔client-7", (try fault_label(arena, pods)).?);
 }
 
 /// The faults' effects so far, as one line (serve keeps the latest): each fault seen in at least

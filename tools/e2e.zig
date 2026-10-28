@@ -437,7 +437,10 @@ fn check_kubernetes(context: *Context) !void {
     const read = std.mem.indexOf(u8, report, "test command completed: eventually_counter_readable") != null;
     const passing = std.mem.indexOf(u8, report, "4 branches, 0 with failing properties") != null;
     // Faults on single pods (Faults.pods), each naming its pod.
-    const pod_faults = try run_kept(context, &.{ "grep", "-rhoE", "\"kind\":\"pod_[a-z]+\"", explored });
+    const pod_faults = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rhoE '\"kind\":\"pod_[a-z]+\"' {s} | sort | uniq -c | tr -s ' \\n' ' '", .{explored}) });
+    // A pod fault that could not be applied or undone (the pod picked, its address, its
+    // namespace): none.
+    const pod_failures = try run_kept(context, &.{ "sh", "-c", try std.fmt.allocPrint(arena, "grep -rh 'fault_failed\\|fault_heal_failed' {s} | grep -c kubernetes || true", .{explored}) });
     const named = try run_kept(context, &.{ "grep", "-rhoE", "\"pod\":\"[a-z0-9-]+\"", explored });
     var same = false;
     if (count > 0) {
@@ -456,6 +459,7 @@ fn check_kubernetes(context: *Context) !void {
         .{ "no property failed", passing },
         .{ "a timeline replays exactly", same },
         .{ "faults on single pods, each naming its pod", pod_faults.stdout.len > 0 and named.stdout.len > 0 },
+        .{ "no fault of the K3s node or its pods failed to apply or heal", std.mem.eql(u8, std.mem.trim(u8, pod_failures.stdout, " \n"), "0") },
     }, "kubernetes: manifests in K3s, deployed before branching, templates run in their pod; " ++
         "pod faults: {s}", .{std.mem.trim(u8, pod_faults.stdout[0..@min(pod_faults.stdout.len, 120)], "\n")});
 }

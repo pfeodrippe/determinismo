@@ -95,6 +95,9 @@ const Kind = enum {
     pod_kill,
     pod_isolate,
     pod_degrade,
+    /// Two pods of a Kubernetes node cut off from each other (each drops what it sends to the
+    /// other), the rest of their network as it was.
+    pod_partition,
     /// The runner and the nodes split into groups that cannot talk across (Antithesis's
     /// partitions), with one disruption form.
     partition_groups,
@@ -335,8 +338,10 @@ const Applied = struct {
     after_sync: bool = false,
     stall_ms_min: u32 = 1,
     stall_ms_max: u32 = 0,
-    /// For the pod faults: the pod's name (process_index picks it among the node's pods).
+    /// For the pod faults: the pod's name (process_index picks it among the node's pods), and
+    /// for pod_partition the other one's (thread_index picks it).
     pod: []const u8 = "",
+    peer_pod: []const u8 = "",
 };
 
 /// A fault's parameters, drawn from platform randomness.
@@ -355,6 +360,10 @@ fn draw(fault: *const Fault) Applied {
         },
         .process_pause, .process_kill, .pod_pause, .pod_kill, .pod_isolate => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
+        .pod_partition => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+            applied.thread_index = @intCast(sdk.random_below(processes_max));
         },
         .pod_degrade => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
@@ -505,7 +514,7 @@ fn faults_collect(
             faults_add(faults, &count, .{ .kind = .process_kill, .node = node.name });
         }
         if (allowed.pods) {
-            for ([_]Kind{ .pod_pause, .pod_kill, .pod_isolate, .pod_degrade }) |kind| {
+            for ([_]Kind{ .pod_pause, .pod_kill, .pod_isolate, .pod_degrade, .pod_partition }) |kind| {
                 faults_add(faults, &count, .{ .kind = kind, .node = node.name });
             }
         }
@@ -588,6 +597,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .pod_pause,
         .pod_isolate,
         .pod_degrade,
+        .pod_partition,
         => node_start(system, applied),
         .process_kill => apply_process_kill(system, applied),
         .pod_kill => apply_pod_kill(applied),
@@ -618,8 +628,12 @@ const NodeFault = struct {
     /// The process or thread stopped (process_pause, thread_pause); for a pod fault, a process
     /// of the pod (its network namespace).
     pid: linux.pid_t = 0,
-    /// The pod's cgroup (pod faults).
+    /// The pod's cgroup (pod faults), and for pod_partition the other one's, its process, and
+    /// the two pods' addresses.
     pod: Pod = .{},
+    peer: Pod = .{},
+    peer_pid: linux.pid_t = 0,
+    addresses: [2]nodes.Address = undefined,
 };
 var nodes_faulted: [schema.nodes_max]?NodeFault = @splat(null);
 /// For starting nodes again when their fault ends (set once faults start).
@@ -641,6 +655,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     var fault = NodeFault{ .applied = applied.*, .end_ns = monotonic_ns() + applied.duration_ns };
     const started: anyerror!void = switch (applied.kind) {
         .pod_pause, .pod_isolate, .pod_degrade => pod_begin(&fault),
+        .pod_partition => pod_partition_begin(&fault),
         .pause => nodes.freeze(applied.node, .frozen),
         .restart => nodes.kill(applied.node),
         .crash => nodes.crash(applied.node),
@@ -654,13 +669,16 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         else => unreachable,
     };
     started catch |err| {
-        sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+        // Nothing to fault (no pod to pick right now): not a failure.
+        const skipped = err == error.NoPods or err == error.OnePod;
+        sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
     slot.* = fault;
     // A pod fault's event names its pod (kept in the slot, which the event reads).
     const node_fault = &slot.*.?;
     if (node_fault.pod.path_size > 0) node_fault.applied.pod = node_fault.pod.name();
+    if (node_fault.peer.path_size > 0) node_fault.applied.peer_pod = node_fault.peer.name();
     sdk.event("fault", node_fault.applied);
 }
 
@@ -702,12 +720,14 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
         // The pod may be gone (killed, rescheduled), its cgroup and namespace with it: said.
-        .pod_pause => fault.pod.write("cgroup.freeze", "0") catch |err| {
+        .pod_pause => fault.pod.write("cgroup.freeze", "0") catch |err| if (fault.pod.exists()) {
             sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
         },
-        .pod_isolate, .pod_degrade => nodes.pod_netem(fault.pid, null) catch |err| {
+        // A pod gone meanwhile took its namespace, and what was set there, with it.
+        .pod_isolate, .pod_degrade => nodes.pod_netem(fault.pid, null) catch |err| if (err != error.NoSuchNamespace) {
             sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
         },
+        .pod_partition => pod_partition_end(&fault),
         else => {},
     }
 }
@@ -732,6 +752,13 @@ const Pod = struct {
     fn name(pod: *const Pod) []const u8 {
         if (pod.name_size > 0) return pod.name_buffer[0..pod.name_size];
         return std.fs.path.basename(pod.path());
+    }
+
+    /// Whether its cgroup is still there (a deleted pod's goes).
+    fn exists(pod: *const Pod) bool {
+        var buffer: [nodes.path_size_max]u8 = undefined;
+        const directory = nodes.print_z(&buffer, "{s}", .{pod.path()}) catch return false;
+        return linux.errno(linux.access(directory, linux.F_OK)) == .SUCCESS;
     }
 
     fn write(pod: *const Pod, file: []const u8, content: []const u8) !void {
@@ -805,13 +832,24 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
         candidates += 1;
     }
     if (candidates == 0) return error.NoPods;
-    const picked = pods.get(order[index % candidates]);
-    @memcpy(pod.path_buffer[0..picked.len], picked);
-    pod.path_size = picked.len;
-    pod.name_size = 0;
+    // The drawn pod, or the next in order with a process (a pod being deleted, or between its
+    // containers' restarts, keeps a cgroup with none for a while).
+    for (0..candidates) |attempt| {
+        const picked = pods.get(order[(index + attempt) % candidates]);
+        @memcpy(pod.path_buffer[0..picked.len], picked);
+        pod.path_size = picked.len;
+        pod.name_size = 0;
+        if (try pod_process(pod)) |pid| return pid;
+    }
+    return error.NoPods;
+}
+
+/// A process of the pod (the first with a HOSTNAME naming the pod, which it notes), if any.
+fn pod_process(pod: *Pod) !?linux.pid_t {
+    var parent_buffer: [nodes.path_size_max]u8 = undefined;
     var containers: Directories = .{};
-    containers.add(try nodes.print_z(&parent_buffer, "{s}", .{picked}), "");
-    var pid: linux.pid_t = 0;
+    containers.add(try nodes.print_z(&parent_buffer, "{s}", .{pod.path()}), "");
+    var pid: ?linux.pid_t = null;
     for (0..@min(containers.count, pod_containers_max)) |at| {
         var procs_buffer: [nodes.path_size_max + 16]u8 = undefined;
         const procs = try nodes.print_z(&procs_buffer, "{s}/cgroup.procs", .{containers.get(at)});
@@ -819,14 +857,12 @@ fn pod_pick(node: []const u8, index: u32, pod: *Pod, spare_drivers: bool) !linux
         const text = nodes.read_small(procs, &text_buffer) orelse continue;
         const line = std.mem.trim(u8, std.mem.sliceTo(text, '\n'), " ");
         const first = std.fmt.parseInt(linux.pid_t, line, 10) catch continue;
-        if (pid == 0) pid = first;
+        if (pid == null) pid = first;
         if (hostname_of(first, &pod.name_buffer)) |host| {
             pod.name_size = host.len;
-            pid = first;
-            break;
+            return first;
         }
     }
-    if (pid == 0) return error.PodWithoutProcesses;
     return pid;
 }
 
@@ -905,11 +941,94 @@ fn pod_begin(fault: *NodeFault) !void {
     }
 }
 
+/// A partition between two pods begins: each drops what it sends to the other (a blackhole route
+/// to the other's address, in its own network namespace). The second pod is picked by the
+/// fault's thread_index, the next one when that is the first.
+fn pod_partition_begin(fault: *NodeFault) !void {
+    const applied = &fault.applied;
+    fault.pid = try pod_pick(applied.node, applied.process_index, &fault.pod, false);
+    fault.peer_pid = try pod_pick(applied.node, applied.thread_index, &fault.peer, false);
+    if (std.mem.eql(u8, fault.pod.path(), fault.peer.path())) {
+        fault.peer_pid = try pod_pick(applied.node, applied.thread_index +% 1, &fault.peer, false);
+        if (std.mem.eql(u8, fault.pod.path(), fault.peer.path())) return error.OnePod;
+    }
+    fault.addresses[0] = try pod_address(applied.node, &fault.pod);
+    fault.addresses[1] = try pod_address(applied.node, &fault.peer);
+    try nodes.pod_blackhole(fault.pid, fault.addresses[1], true);
+    nodes.pod_blackhole(fault.peer_pid, fault.addresses[0], true) catch |err| {
+        nodes.pod_blackhole(fault.pid, fault.addresses[1], false) catch {};
+        return err;
+    };
+}
+
+fn pod_partition_end(fault: *const NodeFault) void {
+    const name = fault.applied.node;
+    for ([_]linux.pid_t{ fault.pid, fault.peer_pid }, [_]nodes.Address{ fault.addresses[1], fault.addresses[0] }) |pid, address| {
+        nodes.pod_blackhole(pid, address, false) catch |err| if (err != error.NoSuchNamespace) {
+            sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .peer_pod = fault.peer.name(), .err = @errorName(err) });
+        };
+    }
+}
+
+/// A pod's address: the file of the cluster's address management (host-local, in the node's
+/// /var/lib/cni/networks/cbr0, seen through its main process) that names its sandbox, one of
+/// the pod's container cgroups.
+fn pod_address(node: []const u8, pod: *const Pod) !nodes.Address {
+    const main_pid = nodes.pid_recorded(node) orelse return error.NodeNotRunning;
+    var directory_buffer: [nodes.path_size_max]u8 = undefined;
+    const directory = try nodes.print_z(&directory_buffer, "/proc/{d}/root/var/lib/cni/networks/cbr0", .{main_pid});
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const opened = linux.open(directory, flags, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.NoAddresses;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var entries: [8192]u8 align(8) = undefined;
+    while (true) {
+        const size = linux.getdents64(fd, &entries, entries.len);
+        if (linux.errno(size) != .SUCCESS or size == 0) return error.NoAddress;
+        var at: usize = 0;
+        while (at < size) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[at]);
+            at += entry.reclen;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            const address = address_parse(name) orelse continue;
+            var file_buffer: [nodes.path_size_max + 32]u8 = undefined;
+            const file = nodes.print_z(&file_buffer, "{s}/{s}", .{ directory, name }) catch continue;
+            var text_buffer: [256]u8 = undefined;
+            const text = nodes.read_small(file, &text_buffer) orelse continue;
+            const sandbox = std.mem.trim(u8, std.mem.sliceTo(text, '\n'), " \r");
+            if (sandbox.len == 0) continue;
+            var sandbox_buffer: [nodes.path_size_max + 80]u8 = undefined;
+            const cgroup = nodes.print_z(&sandbox_buffer, "{s}/{s}", .{ pod.path(), sandbox }) catch continue;
+            if (linux.errno(linux.access(cgroup, linux.F_OK)) == .SUCCESS) return address;
+        }
+    }
+}
+
+/// An IPv4 address written as such ("10.42.0.5"), else null.
+fn address_parse(text: []const u8) ?nodes.Address {
+    var address: nodes.Address = undefined;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    for (&address) |*byte| {
+        byte.* = std.fmt.parseInt(u8, parts.next() orelse return null, 10) catch return null;
+    }
+    if (parts.next() != null) return null;
+    return address;
+}
+
+test address_parse {
+    try std.testing.expectEqual(nodes.Address{ 10, 42, 0, 5 }, address_parse("10.42.0.5").?);
+    try std.testing.expectEqual(@as(?nodes.Address, null), address_parse("last_reserved_ip.0"));
+    try std.testing.expectEqual(@as(?nodes.Address, null), address_parse("lock"));
+    try std.testing.expectEqual(@as(?nodes.Address, null), address_parse("10.42.0"));
+}
+
 /// Every process of a pod killed at once (cgroup.kill): kubelet starts its containers again.
 fn apply_pod_kill(applied: *const Applied) void {
     var pod: Pod = .{};
     _ = pod_pick(applied.node, applied.process_index, &pod, true) catch |err| {
-        sdk.event("fault_failed", .{ .node = applied.node, .err = @errorName(err) });
+        const skipped = err == error.NoPods;
+        sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
     pod.write("cgroup.kill", "1") catch |err| {
@@ -1724,6 +1843,10 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
         .throttle => applied.cpu_percent = request.cpu_percent,
         .process_pause, .process_kill, .pod_pause, .pod_kill, .pod_isolate => {
             applied.process_index = @intCast(sdk.random_below(processes_max));
+        },
+        .pod_partition => {
+            applied.process_index = @intCast(sdk.random_below(processes_max));
+            applied.thread_index = @intCast(sdk.random_below(processes_max));
         },
         .pod_degrade => {
             applied.process_index = @intCast(sdk.random_below(processes_max));

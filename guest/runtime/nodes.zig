@@ -977,6 +977,13 @@ pub fn link_degrade(from: []const u8, to: []const u8, netem: ?netlink.Netem) !vo
 }
 
 pub const Netem = netlink.Netem;
+pub const Address = netlink.Address;
+
+/// A blackhole route to `destination` in a Kubernetes pod's network namespace (one of its
+/// processes'): one direction of a partition between two pods (faults.zig's pod_partition).
+pub fn pod_blackhole(pid: linux.pid_t, destination: netlink.Address, present: bool) !void {
+    try netlink.in_namespace_of(pid, netlink.Socket.blackhole_set, .{ destination, present });
+}
 
 /// A Kubernetes pod's network (faults.zig's pod faults): netem on its eth0, in the namespace of
 /// one of its processes; null clears it.

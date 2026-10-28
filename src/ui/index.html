@@ -946,7 +946,7 @@ function faultName(event) {
   const d = (event.event && event.event.details) || {};
   const kind = [d.kind, d.flavor].filter(Boolean).join(" ");
   // A pod fault (Kubernetes) names its pod, not the node it runs in.
-  return `${kind || "fault"}${d.pod ? " " + d.pod : d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}`;
+  return `${kind || "fault"}${d.pod ? " " + d.pod + (d.peer_pod ? "↔" + d.peer_pod : "") : d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}`;
 }
 // Text to the clipboard: the Clipboard API where the page is a secure context, else a selected
 // textarea and the copy command (serve is often reached over plain HTTP, at a Tailscale address,
@@ -1128,7 +1128,7 @@ function faultTip(event, decision) {
   const between = d.node ? (d.peer ? `${d.node} ↔ ${d.peer}` : d.node) : "";
   const netem = d.netem || {};
   const groups = Array.isArray(d.groups) && d.groups.some((g) => g !== 255) ? d.groups.filter((g) => g !== 255).join(" | ") : undefined;
-  const pairs = [["between", between || undefined], ["pod", d.pod || undefined], ["for", d.duration_ns ? ms(d.duration_ns) : undefined],
+  const pairs = [["between", between || undefined], ["pod", d.pod ? d.pod + (d.peer_pod ? " ↔ " + d.peer_pod : "") : undefined], ["for", d.duration_ns ? ms(d.duration_ns) : undefined],
     ["delay", netem.delay_ns ? `${ms(netem.delay_ns)}${netem.jitter_ns ? " ± " + ms(netem.jitter_ns) : ""}` : undefined],
     ["loss", netem.loss_ppm ? `${(netem.loss_ppm / 1e4).toFixed(1)}%` : undefined],
     ["duplicates", netem.duplicate_percent ? netem.duplicate_percent + "%" : undefined],

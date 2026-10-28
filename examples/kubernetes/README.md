@@ -22,4 +22,6 @@ follows. The template's commands run in a running container of the image that ha
 Faults act on the K3s node (its processes, the pods' among them) and on single pods: a pod
 frozen (`pod_pause`), killed at once with kubelet starting it again (`pod_kill`; pods holding
 test templates are spared: the drivers run there), cut off (`pod_isolate`) or its network
-degraded (`pod_degrade`), in the pod's own network namespace. Each fault event names its pod.
+degraded (`pod_degrade`), in the pod's own network namespace, or two pods partitioned from each
+other (`pod_partition`: a blackhole route to the other's address in each). The cluster's own
+pods (kube-system) are left to the node's faults. Each fault event names its pods.

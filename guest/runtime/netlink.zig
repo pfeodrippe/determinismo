@@ -16,6 +16,7 @@ const rtm_newlink: u16 = 16;
 const rtm_dellink: u16 = 17;
 const rtm_newaddr: u16 = 20;
 const rtm_newroute: u16 = 24;
+const rtm_delroute: u16 = 25;
 const rtm_newqdisc: u16 = 36;
 const rtm_delqdisc: u16 = 37;
 const flag_replace: u16 = 0x100;
@@ -137,6 +138,27 @@ pub const Socket = struct {
         var index_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &index_bytes, @intCast(try socket.index(name)), .little);
         message.attribute(rta_output_interface, &index_bytes);
+        try socket.send(&message);
+    }
+
+    /// A blackhole route to `destination` (its packets dropped where they are sent: one direction
+    /// of a partition between two hosts on the same link, a pod's), or with `present` false,
+    /// that route removed.
+    pub fn blackhole_set(socket: *Socket, destination: Address, present: bool) !void {
+        var message: Message = if (present)
+            .init(rtm_newroute, flag_create | flag_exclusive)
+        else
+            .init(rtm_delroute, 0);
+        const table_main = 254;
+        const protocol_boot = 3;
+        const scope_universe = 0;
+        const type_blackhole = 6;
+        const info = [12]u8{
+            linux.AF.INET,  32,             0, 0, table_main, protocol_boot,
+            scope_universe, type_blackhole, 0, 0, 0,          0,
+        };
+        message.append_bytes(&info);
+        message.attribute(rta_destination, &destination);
         try socket.send(&message);
     }
 
