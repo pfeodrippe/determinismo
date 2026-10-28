@@ -4,7 +4,7 @@
 //! Each service becomes a node: `image` (by name, as Antithesis uses it) or else `build` as its
 //! source, `entrypoint` and `command`
 //! (lists, or strings split like a shell), `environment` (list or map), `working_dir`, `user`,
-//! `depends_on` (dependencies start first), `mem_limit`, `privileged`, and the first container
+//! `depends_on` (dependencies start first), `mem_limit`, `privileged`, `ulimits`, and the first container
 //! port of `ports`
 //! or `expose` as its readiness check. Every node gets
 //! ANTITHESIS_SDK_LOCAL_OUTPUT (a regular file the platform reads: detfs), so
@@ -21,10 +21,9 @@ const yaml = @import("yaml.zig");
 pub const sdk_output_variable = "ANTITHESIS_SDK_LOCAL_OUTPUT=/opt/determinismo/sdk/output";
 
 const ignored_fields = [_][]const u8{
-    "volumes",      "networks",    "restart",     "deploy",   "logging", "container_name",
-    "hostname",     "env_file",    "cap_add",     "cap_drop", "ulimits", "labels",
-    "init",         "stop_signal", "healthcheck", "platform", "tty",     "stdin_open",
-    "security_opt",
+    "volumes",     "networks",    "restart",  "deploy",   "logging",    "container_name",
+    "hostname",    "env_file",    "cap_add",  "cap_drop", "labels",     "init",
+    "stop_signal", "healthcheck", "platform", "tty",      "stdin_open", "security_opt",
 };
 
 /// The profile ("default") of the Compose file at `path`. Relative build contexts are taken
@@ -90,7 +89,56 @@ fn node_from_service(
     if (fields.get("privileged")) |value| {
         node.privileged = std.mem.eql(u8, try scalar(value), "true");
     }
+    node.ulimits = try ulimits(arena, fields.get("ulimits"));
     return node;
+}
+
+/// Compose's `ulimits`: per name one value (soft and hard) or a `soft` and a `hard`; -1 is
+/// unlimited, as in Docker.
+fn ulimits(arena: std.mem.Allocator, value: ?yaml.Value) !?[]const schema.Ulimit {
+    const given = value orelse return null;
+    if (given != .mapping) return error.BadUlimits;
+    var out: std.ArrayList(schema.Ulimit) = .empty;
+    for (given.mapping) |entry| {
+        const soft, const hard = switch (entry.value) {
+            .scalar => |text| .{ try ulimit_value(text), try ulimit_value(text) },
+            .mapping => .{
+                try ulimit_value(try scalar(entry.value.get("soft") orelse return error.BadUlimits)),
+                try ulimit_value(try scalar(entry.value.get("hard") orelse return error.BadUlimits)),
+            },
+            .sequence, .empty => return error.BadUlimits,
+        };
+        try out.append(arena, .{ .name = entry.key, .soft = soft, .hard = hard });
+    }
+    return out.items;
+}
+
+fn ulimit_value(text: []const u8) !u64 {
+    if (std.mem.eql(u8, text, "-1") or std.mem.eql(u8, text, "unlimited")) return schema.Ulimit.unlimited;
+    return std.fmt.parseInt(u64, text, 10) catch error.BadUlimits;
+}
+
+test ulimits {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try yaml.parse(arena,
+        \\ulimits:
+        \\  nproc: 65535
+        \\  memlock: -1
+        \\  nofile:
+        \\    soft: 20000
+        \\    hard: 40000
+        \\
+    );
+    const parsed = (try ulimits(arena, root.get("ulimits"))).?;
+    try std.testing.expectEqual(3, parsed.len);
+    try std.testing.expectEqualStrings("nproc", parsed[0].name);
+    try std.testing.expectEqual(65535, parsed[0].hard);
+    try std.testing.expectEqual(schema.Ulimit.unlimited, parsed[1].soft);
+    try std.testing.expectEqual(20000, parsed[2].soft);
+    try std.testing.expectEqual(40000, parsed[2].hard);
+    try std.testing.expectEqual(null, try ulimits(arena, null));
 }
 
 /// A Compose byte value ("64m", "1g", "512mb", "1048576") in MiB, rounded up.

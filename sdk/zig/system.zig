@@ -106,6 +106,8 @@ pub fn NodeSpec(comptime Name: type) type {
         faults: schema.Faults = .{},
         memory_max_mib: ?u32 = null,
         privileged: bool = false,
+        /// Process limits (Docker's names: .{ .name = "nofile", .soft = 65536, .hard = 65536 }).
+        ulimits: ?[]const schema.Ulimit = null,
     };
 }
 
@@ -401,6 +403,7 @@ pub fn System(comptime Nodes: type) type {
                         .faults = spec.faults,
                         .memory_max_mib = spec.memory_max_mib,
                         .privileged = spec.privileged,
+                        .ulimits = spec.ulimits,
                     });
                 } else if (Field == Node) {
                     const message = "profile {s}: node {s} is not optional\n";

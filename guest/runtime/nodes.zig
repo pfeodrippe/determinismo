@@ -1293,6 +1293,11 @@ const Launch = struct {
     gid: ?u32,
     privileged: bool,
     antithesis_library: bool,
+    /// The node's process limits (Compose's `ulimits`), resource numbers resolved.
+    limits: [schema.ulimits_max]Limit = undefined,
+    limit_count: u32 = 0,
+
+    const Limit = struct { resource: u32, value: linux.rlimit };
 
     fn init(arena: std.mem.Allocator, node: *const schema.Resolved, paths: *const Paths) !Launch {
         if (node.command.len == 0 or node.command.len >= arguments_max) return error.BadCommand;
@@ -1310,7 +1315,7 @@ const Launch = struct {
         }
         for (platform_environment, envp[node.env.len..]) |entry, *slot| slot.* = entry.ptr;
         const ids: ?Ids = if (node.user) |user| try user_resolve(arena, paths.root, user) else null;
-        return .{
+        var launch: Launch = .{
             .root = paths.root,
             .hostname = node.name,
             .workdir = try arena.dupeSentinel(u8, node.workdir, 0),
@@ -1322,6 +1327,16 @@ const Launch = struct {
             .privileged = node.privileged,
             .antithesis_library = node.antithesis_library,
         };
+        for (node.ulimits orelse &.{}) |ulimit| {
+            if (launch.limit_count == schema.ulimits_max) return error.TooManyUlimits;
+            const resource = schema.ulimit_resource(ulimit.name) orelse return error.BadUlimit;
+            launch.limits[launch.limit_count] = .{ .resource = resource, .value = .{
+                .cur = ulimit.soft,
+                .max = ulimit.hard,
+            } };
+            launch.limit_count += 1;
+        }
+        return launch;
     }
 
     /// In the child, PID 1 of the node's namespaces.
@@ -1336,8 +1351,14 @@ const Launch = struct {
         launch.exec_in_root();
     }
 
-    /// In the node's root: drop to its user, enter its working directory, run the command.
+    /// In the node's root: its process limits, then drop to its user, enter its working
+    /// directory, run the command.
     fn exec_in_root(launch: *const Launch) noreturn {
+        // Before the user: a hard limit above the one inherited needs root to raise.
+        for (launch.limits[0..launch.limit_count]) |limit| {
+            const result = linux.syscall4(.prlimit64, 0, limit.resource, @intFromPtr(&limit.value), 0);
+            if (linux.errno(result) != .SUCCESS) die("setrlimit", error.Setrlimit);
+        }
         if (launch.gid) |gid| {
             _ = linux.syscall2(.setgroups, 0, 0);
             if (linux.errno(linux.setgid(gid)) != .SUCCESS) die("setgid", error.Setgid);

@@ -1967,12 +1967,14 @@ fn check_changed(context: *Context) !void {
 
 /// libvoidstar.so, Antithesis's native library, in a node: Python (musl) loads it with ctypes,
 /// and its SDK message is an event, its random number a decision (the same on a replay), its
-/// coverage an edge event of the module, in the timeline's events.
+/// coverage an edge event of the module, in the timeline's events. The command runs with the
+/// node's Compose ulimits (open files 20000, 40000 hard).
 fn check_voidstar(context: *Context) !void {
     const arena = context.arena;
     const code =
         \\det-nodes exec client python3 -c '
-        \\import ctypes, json
+        \\import ctypes, json, resource
+        \\print("nofile", *resource.getrlimit(resource.RLIMIT_NOFILE))
         \\lib = ctypes.CDLL("/usr/lib/libvoidstar.so")
         \\lib.fuzz_get_random.restype = ctypes.c_uint64
         \\lib.init_coverage_module.restype = ctypes.c_uint64
@@ -1996,7 +1998,7 @@ fn check_voidstar(context: *Context) !void {
             "--until",      "event=command_start",                         "--exec",     code,
             "--events-dir", events,
         });
-        output.* = try lines_with(arena, report, &.{"voidstar"});
+        output.* = try lines_with(arena, report, &.{ "voidstar", "nofile" });
         const path = try std.fs.path.join(arena, &.{ events, "branch-0.jsonl" });
         const cwd = std.Io.Dir.cwd();
         const text = cwd.readFileAlloc(context.io, path, arena, .limited(64 << 20)) catch "";
@@ -2011,9 +2013,11 @@ fn check_voidstar(context: *Context) !void {
     // Thread-local state would be the host program's (static-pie: local-exec): none at all.
     const library = try std.fs.path.join(arena, &.{ context.bin, "libvoidstar.so" });
     const tls_free = !(try elf_has_tls(context, library));
-    const passes = answered and events_found and same and tls_free;
+    const ulimits = std.mem.indexOf(u8, outputs[0], "nofile 20000 40000") != null;
+    const passes = answered and events_found and same and tls_free and ulimits;
     expect_all(context, &.{
         .{ "notify_coverage answered (False)", answered },
+        .{ "the command ran with the node's Compose ulimits (nofile 20000 40000)", ulimits },
         .{ "its events and edges reach the timeline", events_found },
         .{ "the same twice", same },
         .{ "libvoidstar.so has no thread-local storage", tls_free },

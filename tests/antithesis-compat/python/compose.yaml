@@ -13,5 +13,9 @@ services:
       context: ../../..
       dockerfile: tests/antithesis-compat/python/client/Dockerfile
     command: [sleep, infinity]
+    ulimits:
+      nofile:
+        soft: 20000
+        hard: 40000
     depends_on:
       - redis

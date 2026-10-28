@@ -208,6 +208,18 @@ fn profile_check(profile: *const schema.Profile) !void {
     for (profile.nodes, 0..) |node, index| {
         if (!schema.name_valid(node.name)) return error.BadNodeName;
         if (node.source.kind_count() != 1) return error.NodeNeedsOneSource;
+        if (node.ulimits) |ulimits| {
+            if (ulimits.len > schema.ulimits_max) return error.TooManyUlimits;
+            for (ulimits) |ulimit| {
+                if (schema.ulimit_resource(ulimit.name) == null or ulimit.soft > ulimit.hard) {
+                    std.debug.print("[determinismo] {s}: ulimit {s} (soft {d}, hard {d}) is not one " ++
+                        "of Docker's, or its soft limit is above its hard one\n", .{
+                        node.name, ulimit.name, ulimit.soft, ulimit.hard,
+                    });
+                    return error.BadUlimit;
+                }
+            }
+        }
         for (profile.nodes[0..index]) |earlier| {
             if (std.mem.eql(u8, earlier.name, node.name)) return error.DuplicateNodeName;
         }
@@ -245,6 +257,7 @@ fn node_resolve(
         .faults = node.faults,
         .memory_max_mib = node.memory_max_mib,
         .privileged = node.privileged,
+        .ulimits = node.ulimits,
         .antithesis_library = node.antithesis_library,
     };
     var image: ImageConfig = .{};

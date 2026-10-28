@@ -73,6 +73,9 @@ pub const Node = struct {
     /// /sys and the node's cgroups writable, as for a privileged container: for nodes that run
     /// containers themselves (K3s, Docker in Docker).
     privileged: bool = false,
+    /// Process limits of its processes and of commands run in it (Compose's `ulimits`); null:
+    /// Docker's (open files 1048576, the kernel's for the rest).
+    ulimits: ?[]const Ulimit = null,
     /// Antithesis's native library at /usr/lib/libvoidstar.so (determinismo's): Antithesis's
     /// SDKs then send through it, and instrumented programs report coverage. Imported Compose
     /// projects have it, as on Antithesis. Off by default: a static program with Antithesis's
@@ -106,6 +109,36 @@ pub const Build = struct {
 
 /// The node is ready once this succeeds (from the runner).
 pub const Ready = struct { tcp: u16 };
+
+/// A process limit, by Docker's name ("nofile", "memlock", "nproc", ...: ulimit_resource), set
+/// before a node's command runs. `unlimited` (RLIM_INFINITY) for no limit.
+pub const Ulimit = struct {
+    name: []const u8,
+    soft: u64,
+    hard: u64,
+
+    pub const unlimited = std.math.maxInt(u64);
+};
+pub const ulimits_max = 16;
+
+/// The Linux resource number (RLIMIT_*) of a Docker ulimit name; null for another name.
+pub fn ulimit_resource(name: []const u8) ?u32 {
+    const names = [_][]const u8{
+        "cpu",     "fsize", "data",  "stack",      "core",     "rss",  "nproc",  "nofile",
+        "memlock", "as",    "locks", "sigpending", "msgqueue", "nice", "rtprio", "rttime",
+    };
+    for (names, 0..) |known, resource| {
+        if (std.mem.eql(u8, name, known)) return @intCast(resource);
+    }
+    return null;
+}
+
+test ulimit_resource {
+    try std.testing.expectEqual(@as(?u32, 7), ulimit_resource("nofile"));
+    try std.testing.expectEqual(@as(?u32, 8), ulimit_resource("memlock"));
+    try std.testing.expectEqual(@as(?u32, 15), ulimit_resource("rttime"));
+    try std.testing.expectEqual(@as(?u32, null), ulimit_resource("files"));
+}
 
 /// What the fault injector may do to the node.
 pub const Faults = struct {
@@ -253,6 +286,7 @@ pub const Resolved = struct {
     faults: Faults = .{},
     memory_max_mib: ?u32 = null,
     privileged: bool = false,
+    ulimits: ?[]const Ulimit = null,
     antithesis_library: bool = false,
 };
 

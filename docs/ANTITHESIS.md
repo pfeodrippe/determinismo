@@ -9,7 +9,7 @@ change that moves it.
 
 | Antithesis | determinismo | Status |
 |---|---|---|
-| Docker Compose setup | `--compose` importer: images, builds, env, depends_on, ports, mem_limit, privileged | ✅ |
+| Docker Compose setup | `--compose` importer: images, builds, env, depends_on, ports, mem_limit, privileged, ulimits | ✅ |
 | Kubernetes setup | K3s in a privileged node, or a three-node cluster (`examples/k3s`) | 🟡 no importer for your own manifests: the example is a template |
 | Setup mode, `setup_complete` | snapshot at `setup_complete` (SDKs, composer, `setup_` template commands) | ✅ |
 | The Antithesis environment (one vCPU, no rdrand, deterministic time) | patched KVM, branches clock, CPUID baseline | ✅ |
