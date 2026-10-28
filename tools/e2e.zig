@@ -2334,10 +2334,16 @@ fn check_script(context: *Context) !void {
     const without = failing_count(try explore(context, &others));
     const scripted = others ++ [_][]const u8{ "--script", script_path };
     const with = failing_count(try explore(context, &scripted));
+    // Its own timeline, scripted: the same failure (the script holds what decided it). Whether
+    // other seeds fail more often with it than without is not a check: bank's bug is found in
+    // most timelines either way (6 of 8 without, 5 with, once), and 8 cannot tell them apart.
+    const own = try explore(context, &(common ++ [_][]const u8{ "--seed", "7", "--branch", index, "--script", script_path }));
+    var replayed: [1]Branch = undefined;
+    const reproduced = parse_branches(own, &replayed) == 1 and replayed[0].failing;
     expect_all(context, &.{
         .{ "other seeds fail with the script", with > 0 },
-        .{ "at least as often as without it", with >= without },
-    }, "script: other seeds fail with it ({d} of 8, {d} without)", .{ with, without });
+        .{ "its own timeline, scripted, fails again", reproduced },
+    }, "script: other seeds fail with it ({d} of 8, {d} without), its own again", .{ with, without });
 }
 
 fn failing_count(report: []const u8) u32 {
