@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# hunt-queue.sh <run id> <request JSON>...: srv2 runs one hunt at a time. Waits for the run to
+# hunt-queue.sh <run id> <request JSON, or a file of it>...: one hunt at a time. Waits for the run to
 # end, then starts each request in turn through serve, waiting for each to end. A run also ends
 # here once its discovery plateaus: after an hour, no new behavior over its last 100 timelines
 # (or its last quarter, if more); its time budget stays the bound.
@@ -41,11 +41,13 @@ wait_run() { # <run id>: until it has not run for 3 minutes running (a stop and 
     sleep 60
   done
 }
-start() { # <request JSON>: its run's id, once serve takes it (retried while serve is away;
-  # what serve answered instead is logged, on stderr: run 37 waited 10 minutes unexplained)
-  local id="" answer
+start() { # <request JSON, or a file of it>: its run's id, once serve takes it (retried while
+  # serve is away; what serve answered instead is logged, on stderr: run 37 waited 10 minutes
+  # unexplained)
+  local id="" answer body=$1
+  [ -f "$body" ] && body=$(cat "$body") # A path given was sent as the request (2026-10-28).
   while [ -z "$id" ]; do
-    answer=$(curl -s --max-time 120 -w "\nHTTP %{http_code}" -X POST localhost:7878/runs -d "$1")
+    answer=$(curl -s --max-time 120 -w "\nHTTP %{http_code}" -X POST localhost:7878/runs -d "$body")
     id=$(printf '%s' "$answer" | head -1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' 2>/dev/null)
     if [ -z "$id" ]; then
       echo "$(date +%H:%M) serve did not start the run: $(printf '%s' "$answer" | tr '\n' ' ' | cut -c1-300)" >&2
