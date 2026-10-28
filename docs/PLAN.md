@@ -79,6 +79,14 @@ event hashing, the guest module.
   - CPU modulation is on by default, as Antithesis's with faults (`--no-cpu-modulation`).
   - The e2e checks that stop in bank's violating timeline find it (the TLB patch made the old
     one keep its money).
+  - Kubernetes manifests imported as Antithesis runs them (`--kubernetes`): a single-node K3s,
+    images from the host, kapp's readiness as the setup, templates run in their pods, faults on
+    single pods (freeze, kill, cut off, degrade). Next: partitions between two given pods.
+  - Branches from a moment step by step (advanced multiverse debugging): commands run or in the
+    background, waits, wait-untils; HTTP replay `steps`, MCP, the notebook's branch functions.
+    Next: a branch's future with fresh randomness (fork's), and containers in notebook cells.
+  - The serve self-test (controller) failed 7 of 16: three serve bugs under concurrency and
+    restarts (fixed), and its fake explorer out of date.
 - srv3 (2026-10-27, night), found and fixed:
   - Nodes ran with the kernel's 1024 open files: YugabyteDB's tablet servers aborted on "Too many
     open files" in every timeline (run 1's 39 failures were that). det-init now gives Docker's
