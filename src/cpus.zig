@@ -201,7 +201,7 @@ pub const Pool = struct {
             // killer took serve, 2026-10-27); nor while less than half the reserve is available
             // (holders go below the reserve, holders.zig: they make room before a VM waits).
             const available = memory_available(); // 0: unknown, never a reason to wait.
-            const below = available != 0 and available < memory_reserve_bytes / 2 + sessions_reserve_bytes();
+            const below = available != 0 and available < memory_reserve() / 2 + sessions_reserve_bytes();
             if (below or !pool.claim_fits(claim_bytes)) {
                 if (memory_since == null) {
                     memory_since = monotonic_ns();
@@ -345,6 +345,14 @@ test "a kernel CPU list's count" {
 /// Memory kept free on the host: no VM starts, and no holder is made, below it.
 pub const memory_reserve_bytes = 8 << 30;
 
+/// The reserve for what this process may use: the host's, or an eighth of a smaller limit (its
+/// cgroup's): 8 GB kept free under a 24 GB unit would have left its checks no holders.
+pub fn memory_reserve() u64 {
+    const total = memory_total();
+    if (total == 0) return memory_reserve_bytes;
+    return @min(memory_reserve_bytes, total / 8);
+}
+
 /// Memory a host's runs leave to its user's own sessions (a host with reserved cores: their
 /// builds, checks and replays) while one of the sessions' VMs waits for memory, from
 /// DETERMINISMO_SESSIONS_MEMORY_MIB: serve carries it (serve.sh sets it with the reserved
@@ -397,17 +405,106 @@ fn memory_priority_waiting() bool {
 
 /// The memory this process leaves free: the host's reserve, and the sessions' if it is a run's.
 pub fn reserve_bytes() u64 {
-    return memory_reserve_bytes + sessions_reserve_bytes();
+    return memory_reserve() + sessions_reserve_bytes();
 }
 
-/// The host's available memory (MemAvailable), or 0 if unknown.
+/// The memory available to this process (MemAvailable, or less within its cgroup's limit), or 0
+/// if unknown.
 pub fn memory_available() u64 {
-    return meminfo("MemAvailable:");
+    const host = meminfo("MemAvailable:");
+    const limited = cgroup_memory() orelse return host;
+    return if (host == 0) limited.available else @min(host, limited.available);
 }
 
-/// The host's memory (MemTotal), 0 if unknown.
+/// The memory this process may use (MemTotal, or its cgroup's limit), 0 if unknown.
 pub fn memory_total() u64 {
-    return meminfo("MemTotal:");
+    const host = meminfo("MemTotal:");
+    const limited = cgroup_memory() orelse return host;
+    return if (host == 0) limited.total else @min(host, limited.total);
+}
+
+/// Memory limits on this process's cgroup v2 or its ancestors (systemd's MemoryMax on a unit, a
+/// container's): the tightest, and what is free under it now. A user's checks confined to cores
+/// of their own (MemoryMax too) once took 30 GB beside a hunt that then made no holders, since
+/// VMs were admitted by the host's memory: under a limit, by the limit's.
+const CgroupMemory = struct { total: u64, available: u64 };
+
+/// The levels with a limit (`memory.max` other than "max"), found once: limits move rarely, and
+/// a process under none reads nothing more.
+const levels_max = 8;
+var limited_levels: [levels_max][256]u8 = undefined;
+var limited_level_sizes: [levels_max]u8 = undefined;
+var limited_count: ?u8 = null;
+
+fn cgroup_memory() ?CgroupMemory {
+    if (limited_count == null) cgroup_levels_find();
+    var found: ?CgroupMemory = null;
+    for (0..limited_count.?) |index| {
+        const level = limited_levels[index][0..limited_level_sizes[index]];
+        const limit = cgroup_number(level, "memory.max") orelse continue;
+        const current = cgroup_number(level, "memory.current") orelse continue;
+        // Reclaimable: file pages not shared (memory.current counts the page cache too).
+        const reclaimable = cgroup_stat(level, "inactive_file ");
+        const available = limit -| (current -| reclaimable);
+        found = if (found) |known| .{
+            .total = @min(known.total, limit),
+            .available = @min(known.available, available),
+        } else .{ .total = limit, .available = available };
+    }
+    return found;
+}
+
+fn cgroup_levels_find() void {
+    limited_count = 0;
+    var buffer: [512]u8 = undefined;
+    const own = read_small("/proc/self/cgroup", &buffer) orelse return;
+    // cgroup v2: one line, "0::<path>".
+    const start = std.mem.indexOf(u8, own, "0::") orelse return;
+    const relative = std.mem.trimEnd(u8, own[start + 3 ..], "\n");
+    var path_buffer: [256]u8 = undefined;
+    var path: []const u8 = std.fmt.bufPrint(&path_buffer, "/sys/fs/cgroup{s}", .{if (std.mem.eql(u8, relative, "/")) "" else relative}) catch return;
+    while (limited_count.? < levels_max) {
+        if (cgroup_number(path, "memory.max") != null) {
+            const index = limited_count.?;
+            @memcpy(limited_levels[index][0..path.len], path);
+            limited_level_sizes[index] = @intCast(path.len);
+            limited_count = index + 1;
+        }
+        if (std.mem.eql(u8, path, "/sys/fs/cgroup")) return;
+        path = std.fs.path.dirname(path) orelse return;
+    }
+}
+
+/// A cgroup file holding one number; null for "max", or when it is not there.
+fn cgroup_number(level: []const u8, comptime name: []const u8) ?u64 {
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}/" ++ name, .{level}, 0) catch return null;
+    var buffer: [64]u8 = undefined;
+    const text = read_small(path, &buffer) orelse return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch null;
+}
+
+/// A field of a cgroup's memory.stat ("<key> <bytes>"), 0 when absent.
+fn cgroup_stat(level: []const u8, comptime key: []const u8) u64 {
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}/memory.stat", .{level}, 0) catch return 0;
+    var buffer: [8192]u8 = undefined;
+    const text = read_small(path, &buffer) orelse return 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, line[key.len..], " "), 10) catch 0;
+    }
+    return 0;
+}
+
+fn read_small(path: [*:0]const u8, buffer: []u8) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), buffer.ptr, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return buffer[0..size];
 }
 
 fn meminfo(comptime key: []const u8) u64 {
@@ -659,4 +756,35 @@ test "a check waiting for memory is seen by the runs" {
     try std.testing.expect(memory_priority_waiting());
     _ = linux.flock(waiter, std.posix.LOCK.UN); // Served.
     try std.testing.expect(!memory_priority_waiting());
+}
+
+test "a cgroup's limit and what is free under it" {
+    var path_buffer: [64]u8 = undefined;
+    const level_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-cgroup-test-{d}", .{linux.getpid()}, 0);
+    const level: []const u8 = level_z;
+    _ = linux.mkdir(level_z, 0o755);
+    defer _ = linux.rmdir(level_z);
+    const files = [_][2][]const u8{
+        .{ "memory.max", "25769803776\n" },
+        .{ "memory.current", "10737418240\n" },
+        .{ "memory.stat", "anon 6442450944\nfile 4294967296\ninactive_file 2147483648\nactive_file 1073741824\n" },
+    };
+    for (files) |file| {
+        var file_buffer: [128]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ level, file[0] }, 0);
+        const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.write(@intCast(fd), file[1].ptr, file[1].len);
+        _ = linux.close(@intCast(fd));
+    }
+    defer for (files) |file| {
+        var file_buffer: [128]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ level, file[0] }, 0) catch unreachable;
+        _ = linux.unlink(path);
+    };
+    try std.testing.expectEqual(24 << 30, cgroup_number(level, "memory.max").?);
+    try std.testing.expectEqual(10 << 30, cgroup_number(level, "memory.current").?);
+    try std.testing.expectEqual(2 << 30, cgroup_stat(level, "inactive_file "));
+    try std.testing.expectEqual(0, cgroup_stat(level, "shmem "));
+    try std.testing.expectEqual(null, cgroup_number(level, "memory.high")); // Not there.
 }

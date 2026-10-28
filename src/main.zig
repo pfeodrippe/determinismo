@@ -2977,7 +2977,7 @@ fn tree_judge(
     // their branches are numbered in the returns' order, as if made one after the other.
     const makings = try arena.alloc(NodeMaking, returns.len);
     const total = cpus.memory_total();
-    const nodes_cap = if (total == 0) std.math.maxInt(u64) / 2 else (total -| cpus.memory_reserve_bytes) / 2;
+    const nodes_cap = if (total == 0) std.math.maxInt(u64) / 2 else (total -| cpus.memory_reserve()) / 2;
     var nodes_pending: u64 = 0; // The nodes being made, each its VM's size at most.
     var making_count: u32 = 0;
     var finished: u32 = 0;

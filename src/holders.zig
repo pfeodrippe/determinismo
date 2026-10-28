@@ -40,7 +40,7 @@ const spacing_ns_unknown = std.time.ns_per_s;
 /// No holder is made with less memory than this available (MemAvailable): room to grow in; a
 /// run's holders leave the sessions' memory too (cpus.sessions_reserve_bytes).
 fn make_available_min() u64 {
-    return 2 * cpus.memory_reserve_bytes + cpus.sessions_reserve_bytes();
+    return 2 * cpus.memory_reserve() + cpus.sessions_reserve_bytes();
 }
 /// A holder goes once less than this is available, above where a VM start waits (cpus.zig).
 fn keep_available_min() u64 {
@@ -687,8 +687,8 @@ fn write_all(fd: linux.fd_t, bytes: []const u8) bool {
 
 test "a timeline's holders on disk go, and only its own" {
     var path_buffer: [64]u8 = undefined;
-    const directory = try std.fmt.bufPrint(&path_buffer, "/tmp/determinismo-holders-test-{d}", .{linux.getpid()});
-    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{directory}, 0);
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-holders-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
     _ = linux.mkdir(directory_z, 0o755);
     defer _ = linux.rmdir(directory_z);
     const names = [_][]const u8{ "h12-5.state", "h12-5.mem", "h12-9.mem.part77", "h123-5.state", "h7-1.mem" };
