@@ -723,6 +723,10 @@ fn mapper_table(name: []const u8, target: MapperTarget) !void {
     if (linux.errno(lock) != .SUCCESS) return error.MapperLock;
     defer _ = linux.close(@intCast(lock));
     while (linux.errno(linux.flock(@intCast(lock), std.posix.LOCK.EX)) == .INTR) {}
+    // Unlocked, not only closed: a process forked meanwhile from another thread has a copy of
+    // the file, and a flock lasts until its last copy closes (output.zig's forwarders once kept
+    // it held for good).
+    defer _ = linux.flock(@intCast(lock), std.posix.LOCK.UN);
     _ = try mapper_call(dm_table_load, name, 0, target);
     _ = try mapper_call(dm_dev_suspend, name, dm_skip_lockfs_flag, null);
 }

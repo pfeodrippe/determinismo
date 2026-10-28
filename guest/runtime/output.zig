@@ -40,14 +40,29 @@ pub fn forward(source: []const u8, log_path: [:0]const u8, from: Pipes) !void {
     }
     const pid = linux.fork();
     if (pid != 0) linux.exit_group(0); // The forwarder is adopted by PID 1.
-    _ = linux.close(from.stdout[1]);
-    _ = linux.close(from.stderr[1]);
+    files_close_except(from.stdout[0], from.stderr[0]);
     var name_buffer: [16]u8 = @splat(0);
     const name_size = @min(source.len, name_buffer.len - 1);
     @memcpy(name_buffer[0..name_size], source[0..name_size]);
     _ = linux.prctl(@backingInt(linux.PR.SET_NAME), @intFromPtr(&name_buffer), 0, 0, 0);
     run(source, log_path, from.stdout[0], from.stderr[0]);
     linux.exit_group(0);
+}
+
+/// Every file the forwarder inherited, but stdin, stdout, stderr and its two pipes: it forks
+/// from det-faults or det-nodes at any moment, from any of their threads, and a copy it kept
+/// held what they held then for as long as it ran. A device-mapper lock det-faults' durability
+/// listener held as its main thread restarted a node: the lock's next taker waited forever, and
+/// the fault injector with it (srv3, 2026-10-28, a Kafka timeline without faults for 69 s); and
+/// another node's pipes, whose forwarder then never saw them end.
+fn files_close_except(a: linux.fd_t, b: linux.fd_t) void {
+    const low: u32 = @intCast(@min(a, b));
+    const high: u32 = @intCast(@max(a, b));
+    const last = std.math.maxInt(u32);
+    for ([_][2]u32{ .{ 3, low -| 1 }, .{ low + 1, high -| 1 }, .{ high + 1, last } }) |range| {
+        if (range[0] > range[1] or range[0] < 3) continue;
+        _ = linux.syscall3(.close_range, range[0], range[1], 0);
+    }
 }
 
 const Stream = struct {
