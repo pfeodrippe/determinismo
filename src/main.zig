@@ -1967,6 +1967,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .path = place.path,
             .generation = place.generation,
             .why = place.why,
+            .memory_wait_ns = if (held) |cpu| cpu.memory_wait_ns else 0,
         });
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };

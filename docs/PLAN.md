@@ -70,10 +70,20 @@ event hashing, the guest module.
   transaction stays open once faults stop), and runs flag a sometimes held in under 5% of the
   timelines ("rarely true"). A default timeline now commits ~460 transactions. Found on the
   way, in the platform: isolation cut a node from its own address (fixed: the address on lo),
-  which stalled Kafka's commit markers and made a false "torn transactions". The `coverage`
-  profile (Java 25, the agent on the transaction path) to compare with the default on the same
-  seed and budget. Rust SDK coverage lines: its coverage.c would need the C SDK's lookup copied
+  which stalled Kafka's commit markers and made a false "torn transactions". Then, in the
+  second timeline of a smoke test: KAFKA-20979 rediscovered blind (a power loss after a clean
+  shutdown leaves a zero-filled time index; retention deleted 30 committed transactions).
+  Hunt run 67 (default, seed 17): commits in 50 of its first 87 timelines; Elle's failures
+  were G0 alone (Jepsen's known Kafka behavior), now `allowed` in the check and reported apart.
+  The `coverage` profile (Java 25, the agent on the transaction path) hunts next on the same
+  seed and budget, for comparison. Rust SDK coverage lines: its coverage.c would need the C SDK's lookup copied
   in (a packaged crate cannot include sdk/c), later.
+- Reserved cores need memory (2026-10-28): a Kafka hunt held all but 9 GiB of srv3's 125
+  (VMs and holders), so the checks on the reserved cores ran one VM at a time (e2e parallel
+  failed at 1.0 timelines at once; ui's causality analysis did not finish in 15 minutes).
+  Runs now leave 6 GiB per reserved core free (DETERMINISMO_SESSIONS_MEMORY_MIB, set by
+  serve.sh), holders included; branch lines show `memory_wait=` when a VM waited for memory,
+  and the parallel check skips, saying so, when its VMs mostly waited.
 - verify: a replay that could not start said "replayed nothing" (the 17:05 hyperthreads
   experiment: 64 refused, TapeInputsDiffer, its script missing serve's --cpu-modulation and
   pin). It prints how the replay ended now, and `verify --run <dir>` takes a run's options as

@@ -262,6 +262,8 @@ pub const Multiverse = struct {
         path: []const tape.Segment = &.{},
         generation: u32 = 0,
         why: []const u8 = "",
+        /// How long its CPU waited for the host's memory before it started (cpus.Held).
+        memory_wait_ns: u64 = 0,
     };
 
     const Aggregate = struct {
@@ -337,6 +339,7 @@ pub const Multiverse = struct {
             seconds(state.tsc / tsc_per_ns), seconds(branch.wall_ns), vm.events.count,
             vm.events.hash.final(),          failing,
         }) catch {};
+        if (branch.memory_wait_ns > 0) line.print(" memory_wait={d:.3}s", .{seconds(branch.memory_wait_ns)}) catch {};
         var failing_names: [64][]const u8 = undefined;
         var failing_count: u32 = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {

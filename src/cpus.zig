@@ -184,6 +184,8 @@ pub const Pool = struct {
         };
         // Host-side only (which CPU a timeline runs on never changes it): any seed will do.
         var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
+        var memory_wait_ns: u64 = 0;
+        var memory_since: ?u64 = null;
         while (true) {
             // Every CPU runs a VM, or a priority process waits for it: back-pressure, until one
             // is free. A priority process tries at once; the others wait their turn first, at
@@ -199,13 +201,17 @@ pub const Pool = struct {
             // killer took serve, 2026-10-27); nor while less than half the reserve is available
             // (holders go below the reserve, holders.zig: they make room before a VM waits).
             const available = memory_available(); // 0: unknown, never a reason to wait.
-            if ((available != 0 and available < memory_reserve_bytes / 2) or !pool.claim_fits(claim_bytes)) {
+            const below = available != 0 and available < memory_reserve_bytes / 2 + sessions_reserve_bytes();
+            if (below or !pool.claim_fits(claim_bytes)) {
+                if (memory_since == null) memory_since = monotonic_ns();
                 if (pool.priority) {
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
                 }
                 continue;
             }
+            if (memory_since) |since| memory_wait_ns += monotonic_ns() - since;
+            memory_since = null;
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
                 if (!pool.priority and pool.priority_waiting(slot)) continue;
@@ -215,7 +221,7 @@ pub const Pool = struct {
                 const claim = std.mem.toBytes(claim_bytes);
                 _ = linux.pwrite(pool.fds[slot], &claim, claim.len, 0);
                 pin(pool.cpus[slot]);
-                return .{ .slot = slot };
+                return .{ .slot = slot, .memory_wait_ns = memory_wait_ns };
             }
             if (pool.priority) {
                 const pause: linux.timespec = .{ .sec = 0, .nsec = wait_ns_min };
@@ -242,7 +248,7 @@ pub const Pool = struct {
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
-        return fits(claimed, bytes, total, if (pool.available_counts) memory_available() else 0);
+        return fits(claimed, bytes, total, if (pool.available_counts) memory_available() else 0, reserve_bytes());
     }
 
     /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
@@ -262,7 +268,12 @@ pub const Pool = struct {
     }
 };
 
-pub const Held = struct { slot: u32 };
+pub const Held = struct {
+    slot: u32,
+    /// How long the take waited for the host's memory (other runs' VMs and holders claim it):
+    /// a run whose VMs mostly wait for memory runs fewer timelines at once than it has CPUs.
+    memory_wait_ns: u64 = 0,
+};
 
 /// The pool directory's `<kind>-<cpu>` file, opened (made if new).
 fn pool_file(directory: [:0]const u8, comptime kind: []const u8, cpu: usize) !linux.fd_t {
@@ -322,6 +333,22 @@ test "a kernel CPU list's count" {
 
 /// Memory kept free on the host: no VM starts, and no holder is made, below it.
 pub const memory_reserve_bytes = 8 << 30;
+
+/// Memory a host's runs leave to its user's own sessions (a host with reserved cores: their
+/// builds, checks and replays), from DETERMINISMO_SESSIONS_MEMORY_MIB: serve carries it
+/// (serve.sh sets it with the reserved cores), and so every process of its runs; the sessions'
+/// own processes do not, and may use it. Without it a hunt held all but 9 GiB of srv3's 125,
+/// and a check on the reserved cores ran one VM at a time (2026-10-28).
+pub fn sessions_reserve_bytes() u64 {
+    const value = std.c.getenv("DETERMINISMO_SESSIONS_MEMORY_MIB") orelse return 0;
+    const mib = std.fmt.parseInt(u64, std.mem.span(value), 10) catch return 0;
+    return mib << 20;
+}
+
+/// The memory this process leaves free: the host's reserve, and the sessions' if it is a run's.
+pub fn reserve_bytes() u64 {
+    return memory_reserve_bytes + sessions_reserve_bytes();
+}
 
 /// The host's available memory (MemAvailable), or 0 if unknown.
 pub fn memory_available() u64 {
@@ -512,17 +539,21 @@ fn nodes_claimed(directory: []const u8) u64 {
 /// without a CPU (holders, in-run snapshots, host checks' services), and a check beside a hunt
 /// once fit its claims while the host ran out (srv3, 2026-10-28: the OOM killer took a hunt's
 /// timeline and podman's pause process).
-fn fits(claimed: u64, bytes: u64, total: u64, available: u64) bool {
-    if (claimed + bytes + memory_reserve_bytes > total) return false;
-    return available == 0 or bytes + memory_reserve_bytes <= available;
+fn fits(claimed: u64, bytes: u64, total: u64, available: u64, reserve: u64) bool {
+    if (claimed + bytes + reserve > total) return false;
+    return available == 0 or bytes + reserve <= available;
 }
 
 test fits {
     const gib = 1 << 30;
-    try std.testing.expect(fits(100 * gib, 7 * gib, 125 * gib, 40 * gib));
-    try std.testing.expect(!fits(112 * gib, 7 * gib, 125 * gib, 40 * gib)); // Past the claims.
-    try std.testing.expect(!fits(60 * gib, 7 * gib, 125 * gib, 12 * gib)); // Not there now.
-    try std.testing.expect(fits(60 * gib, 7 * gib, 125 * gib, 0)); // Unknown: the claims alone.
+    const reserve = memory_reserve_bytes;
+    try std.testing.expect(fits(100 * gib, 7 * gib, 125 * gib, 40 * gib, reserve));
+    try std.testing.expect(!fits(112 * gib, 7 * gib, 125 * gib, 40 * gib, reserve)); // Past the claims.
+    try std.testing.expect(!fits(60 * gib, 7 * gib, 125 * gib, 12 * gib, reserve)); // Not there now.
+    try std.testing.expect(fits(60 * gib, 7 * gib, 125 * gib, 0, reserve)); // Unknown: the claims alone.
+    // A run leaves the sessions' memory: what a check could take, a run waits for.
+    try std.testing.expect(fits(60 * gib, 2 * gib, 125 * gib, 12 * gib, reserve));
+    try std.testing.expect(!fits(60 * gib, 2 * gib, 125 * gib, 12 * gib, reserve + 12 * gib));
 }
 
 test "a VM's memory claim counts while its CPU is held" {

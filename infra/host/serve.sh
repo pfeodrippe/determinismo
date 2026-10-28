@@ -11,6 +11,9 @@
 #   (ssh: builds, checks, benchmarks), the rest for serve and every run it starts (hunts), each
 #   confined to its share by the kernel (cgroup cpusets: systemd's AllowedCPUs). Kept in
 #   /etc/determinismo/reserved-cores for the next start. Default 0: runs may take every core.
+#   With them, 6 GiB per reserved core of the host's memory, which runs leave free for the
+#   sessions' VMs (DETERMINISMO_SESSIONS_MEMORY_MIB, cpus.zig): cores without memory to run
+#   VMs on are no reservation (a hunt left a check one VM at a time, srv3 2026-10-28).
 #   --siblings on|off: VMs on a core's second hyperthread too, once every core's first is busy
 #   (DETERMINISMO_SMT, cpus.zig). Kept in /etc/determinismo/siblings. Default off.
 set -euo pipefail
@@ -119,6 +122,7 @@ Wants=user@$uid.service
 User=$user
 Environment=XDG_RUNTIME_DIR=/run/user/$uid
 Environment=DETERMINISMO_SMT=$smt
+Environment=DETERMINISMO_SESSIONS_MEMORY_MIB=$((reserved * 6144))
 WorkingDirectory=$home/determinismo
 ExecStart=$home/determinismo/zig-out/bin/determinismo serve --listen $listen \\
   --bb $home/opt/bb/bb --kernel $home/guest/vmlinuz \\

@@ -31,10 +31,15 @@ const spacing_ns_min = 10 * std.time.ns_per_ms;
 /// every 10 ms of a long timeline (a YugabyteDB VM of 7 GB, reaching new log lines all the
 /// time, spent half its time outside the guest; srv3).
 const spacing_ns_unknown = std.time.ns_per_s;
-/// No holder is made with less memory than this available (MemAvailable): room to grow in.
-const make_available_min = 2 * cpus.memory_reserve_bytes;
+/// No holder is made with less memory than this available (MemAvailable): room to grow in; a
+/// run's holders leave the sessions' memory too (cpus.sessions_reserve_bytes).
+fn make_available_min() u64 {
+    return 2 * cpus.memory_reserve_bytes + cpus.sessions_reserve_bytes();
+}
 /// A holder goes once less than this is available, above where a VM start waits (cpus.zig).
-const keep_available_min = cpus.memory_reserve_bytes;
+fn keep_available_min() u64 {
+    return cpus.reserve_bytes();
+}
 /// How often a holder looks at the host's memory, plus up to as much again by its pid: holders
 /// look at different moments, so the first ones gone can give enough back for the rest.
 const memory_check_ms = 200;
@@ -265,10 +270,10 @@ pub const Owner = struct {
         owner.last_ns = moment;
         try owner.arm(vm, moment + owner.period(), false); // The next, unless one is new first.
         const available = cpus.memory_available();
-        if (available < make_available_min) {
+        if (available < make_available_min()) {
             // Said once a timeline: its nodes are then made by replays (checks read it).
             if (!owner.short_said) std.debug.print("[determinismo] holders: none made, {d} GB " ++
-                "available ({d} needed)\n", .{ available >> 30, make_available_min >> 30 });
+                "available ({d} needed)\n", .{ available >> 30, make_available_min() >> 30 });
             owner.short_said = true;
             return;
         }
@@ -346,7 +351,7 @@ pub const Owner = struct {
             if (linux.errno(ready) != .SUCCESS or polled[1].revents != 0) linux.exit_group(0);
             if (polled[0].revents != 0) break;
             const available = cpus.memory_available(); // 0: unknown, never a reason to go.
-            if (available == 0 or available >= keep_available_min) continue;
+            if (available == 0 or available >= keep_available_min()) continue;
             // Going, unless the explorer asked meanwhile.
             const asked = linux.poll(polled[0..1], 1, 0);
             if (linux.errno(asked) == .SUCCESS and polled[0].revents != 0) break;

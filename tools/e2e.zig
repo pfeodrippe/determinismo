@@ -2469,14 +2469,27 @@ fn check_parallel(context: *Context) !void {
             "--program", program, "--scenario", "bank", "--seed", "22", "--branches", "48", "--branching", branching,
         });
         // On the cores the run has (a host's reserved cores give a check 2): a core short of
-        // them all is fine, one timeline at a time is the bug.
+        // them all is fine, one timeline at a time is the bug (0.95 at once on 2 cores). A
+        // tree waits for its nodes between generations: 1.46 at once on 2 cores (srv3,
+        // 2026-10-28), so 0.65 of the cores, up to 1.8.
         const cores = workers_said(output);
         if (cores < 2) {
             std.debug.print("SKIP parallel: a {s} run on {d} core\n", .{ branching, cores });
             continue;
         }
         const at_once = concurrency(output);
-        const least = @min(1.8, 0.75 * @as(f64, @floatFromInt(cores)));
+        // A host whose memory other runs claim (a hunt beside the checks) admits fewer VMs at
+        // once than it has CPUs: that is the pool's back-pressure, not this bug (srv3,
+        // 2026-10-28: a Kafka hunt's 50 GB and its holders left one VM at a time).
+        const waited = memory_waited(output);
+        if (waited.memory_s > 0.25 * waited.run_s) {
+            std.debug.print("SKIP parallel: a {s} run's VMs waited {d:.0}s for memory in {d:.0}s " ++
+                "(other runs' claims): {d:.1} timelines at once says nothing of its cores\n", .{
+                branching, waited.memory_s, waited.run_s, at_once,
+            });
+            continue;
+        }
+        const least = @min(1.8, 0.65 * @as(f64, @floatFromInt(cores)));
         expect(context, at_once >= least, "parallel: without --jobs, a {s} run keeps its {d} cores busy " ++
             "({d:.1} timelines at once on average)", .{ branching, cores, at_once });
     }
@@ -2496,6 +2509,36 @@ fn workers_said(output: []const u8) u32 {
 }
 
 /// The timelines' wall times over the run's (its multiverse line's).
+/// How long a report's timelines waited for the host's memory (their `memory_wait=`), and the
+/// run's wall time.
+fn memory_waited(output: []const u8) struct { memory_s: f64, run_s: f64 } {
+    var memory_s: f64 = 0;
+    var run_s: f64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "[branch ")) {
+            const wait = field(line, "memory_wait=") orelse continue;
+            memory_s += std.fmt.parseFloat(f64, std.mem.trimEnd(u8, wait, "s")) catch 0;
+        } else if (std.mem.indexOf(u8, line, "] multiverse: ")) |_| {
+            const end = std.mem.lastIndexOf(u8, line, "s wall") orelse continue;
+            const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ' ') orelse continue) + 1;
+            run_s = std.fmt.parseFloat(f64, line[start..end]) catch 0;
+        }
+    }
+    return .{ .memory_s = memory_s, .run_s = run_s };
+}
+
+test memory_waited {
+    const report = "[branch    0] seed=ab shutdown vtime=2.9s wall=0.4s events=488 " ++
+        "events_hash=5167 failing=0 memory_wait=1.500s\n" ++
+        "[branch    1] seed=cd shutdown vtime=2.1s wall=0.1s events=99 events_hash=c66e failing=1 " ++
+        "memory_wait=0.500s  FAIL \"total\"\n" ++
+        "[determinismo] multiverse: 2 branches, 1 with failing properties, 3.000s wall\n";
+    const waited = memory_waited(report);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), waited.memory_s, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), waited.run_s, 0.001);
+}
+
 fn concurrency(output: []const u8) f64 {
     var timelines_s: f64 = 0;
     var run_s: f64 = 0;
