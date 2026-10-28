@@ -36,7 +36,9 @@ WORKLOADS = {
               "--cpu-modulation"],
              ["[workload-commit-progress]", "[log-matching]", "[fsm-convergence] cluster failed",
               "[election-safety]", "[leader-completeness]"]),
-    "maze": (["--program", "zig-out/bin/det-selftest", "--profile", "maze", "--scenario", "maze"],
+    # No faults and earlier numbers without CPU modulation (on by default since 2026-10-28).
+    "maze": (["--program", "zig-out/bin/det-selftest", "--profile", "maze", "--scenario", "maze",
+              "--no-cpu-modulation"],
              ["the maze is never solved"]),
     "nats": (["--program", "zig-out/bin/nats-test", "--profile", "jepsen", "--scenario", "queue"],
              ["every acknowledged publish is read back", "no two acknowledged messages"]),
@@ -84,6 +86,7 @@ def run(workload, seed, budget, options, bb):
                     "--tape-dir", tempfile.mkdtemp(prefix="explore-bench-tapes-")]
     start = time.monotonic()
     found = {}
+    hits = []  # Every find, in the order timelines ended: (target, wall_s, timelines, branch).
     timelines = 0
     process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, errors="replace")
     for line in process.stderr:
@@ -92,9 +95,12 @@ def run(workload, seed, budget, options, bb):
             continue
         timelines += 1
         for target in targets:
-            if target not in found and f'FAIL "{target}' in match.group(3):
-                found[target] = {"wall_s": round(time.monotonic() - start, 1), "timelines": timelines,
-                                 "branch": int(match.group(1))}
+            if f'FAIL "{target}' not in match.group(3):
+                continue
+            hit = {"wall_s": round(time.monotonic() - start, 1), "timelines": timelines,
+                   "branch": int(match.group(1))}
+            hits.append((target, hit))
+            found.setdefault(target, hit)
     process.wait()
     if process.returncode not in (0, 3):  # 3: properties failed, as expected.
         print(f"explore exited with {process.returncode}: {' '.join(command)}", flush=True)
@@ -103,7 +109,13 @@ def run(workload, seed, budget, options, bb):
         with open(record) as lines:
             rows = [json.loads(line)["branch"] for line in lines if '"branch"' in line]
     depths = [len(row.get("path") or []) for row in rows]
-    # A find from a fresh start is the seed's; one from a moment, the strategy's.
+    # A find from a fresh start is the seed's; one from a moment, the strategy's: the first of
+    # those is the variant's own time to find.
+    returned = {row["index"] for row in rows if row.get("path")}
+    found_from_moment = {}
+    for target, hit in hits:
+        if hit["branch"] in returned:
+            found_from_moment.setdefault(target, hit)
     finds = {}
     for row in rows:
         for target in targets:
@@ -116,7 +128,7 @@ def run(workload, seed, budget, options, bb):
         "timelines": len(rows), "from_moment": sum(1 for depth in depths if depth > 0),
         "depth_max": max(depths, default=0),
         "vtime_mean_s": round(sum(row["vtime_ns"] for row in rows) / max(1, len(rows)) / 1e9, 1),
-        "found": found, "finds": finds,
+        "found": found, "found_from_moment": found_from_moment, "finds": finds,
     }
 
 
@@ -138,8 +150,11 @@ def main():
                 out.write(json.dumps(result) + "\n")
             found = ", ".join(f"{target} at {hit['wall_s']}s (#{hit['timelines']})"
                               for target, hit in result["found"].items()) or "nothing"
+            returned = ", ".join(f"{target} at {hit['wall_s']}s (#{hit['timelines']})"
+                                 for target, hit in result["found_from_moment"].items()) or "nothing"
             print(f"{name} seed {seed}: {result['timelines']} timelines, {result['from_moment']} from "
-                  f"moments, depth {result['depth_max']}, {result['vtime_mean_s']}s mean; found {found}",
+                  f"moments, depth {result['depth_max']}, {result['vtime_mean_s']}s mean; found {found}; "
+                  f"from moments {returned}",
                   flush=True)
 
 
