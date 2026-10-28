@@ -26,6 +26,11 @@ pub const per_timeline_max = 8;
 /// behaviors in bursts: one holder per burst).
 const spacing_divisor = 64;
 const spacing_ns_min = 10 * std.time.ns_per_ms;
+/// Before any of the run's timelines said how long they run: each holder is a fork of the VM
+/// (its page tables copied, and every page the guest writes after it copied again), so not
+/// every 10 ms of a long timeline (a YugabyteDB VM of 7 GB, reaching new log lines all the
+/// time, spent half its time outside the guest; srv3).
+const spacing_ns_unknown = std.time.ns_per_s;
 /// No holder is made with less memory than this available (MemAvailable): room to grow in.
 const make_available_min = 2 * cpus.memory_reserve_bytes;
 /// A holder goes once less than this is available, above where a VM start waits (cpus.zig).
@@ -206,7 +211,7 @@ pub const Owner = struct {
     };
 
     pub fn spacing(timeline_ns: ?u64) u64 {
-        const length = timeline_ns orelse return spacing_ns_min;
+        const length = timeline_ns orelse return spacing_ns_unknown;
         return @max(spacing_ns_min, length / spacing_divisor);
     }
 

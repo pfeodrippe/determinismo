@@ -1705,6 +1705,9 @@ const Branches = struct {
     seen: ?*const std.AutoHashMapUnmanaged(u64, void) = null,
     /// Where its holders write themselves when it fails (Ladders).
     ladder: ?*const holders.Ladder = null,
+    /// Where the run's timelines end, on average so far (virtual time): its holders' spacing
+    /// when neither a horizon nor `--timeline` says how long it runs.
+    end_ns_expected: ?u64 = null,
     /// Shared by parallel workers (memory mapped before they fork): the next position to run.
     /// A timeline is the same whichever worker runs it, so a worker that finished takes the
     /// next instead of idling while others run long ones.
@@ -1794,6 +1797,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                     horizon -| place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s)
                 else if (branches.arguments.timeline_ms) |ms|
                     ms * std.time.ns_per_ms
+                else if (branches.end_ns_expected) |end|
+                    end -| place.snapshot.tsc / (cpuid_tsc_hz / std.time.ns_per_s)
                 else
                     null),
                 .snapshot = capture,
@@ -2119,6 +2124,7 @@ fn explore_tree(
                 mine.holders = registry.explorer;
                 mine.seen = &state.seen;
                 if (ladders) |known| mine.ladder = &known.ladder;
+                if (state.ends_count > 0) mine.end_ns_expected = state.ends_ns_sum / state.ends_count;
             }
             running[running_count] = try timeline_start(context, vm, options, mine, &batch);
             running_count += 1;
@@ -2502,6 +2508,10 @@ const TreeState = struct {
     next_index: u32 = 0,
     /// The failing timelines' holders written to disk (with a run directory).
     ladders: ?*Ladders = null,
+    /// Where the timelines that ran to their end ended (virtual time): their sum and count, for
+    /// a timeline's expected end (holders' spacing).
+    ends_ns_sum: u64 = 0,
+    ends_count: u64 = 0,
     /// Planned timelines, taken in order from `queue_head` (explore_tree).
     queue: std.ArrayList(Planned) = .empty,
     queue_head: u32 = 0,
@@ -2727,6 +2737,10 @@ fn tree_judge(
     while (finished < making_count) : (finished += 1) {
         node_make_finish(arena, &makings[finished]);
     }
+    for (done) |summary| if (!summary.cut and summary.end_ns > 0) {
+        state.ends_ns_sum += summary.end_ns;
+        state.ends_count += 1;
+    };
     // A property's first failing timeline: its holders nobody took, to disk (Ladders).
     if (state.ladders) |ladders| for (done) |summary| {
         if (summary.failing_count > 0) try ladders.consider(arena, state.registry, summary);
