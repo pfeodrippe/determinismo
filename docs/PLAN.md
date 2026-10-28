@@ -131,6 +131,13 @@ event hashing, the guest module.
     (each core's first thread first; `--siblings off`, DETERMINISMO_SMT=0, for one per core):
     a VM with a busy sibling runs at about 0.7x, a core does about 1.4x. Hunts keep checking
     it with their own replays.
+  - Fault injector deadlock (2026-10-28, Kafka run 24, 1 timeline of 68): no fault for the
+    last 69 s of timeline 63, a crashed node never started again, an isolation never ended.
+    Found by replaying the timeline to 60 s and dumping det-faults' threads and /proc/locks:
+    the durability listener waited for the device-mapper flock while holding the durability
+    lock the main loop waited for; the flock's holder was a node's output forwarder, forked
+    from the main thread while the listener held it. Fixed (explicit unlock; forwarders close
+    what they inherited). Also from that run: crash properties are named by process now.
   - Saving a ladder by replay: 9 moments of a YugabyteDB timeline took 25 minutes on an earlier
     build; with the exit fixes, run 18 (srv3) saved 10 moments over 85 virtual seconds in 88 s,
     the replay's own pace. Open: a ladder once stopped after 2 of 9 moments (timeline 5 of run
