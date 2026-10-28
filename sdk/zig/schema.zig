@@ -180,6 +180,12 @@ pub const Faults = struct {
     /// Degrade single links, in one direction, for a while: delay and loss, duplication,
     /// corruption, reordering or congestion.
     degrade: bool = true,
+    /// Whether link faults (isolate, partition, degrade, partitions into groups, clogs) may
+    /// reach its link with the runner (the test program's drivers). Off for a node that stands
+    /// for the test's own client library, as Jepsen's clients live in the test process: its
+    /// links to the servers are faulted (a commit delayed on its way to the coordinator), the
+    /// drivers' calls into it are not.
+    runner_links: bool = true,
     /// Limit its CPU (a share of one CPU) for a while.
     throttle: bool = true,
     /// Stop one of its processes (SIGSTOP) for a while.

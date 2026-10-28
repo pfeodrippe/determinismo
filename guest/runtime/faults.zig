@@ -553,7 +553,7 @@ fn links_collect(
     count: *u32,
 ) void {
     const node = &system.nodes[index];
-    links_add(faults, count, node, schema.runner_name, .{});
+    if (node.faults.runner_links) links_add(faults, count, node, schema.runner_name, .{});
     for (system.nodes[index + 1 ..]) |peer| links_add(faults, count, node, peer.name, peer.faults);
 }
 
@@ -1345,7 +1345,7 @@ fn disrupted_links(
 
 /// Whether a partition into groups or a clog disrupts the direction from endpoint a to b.
 fn disrupts(system: *const schema.System, applied: *const Applied, a: usize, b: usize) bool {
-    if (a == b) return false;
+    if (a == b or !faultable(system, a, b)) return false;
     return switch (applied.kind) {
         .partition_groups => applied.groups[a] != group_none and
             applied.groups[b] != group_none and switch (applied.direction orelse .both) {
@@ -1478,7 +1478,9 @@ fn network_refresh(system: *const schema.System) void {
         }
         const from = endpoint_name(system, a);
         const to = endpoint_name(system, b);
-        if (wanted == null and degradable(system, from) and degradable(system, to)) {
+        if (wanted == null and faultable(system, a, b) and degradable(system, from) and
+            degradable(system, to))
+        {
             wanted = baseline;
         }
         if (std.meta.eql(wanted, network.netem[a][b])) continue;
@@ -1487,8 +1489,17 @@ fn network_refresh(system: *const schema.System) void {
     };
 }
 
+/// Whether link faults may reach the link between endpoints a and b: not the runner's with a
+/// node that keeps it (Faults.runner_links).
+fn faultable(system: *const schema.System, a: usize, b: usize) bool {
+    if (a != 0 and b != 0) return true;
+    if (a == b) return false;
+    return system.nodes[@max(a, b) - 1].faults.runner_links;
+}
+
 /// Whether a fault takes the link between endpoints a and b down (isolate, partition).
 fn cuts_link(system: *const schema.System, applied: *const Applied, a: usize, b: usize) bool {
+    if (!faultable(system, a, b)) return false;
     const node = endpoint_index(system, applied.node) orelse return false;
     return switch (applied.kind) {
         .isolate => a == node or b == node,
@@ -2029,4 +2040,60 @@ test disrupted_links {
     };
     // Into a: from the runner and from b.
     try std.testing.expectEqual(@as(u32, 2), disrupted_links(&system, &clog, &links));
+}
+
+test "runner_links: a client node's link with the runner is never faulted" {
+    const base = schema.Resolved{
+        .name = "server",
+        .address = "10.0.0.2",
+        .disk = "vdb",
+        .digest = "",
+        .command = &.{"x"},
+        .env = &.{},
+    };
+    var resolved = [2]schema.Resolved{ base, base };
+    resolved[1].name = "client";
+    resolved[1].faults.runner_links = false;
+    const scenario = schema.Scenario{ .name = "s", .commands = &.{} };
+    const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
+    var faults: [faults_max]Fault = undefined;
+    const count = faults_collect(&system, &scenario, &faults);
+    var client_server: u32 = 0;
+    for (faults[0..count]) |fault| {
+        if (fault.kind != .partition and fault.kind != .degrade) continue;
+        const node_client = std.mem.eql(u8, fault.node, "client");
+        const peer_client = std.mem.eql(u8, fault.peer, "client");
+        const node_runner = std.mem.eql(u8, fault.node, schema.runner_name);
+        const peer_runner = std.mem.eql(u8, fault.peer, schema.runner_name);
+        try std.testing.expect(!(node_client and peer_runner) and !(node_runner and peer_client));
+        if (std.mem.eql(u8, fault.node, "client") or std.mem.eql(u8, fault.peer, "client")) {
+            client_server += 1;
+        }
+    }
+    // Its links with the server are: a partition and a degradation each way.
+    try std.testing.expectEqual(@as(u32, 3), client_server);
+    var groups: [endpoints_max]u16 = @splat(group_none);
+    groups[0] = 0; // runner
+    groups[1] = 0; // server
+    groups[2] = 1; // client
+    const partition = Applied{
+        .kind = .partition_groups,
+        .duration_ns = 1,
+        .disruption = .stopped,
+        .groups = groups,
+    };
+    var links: [directed_max]Directed = undefined;
+    // The client is cut from the server only, both ways.
+    try std.testing.expectEqual(@as(u32, 2), disrupted_links(&system, &partition, &links));
+    const clog = Applied{
+        .kind = .clog,
+        .node = "client",
+        .duration_ns = 1,
+        .disruption = .stopped,
+        .direction = .both,
+    };
+    try std.testing.expectEqual(@as(u32, 2), disrupted_links(&system, &clog, &links));
+    const isolate = Applied{ .kind = .isolate, .node = "client", .duration_ns = 1 };
+    try std.testing.expect(!cuts_link(&system, &isolate, 0, 2));
+    try std.testing.expect(cuts_link(&system, &isolate, 1, 2));
 }
