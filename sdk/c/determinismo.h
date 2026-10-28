@@ -35,6 +35,16 @@ extern "C" {
 void det_random_bytes(void *target, size_t count);
 uint64_t det_random_u64(void);
 uint64_t det_random_below(uint64_t count); /* Uniform in [0, count). */
+double det_random(void);                   /* In [0, 1), from 53 random bits. */
+
+/* A generator the platform seeds once (SplitMix64): draws cost nothing, and replay with the
+   seed. For hot loops; det_random_u64 is a platform decision a draw. */
+struct det_prng {
+  uint64_t state;
+};
+void det_prng_seed(struct det_prng *prng);
+uint64_t det_prng_next(struct det_prng *prng);
+uint64_t det_prng_below(struct det_prng *prng, uint64_t count);
 
 /* Which evaluations become events: every one (0, the default: queries see each), or, as
    Antithesis's SDKs do, each assertion's first pass and first failure in this process (1: for
@@ -52,6 +62,13 @@ void det_unreachable(const char *message, const char *details);
 
 void det_setup_complete(const char *details); /* The platform snapshots here. */
 void det_event(const char *name, const char *details);
+void det_output(const char *json); /* Any JSON object as an event of its own (docs/SDKS.md). */
+
+/* The assertion catalog: one announced before it runs (a message computed at run time); and
+   the program's assertions (its DET_* call sites and those declared), one JSON object a line
+   ({"kind","message"}) to `fd`, for review or CI. */
+void det_declare(const char *kind, const char *message);
+void det_catalog_write(int fd);
 
 /* Faults from the scenario. A quiet period of `seconds` (0 ends it): faults stop, except clock
    skips. A fault now (`json` as det-faults inject takes it, e.g. {"kind": "pause", "node": "db",
@@ -84,6 +101,9 @@ uint64_t det_random_below_named(const char *name, uint64_t count);
    that lives as long as the program (a literal); up to 256 points. Where it is true, take a rare
    path the real system can take too (a pause, a retry), never one it cannot. */
 int det_buggify(const char *name);
+/* At a buggify point, a pause of up to 9 ms one evaluation in 32 while the point is active
+   (rarer than det_buggify: pause points sit on hot paths). */
+void det_buggify_pause(const char *name);
 
 /* The assertion catalog: one entry per call site, in the det_catalog section (the layout the Zig
    SDK uses too); the magic tells entries from the linker's padding. */
@@ -156,6 +176,37 @@ struct det_catalog_entry {
     det_compare(0, DET_LESS_OR_EQUAL, (left), (right), (message), (details));                  \
   } while (0)
 
+#define DET_ALWAYS_GREATER_THAN_OR_EQUAL(left, right, message, details)                       \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_compare(1, DET_GREATER_OR_EQUAL, (left), (right), (message), (details));               \
+  } while (0)
+#define DET_ALWAYS_LESS_THAN_OR_EQUAL(left, right, message, details)                          \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_compare(1, DET_LESS_OR_EQUAL, (left), (right), (message), (details));                  \
+  } while (0)
+#define DET_SOMETIMES_GREATER_THAN(left, right, message, details)                             \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_compare(0, DET_GREATER, (left), (right), (message), (details));                        \
+  } while (0)
+#define DET_SOMETIMES_LESS_THAN(left, right, message, details)                                \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_compare(0, DET_LESS, (left), (right), (message), (details));                           \
+  } while (0)
+#define DET_ALWAYS_SOME(names, values, count, message, details)                                \
+  do {                                                                                         \
+    DET_CATALOG_SITE("always", message);                                                       \
+    det_always_some((names), (values), (count), (message), (details));                         \
+  } while (0)
+#define DET_SOMETIMES_ALL(names, values, count, message, details)                              \
+  do {                                                                                         \
+    DET_CATALOG_SITE("sometimes", message);                                                    \
+    det_sometimes_all((names), (values), (count), (message), (details));                       \
+  } while (0)
+
 #define DET_UNREACHABLE(message, details)                                                      \
   do {                                                                                         \
     DET_CATALOG_SITE("unreachable", message);                                                  \
@@ -164,6 +215,26 @@ struct det_catalog_entry {
 
 #ifdef __cplusplus
 }
+
+namespace determinismo {
+/* A UniformRandomBitGenerator (std::shuffle, std::uniform_int_distribution, ...) whose every draw
+   is a platform decision. */
+struct random_engine {
+  typedef uint64_t result_type;
+  static constexpr result_type min() { return 0; }
+  static constexpr result_type max() { return UINT64_MAX; }
+  result_type operator()() { return det_random_u64(); }
+};
+/* One the platform seeds once (det_prng): draws cost nothing. */
+struct prng_engine {
+  typedef uint64_t result_type;
+  det_prng prng;
+  prng_engine() { det_prng_seed(&prng); }
+  static constexpr result_type min() { return 0; }
+  static constexpr result_type max() { return UINT64_MAX; }
+  result_type operator()() { return det_prng_next(&prng); }
+};
+} /* namespace determinismo */
 #endif
 
 #ifdef DETERMINISMO_IMPLEMENTATION
@@ -175,12 +246,19 @@ struct det_catalog_entry {
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Strict C (-std=c11 with glibc) hides O_CLOEXEC: Linux's value (the guests are Linux). */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 02000000
+#endif
 
 #define DET_DEVICE_PATH "/dev/determinismo"
 #define DET_MESSAGE_SIZE_MAX (4096 - 16) /* One event or one pull per device call. */
@@ -234,15 +312,31 @@ static size_t det_json_string(char *out, size_t used, size_t size, const char *t
   return used;
 }
 
+/* Outside determinismo: the file DETERMINISMO_SDK_LOCAL_OUTPUT (or Antithesis's
+   ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else stderr. */
+static int det_local_output_fd(void) {
+  static int fd = -2;
+  if (fd == -2) {
+    const char *path = getenv("DETERMINISMO_SDK_LOCAL_OUTPUT");
+    if (!path || !*path) path = getenv("ANTITHESIS_SDK_LOCAL_OUTPUT");
+    fd = path && *path ? open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644) : -1;
+    if (fd < 0) fd = 2;
+  }
+  return fd;
+}
+
 static void det_emit(const char *line, size_t length) {
   int fd = det_device_fd();
   if (fd >= 0) {
     (void)!write(fd, line, length); /* One write, one event. */
   } else {
-    (void)!write(2, line, length);
-    (void)!write(2, "\n", 1);
+    int local = det_local_output_fd();
+    (void)!write(local, line, length);
+    (void)!write(local, "\n", 1);
   }
 }
+
+void det_output(const char *json) { det_emit(json, strlen(json)); }
 
 static int det_repeated(const char *message, int condition);
 
@@ -301,7 +395,7 @@ void det_unreachable(const char *message, const char *details) {
   det_assert("unreachable", 1, message, details);
 }
 
-static void det_declare(const char *kind, const char *message, size_t message_size) {
+static void det_declare_sized(const char *kind, const char *message, size_t message_size) {
   char text[DET_MESSAGE_SIZE_MAX];
   if (message_size >= sizeof text) return;
   memcpy(text, message, message_size);
@@ -445,7 +539,8 @@ static struct det_buggify_point det_buggify_points[256];
 static size_t det_buggify_point_count;
 static int det_buggify_lock; /* A spinlock (__atomic builtins): taken briefly, rarely contended. */
 
-int det_buggify(const char *name) {
+/* The next draw of `name`'s generator into *value, while the point is active (1), else 0. */
+static int det_buggify_draw(const char *name, uint64_t *value) {
   if (det_device_fd() < 0) return 0;
   /* Virtual time inside determinismo, in whole seconds (standard C's time(): no feature macros
      needed, and enough for stretches of two seconds). */
@@ -472,11 +567,40 @@ int det_buggify(const char *name) {
       point->state ^= point->state >> 12;
       point->state ^= point->state << 25;
       point->state ^= point->state >> 27;
-      fires = (point->state * 0x2545F4914F6CDD1Dull) % 4 == 0;
+      *value = point->state * 0x2545F4914F6CDD1Dull;
+      fires = 1;
     }
   }
   __atomic_clear(&det_buggify_lock, __ATOMIC_RELEASE);
   return fires;
+}
+
+int det_buggify(const char *name) {
+  uint64_t value;
+  return det_buggify_draw(name, &value) && value % 4 == 0;
+}
+
+void det_buggify_pause(const char *name) {
+  uint64_t value;
+  if (!det_buggify_draw(name, &value) || value % 32 != 0) return;
+  uint64_t ms = (value >> 8) % 10;
+  if (ms == 0) return;
+  (void)poll(0, 0, (int)ms); /* A pause: no file to wait for, only the timeout. */
+}
+
+double det_random(void) { return (double)(det_random_u64() >> 11) / 9007199254740992.0; }
+
+void det_prng_seed(struct det_prng *prng) { prng->state = det_random_u64(); }
+
+uint64_t det_prng_next(struct det_prng *prng) {
+  uint64_t z = (prng->state += 0x9e3779b97f4a7c15ull);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+
+uint64_t det_prng_below(struct det_prng *prng, uint64_t count) {
+  return count ? det_prng_next(prng) % count : 0;
 }
 
 uint64_t det_random_below_named(const char *name, uint64_t count) {
@@ -518,8 +642,64 @@ __attribute__((constructor)) static void det_catalog_announce(void) {
       at += 8;
       continue;
     }
-    det_declare(entry->kind, entry->message, (size_t)entry->message_size);
+    det_declare_sized(entry->kind, entry->message, (size_t)entry->message_size);
     at += sizeof(struct det_catalog_entry);
+  }
+}
+
+/* Assertions declared at run time, for det_catalog_write (up to 256). */
+static struct {
+  const char *kind;
+  char *message;
+} det_declared[256];
+static size_t det_declared_count;
+
+void det_declare(const char *kind, const char *message) {
+  for (size_t index = 0; index < det_declared_count; index++) {
+    if (strcmp(det_declared[index].kind, kind) == 0 && strcmp(det_declared[index].message, message) == 0) return;
+  }
+  if (det_declared_count < sizeof det_declared / sizeof *det_declared) {
+    det_declared[det_declared_count].kind = kind;
+    size_t size = strlen(message) + 1;
+    char *copy = (char *)malloc(size);
+    if (!copy) return;
+    memcpy(copy, message, size);
+    det_declared[det_declared_count].message = copy;
+    det_declared_count++;
+  }
+  if (det_device_fd() >= 0) det_declare_sized(kind, message, strlen(message));
+}
+
+static void det_catalog_line(int fd, const char *kind, const char *message, size_t size) {
+  char text[DET_MESSAGE_SIZE_MAX];
+  if (size >= sizeof text) return;
+  memcpy(text, message, size);
+  text[size] = 0;
+  char line[DET_MESSAGE_SIZE_MAX];
+  size_t used = (size_t)snprintf(line, sizeof line, "{\"kind\":\"%s\",\"message\":", kind);
+  used = det_json_string(line, used, sizeof line, text);
+  if (used + 2 >= sizeof line) return;
+  line[used++] = '}';
+  line[used++] = '\n';
+  (void)!write(fd, line, used);
+}
+
+void det_catalog_write(int fd) {
+  if (__start_det_catalog && __stop_det_catalog) {
+    for (const char *at = __start_det_catalog;
+         at + sizeof(struct det_catalog_entry) <= __stop_det_catalog;) {
+      const struct det_catalog_entry *entry = (const struct det_catalog_entry *)(const void *)at;
+      if (entry->magic != DET_CATALOG_MAGIC) {
+        at += 8;
+        continue;
+      }
+      det_catalog_line(fd, entry->kind, entry->message, (size_t)entry->message_size);
+      at += sizeof(struct det_catalog_entry);
+    }
+  }
+  for (size_t index = 0; index < det_declared_count; index++) {
+    det_catalog_line(fd, det_declared[index].kind, det_declared[index].message,
+                     strlen(det_declared[index].message));
   }
 }
 

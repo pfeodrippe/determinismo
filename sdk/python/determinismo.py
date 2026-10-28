@@ -3,8 +3,12 @@
 
 Inside determinismo everything goes through /dev/determinismo: events are recorded with their
 moment, and every random value is a decision the platform can steer and replay. Outside it
-(local runs) randomness comes from the OS and events go to stderr, so the same code runs
-everywhere. One file, standard library only: copy it next to your code.
+(local runs) randomness comes from the OS and events go to the file DETERMINISMO_SDK_LOCAL_OUTPUT
+(or Antithesis's ANTITHESIS_SDK_LOCAL_OUTPUT) names, one JSON object a line, else to stderr, so
+the same code runs everywhere. One file, standard library only: copy it next to your code.
+
+The same API as the other SDKs (docs/SDKS.md); Antithesis's Python SDK's names work too
+(get_random, send_event, always_greater_than_or_equal_to, ...).
 
     import determinismo as det
     account = det.random_below(10)
@@ -66,6 +70,14 @@ def random_choice(items):
     return items[random_below(len(items))]
 
 
+def random_float():
+    """A float in [0, 1) from 53 random bits: a platform decision."""
+    return (random_u64() >> 11) * (1.0 / (1 << 53))
+
+
+get_random = random_u64  # Antithesis's name.
+
+
 class Random(random.Random):
     """A random.Random whose every draw is a platform decision, for code that takes an RNG
     (shuffle, choice, sample, uniform, ...): what it draws is steerable by strategies and replays
@@ -100,6 +112,25 @@ def prng():
     return random.Random(random_u64())
 
 
+_local_output = None
+_local_output_opened = False
+
+
+def _local_output_fd():
+    global _local_output, _local_output_opened
+    if not _local_output_opened:
+        _local_output_opened = True
+        path = os.environ.get("DETERMINISMO_SDK_LOCAL_OUTPUT") or os.environ.get(
+            "ANTITHESIS_SDK_LOCAL_OUTPUT")
+        if path:
+            try:
+                _local_output = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
+                                        0o644)
+            except OSError:
+                _local_output = None
+    return _local_output
+
+
 def _emit(message):
     line = json.dumps(message, separators=(",", ":"), default=str)
     data = line.encode()
@@ -109,9 +140,18 @@ def _emit(message):
         data = json.dumps(message, separators=(",", ":")).encode()[:MESSAGE_SIZE_MAX]
     fd = _device_fd()
     if fd is None:
-        sys.stderr.write(line + "\n")
+        local = _local_output_fd()
+        if local is None:
+            sys.stderr.write(line + "\n")
+        else:
+            os.write(local, (line + "\n").encode())
         return
     os.write(fd, data)  # One write, one event.
+
+
+def output(message):
+    """Any JSON object as an event of its own (the protocol's raw form: docs/SDKS.md)."""
+    _emit(message)
 
 
 _located = set()  # Assertions whose location this process already sent.
@@ -221,6 +261,13 @@ def sometimes_less_than_or_equal(left, right, message, details=None):
     _compare("sometimes", left <= right, right - left, left, right, message, details)
 
 
+# Antithesis's names.
+always_greater_than_or_equal_to = always_greater_than_or_equal
+always_less_than_or_equal_to = always_less_than_or_equal
+sometimes_greater_than_or_equal_to = sometimes_greater_than_or_equal
+sometimes_less_than_or_equal_to = sometimes_less_than_or_equal
+
+
 def always_some(conditions, message, details=None):
     """At least one of the named conditions (a dict of bools, all evaluated) holds, every time."""
     held = sum(1 for value in conditions.values() if value)
@@ -266,16 +313,34 @@ def buggify(name):
     generator seeded by the platform for the stretch (a hot point costs a decision a stretch).
     Outside determinismo, always False. Where it is True, take a rare path the real system can
     take too (a pause, a retry), never one it cannot."""
-    if _device_fd() is None:
-        return False
-    now = time.monotonic_ns()  # Virtual time inside determinismo.
     with _buggify_lock:
-        generator, until = _buggified.get(name, (None, 0))
-        if now >= until:
-            active = random_below_named("buggify " + name, 4) == 0
-            generator = random.Random(random_u64()) if active else None
-            _buggified[name] = (generator, now + _BUGGIFY_PERIOD_NS)
+        generator = _buggify_generator(name)
         return generator is not None and generator.randrange(4) == 0
+
+
+def buggify_pause(name):
+    """At a buggify point, a pause of up to 9 ms one evaluation in 32 while the point is active
+    (rarer than buggify: pause points sit on hot paths, and a few pauses a stretch are enough for
+    the other threads to run in the window)."""
+    with _buggify_lock:
+        generator = _buggify_generator(name)
+        if generator is None or generator.randrange(32) != 0:
+            return
+        ms = generator.randrange(10)
+    if ms:
+        time.sleep(ms / 1000)
+
+
+def _buggify_generator(name):
+    if _device_fd() is None:
+        return None
+    now = time.monotonic_ns()  # Virtual time inside determinismo.
+    generator, until = _buggified.get(name, (None, 0))
+    if now >= until:
+        active = random_below_named("buggify " + name, 4) == 0
+        generator = random.Random(random_u64()) if active else None
+        _buggified[name] = (generator, now + _BUGGIFY_PERIOD_NS)
+    return generator
 
 
 def setup_complete(details=None):
@@ -287,6 +352,9 @@ def event(name, details=None):
     """A structured event: {"event": name, "details": details}."""
     assert name
     _emit({"event": name, "details": details or {}})
+
+
+send_event = event  # Antithesis's name.
 
 
 _FAULTS_CONTROL = "/opt/determinismo/faults-control"  # faults.zig's control_path
@@ -348,20 +416,44 @@ _KINDS = ("always", "always_or_unreachable", "sometimes", "reachable", "unreacha
 _GUIDED = {name: ("always" if name.startswith("always") else "sometimes", position)
            for name, position in [(f"{kind}_{relation}", 2)
                                   for kind in ("always", "sometimes")
-                                  for relation in ("greater_than", "greater_than_or_equal",
+                                  for relation in ("greater_than_or_equal_to",
+                                                   "less_than_or_equal_to",
+                                                   "greater_than", "greater_than_or_equal",
                                                    "less_than", "less_than_or_equal")]
            + [("always_some", 1), ("sometimes_all", 1)]}
-_declared = set()
+_declared = {}  # (kind, message) -> the file it is in (None: declare()'s)
 _scanned = set()
+_announcing = False  # Inside determinismo, declared assertions are announced as they are.
 
 
-def declare(kind, message):
+def declare(kind, message, file=None):
     """Announces an assertion before it runs: one never reached is judged too. Assertions with
     literal messages are announced already."""
     if (kind, message) in _declared:
         return
-    _declared.add((kind, message))
-    _emit({"assert": {"type": kind, "message": message, "hit": False}})
+    _declared[(kind, message)] = file
+    if _announcing:
+        _emit({"assert": {"type": kind, "message": message, "hit": False}})
+
+
+def catalog_assertions():
+    """The assertions the program declares so far (its loaded modules' and declare()'s): a list
+    of {"kind", "message", "file"}."""
+    return [{"kind": kind, "message": message, "file": file}
+            for (kind, message), file in _declared.items()]
+
+
+def catalog_write(stream=None):
+    """Writes the catalog, one JSON object a line, to `stream` (stdout by default): what a
+    program checks, for review or CI."""
+    stream = stream or sys.stdout
+    for entry in catalog_assertions():
+        stream.write(json.dumps(entry) + "\n")
+
+
+def catalog(filename):
+    """Announces the assertions of `filename` (a module this SDK did not see run)."""
+    _catalog_source(os.path.abspath(filename))
 
 
 def _catalog_source(filename):
@@ -406,7 +498,7 @@ def _catalog_source(filename):
         message = node.args[position] if len(node.args) > position else next(
             (keyword.value for keyword in node.keywords if keyword.arg == "message"), None)
         if isinstance(message, ast.Constant) and isinstance(message.value, str):
-            declare(kind, message.value)
+            declare(kind, message.value, filename)
 
 
 def _catalog_hook(name, arguments):
@@ -416,8 +508,9 @@ def _catalog_hook(name, arguments):
 
 
 def _catalog_start():
-    if _device_fd() is None:
-        return  # Outside determinismo: no platform to announce to.
+    global _announcing
+    # Outside determinismo too: catalog_assertions() lists them, but nothing is announced.
+    _announcing = _device_fd() is not None
     for module in list(sys.modules.values()):  # Those that ran before this SDK was imported.
         filename = getattr(module, "__file__", None)
         if filename:
