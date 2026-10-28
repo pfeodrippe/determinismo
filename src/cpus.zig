@@ -203,14 +203,25 @@ pub const Pool = struct {
             const available = memory_available(); // 0: unknown, never a reason to wait.
             const below = available != 0 and available < memory_reserve_bytes / 2 + sessions_reserve_bytes();
             if (below or !pool.claim_fits(claim_bytes)) {
-                if (memory_since == null) memory_since = monotonic_ns();
+                if (memory_since == null) {
+                    memory_since = monotonic_ns();
+                    // A check waiting for memory: the runs leave it the sessions' room.
+                    if (pool.priority) if (memory_priority_open()) |fd| {
+                        _ = linux.flock(fd, std.posix.LOCK.SH);
+                    };
+                }
                 if (pool.priority) {
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
                 }
                 continue;
             }
-            if (memory_since) |since| memory_wait_ns += monotonic_ns() - since;
+            if (memory_since) |since| {
+                memory_wait_ns += monotonic_ns() - since;
+                if (pool.priority) if (memory_priority_open()) |fd| {
+                    _ = linux.flock(fd, std.posix.LOCK.UN);
+                };
+            }
             memory_since = null;
             for (0..pool.count) |index| {
                 const slot: u32 = @intCast(index);
@@ -335,14 +346,53 @@ test "a kernel CPU list's count" {
 pub const memory_reserve_bytes = 8 << 30;
 
 /// Memory a host's runs leave to its user's own sessions (a host with reserved cores: their
-/// builds, checks and replays), from DETERMINISMO_SESSIONS_MEMORY_MIB: serve carries it
-/// (serve.sh sets it with the reserved cores), and so every process of its runs; the sessions'
-/// own processes do not, and may use it. Without it a hunt held all but 9 GiB of srv3's 125,
-/// and a check on the reserved cores ran one VM at a time (2026-10-28).
+/// builds, checks and replays) while one of the sessions' VMs waits for memory, from
+/// DETERMINISMO_SESSIONS_MEMORY_MIB: serve carries it (serve.sh sets it with the reserved
+/// cores), and so every process of its runs; the sessions' own processes do not. Without it a
+/// hunt held all but 9 GiB of srv3's 125, and a check on the reserved cores ran one VM at a
+/// time; held back always, it kept a Kafka hunt's holders from being made (they want room to
+/// grow) in nearly every timeline (2026-10-28). So only while a priority process (a check)
+/// waits for memory (`memory-priority`, held shared by it): runs start no VM into that room,
+/// and their holders give theirs up.
 pub fn sessions_reserve_bytes() u64 {
     const value = std.c.getenv("DETERMINISMO_SESSIONS_MEMORY_MIB") orelse return 0;
     const mib = std.fmt.parseInt(u64, std.mem.span(value), 10) catch return 0;
+    if (!memory_priority_waiting()) return 0;
     return mib << 20;
+}
+
+/// The pool directory's `memory-priority` file, opened once by this process (-1: not yet, -2:
+/// could not be).
+var memory_priority_fd: linux.fd_t = -1;
+
+fn memory_priority_open() ?linux.fd_t {
+    if (memory_priority_fd == -2) return null;
+    if (memory_priority_fd >= 0) return memory_priority_fd;
+    var buffer: [96]u8 = undefined;
+    const path = (if (builtin.is_test)
+        std.fmt.bufPrintSentinel(&buffer, "/tmp/determinismo-cpus-test-{d}/memory-priority", .{linux.getpid()}, 0)
+    else
+        std.fmt.bufPrintSentinel(&buffer, "/tmp/determinismo-cpus-{d}/memory-priority", .{linux.getuid()}, 0)) catch {
+        memory_priority_fd = -2;
+        return null;
+    };
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o600);
+    if (linux.errno(fd) != .SUCCESS) {
+        memory_priority_fd = -2;
+        return null;
+    }
+    memory_priority_fd = @intCast(fd);
+    return memory_priority_fd;
+}
+
+/// Whether a priority process waits for memory: it holds `memory-priority` shared.
+fn memory_priority_waiting() bool {
+    const fd = memory_priority_open() orelse return false;
+    const probe = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    if (linux.errno(probe) != .SUCCESS) return true;
+    _ = linux.flock(fd, std.posix.LOCK.UN);
+    return false;
 }
 
 /// The memory this process leaves free: the host's reserve, and the sessions' if it is a run's.
@@ -593,4 +643,20 @@ test "a CPU is held by one process at a time, and given back" {
     try std.testing.expect(linux.errno(again) == .SUCCESS);
     _ = linux.flock(second.fds[held.slot], std.posix.LOCK.UN);
     unpin();
+}
+
+test "a check waiting for memory is seen by the runs" {
+    var directory_buffer: [64]u8 = undefined;
+    const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/determinismo-cpus-test-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdir(directory, 0o700);
+    try std.testing.expect(!memory_priority_waiting());
+    var path_buffer: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/memory-priority", .{directory}, 0);
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const waiter: linux.fd_t = @intCast(linux.open(path, flags, 0o600));
+    defer _ = linux.close(waiter);
+    _ = linux.flock(waiter, std.posix.LOCK.SH); // The check, waiting.
+    try std.testing.expect(memory_priority_waiting());
+    _ = linux.flock(waiter, std.posix.LOCK.UN); // Served.
+    try std.testing.expect(!memory_priority_waiting());
 }
