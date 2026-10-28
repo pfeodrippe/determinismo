@@ -17,7 +17,7 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio \
 
 | Scenario | Transactions | Elle checks for |
 |---|---|---|
-| `serializable` | SERIALIZABLE | strict serializability |
+| `serializable` | SERIALIZABLE | serializability (what PostgreSQL promises, and Jepsen checked) |
 | `repeatable_read` | REPEATABLE READ | snapshot isolation (what PostgreSQL's Repeatable Read is) |
 
 Faults: Antithesis's set, restarts, graceful stops and power losses (committed transactions are
@@ -25,4 +25,11 @@ synced first, so they must survive), and stalls and power losses at the server's
 
 ## Findings
 
-None yet: 6 of 6 timelines of `serializable` pass.
+None yet. Run 43 (srv3, 2026-10-28, `jepsen` profile, 12.3, seed 1, tree, checked then for
+strict serializability) failed Elle in timeline 173 at 73.2 s with G2-item-realtime only: T17
+appended to key 3 and read key 2 empty, T12 appended to key 2, and T14, the next transaction of
+T12's session, read key 3 empty. The serial order T14, T17, T12 explains every read, so the
+history is serializable; only real-time order breaks (T14 started after T12 committed).
+PostgreSQL promises serializability, not real-time order (Jepsen observed histories that looked
+strictly serializable, without a promise), so the scenario checks serializability now. Jepsen's
+G2-item, a cycle of anti-dependencies alone, is what the `jepsen` profile hunts for.

@@ -31,9 +31,12 @@ pub fn main(init: std.process.Init) !void {
             .serializable = Isolation("SERIALIZABLE").scenario,
             .repeatable_read = Isolation("REPEATABLE READ").scenario,
         },
-        // Elle, on the host, on every timeline's history: each scenario against its level.
+        // Elle, on the host, on every timeline's history: each scenario against what its level
+        // promises. Serializable, not strict serializable: PostgreSQL promises some serial order,
+        // not real time (Jepsen checked the same); run 43's first anomaly, G2-item-realtime, was
+        // a serializable history whose order put a session's later transaction first.
         .checks = .{ .elle = sdk.elle.check(.{
-            .consistency = "strict-serializable",
+            .consistency = "serializable",
             .by_scenario = &.{.{ .scenario = "repeatable_read", .consistency = "snapshot-isolation" }},
         }) },
     });
