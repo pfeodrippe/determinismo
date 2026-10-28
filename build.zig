@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     check_exe.root_module.link_libc = true;
-    const check = b.step("check", "Compile determinismo without linking it (no DuckDB needed), and the guest's programs");
+    const check = b.step("check", "Compile determinismo without linking it (no DuckDB needed), the guest's programs and the e2e checks");
     check.dependOn(&check_exe.step);
 
     // A small Redis client, shared by the examples and the plain workload.
@@ -281,6 +281,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    check.dependOn(&e2e.step);
     const e2e_run = b.addRunArtifact(e2e);
     e2e_run.step.dependOn(b.getInstallStep());
     e2e_run.setCwd(b.path(".")); // Its defaults (zig-out/bin) and the examples' paths.

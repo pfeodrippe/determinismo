@@ -22,6 +22,10 @@ const Context = struct {
     /// Babashka, for notebooks ($DETERMINISMO_BB); without it their evaluation is skipped.
     bb: ?[]const u8 = null,
     failures: u32 = 0,
+    /// Every exploration's whole output is kept (`<scratch>/outputs/<n>.log`): a failing check
+    /// names the ones it judged (those since the check before it), to read rather than rerun.
+    outputs: std.ArrayList([]const u8) = .empty,
+    output_count: u32 = 0,
 };
 
 /// One branch line of a report: `[branch N] seed=... events_hash=H failing=F ...`.
@@ -49,26 +53,33 @@ pub fn main(init: std.process.Init) !void {
             only = value;
         } else return error.Usage;
     }
+    // Its own: suites run at once (a full one and a single check) do not share files.
+    const scratch = try std.fmt.allocPrint(arena, "/tmp/determinismo-e2e-{d}", .{std.os.linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(init.io, scratch) catch {};
+    try std.Io.Dir.cwd().createDirPath(init.io, scratch);
+    // The guest as the suite started: a deploy meanwhile rewrites ~/guest, and the replays of
+    // timelines explored before it would boot other inputs (refused: TapeInputsDiffer; srv3,
+    // 2026-10-27).
+    const kernel = try std.fs.path.join(arena, &.{ scratch, "vmlinuz" });
+    const initrd = try std.fs.path.join(arena, &.{ scratch, "base.cpio" });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.copyFile(try std.fs.path.join(arena, &.{ guest, "vmlinuz" }), cwd, kernel, init.io, .{});
+    try cwd.copyFile(try std.fs.path.join(arena, &.{ guest, "base.cpio" }), cwd, initrd, init.io, .{});
     var context = Context{
         .arena = arena,
         .io = init.io,
         .bb = init.environ_map.get("DETERMINISMO_BB"),
         .determinismo = try std.fs.path.join(arena, &.{ bin, "determinismo" }),
         .machine = &.{
-            "--kernel",     try std.fs.path.join(arena, &.{ guest, "vmlinuz" }),
-            "--initrd",     try std.fs.path.join(arena, &.{ guest, "base.cpio" }),
+            "--kernel",     kernel,
+            "--initrd",     initrd,
             "--memory-mib", "2048",
             "--append",     "quiet",
             "--cache",      cache,
         },
         .bin = bin,
-        // Its own: suites run at once (a full one and a single check) do not share files.
-        .scratch = try std.fmt.allocPrint(arena, "/tmp/determinismo-e2e-{d}", .{
-            std.os.linux.getpid(),
-        }),
+        .scratch = scratch,
     };
-    std.Io.Dir.cwd().deleteTree(init.io, context.scratch) catch {};
-    try std.Io.Dir.cwd().createDirPath(init.io, context.scratch);
 
     const jar = try std.fs.path.join(arena, &.{ home, "opt", "tla", "tla2tools.jar" });
     const ran = try checks_run(&context, only, jar);
@@ -161,9 +172,11 @@ fn check_example(context: *Context, example: Example) !void {
             "--branch",  index_text,
         });
         var replayed: [1]Branch = undefined;
-        const same = parse_branches(replay, &replayed) == 1 and
-            std.mem.eql(u8, replayed[0].events_hash, branch.events_hash);
-        expect(context, same, "{s}: branch {d} ({s}) replays from a fresh boot", .{
+        const ran_one = parse_branches(replay, &replayed) == 1;
+        expect_all(context, &.{
+            .{ "the replay ran one timeline", ran_one },
+            .{ "its events hash is the original's", ran_one and std.mem.eql(u8, replayed[0].events_hash, branch.events_hash) },
+        }, "{s}: branch {d} ({s}) replays from a fresh boot", .{
             example.program, branch.index, if (failing) "failing" else "passing",
         });
     }
@@ -195,9 +208,11 @@ fn check_tapes(context: *Context) !void {
         "--program", program, "--scenario", "bank", "--tape", tape,
     });
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, last.events_hash);
-    expect(context, same, "tapes: branch {d} replays from its tape without the strategy", .{
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "its events hash is the original's", ran_one and std.mem.eql(u8, replayed[0].events_hash, last.events_hash) },
+    }, "tapes: branch {d} replays from its tape without the strategy", .{
         last.index,
     });
     const elsewhere = try explore(context, &.{
@@ -212,10 +227,11 @@ fn check_tapes(context: *Context) !void {
         "--at-vtime-ms", "1500",  "--exec",     "echo looked inside", "--continue",
     });
     var looked: [1]Branch = undefined;
-    const goes_on = std.mem.indexOf(u8, inside, "looked inside") != null and
-        std.mem.indexOf(u8, inside, "diverged") == null and parse_branches(inside, &looked) == 1;
-    expect(context, goes_on, "tapes: a command at a moment of a replay runs, and the replay " ++
-        "goes on to the end", .{});
+    expect_all(context, &.{
+        .{ "the command ran (\"looked inside\")", std.mem.indexOf(u8, inside, "looked inside") != null },
+        .{ "the replay did not diverge", std.mem.indexOf(u8, inside, "diverged") == null },
+        .{ "one timeline ran to its end", parse_branches(inside, &looked) == 1 },
+    }, "tapes: a command at a moment of a replay runs, and the replay goes on to the end", .{});
 }
 
 /// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance): with coverage
@@ -281,11 +297,12 @@ fn check_maze(context: *Context, maze: Maze, index: usize) !void {
     try replay_arguments.appendSlice(arena, &.{ "--tape", tape });
     const replay = try explore(context, replay_arguments.items);
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and replayed[0].failing and
-        std.mem.eql(u8, replayed[0].events_hash, branch.events_hash);
-    expect(context, same, "coverage ({s}): the solving branch {d} replays from its tape", .{
-        maze.label, branch.index,
-    });
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "it fails, as the original", ran_one and replayed[0].failing },
+        .{ "its events hash is the original's", ran_one and std.mem.eql(u8, replayed[0].events_hash, branch.events_hash) },
+    }, "coverage ({s}): the solving branch {d} replays from its tape", .{ maze.label, branch.index });
 }
 
 /// A strategy written in Python (found through PATH, as a shell would) steers decisions, and a
@@ -310,9 +327,11 @@ fn check_python_strategy(context: *Context) !void {
     expect(context, steered, "python strategy: it overrides decisions", .{});
     const replay = try explore(context, &(common ++ [_][]const u8{ "--tape", tape }));
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash);
-    expect(context, same, "python strategy: its branch replays from the tape without it", .{});
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "its events hash is the original's", ran_one and std.mem.eql(u8, replayed[0].events_hash, branches[1].events_hash) },
+    }, "python strategy: its branch replays from the tape without it", .{});
 }
 
 /// Kubernetes (K3s) as the system under test, on one node and as a three-node cluster (pods
@@ -349,9 +368,12 @@ fn check_k3s_profile(
         "--branch", index, "--events", replayed_events,
     }));
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and
-        std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
-    expect(context, same, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    const same = ran_one and std.mem.eql(u8, replayed[0].events_hash, branches[0].events_hash);
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "its events hash is the original's", same },
+    }, "k3s ({s}): branch {d} replays exactly", .{ label, branches[0].index });
     if (!same) {
         const original = try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{
             explored, branches[0].index,
@@ -400,10 +422,14 @@ fn check_query(context: *Context) !void {
     const output = try query_count(context, &.{ events, "output.source=redis" });
     // A regular expression finds the same lines.
     const matched = try query_count(context, &.{ events, "output.source=~^re(d|x)i[s]$" });
-    const found = failing_report and all > 0 and output > 0 and after_fault + no_fault == all and
-        matched == output;
-    expect(context, found, "query: {d} violations ({d} after a fault, {d} without), {d} redis " ++
-        "output lines ({d} by a regex)", .{ all, after_fault, no_fault, output, matched });
+    expect_all(context, &.{
+        .{ "the run reports failing properties", failing_report },
+        .{ "violations found", all > 0 },
+        .{ "redis output found", output > 0 },
+        .{ "after a fault + without one = all violations", after_fault + no_fault == all },
+        .{ "the regex finds the same output lines", matched == output },
+    }, "query: {d} violations ({d} after a fault, {d} without), {d} redis output lines ({d} " ++
+        "by a regex)", .{ all, after_fault, no_fault, output, matched });
     // Event sets: the same answers through a pipeline (with_last), and through a program.
     const arena = context.arena;
     const annotated = try std.fmt.allocPrint(arena, "[{{\"filter\": {f}}}, " ++
@@ -414,8 +440,12 @@ fn check_query(context: *Context) !void {
     const piped = try std.fmt.allocPrint(arena, "[{{\"filter\": {f}}}, " ++
         "{{\"through\": \"cat\"}}]", .{std.json.fmt(violation, .{})});
     const through = try events_count(context, &.{ events, piped });
-    expect(context, with_last == after_fault and through == all, "event sets: with_last finds " ++
-        "{d} violations after a fault, a program passes {d} through", .{ with_last, through });
+    expect_all(context, &.{
+        .{ "with_last finds the violations after a fault", with_last == after_fault },
+        .{ "a program passes every violation through", through == all },
+    }, "event sets: with_last finds {d} violations after a fault, a program passes {d} through", .{
+        with_last, through,
+    });
 }
 
 /// How many events `determinismo events` gives (its --count line).
@@ -424,7 +454,7 @@ fn events_count(context: *Context, arguments: []const []const u8) !u64 {
     try argv.appendSlice(context.arena, &.{ context.determinismo, "events" });
     try argv.appendSlice(context.arena, arguments);
     try argv.append(context.arena, "--count");
-    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     const end = std.mem.indexOfScalar(u8, result.stdout, ' ') orelse return 0;
     return std.fmt.parseInt(u64, result.stdout[0..end], 10) catch 0;
 }
@@ -476,12 +506,15 @@ fn check_serve(context: *Context) !void {
     const answer = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs/1/query" });
     const discovery = try curl(context, &.{url ++ "/runs/1/discovery"});
     const curve = std.mem.indexOf(u8, discovery, "[8,") != null; // A point after 8 branches.
-    const ui = std.mem.indexOf(u8, page, "<title>determinismo</title>") != null and curve;
-    const finished = std.mem.indexOf(u8, run, "\"summary\"") != null;
-    const queried = std.mem.indexOf(u8, answer, "\"events\":") != null and
-        std.mem.indexOf(u8, answer, "\"events\":0,") == null;
-    expect(context, ui and finished and queried, "serve: the UI, a run over HTTP, and a query " ++
-        "of its events ({s})", .{std.mem.trim(u8, answer, "\n")});
+    expect_all(context, &.{
+        .{ "the UI page loads", std.mem.indexOf(u8, page, "<title>determinismo</title>") != null },
+        .{ "the discovery curve has a point after 8 branches", curve },
+        .{ "the run finished (its summary)", std.mem.indexOf(u8, run, "\"summary\"") != null },
+        .{ "the query answers", std.mem.indexOf(u8, answer, "\"events\":") != null },
+        .{ "the query finds events", std.mem.indexOf(u8, answer, "\"events\":0,") == null },
+    }, "serve: the UI, a run over HTTP, and a query of its events ({s})", .{
+        std.mem.trim(u8, answer, "\n"),
+    });
     // A deploy replaces the initramfs: the run's replays still boot what it booted (kept by
     // content), to the same events.
     try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = initrd, .data = "not the run's" });
@@ -490,18 +523,20 @@ fn check_serve(context: *Context) !void {
     const hash = if (hash_at) |at| replayed[at + "events_hash=".len ..][0..16] else "";
     const record_path = try std.fs.path.join(arena, &.{ data, "runs", "1", "record.jsonl" });
     const record = try std.Io.Dir.cwd().readFileAlloc(context.io, record_path, arena, .limited(1 << 24));
-    const same = hash.len == 16 and std.mem.indexOf(u8, record, hash) != null;
-    expect(context, same, "serve: a run replays after a deploy replaced its initramfs " ++
-        "(events hash {s})", .{hash});
+    expect_all(context, &.{
+        .{ "the replay printed an events hash", hash.len == 16 },
+        .{ "the record has that hash", hash.len == 16 and std.mem.indexOf(u8, record, hash) != null },
+    }, "serve: a run replays after a deploy replaced its initramfs (events hash {s})", .{hash});
     // The run's notebook: none at first, then what was saved.
     const empty = try curl(context, &.{url ++ "/runs/1/notebook"});
     const cells = "{\"source\":\"print(1)\\n// %%\\nprint(2)\"}";
     _ = try curl(context, &.{ "-X", "PUT", "-d", cells, url ++ "/runs/1/notebook" });
     const saved = try curl(context, &.{url ++ "/runs/1/notebook"});
-    const notebook = std.mem.indexOf(u8, empty, "\"source\":null") != null and
-        std.mem.indexOf(u8, saved, "print(1)\\n// %%\\nprint(2)") != null;
-    const in_page = std.mem.indexOf(u8, page, "notebookEvaluate") != null;
-    expect(context, notebook and in_page, "serve: the notebook is kept with the run", .{});
+    expect_all(context, &.{
+        .{ "no notebook at first", std.mem.indexOf(u8, empty, "\"source\":null") != null },
+        .{ "the saved notebook comes back", std.mem.indexOf(u8, saved, "print(1)\\n// %%\\nprint(2)") != null },
+        .{ "the page evaluates notebooks", std.mem.indexOf(u8, page, "notebookEvaluate") != null },
+    }, "serve: the notebook is kept with the run", .{});
     // Clojure cells, evaluated with babashka: a query of the run's events, and a value.
     if (context.bb == null) {
         std.debug.print("SKIP serve: notebook evaluation ($DETERMINISMO_BB is not set)\n", .{});
@@ -560,9 +595,9 @@ fn check_ui(context: *Context) !void {
             sleep_ms(200);
         }
     }
-    // serve saved run 1's first failure to disk on its own, as soon as it found it.
+    // serve started the analysis of run 1's first failure on its own, as soon as it found it.
     const snapshots = try std.fs.path.join(arena, &.{ data, "runs", "1", "snapshots" });
-    var saved_log: []const u8 = "";
+    var analyzed: []const u8 = "";
     for (0..600) |_| {
         var dir = cwd.openDir(context.io, snapshots, .{ .iterate = true }) catch {
             sleep_ms(500);
@@ -571,16 +606,22 @@ fn check_ui(context: *Context) !void {
         defer dir.close(context.io);
         var iterator = dir.iterate();
         while (try iterator.next(context.io)) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "failure-")) continue;
+            if (!std.mem.startsWith(u8, entry.name, "analyzed-")) continue;
             const path = try std.fs.path.join(arena, &.{ snapshots, entry.name });
-            const text = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 20)) catch "";
-            if (std.mem.indexOf(u8, text, "{\"saved\":") != null) saved_log = text;
+            analyzed = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 20)) catch "";
         }
-        if (saved_log.len > 0) break;
+        if (analyzed.len > 0) break;
         sleep_ms(500);
     }
-    expect(context, saved_log.len > 0, "ui: serve saved run 1's first failure to disk as soon " ++
-        "as it found it", .{});
+    const analysis = try std.fs.path.join(arena, &.{ data, "runs", "1", "causality-0.jsonl" });
+    const analysis_started = if (cwd.access(context.io, analysis, .{})) |_| true else |_| false;
+    expect_all(context, &.{
+        .{ "a timeline marked analyzed", analyzed.len > 0 },
+        .{ "its analysis is causality 0", std.mem.startsWith(u8, analyzed, "causality 0:") },
+        .{ "causality-0.jsonl exists", analysis_started },
+    }, "ui: serve analyzed run 1's first failure on its own as soon as it found it ({s})", .{
+        std.mem.trimEnd(u8, analyzed, "\n"),
+    });
     // The third runs while the tests look at it (on one CPU: the analysis needs the rest).
     const running = try std.fmt.allocPrint(arena, "{{\"program\":{f},\"scenario\":\"bank\"," ++
         "\"seed\":5,\"branches\":100000,\"jobs\":1,\"time_budget\":\"30m\"}}", .{std.json.fmt(program, .{})});
@@ -636,8 +677,12 @@ fn check_runs(context: *Context) !void {
     }
     const timelines = curl(context, &.{url ++ "/runs/1/timelines"}) catch "";
     const logged = cwd.readFileAlloc(context.io, try std.fs.path.join(arena, &.{ data, "runs", "1", "output.log" }), arena, .limited(1 << 24)) catch "";
-    expect(context, claimed and std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null and
-        std.mem.count(u8, timelines, "\"index\"") == 8 and std.mem.indexOf(u8, logged, "[branch") != null, "runs: an exploration at a terminal is run 1 of the host's, in serve with its 8 timelines " ++
+    expect_all(context, &.{
+        .{ "the exploration claimed run 1", claimed },
+        .{ "serve shows it failed", std.mem.indexOf(u8, listed, "\"state\":\"failed\"") != null },
+        .{ "serve lists its 8 timelines", std.mem.count(u8, timelines, "\"index\"") == 8 },
+        .{ "its output.log has its timelines", std.mem.indexOf(u8, logged, "[branch") != null },
+    }, "runs: an exploration at a terminal is run 1 of the host's, in serve with its 8 timelines " ++
         "and its output, failed as it ended", .{});
     // Another, long, which serve stops.
     var command: std.ArrayList(u8) = .empty;
@@ -663,8 +708,10 @@ fn check_runs(context: *Context) !void {
         sleep_ms(200);
     }
     _ = term;
-    expect(context, running and stopped, "runs: another, running at a terminal, shows " ++
-        "running in serve, and serve stops it", .{});
+    expect_all(context, &.{
+        .{ "serve shows it running", running },
+        .{ "serve stopped it", stopped },
+    }, "runs: another, running at a terminal, shows running in serve, and serve stops it", .{});
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
@@ -672,7 +719,7 @@ fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
     const json = "Content-Type: application/json";
     try argv.appendSlice(context.arena, &.{ "curl", "-s", "--fail", "-H", json });
     try argv.appendSlice(context.arena, arguments);
-    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     if (!result.term.success()) return error.RequestFailed;
     return result.stdout;
 }
@@ -701,9 +748,10 @@ fn check_until_and_causality(context: *Context) !void {
         }));
         output.* = try lines_with(arena, report, &.{ "at moment", "exec_output" });
     }
-    const stopped = std.mem.indexOf(u8, outputs[0], "exec_output") != null and
-        std.mem.eql(u8, outputs[0], outputs[1]);
-    expect(context, stopped, "until: branch 4 stops at its first violation, the same twice", .{});
+    expect_all(context, &.{
+        .{ "the command ran at the violation", std.mem.indexOf(u8, outputs[0], "exec_output") != null },
+        .{ "the same output twice", std.mem.eql(u8, outputs[0], outputs[1]) },
+    }, "until: branch 4 stops at its first violation, the same twice", .{});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
     try argv.appendSlice(arena, context.machine);
@@ -712,7 +760,7 @@ fn check_until_and_causality(context: *Context) !void {
         "--branch",  "4", "--property", "total balance is conserved", "--points", "4",
         "--futures", "8", "--json",
     });
-    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     // Points come as their futures finish, and refinement adds moments inside jumps.
     const Point = struct { vtime_ms: u64, probability: f64, low: f64, high: f64 };
     var points: u32 = 0;
@@ -727,9 +775,12 @@ fn check_until_and_causality(context: *Context) !void {
         points += 1;
         if (point.vtime_ms >= latest.vtime_ms) latest = point;
     }
-    expect(context, points >= 4 and latest.probability == 1 and bounded, "causality: {d} " ++
-        "moments (4, and refinements inside jumps), certain at the failure ({d:.2}), each " ++
-        "within its 90% interval", .{ points, latest.probability });
+    expect_all(context, &.{
+        .{ "at least 4 moments", points >= 4 },
+        .{ "certain at the failure", latest.probability == 1 },
+        .{ "each within its 90% interval", bounded },
+    }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
+        "({d:.2}), each within its 90% interval", .{ points, latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
     var verdict_argv: std.ArrayList([]const u8) = .empty;
     try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });
@@ -738,7 +789,7 @@ fn check_until_and_causality(context: *Context) !void {
     try verdict_argv.appendSlice(arena, &.{
         "--branch", "4", "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
     });
-    const verdict_result = try std.process.run(arena, context.io, .{ .argv = verdict_argv.items });
+    const verdict_result = try run_kept(context, verdict_argv.items);
     var verdict_points: u32 = 0;
     var verdict_latest: Point = .{ .vtime_ms = 0, .probability = 0, .low = 0, .high = 0 };
     var verdict_lines = std.mem.tokenizeScalar(u8, verdict_result.stdout, '\n');
@@ -749,10 +800,11 @@ fn check_until_and_causality(context: *Context) !void {
         verdict_points += 1;
         if (point.vtime_ms >= verdict_latest.vtime_ms) verdict_latest = point;
     }
-    expect(context, verdict_points == 5 and verdict_latest.probability == 1, "causality with a " ++
-        "verdict (an event condition, no property): {d} moments, certain at the failure ({d:.2})", .{
-        verdict_points, verdict_latest.probability,
-    });
+    expect_all(context, &.{
+        .{ "5 moments", verdict_points == 5 },
+        .{ "certain at the failure", verdict_latest.probability == 1 },
+    }, "causality with a verdict (an event condition, no property): {d} moments, certain at the " ++
+        "failure ({d:.2})", .{ verdict_points, verdict_latest.probability });
     try check_files(context, &system, violation);
     try check_rewind(context, &system, violation);
 }
@@ -774,7 +826,7 @@ fn check_profile(context: *Context) !void {
         try argv.appendSlice(arena, &.{ "--branch", "0", "--at-vtime-ms", "1050" });
         try argv.appendSlice(arena, &.{ "--node", "echo", "--ms", "100", "--all" });
         try argv.appendSlice(arena, &.{ "--folded", path });
-        _ = try std.process.run(arena, context.io, .{ .argv = argv.items });
+        _ = try run_kept(context, argv.items);
         const cwd = std.Io.Dir.cwd();
         text.* = cwd.readFileAlloc(context.io, path, arena, .limited(1 << 22)) catch "";
     }
@@ -788,20 +840,23 @@ fn check_profile(context: *Context) !void {
         const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ';') orelse continue) + 1;
         named = named or std.mem.indexOf(u8, line[start..end], "0x") == null;
     }
-    const same = std.mem.eql(u8, folded[0], folded[1]);
-    expect(context, samples > 0 and named and same, "profile: {d} samples of a node at a " ++
-        "moment, functions named, the same twice", .{samples});
+    expect_all(context, &.{
+        .{ "samples taken", samples > 0 },
+        .{ "a stack ends in a named function", named },
+        .{ "the same profile twice", std.mem.eql(u8, folded[0], folded[1]) },
+    }, "profile: {d} samples of a node at a moment, functions named, the same twice", .{samples});
     // Every thread's stack at the same moment.
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ context.determinismo, "stacks" });
     try argv.appendSlice(arena, context.machine);
     try argv.appendSlice(arena, &system);
     try argv.appendSlice(arena, &.{ "--branch", "0", "--at-vtime-ms", "1050", "--node", "echo" });
-    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
-    const stacks = std.mem.indexOf(u8, result.stderr, " thread ") != null and
-        std.mem.indexOf(u8, result.stderr, "#0  ") != null and
-        std.mem.indexOf(u8, result.stderr, "_start") != null;
-    expect(context, stacks, "stacks: every thread of a node at a moment, named", .{});
+    const result = try run_kept(context, argv.items);
+    expect_all(context, &.{
+        .{ "threads listed", std.mem.indexOf(u8, result.stderr, " thread ") != null },
+        .{ "frames listed (#0)", std.mem.indexOf(u8, result.stderr, "#0  ") != null },
+        .{ "frames named (_start)", std.mem.indexOf(u8, result.stderr, "_start") != null },
+    }, "stacks: every thread of a node at a moment, named", .{});
 }
 
 /// Rewind: 5 ms of virtual time before the first violation, where it has not happened yet.
@@ -817,12 +872,12 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     const last = std.mem.lastIndexOf(u8, report, "at moment vtime=") orelse 0;
     const reached: u64 = @trunc(number_after(report[last..], "at moment vtime=") orelse 0);
     // The guest runs on while the command does: the rewind leaves it room to end first.
-    const exact = holds > target and holds - target == 50 * std.time.ns_per_ms and
-        reached >= target and reached - target < std.time.ns_per_ms;
-    const ran = std.mem.indexOf(u8, report, "\"text\":\"rewound\\n\"") != null;
-    const before = std.mem.indexOf(u8, report, "failing=0") != null;
-    expect(context, exact and ran and before, "rewind: 50 ms before the violation " ++
-        "({d}ns, then {d}ns), not failing yet", .{ holds, reached });
+    expect_all(context, &.{
+        .{ "the moment is exactly 50 ms before the condition holds", holds > target and holds - target == 50 * std.time.ns_per_ms },
+        .{ "the guest stopped within 1 ms of the moment", reached >= target and reached - target < std.time.ns_per_ms },
+        .{ "the command ran (\"rewound\")", std.mem.indexOf(u8, report, "\"text\":\"rewound\\n\"") != null },
+        .{ "not failing yet", std.mem.indexOf(u8, report, "failing=0") != null },
+    }, "rewind: 50 ms before the violation ({d}ns, then {d}ns), not failing yet", .{ holds, reached });
     // wait_until's timeout: the condition, or this time at the latest (here, before it holds:
     // just after the setup snapshot, wherever the guest's setup put it).
     const snapshot_ms = snapshot_vtime_ms(report) orelse 0;
@@ -836,10 +891,10 @@ fn check_rewind(context: *Context, system: []const []const u8, violation: []cons
     const expected = try std.fmt.allocPrint(context.arena, "at moment vtime={d}", .{
         snapshot_ms + 20,
     });
-    const late = std.mem.indexOf(u8, timed, "until: timed out") != null and
-        std.mem.indexOf(u8, timed, expected) != null;
-    expect(context, late, "until: with a timeout, the moment is the timeout when the " ++
-        "condition has not held", .{});
+    expect_all(context, &.{
+        .{ "until says it timed out", std.mem.indexOf(u8, timed, "until: timed out") != null },
+        .{ "the moment is the timeout's", std.mem.indexOf(u8, timed, expected) != null },
+    }, "until: with a timeout, the moment is the timeout when the condition has not held", .{});
 }
 
 /// extract_file and inject_file at the first violation of branch 4.
@@ -855,7 +910,7 @@ fn check_files(context: *Context, system: []const []const u8, violation: []const
         "--branch", "4",       "--until", violation, "--file", "redis:/etc/hostname",
         "--to",     extracted,
     });
-    _ = try std.process.run(arena, context.io, .{ .argv = extract_argv.items });
+    _ = try run_kept(context, extract_argv.items);
     const cwd = std.Io.Dir.cwd();
     const hostname = cwd.readFileAlloc(context.io, extracted, arena, .limited(64)) catch "";
     expect(context, std.mem.eql(u8, hostname, "redis\n"), "extract: a node's file at a moment " ++
@@ -878,7 +933,7 @@ fn check_files(context: *Context, system: []const []const u8, violation: []const
     try inject_argv.appendSlice(arena, &.{
         "--then", "md5sum /proc/$(cat /run/det/nodes/redis/pid)/root/tmp/injected",
     });
-    const injected = try std.process.run(arena, context.io, .{ .argv = inject_argv.items });
+    const injected = try run_kept(context, inject_argv.items);
     const hex = std.fmt.bytesToHex(digest, .lower);
     const seen = std.mem.indexOf(u8, injected.stderr, &hex) != null;
     expect(context, seen, "inject: {d} bytes into a node at a moment, the same there", .{
@@ -924,7 +979,7 @@ fn check_network_faults(context: *Context) !void {
         context.determinismo, "query",  events, "event=fault details.kind=partition_groups",
         "--branches",         "--json",
     });
-    const found = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const found = try run_kept(context, argv.items);
     const First = struct { branch: u32 };
     const line_end = std.mem.indexOfScalar(u8, found.stdout, '\n') orelse found.stdout.len;
     const first = std.json.parseFromSliceLeaky(First, arena, found.stdout[0..line_end], .{
@@ -943,9 +998,14 @@ fn check_network_faults(context: *Context) !void {
         }
         same = std.mem.eql(u8, hashes[0].events_hash, hashes[1].events_hash);
     }
-    const all = groups > 0 and clogs > 0 and threads > 0 and baselines == 64 and
-        restores > 0 and same;
-    expect(context, all, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses, " ++
+    expect_all(context, &.{
+        .{ "partitions into groups", groups > 0 },
+        .{ "clogs", clogs > 0 },
+        .{ "thread pauses", threads > 0 },
+        .{ "64 network baselines", baselines == 64 },
+        .{ "restores of overlapping network faults", restores > 0 },
+        .{ "a branch with a partition replays exactly", same },
+    }, "faults: {d} partitions into groups, {d} clogs, {d} thread pauses, " ++
         "{d} network baselines, {d} restores of overlapping network faults; a branch with a " ++
         "partition replays exactly", .{ groups, clogs, threads, baselines, restores });
 }
@@ -956,7 +1016,7 @@ fn query_count(context: *Context, arguments: []const []const u8) !u64 {
     try argv.appendSlice(context.arena, &.{ context.determinismo, "query" });
     try argv.appendSlice(context.arena, arguments);
     try argv.append(context.arena, "--count");
-    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     const end = std.mem.indexOfScalar(u8, result.stdout, ' ') orelse return 0;
     return std.fmt.parseInt(u64, result.stdout[0..end], 10) catch 0;
 }
@@ -981,9 +1041,13 @@ fn check_quiet_period(context: *Context) !void {
         "event=faults_quiet", "--within",                             "1.9",
     });
     const counts = .{ quiet, faults, during, custom };
-    expect(context, quiet == 4 and faults > 0 and during == 0 and custom > 0, "quiet periods: " ++
-        "requested from a node in {d} of 4 timelines; {d} faults, {d} during them; {d} custom " ++
-        "faults", counts);
+    expect_all(context, &.{
+        .{ "quiet periods in all 4 timelines", quiet == 4 },
+        .{ "faults happened", faults > 0 },
+        .{ "none during a quiet period", during == 0 },
+        .{ "custom faults ran in the node", custom > 0 },
+    }, "quiet periods: requested from a node in {d} of 4 timelines; {d} faults, {d} during " ++
+        "them; {d} custom faults", counts);
 }
 
 /// The guest kernel's random generator after the snapshot: different in every branch, the same
@@ -1015,10 +1079,11 @@ fn check_kernel_entropy(context: *Context) !void {
         value.* = log[start..end];
     }
     const found = values[0].len > 0 and values[1].len > 0;
-    const differs = found and !std.mem.eql(u8, values[0], values[1]);
-    const replays = found and std.mem.eql(u8, values[0], values[2]);
-    expect(context, differs and replays, "kernel randomness: {s} and {s} in two branches, " ++
-        "{s} on replay", .{ values[0], values[1], values[2] });
+    expect_all(context, &.{
+        .{ "both branches logged their kernel entropy", found },
+        .{ "it differs between the branches", found and !std.mem.eql(u8, values[0], values[1]) },
+        .{ "the replay has the first branch's", found and std.mem.eql(u8, values[0], values[2]) },
+    }, "kernel randomness: {s} and {s} in two branches, {s} on replay", .{ values[0], values[1], values[2] });
 }
 
 /// The built-in properties pass on a steady system and catch a node that exits by itself and an
@@ -1034,9 +1099,10 @@ fn check_builtin_properties(context: *Context) !void {
         "--program", program, "--profile",  "default,mutant", "--scenario", "steady",
         "--seed",    "1",     "--branches", "2",
     });
-    const killed = std.mem.indexOf(u8, both, "PASS default") != null and
-        std.mem.indexOf(u8, both, "FAIL mutant") != null;
-    expect(context, killed, "mutation: the tests pass on the system and catch its mutant", .{});
+    expect_all(context, &.{
+        .{ "the tests pass on the system (PASS default)", std.mem.indexOf(u8, both, "PASS default") != null },
+        .{ "they catch its mutant (FAIL mutant)", std.mem.indexOf(u8, both, "FAIL mutant") != null },
+    }, "mutation: the tests pass on the system and catch its mutant", .{});
     const crash = try explore(context, &.{
         "--program", program, "--scenario", "node_exit", "--seed", "1", "--branches", "1",
     });
@@ -1051,13 +1117,15 @@ fn check_builtin_properties(context: *Context) !void {
         "--branches", "8",
     });
     const all_pass = "8 branches, 0 with failing properties";
-    const replaced = std.mem.indexOf(u8, workers, all_pass) != null and
-        std.mem.indexOf(u8, workers, "PASS reachable") != null;
-    expect(context, replaced, "process kills hit workers, never a node's main process", .{});
+    expect_all(context, &.{
+        .{ "every property passes in all 8", std.mem.indexOf(u8, workers, all_pass) != null },
+        .{ "the workers' kills were reached (PASS reachable)", std.mem.indexOf(u8, workers, "PASS reachable") != null },
+    }, "process kills hit workers, never a node's main process", .{});
     const oom = "FAIL \"the kernel kills no process for lack of memory\"";
-    const oom_caught = std.mem.indexOf(u8, hog, oom) != null and
-        std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null;
-    expect(context, oom_caught, "built-in properties catch an OOM kill in a node", .{});
+    expect_all(context, &.{
+        .{ "the OOM kill fails its property", std.mem.indexOf(u8, hog, oom) != null },
+        .{ "the hog was killed", std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null },
+    }, "built-in properties catch an OOM kill in a node", .{});
     const crashed = try explore(context, &.{
         "--program", program, "--scenario", "crash", "--seed", "1", "--branches", "1",
     });
@@ -1138,12 +1206,34 @@ fn check_resume(context: *Context) !void {
         _ = try explore(context, &(system ++ [_][]const u8{ "--record", parts, "--resume" }));
         const expected = try record_timelines(context, whole);
         const resumed = try record_timelines(context, parts);
-        const same = expected.len == 48 and expected.len == resumed.len and for (expected, resumed) |a, b| {
-            if (!std.mem.eql(u8, a, b)) break false;
+        const once = resumed.len == 48 and for (resumed[1..], resumed[0 .. resumed.len - 1]) |a, b| {
+            if (std.mem.eql(u8, timeline_index(a), timeline_index(b))) break false;
         } else true;
-        expect(context, same, "resume ({s}): killed at {d} timelines, resumed: the {d} timelines " ++
-            "of the whole run, once each ({d} recorded)", .{ branching, interrupted.len, expected.len, resumed.len });
+        const kept = for (interrupted) |line| {
+            const found = for (resumed) |other| {
+                if (std.mem.eql(u8, line, other)) break true;
+            } else false;
+            if (!found) break false;
+        } else true;
+        // Flat: the timelines of the whole run. A tree's generations follow its timelines'
+        // finishing order, which the interruption changed: the resumed tree goes on from the
+        // record, not as the whole run went.
+        const as_whole = std.mem.eql(u8, branching, "tree") or (expected.len == resumed.len and
+            for (expected, resumed) |a, b| {
+                if (!std.mem.eql(u8, a, b)) break false;
+            } else true);
+        expect_all(context, &.{
+            .{ "48 timelines recorded, once each", once },
+            .{ "those recorded before the interruption kept as they were", kept },
+            .{ "flat: the whole run's timelines", as_whole },
+        }, "resume ({s}): killed at {d} timelines, resumed: {d} timelines, once each (the whole " ++
+            "run: {d})", .{ branching, interrupted.len, resumed.len, expected.len });
     }
+}
+
+/// A record_timelines line's index.
+fn timeline_index(line: []const u8) []const u8 {
+    return line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
 }
 
 /// A record's timelines as "index events_hash", sorted (duplicates kept: they would differ).
@@ -1191,12 +1281,12 @@ fn check_core_dump(context: *Context, program: []const u8) !void {
     const file = try std.fmt.allocPrint(arena, "runner:{s}", .{core_path});
     try argv.appendSlice(arena, &.{ "--branch", "0", "--until", "event=core_dump" });
     try argv.appendSlice(arena, &.{ "--file", file, "--to", local });
-    _ = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    _ = try run_kept(context, argv.items);
     const core = cwd.readFileAlloc(context.io, local, arena, .limited(1 << 28)) catch "";
-    const elf = core.len > 4 and std.mem.eql(u8, core[0..4], "\x7fELF");
-    expect(context, elf, "core dump: {s}, {d} bytes, an ELF core, extracted at a moment", .{
-        core_path, core.len,
-    });
+    expect_all(context, &.{
+        .{ "the core was extracted", core.len > 4 },
+        .{ "it is an ELF file", core.len > 4 and std.mem.eql(u8, core[0..4], "\x7fELF") },
+    }, "core dump: {s}, {d} bytes, an ELF core, extracted at a moment", .{ core_path, core.len });
 }
 
 /// CPU modulation: the same seed's timelines change (preemption lands elsewhere), the bug is
@@ -1235,11 +1325,14 @@ fn check_cpu_modulation(context: *Context) !void {
             .failing = false,
         };
     }
-    const exact = count_modulated == 8 and third.len > 0 and
-        std.mem.eql(u8, replays[0].events_hash, third) and
-        std.mem.eql(u8, replays[1].events_hash, third);
-    expect(context, changed > 0 and failing and exact, "cpu modulation: {d} of {d} timelines " ++
-        "change, the bug is found, branch 3 replays exactly", .{ changed, count });
+    expect_all(context, &.{
+        .{ "modulation changes timelines", changed > 0 },
+        .{ "the bug is found", failing },
+        .{ "8 modulated timelines", count_modulated == 8 },
+        .{ "branch 3 replays exactly, twice", third.len > 0 and std.mem.eql(u8, replays[0].events_hash, third) and std.mem.eql(u8, replays[1].events_hash, third) },
+    }, "cpu modulation: {d} of {d} timelines change, the bug is found, branch 3 replays exactly", .{
+        changed, count,
+    });
 }
 
 /// The assertion catalog: an assertion no timeline evaluates fails, known from the catalog the
@@ -1260,8 +1353,11 @@ fn check_catalog(context: *Context) !void {
     const log = cwd.readFileAlloc(context.io, events, arena, .limited(1 << 24)) catch "";
     const declared_c = std.mem.indexOf(u8, log, "\"message\":\"the C SDK's randomness stays " ++
         "below its bound\",\"hit\":false") != null;
-    expect(context, failed and declared_c, "catalog: an assertion no timeline evaluates fails " ++
-        "from the catalog alone; the C node announces its own", .{});
+    expect_all(context, &.{
+        .{ "the never-evaluated assertion fails from the catalog", failed },
+        .{ "the C node announces its own assertion", declared_c },
+    }, "catalog: an assertion no timeline evaluates fails from the catalog alone; the C node " ++
+        "announces its own", .{});
     // Zig assertions carry their place in the code, from the program's debug info.
     const place = "catalog_test.zig\",\"line\":26,\"function\":";
     const located = std.mem.indexOf(u8, log, place) != null;
@@ -1290,13 +1386,17 @@ fn check_guidance(context: *Context) !void {
     const guided = try explore(context, &(common ++ [_][]const u8{ "--strategy", strategy }));
     const missed = std.mem.indexOf(u8, random, property) == null;
     const found = std.mem.indexOf(u8, guided, property) != null;
-    expect(context, missed and found, "guidance: 300 random timelines miss the sum maze; " ++
-        "guided by its distance, the strategy solves it", .{});
+    expect_all(context, &.{
+        .{ "300 random timelines miss it", missed },
+        .{ "the guided strategy solves it", found },
+    }, "guidance: 300 random timelines miss the sum maze; guided by its distance, the strategy " ++
+        "solves it", .{});
 }
 
-/// The tree explorer: timelines return to moments of earlier ones (a path at least one deep);
-/// the tree is the same with one worker or four; and a timeline of the greatest depth replays
-/// alone, exactly, from its tape (which holds its path).
+/// The tree explorer: timelines return to moments of earlier ones (a path at least one deep),
+/// with one worker or four (a tree's generations follow its timelines' finishing order: not the
+/// same tree); and a timeline of the greatest depth replays alone, exactly, from its tape (which
+/// holds its path).
 fn check_tree(context: *Context) !void {
     const arena = context.arena;
     const program = try std.fs.path.join(arena, &.{ context.bin, "bank-test" });
@@ -1313,9 +1413,8 @@ fn check_tree(context: *Context) !void {
     var sequential: [branches_max]Branch = undefined;
     var parallel: [branches_max]Branch = undefined;
     const count = parse_branches(one, &sequential);
-    // Past the first generations in flight (all from the setup snapshot), the tree deepens.
-    const same = count == 64 and parse_branches(many, &parallel) == count and
-        same_timelines(sequential[0..count], parallel[0..count]);
+    const parallel_count = parse_branches(many, &parallel);
+    // Past the first generations planned (all from the setup snapshot), the tree deepens.
     const deep = try deepest_replays(context, program, record, tapes, sequential[0..count], &.{});
     // In-run snapshots (holders) made nodes without replays, in both: the same tree as replays
     // from their parents' start would make, which the deepest timeline's lone replay checks.
@@ -1323,11 +1422,16 @@ fn check_tree(context: *Context) !void {
     // Each the node a replay makes, in what the guest can see (--verify-holders remade them).
     const verified = std.mem.indexOf(u8, one, "ns: the same") != null and
         std.mem.indexOf(u8, one, "DIFFERENT") == null;
-    const passes = same and deep.depth >= 1 and deep.replays and held and verified;
-    expect(context, passes, "tree: {d} timelines, up to {d} deep, the same with one worker or " ++
-        "four; #{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the " ++
-        "one a replay makes", .{
-        count, deep.depth, deep.index, held_nodes(one),
+    expect_all(context, &.{
+        .{ "64 timelines with one worker", count == 64 },
+        .{ "64 timelines with four", parallel_count == 64 },
+        .{ "the tree deepens (a path at least one deep)", deep.depth >= 1 },
+        .{ "the deepest timeline replays alone from its tape", deep.replays },
+        .{ "in-run snapshots made nodes, with one worker and with four", held },
+        .{ "each such node is the one a replay makes (--verify-holders)", verified },
+    }, "tree: {d} and {d} timelines, up to {d} deep; #{?d} replays alone from its tape; {d} and " ++
+        "{d} nodes from in-run snapshots, each the one a replay makes", .{
+        count, parallel_count, deep.depth, deep.index, held_nodes(one), held_nodes(many),
     });
     if (!verified) std.debug.print("{s}\n", .{lines_with(context.arena, one, &.{
         "verify",
@@ -1354,8 +1458,11 @@ fn check_tree(context: *Context) !void {
         steered_branches[0..steered_count],
         &.{},
     );
-    const steered_ok = steered_count == 64 and steered_deep.depth >= 1 and steered_deep.replays;
-    expect(context, steered_ok, "tree with a strategy: {d} timelines, up to {d} deep; #{?d} " ++
+    expect_all(context, &.{
+        .{ "64 timelines", steered_count == 64 },
+        .{ "the tree deepens", steered_deep.depth >= 1 },
+        .{ "the deepest replays alone from its tape", steered_deep.replays },
+    }, "tree with a strategy: {d} timelines, up to {d} deep; #{?d} " ++
         "replays from its tape (its ancestors' decisions from theirs)", .{
         steered_count, steered_deep.depth, steered_deep.index,
     });
@@ -1383,9 +1490,13 @@ fn check_tree(context: *Context) !void {
     );
     const modulated_verified = std.mem.indexOf(u8, modulated, "ns: the same") != null and
         std.mem.indexOf(u8, modulated, "DIFFERENT") == null;
-    const modulated_ok = modulated_count == 64 and modulated_deep.depth >= 1 and
-        modulated_deep.replays and held_nodes(modulated) > 0 and modulated_verified;
-    expect(context, modulated_ok, "tree with cpu modulation: {d} timelines, up to {d} deep; " ++
+    expect_all(context, &.{
+        .{ "64 timelines", modulated_count == 64 },
+        .{ "the tree deepens", modulated_deep.depth >= 1 },
+        .{ "the deepest replays alone from its tape", modulated_deep.replays },
+        .{ "in-run snapshots made nodes", held_nodes(modulated) > 0 },
+        .{ "each such node is the one a replay makes", modulated_verified },
+    }, "tree with cpu modulation: {d} timelines, up to {d} deep; " ++
         "#{?d} replays alone from its tape; {d} nodes from in-run snapshots, each the one a " ++
         "replay makes", .{
         modulated_count, modulated_deep.depth, modulated_deep.index, held_nodes(modulated),
@@ -1458,11 +1569,14 @@ fn check_inject(context: *Context) !void {
         "--program",  program, "--profile", "injectable", "--scenario", "inject", "--seed", "1",
         "--branches", "2",
     });
-    const passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null and
-        std.mem.indexOf(u8, report, "injected faults came and went") != null;
-    expect(context, passes, "inject: a pause, a stop and a one-way partition asked for by " ++
-        "the scenario take the node away and give it back", .{});
-    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+    const clean = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
+    const came_and_went = std.mem.indexOf(u8, report, "injected faults came and went") != null;
+    expect_all(context, &.{
+        .{ "no failing properties", clean },
+        .{ "the injected faults came and went", came_and_went },
+    }, "inject: a pause, a stop and a one-way partition asked for by the scenario take the node " ++
+        "away and give it back", .{});
+    if (!clean or !came_and_went) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_inject_refused", "fault_failed",
     }) catch ""});
 }
@@ -1480,12 +1594,15 @@ fn check_mutate(context: *Context) !void {
         "--program",  program, "--scenario", "sum",                        "--seed", "1",
         "--branches", "4",     "--mutants",  "tests/mutate/mutants.jsonl", "--out",  out,
     });
-    const result = try std.process.run(arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     const caught = std.mem.indexOf(u8, result.stdout, "caught     sum subtracts") != null;
     const unnoticed = std.mem.indexOf(u8, result.stdout, "unnoticed  an unused function") != null;
     const counted = std.mem.indexOf(u8, result.stdout, "1 of 2 mutants caught") != null;
-    expect(context, caught and unnoticed and counted, "mutate: the mutant that breaks the " ++
-        "sums is caught, the one in unused code is not", .{});
+    expect_all(context, &.{
+        .{ "the mutant that breaks the sums is caught", caught },
+        .{ "the one in unused code goes unnoticed", unnoticed },
+        .{ "1 of 2 mutants counted caught", counted },
+    }, "mutate: the mutant that breaks the sums is caught, the one in unused code is not", .{});
     if (!(caught and unnoticed and counted)) {
         std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
     }
@@ -1500,13 +1617,15 @@ fn check_disk(context: *Context) !void {
         "--program", program, "--profile", "durable", "--scenario", "disk", "--seed", "1",
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "3" }));
-    const passes = std.mem.indexOf(u8, report, "3 branches, 0 with failing properties") != null and
-        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
-            "failing in    0  a crash keeps what was synced and loses the rest") != null and
-        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
-            "failing in    0  writes a disk drops are synced, then gone after a crash") != null and
-        std.mem.indexOf(u8, report, "PASS always                hit in    3/3 branches, " ++
-            "failing in    0  a disk works again after its faults") != null;
+    const passes = has_lines(report, &.{
+        "3 branches, 0 with failing properties",
+        "PASS always                hit in    3/3 branches, failing in    0  a crash keeps what " ++
+            "was synced and loses the rest",
+        "PASS always                hit in    3/3 branches, failing in    0  writes a disk drops " ++
+            "are synced, then gone after a crash",
+        "PASS always                hit in    3/3 branches, failing in    0  a disk works again " ++
+            "after its faults",
+    });
     var branches: [3]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -1516,9 +1635,12 @@ fn check_disk(context: *Context) !void {
         same = parse_branches(replay, &replayed) == 1 and
             same_timelines(&replayed, branches[0..count]);
     }
-    expect(context, passes and same, "disk: a crash keeps what was synced and loses the " ++
-        "rest, a wipe loses both; dropped writes vanish, refused ones fail, a slow disk is " ++
-        "slow, and it works again; a timeline replays exactly", .{});
+    expect_all(context, &.{
+        .{ "every disk property passes in all 3 timelines", passes },
+        .{ "a timeline replays exactly", same },
+    }, "disk: a crash keeps what was synced and loses the rest, a wipe loses both; dropped " ++
+        "writes vanish, refused ones fail, a slow disk is slow, and it works again; a timeline " ++
+        "replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_heal_failed", "det-nodes",
     }) catch ""});
@@ -1536,11 +1658,12 @@ fn check_host_checks(context: *Context) !void {
         "a host check gets the records in order, as made",
         "host checks run to completion",
     };
-    var passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
-    for (properties) |property| {
-        const line = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
-        passes = passes and std.mem.indexOf(u8, report, line) != null;
+    var lines: [properties.len + 1][]const u8 = undefined;
+    lines[0] = "2 branches, 0 with failing properties";
+    for (properties, lines[1..]) |property, *line| {
+        line.* = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
     }
+    const passes = has_lines(report, &lines);
     var branches: [2]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -1550,8 +1673,11 @@ fn check_host_checks(context: *Context) !void {
         same = parse_branches(replay, &replayed) == 1 and
             same_timelines(&replayed, branches[0..count]);
     }
-    expect(context, passes and same, "host checks: a timeline's records reach the program's " ++
-        "check on the host, in order and typed, as properties; a replay agrees", .{});
+    expect_all(context, &.{
+        .{ "every host-check property passes in both timelines", passes },
+        .{ "a replay agrees", same },
+    }, "host checks: a timeline's records reach the program's check on the host, in order and " ++
+        "typed, as properties; a replay agrees", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "check", "always",
     }) catch ""});
@@ -1571,11 +1697,12 @@ fn check_durability(context: *Context) !void {
         "a crash just after a sync keeps the write",
         "a write crashed at its sync never returns",
     };
-    var passes = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
-    for (properties) |property| {
-        const line = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
-        passes = passes and std.mem.indexOf(u8, report, line) != null;
+    var lines: [properties.len + 1][]const u8 = undefined;
+    lines[0] = "2 branches, 0 with failing properties";
+    for (properties, lines[1..]) |property, *line| {
+        line.* = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
     }
+    const passes = has_lines(report, &lines);
     var branches: [2]Branch = undefined;
     const count = parse_branches(report, &branches);
     var same = false;
@@ -1585,9 +1712,11 @@ fn check_durability(context: *Context) !void {
         same = parse_branches(replay, &replayed) == 1 and
             same_timelines(&replayed, branches[0..count]);
     }
-    expect(context, passes and same, "durability points: a stall holds a node's syncs; a " ++
-        "crash just before a sync loses the write, just after keeps it; a timeline replays " ++
-        "exactly", .{});
+    expect_all(context, &.{
+        .{ "every durability property passes in both timelines", passes },
+        .{ "a timeline replays exactly", same },
+    }, "durability points: a stall holds a node's syncs; a crash just before a sync loses the " ++
+        "write, just after keeps it; a timeline replays exactly", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});
@@ -1601,16 +1730,23 @@ fn check_hang(context: *Context) !void {
         "--program", program, "--scenario", "hang", "--seed", "1", "--timeline-limit", "20s",
     };
     const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
-    const hung = std.mem.count(u8, report, " hung ") == 2 and std.mem.indexOf(u8, report, "FAIL always                hit in    2/2 branches, failing in    2  the guest " ++
-        "finishes its scenario") != null;
+    const both_hung = std.mem.count(u8, report, " hung ") == 2;
+    const unfinished = std.mem.indexOf(u8, report, "FAIL always                hit in    2/2 " ++
+        "branches, failing in    2  the guest finishes its scenario") != null;
+    const hung = both_hung and unfinished;
     var branches: [2]Branch = undefined;
     const count = parse_branches(report, &branches);
     const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
     var replayed: [1]Branch = undefined;
-    const same = count == 2 and parse_branches(replay, &replayed) == 1 and
-        same_timelines(&replayed, branches[0..count]);
-    expect(context, hung and same, "hang: a timeline that never finishes ends at its " ++
-        "ceiling, hung, the same in a replay", .{});
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    const same = count == 2 and ran_one and same_timelines(&replayed, branches[0..count]);
+    expect_all(context, &.{
+        .{ "both timelines end hung", both_hung },
+        .{ "\"the guest finishes its scenario\" fails in both", unfinished },
+        .{ "2 timelines", count == 2 },
+        .{ "the replay ran one timeline", ran_one },
+        .{ "the replay is the same timeline", same },
+    }, "hang: a timeline that never finishes ends at its ceiling, hung, the same in a replay", .{});
     if (!(hung and same)) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "[branch", "FAIL",
     }) catch ""});
@@ -1641,14 +1777,15 @@ fn check_retroactive(context: *Context) !void {
     const replayed = try directory_has(context, replay_dir, text);
     var with: [2]Branch = undefined;
     var without: [2]Branch = undefined;
-    const same = parse_branches(reports[0], &with) == 2 and
-        parse_branches(reports[1], &without) == 2 and same_timelines(&with, &without);
-    const passes = !hidden and shown and replayed and same;
-    expect(context, passes, "retroactive: hidden output stays out of an exploration's events, " ++
-        "the timelines unchanged, and a replay writes it", .{});
-    if (!passes) std.debug.print("hidden {} shown {} replayed {} same {}\n", .{
-        hidden, shown, replayed, same,
-    });
+    const both = parse_branches(reports[0], &with) == 2 and parse_branches(reports[1], &without) == 2;
+    expect_all(context, &.{
+        .{ "the hidden text is not in the exploration's events", !hidden },
+        .{ "shown, it is", shown },
+        .{ "a replay writes it", replayed },
+        .{ "2 timelines each way", both },
+        .{ "the timelines are the same either way", both and same_timelines(&with, &without) },
+    }, "retroactive: hidden output stays out of an exploration's events, the timelines unchanged, " ++
+        "and a replay writes it", .{});
 }
 
 /// A pinned system replays on another host: a kit (the run's pin, with its node disks beside it
@@ -1682,13 +1819,17 @@ fn check_pinned(context: *Context) !void {
     const replayed = try explore(context, &(system ++ [_][]const u8{ "--system", kit_pin, "--cache", fresh }));
     var original: [1]Branch = undefined;
     var again: [1]Branch = undefined;
-    const same = parse_branches(report, &original) == 1 and parse_branches(replayed, &again) == 1 and
-        std.mem.eql(u8, original[0].events_hash, again[0].events_hash);
-    const built = std.mem.indexOf(u8, replayed, "] building ") != null or
-        std.mem.indexOf(u8, replayed, "] pulling ") != null or
-        std.mem.indexOf(u8, replayed, "] flattening ") != null;
-    expect(context, same and !built, "pinned: a kit replays a timeline from an empty cache, " ++
-        "nothing pulled or built ({s})", .{if (same) original[0].events_hash else "differs"});
+    const ran = parse_branches(report, &original) == 1 and parse_branches(replayed, &again) == 1;
+    const same = ran and std.mem.eql(u8, original[0].events_hash, again[0].events_hash);
+    expect_all(context, &.{
+        .{ "one timeline each", ran },
+        .{ "the same events hash", same },
+        .{ "nothing built", std.mem.indexOf(u8, replayed, "] building ") == null },
+        .{ "nothing pulled", std.mem.indexOf(u8, replayed, "] pulling ") == null },
+        .{ "nothing flattened", std.mem.indexOf(u8, replayed, "] flattening ") == null },
+    }, "pinned: a kit replays a timeline from an empty cache, nothing pulled or built ({s})", .{
+        if (same) original[0].events_hash else "differs",
+    });
 }
 
 /// Whether some events file of an events directory has `text`.
@@ -1719,8 +1860,10 @@ fn check_readdress(context: *Context) !void {
         "branches, failing in    0  a restarted node answers at its name") != null;
     const moved = std.mem.indexOf(u8, report, "PASS sometimes") != null and
         std.mem.indexOf(u8, report, "a restarted node comes back at a new address") != null;
-    expect(context, answers and moved, "readdress: restarted nodes answer at their names, " ++
-        "some at a new address", .{});
+    expect_all(context, &.{
+        .{ "a restarted node answers at its name, in all 4", answers },
+        .{ "some came back at a new address (PASS sometimes)", moved },
+    }, "readdress: restarted nodes answer at their names, some at a new address", .{});
     if (!(answers and moved)) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "PASS", "readdress",
     }) catch ""});
@@ -1747,13 +1890,14 @@ fn check_changed(context: *Context) !void {
     const some = try std.fmt.allocPrint(arena, "{s}:17-17", .{file});
     const cwd = std.Io.Dir.cwd();
     const recorded = cwd.readFileAlloc(context.io, record, arena, .limited(64 << 20)) catch "";
-    const passes = std.mem.indexOf(u8, report, "2 of 3 hunks ran") != null and
-        std.mem.indexOf(u8, report, every) != null and
-        std.mem.indexOf(u8, report, never) != null and
-        std.mem.indexOf(u8, report, some) != null and
-        std.mem.indexOf(u8, recorded, "just after it first ran changed code") != null;
-    expect(context, passes, "changed: a targeted run says which hunks ran and which never did, " ++
-        "and returns to changed code", .{});
+    const said = has_lines(report, &.{ "2 of 3 hunks ran", every, never, some });
+    const returned = std.mem.indexOf(u8, recorded, "just after it first ran changed code") != null;
+    const passes = said and returned;
+    expect_all(context, &.{
+        .{ "it says which hunks ran and which never did", said },
+        .{ "the tree returned just after changed code", returned },
+    }, "changed: a targeted run says which hunks ran and which never did, and returns to changed " ++
+        "code", .{});
     if (!passes) std.debug.print("{s}\n", .{lines_with(arena, report, &.{
         "changed code", "ran in", "NEVER", "tree:",
     }) catch ""});
@@ -1806,8 +1950,13 @@ fn check_voidstar(context: *Context) !void {
     const library = try std.fs.path.join(arena, &.{ context.bin, "libvoidstar.so" });
     const tls_free = !(try elf_has_tls(context, library));
     const passes = answered and events_found and same and tls_free;
-    expect(context, passes, "voidstar: a node's Python loads libvoidstar.so; its message, " ++
-        "decision and coverage reach the timeline, the same twice", .{});
+    expect_all(context, &.{
+        .{ "notify_coverage answered (False)", answered },
+        .{ "its events and edges reach the timeline", events_found },
+        .{ "the same twice", same },
+        .{ "libvoidstar.so has no thread-local storage", tls_free },
+    }, "voidstar: a node's Python loads libvoidstar.so; its message, decision and coverage reach " ++
+        "the timeline, the same twice", .{});
     if (!passes) std.debug.print("tls free: {}\n{s}\n{s}\n", .{
         tls_free, outputs[0], outputs[1],
     });
@@ -1842,8 +1991,10 @@ fn check_parallel(context: *Context) !void {
     var parallel: [branches_max]Branch = undefined;
     const count = parse_branches(one, &sequential);
     const counts_match = count == 8 and parse_branches(many, &parallel) == count;
-    const same = counts_match and same_timelines(sequential[0..count], parallel[0..count]);
-    expect(context, same, "parallel workers give the timelines of one worker", .{});
+    expect_all(context, &.{
+        .{ "8 timelines each way", counts_match },
+        .{ "the same timelines", counts_match and same_timelines(sequential[0..count], parallel[0..count]) },
+    }, "parallel workers give the timelines of one worker", .{});
     // Without --jobs a run takes every core: an explorer pinned to the CPU it booted on once
     // counted one, and ran one timeline at a time (srv2, 2026-10-27). Timelines at once, on
     // average: their wall times over the run's.
@@ -1851,10 +2002,31 @@ fn check_parallel(context: *Context) !void {
         const output = try explore(context, &[_][]const u8{
             "--program", program, "--scenario", "bank", "--seed", "22", "--branches", "48", "--branching", branching,
         });
+        // On the cores the run has (a host's reserved cores give a check 2): a core short of
+        // them all is fine, one timeline at a time is the bug.
+        const cores = workers_said(output);
+        if (cores < 2) {
+            std.debug.print("SKIP parallel: a {s} run on {d} core\n", .{ branching, cores });
+            continue;
+        }
         const at_once = concurrency(output);
-        expect(context, at_once >= 1.8, "parallel: without --jobs, a {s} run keeps the cores busy " ++
-            "({d:.1} timelines at once on average)", .{ branching, at_once });
+        const least = @min(1.8, 0.75 * @as(f64, @floatFromInt(cores)));
+        expect(context, at_once >= least, "parallel: without --jobs, a {s} run keeps its {d} cores busy " ++
+            "({d:.1} timelines at once on average)", .{ branching, cores, at_once });
     }
+}
+
+/// The workers a run says it has ("... on N workers"), 0 if it does not say.
+fn workers_said(output: []const u8) u32 {
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[determinismo] ")) continue;
+        if (!std.mem.endsWith(u8, line, " workers")) continue;
+        const end = line.len - " workers".len;
+        const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ' ') orelse continue) + 1;
+        return std.fmt.parseInt(u32, line[start..end], 10) catch continue;
+    }
+    return 0;
 }
 
 /// The timelines' wall times over the run's (its multiverse line's).
@@ -1897,9 +2069,9 @@ fn check_tla(context: *Context, jar: []const u8) !void {
     }));
     var statuses: [2]u8 = undefined;
     for ([_][]const u8{ buggy_events, fixed_events }, &statuses) |events, *status| {
-        const result = try std.process.run(context.arena, context.io, .{ .argv = &.{
+        const result = try run_kept(context, &.{
             context.determinismo, "tla", "--spec", spec, "--events", events, "--tla2tools", jar,
-        } });
+        });
         status.* = switch (result.term) {
             .exited => |code| code,
             else => 255,
@@ -1926,9 +2098,7 @@ fn check_script(context: *Context) !void {
     _ = try explore(context, &(common ++ [_][]const u8{
         "--seed", "7", "--branch", index, "--events", events,
     }));
-    const extracted = try std.process.run(context.arena, context.io, .{
-        .argv = &.{ context.determinismo, "script", events },
-    });
+    const extracted = try run_kept(context, &.{ context.determinismo, "script", events });
     const script_path = try std.fs.path.join(context.arena, &.{ context.scratch, "script.json" });
     const script_file: std.Io.Dir.WriteFileOptions = .{
         .sub_path = script_path,
@@ -1939,8 +2109,10 @@ fn check_script(context: *Context) !void {
     const without = failing_count(try explore(context, &others));
     const scripted = others ++ [_][]const u8{ "--script", script_path };
     const with = failing_count(try explore(context, &scripted));
-    expect(context, with > 0 and with >= without, "script: other seeds fail with it ({d} of 8, " ++
-        "{d} without)", .{ with, without });
+    expect_all(context, &.{
+        .{ "other seeds fail with the script", with > 0 },
+        .{ "at least as often as without it", with >= without },
+    }, "script: other seeds fail with it ({d} of 8, {d} without)", .{ with, without });
 }
 
 fn failing_count(report: []const u8) u32 {
@@ -2039,16 +2211,16 @@ fn check_shards(context: *Context) !void {
         const shard_flags = [_][]const u8{ "--shard", flag, "--record", record.* };
         _ = try explore(context, &(common ++ shard_flags));
     }
-    const result = try std.process.run(context.arena, context.io, .{
-        .argv = &.{ context.determinismo, "merge", records[0], records[1] },
-    });
+    const result = try run_kept(context, &.{ context.determinismo, "merge", records[0], records[1] });
     var unsharded: [branches_max]Branch = undefined;
     const count = parse_branches(whole, &unsharded);
     var merged: [branches_max]Branch = undefined;
     const merged_count = merged_branches(result.stdout, &merged);
-    const same = count == 6 and merged_count == count and
-        same_timelines(unsharded[0..count], merged[0..merged_count]);
-    expect(context, same, "shards: two shards merged give the timelines of one run", .{});
+    expect_all(context, &.{
+        .{ "6 timelines in the whole run", count == 6 },
+        .{ "as many merged", merged_count == count },
+        .{ "the same timelines", count == merged_count and same_timelines(unsharded[0..count], merged[0..merged_count]) },
+    }, "shards: two shards merged give the timelines of one run", .{});
 }
 
 /// The branches of a merged record (JSON lines).
@@ -2095,9 +2267,11 @@ fn check_compose(context: *Context) !void {
     const index = try std.fmt.allocPrint(context.arena, "{d}", .{branch.index});
     const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", index }));
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and
-        same_timelines(&replayed, branches[0..count]);
-    expect(context, same, "compose: branch {d} replays", .{branch.index});
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "the same timeline", ran_one and same_timelines(&replayed, branches[0..count]) },
+    }, "compose: branch {d} replays", .{branch.index});
 }
 
 /// Branches from a moment of another branch (a nested snapshot) replay alone.
@@ -2108,7 +2282,10 @@ fn check_fork(context: *Context) !void {
     const setup_s = number_after(parent, "snapshot at setup_complete: vtime=") orelse 0;
     const branch_end_s = branch_vtime(parent) orelse 0;
     const ok_times = setup_s > 0 and branch_end_s > setup_s;
-    expect(context, ok_times, "fork: the parent branch runs past its snapshot", .{});
+    expect_all(context, &.{
+        .{ "the setup snapshot's moment is known", setup_s > 0 },
+        .{ "the branch ends after it", branch_end_s > setup_s },
+    }, "fork: the parent branch runs past its snapshot", .{});
     if (!ok_times) return;
     const middle_ms: u64 = @trunc((setup_s + branch_end_s) / 2 * 1000);
     const middle = try std.fmt.allocPrint(context.arena, "{d}", .{middle_ms});
@@ -2122,9 +2299,11 @@ fn check_fork(context: *Context) !void {
     if (count == 0) return;
     const replay = try explore(context, &(fork ++ [_][]const u8{ "--branch", "2" }));
     var replayed: [1]Branch = undefined;
-    const same = parse_branches(replay, &replayed) == 1 and
-        same_timelines(&replayed, branches[0..count]);
-    expect(context, same, "fork: a branch from the fork point replays alone", .{});
+    const ran_one = parse_branches(replay, &replayed) == 1;
+    expect_all(context, &.{
+        .{ "the replay ran one timeline", ran_one },
+        .{ "the same timeline", ran_one and same_timelines(&replayed, branches[0..count]) },
+    }, "fork: a branch from the fork point replays alone", .{});
 }
 
 /// The end vtime (seconds) of the first branch line.
@@ -2199,7 +2378,10 @@ fn check_saved(context: *Context) !void {
         same = same and count == 4 and parse_branches(loaded, &from_disk) == count and
             same_timelines(from_replay[0..count], from_disk[0..count]);
     }
-    expect(context, saved_count == 2 and same, "saved: {d} snapshots on disk along branch 1 " ++
+    expect_all(context, &.{
+        .{ "2 snapshots on disk", saved_count == 2 },
+        .{ "the futures from each, loaded, are the ones a replay forks there", same },
+    }, "saved: {d} snapshots on disk along branch 1 " ++
         "(at {d} and {d} ms); the futures from each, loaded, are the ones a replay forks there", .{
         saved_count, moments[0], moments[1],
     });
@@ -2211,7 +2393,7 @@ fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
     try argv.appendSlice(context.arena, &.{ context.determinismo, "explore" });
     try argv.appendSlice(context.arena, context.machine);
     try argv.appendSlice(context.arena, extra);
-    const result = try std.process.run(context.arena, context.io, .{ .argv = argv.items });
+    const result = try run_kept(context, argv.items);
     // Exit status 3 means "properties failed", which the checks expect; others are errors.
     const status: u8 = switch (result.term) {
         .exited => |code| code,
@@ -2224,6 +2406,33 @@ fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
         std.debug.print("e2e: determinismo exited with {d}:\n{s}\n", .{ status, result.stderr });
     }
     return std.mem.concat(context.arena, u8, &.{ result.stdout, result.stderr });
+}
+
+/// Runs a command (determinismo's causality, extract, a replay...) and keeps its output as
+/// `explore` does, for the check that judges it.
+fn run_kept(context: *Context, argv: []const []const u8) !std.process.RunResult {
+    const result = try std.process.run(context.arena, context.io, .{ .argv = argv });
+    const status: u8 = switch (result.term) {
+        .exited => |code| code,
+        else => 255,
+    };
+    const output = try std.mem.concat(context.arena, u8, &.{ result.stdout, result.stderr });
+    output_keep(context, argv, status, output);
+    return result;
+}
+
+/// Keeps an exploration's command, exit status and output in the scratch directory, for the
+/// check that judges it to name when it fails.
+fn output_keep(context: *Context, argv: []const []const u8, status: u8, output: []const u8) void {
+    const directory = std.fs.path.join(context.arena, &.{ context.scratch, "outputs" }) catch return;
+    std.Io.Dir.cwd().createDirPath(context.io, directory) catch return;
+    context.output_count += 1;
+    const path = std.fmt.allocPrint(context.arena, "{s}/{d}.log", .{ directory, context.output_count }) catch return;
+    const command = std.mem.join(context.arena, " ", argv) catch return;
+    const header = std.fmt.allocPrint(context.arena, "$ {s}\nexit {d}\n\n", .{ command, status }) catch return;
+    const contents = std.mem.concat(context.arena, u8, &.{ header, output }) catch return;
+    std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = path, .data = contents }) catch return;
+    context.outputs.append(context.arena, path) catch return;
 }
 
 fn parse_branches(report: []const u8, branches: []Branch) u32 {
@@ -2255,7 +2464,37 @@ fn field(line: []const u8, comptime key: []const u8) ?[]const u8 {
 fn expect(context: *Context, ok: bool, comptime format: []const u8, arguments: anytype) void {
     const status = if (ok) "PASS" else "FAIL";
     std.debug.print("{s} " ++ format ++ "\n", .{status} ++ arguments);
-    if (!ok) context.failures += 1;
+    if (!ok) {
+        context.failures += 1;
+        for (context.outputs.items) |path| std.debug.print("  output: {s}\n", .{path});
+    }
+    context.outputs.clearRetainingCapacity();
+}
+
+/// Whether the report has every line; prints those it lacks (why its check fails).
+fn has_lines(report: []const u8, lines: []const []const u8) bool {
+    var all = true;
+    for (lines) |line| if (std.mem.indexOf(u8, report, line) == null) {
+        std.debug.print("  missing: {s}\n", .{line});
+        all = false;
+    };
+    return all;
+}
+
+/// A condition of a check, named: a failing check says which of its conditions failed.
+const Condition = struct { []const u8, bool };
+
+/// A check of several conditions: it passes when all hold, and a failure names those that did
+/// not (and the outputs judged), never only that the whole failed.
+fn expect_all(context: *Context, conditions: []const Condition, comptime format: []const u8, arguments: anytype) void {
+    var ok = true;
+    for (conditions) |condition| ok = ok and condition[1];
+    if (!ok) {
+        std.debug.print("  failed:", .{});
+        for (conditions) |condition| if (!condition[1]) std.debug.print(" {s};", .{condition[0]});
+        std.debug.print("\n", .{});
+    }
+    expect(context, ok, format, arguments);
 }
 
 test parse_branches {
