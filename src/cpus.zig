@@ -46,6 +46,10 @@ const linux = std.os.linux;
 const cpus_max = 1024;
 const wait_ns_min = 10 * std.time.ns_per_ms;
 const wait_ns_max = 30 * std.time.ns_per_ms;
+/// A session waiting for memory says so after this long, and again every `memory_say_every_ns`:
+/// replays through serve beside a YugabyteDB hunt waited 30 minutes and said nothing.
+const memory_say_after_ns = 30 * std.time.ns_per_s;
+const memory_say_every_ns = 5 * 60 * std.time.ns_per_s;
 
 /// The run this process belongs to: set by a run's first process before it forks the others
 /// (they inherit it); a process outside any run is a run of its own.
@@ -186,6 +190,7 @@ pub const Pool = struct {
         var random: std.Random.DefaultPrng = .init(@as(u64, @intCast(linux.getpid())) ^ monotonic_ns());
         var memory_wait_ns: u64 = 0;
         var memory_since: ?u64 = null;
+        var memory_said_ns: u64 = 0;
         while (true) {
             // Every CPU runs a VM, or a priority process waits for it: back-pressure, until one
             // is free. A priority process tries at once; the others wait their turn first, at
@@ -211,6 +216,26 @@ pub const Pool = struct {
                     };
                 }
                 if (pool.priority) {
+                    const now = monotonic_ns();
+                    if (now - memory_since.? >= memory_say_after_ns and
+                        (memory_said_ns == 0 or now - memory_said_ns >= memory_say_every_ns))
+                    {
+                        memory_said_ns = now;
+                        const waited_s = (now - memory_since.?) / std.time.ns_per_s;
+                        if (below) {
+                            std.debug.print("[determinismo] waiting {d} s for memory: {d} MiB " ++
+                                "available, below the {d} MiB kept free (the runs' VMs and holders " ++
+                                "hold the rest, until they end)\n", .{
+                                waited_s,
+                                available >> 20,
+                                (memory_reserve() / 2 + sessions_reserve_bytes()) >> 20,
+                            });
+                        } else {
+                            std.debug.print("[determinismo] waiting {d} s for memory: a VM of {d} " ++
+                                "MiB beside the running ones could outgrow the host (each may " ++
+                                "grow to its guest's size)\n", .{ waited_s, claim_bytes >> 20 });
+                        }
+                    }
                     const pause: linux.timespec = .{ .sec = 0, .nsec = @intCast(wait_ns_max) };
                     _ = linux.nanosleep(&pause, null);
                 }
