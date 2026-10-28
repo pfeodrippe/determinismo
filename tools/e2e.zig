@@ -382,6 +382,46 @@ fn check_k3s_profile(
     }
 }
 
+/// In each timeline's events (`--events-dir`), the first branch point naming a node
+/// (`faults_branch`) and whether the fault after it involves that node.
+fn branches_aimed(context: *Context, dir: []const u8, branches: []const Branch) !struct { named: u32, aimed: u32 } {
+    var named: u32 = 0;
+    var aimed: u32 = 0;
+    for (branches) |branch| {
+        const path = try std.fmt.allocPrint(context.arena, "{s}/branch-{d}.jsonl", .{ dir, branch.index });
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .limited(1 << 28)) catch continue;
+        var node: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, context.arena, line, .{}) catch continue;
+            if (parsed != .object) continue;
+            const data = parsed.object.get("event") orelse continue;
+            if (data != .object) continue;
+            const name = data.object.get("event") orelse continue;
+            const details = data.object.get("details") orelse continue;
+            if (name != .string or details != .object) continue;
+            if (node == null and std.mem.eql(u8, name.string, "faults_branch")) {
+                const at = json_string(details.object, "node");
+                if (at.len > 0) {
+                    node = at;
+                    named += 1;
+                }
+            } else if (node != null and std.mem.eql(u8, name.string, "fault")) {
+                const involved = std.mem.eql(u8, json_string(details.object, "node"), node.?) or
+                    std.mem.eql(u8, json_string(details.object, "peer"), node.?);
+                aimed += @intFromBool(involved);
+                break;
+            }
+        }
+    }
+    return .{ .named = named, .aimed = aimed };
+}
+
+fn json_string(object: std.json.ObjectMap, key: []const u8) []const u8 {
+    const value = object.get(key) orelse return "";
+    return if (value == .string) value.string else "";
+}
+
 /// Prints where two event logs part: what a replay did differently.
 fn first_difference(context: *Context, a_path: []const u8, b_path: []const u8) void {
     const cwd = std.Io.Dir.cwd();
@@ -1409,7 +1449,8 @@ fn check_tree(context: *Context) !void {
     const one = try explore(context, &(common ++ [_][]const u8{
         "--jobs", "1", "--tape-dir", tapes, "--record", record, "--verify-holders",
     }));
-    const many = try explore(context, &(common ++ [_][]const u8{ "--jobs", "4" }));
+    const tree_events = try std.fmt.allocPrint(arena, "{s}/tree-events", .{context.scratch});
+    const many = try explore(context, &(common ++ [_][]const u8{ "--jobs", "4", "--events-dir", tree_events }));
     var sequential: [branches_max]Branch = undefined;
     var parallel: [branches_max]Branch = undefined;
     const count = parse_branches(one, &sequential);
@@ -1436,6 +1477,13 @@ fn check_tree(context: *Context) !void {
     if (!verified) std.debug.print("{s}\n", .{lines_with(context.arena, one, &.{
         "verify",
     }) catch ""});
+    // Branch points: a timeline from a node starts with the injector told where the news came
+    // from, and its first fault involves that node.
+    const aim = try branches_aimed(context, tree_events, parallel[0..parallel_count]);
+    expect_all(context, &.{
+        .{ "timelines from nodes had branch points naming a node", aim.named > 0 },
+        .{ "the fault after a named branch point involved its node", aim.aimed > 0 },
+    }, "tree: {d} branch points named a node, the next fault involved it in {d}", .{ aim.named, aim.aimed });
     // With a strategy (overriding decisions): nodes replay their parents with their tapes, and
     // a deep timeline still replays alone, without the strategy.
     const strategy_tapes = try std.fmt.allocPrint(arena, "{s}/tree-strategy-tapes", .{
