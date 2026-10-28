@@ -888,7 +888,8 @@ fn moment_arrive(vm: *VM) !?Outcome {
         vm.decisions.seed = seed;
         vm.overrides = null;
         std.debug.print("[determinismo] a fresh future from here (seed {d})\n", .{seed});
-        break :blk try std.mem.concat(vm.step_arena.allocator(), u8, &.{ "det:reseed\x00", given });
+        // A no-op in the shell of a guest older than det:reseed (runs replay with their own).
+        break :blk try std.mem.concat(vm.step_arena.allocator(), u8, &.{ ": det:reseed\x00", given });
     } else given;
     vm.moment_printing = true;
     // Steps of the platform's: the guest's agent holds the timeline from its end meanwhile.

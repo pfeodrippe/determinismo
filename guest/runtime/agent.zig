@@ -25,7 +25,8 @@ const release_action = "det:release";
 /// A fresh future from the moment (VM.Options.fresh_seed): the kernel's generator reseeded from
 /// a platform decision (now drawn from the new seed), so what processes draw afresh differs from
 /// the timeline's too, and the fault injector perturbs at once, as at a tree's branch point.
-const reseed_action = "det:reseed";
+/// Written as a shell no-op (`:`): an agent older than it runs it, harmlessly.
+const reseed_action = ": det:reseed";
 pub const hold_path = "/run/det-agent-hold";
 
 const action_size_max = sdk.message_size_max;

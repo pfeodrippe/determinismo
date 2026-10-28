@@ -67,6 +67,18 @@
   ([pipeline] (events pipeline {}))
   ([pipeline options] (json-lines (database "events" (merge {:pipeline pipeline :limit 100} options)))))
 
+(def sources
+  "The run's events by source, as Antithesis's environment names them (conditions for query):
+  (query (:faults sources) {:limit 20})."
+  {:containers "output.source?"
+   :assertions "assert.message?"
+   :sdk "assert.message? or event? or decision?"
+   :fault-injector "event=faults_start or event=faults_stop or event=faults_phase or event=fault_failed"
+   :faults "event=fault"
+   :nodes "event=node_start or event=node_ready or event=node_kill or event=node_crash"
+   ;; The kernel's log is read when a timeline ends: its OOM kills, crashes and warnings.
+   :journal "assert.message~kernel or assert.message~\"no process crashes\""})
+
 (defn sql
   "One SELECT on the run's events database (tables events, timelines, steps; the view
   timeline_events): its rows. (sql \"SELECT kind, count(*) AS n FROM events GROUP BY kind\")."
@@ -178,6 +190,17 @@
   [branch condition & [{:keys [timeout_ms]}]]
   (update branch :steps conj (cond-> {:until condition} timeout_ms (assoc :timeout_ms timeout_ms))))
 
+(defn faults-pause
+  "The fault injector stops from here (faults under way undone), as Antithesis's
+  environment.fault_injector.pause: a step of the branch."
+  [branch]
+  (update branch :steps conj {:exec "/opt/determinismo/bin/det-stop-faults 86400"}))
+
+(defn faults-resume
+  "The fault injector goes on (environment.fault_injector.unpause): a step of the branch."
+  [branch]
+  (update branch :steps conj {:exec "/opt/determinismo/bin/det-stop-faults 0"}))
+
 (defn- branch-result
   "A branch's replay as data: the moment each step ended at (:moments, the first the branch's
   start), whether each wait-until's condition held (:timed-out, by step), and every command as a
@@ -204,7 +227,8 @@
     {:moments moments
      :end (peek moments)
      :timed-out (count (filter #(str/includes? % "until: timed out") lines))
-     :processes (vec (vals processes))
+     ;; Not the platform's own steps (": det:reseed", run by a guest older than it).
+     :processes (vec (remove #(some-> (:command %) (str/starts-with? ": det:")) (vals processes)))
      :replay (str/join "\n" (filter #(str/starts-with? % "[branch") lines))}))
 
 (defn exited-by?
@@ -227,9 +251,15 @@
   state, pid, address and image: (containers {:branch 0 :at_vtime_ms 1550})."
   [options]
   (let [body (assoc (moment options) :exec "det-nodes list")
+        ;; Its lines, printed as they are or in exec_output events.
         parse (fn [text]
-                (->> (:processes (branch-result text)) first :output str/split-lines
-                     (keep #(try (json/parse-string % true) (catch Exception _ nil))) vec))
+                (let [printed (str/join (keep #(when-let [at (str/index-of % "{\"event\":\"exec_output\"")]
+                                                 (-> (subs % at) (json/parse-string true) :details :text))
+                                              (str/split-lines text)))]
+                  (->> (concat (str/split-lines printed) (str/split-lines text))
+                       (keep #(when (str/starts-with? (str/trim %) "{\"name\"")
+                                (try (json/parse-string (str/trim %) true) (catch Exception _ nil))))
+                       distinct vec)))
         done (action (str "containers " (json/generate-string body)) {:path "replay" :body body :raw true})]
     (cond (string? done) (parse done)
           (string? (:result done)) (assoc done :result (parse (:result done)))
@@ -265,7 +295,8 @@
          :failed true}))))
 
 (def ^:private names '[run query events sql md replay stacks profile extract result
-                        branch bash bash-bg wait wait-until run-branch exited-by?])
+                        branch bash bash-bg wait wait-until run-branch exited-by?
+                        containers faults-pause faults-resume sources])
 
 (defn -main [input-path]
   (let [input (json/parse-string (slurp input-path))]
