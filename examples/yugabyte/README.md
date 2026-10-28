@@ -52,6 +52,13 @@ design; with a fault every 10 to 300 ms, YSQL was always restarting ("the databa
 starting up", "shutting down", "in recovery mode") and no transaction got through. Without
 faults, histories are valid and nothing crashes.
 
+## Found blind: yugabyte-db#2571
+
+A single fresh timeline (srv3, 2026-10-28, seed 3, `--scenario append`, faults on) aborted yb3's
+tablet server at 41.3 s of virtual time with `mvcc.cc:340] Check failed: result >=
+enforced_min_time`: a read's safe time below the minimum the tablet enforces. Known upstream as
+[#2571](https://github.com/yugabyte/yugabyte-db/issues/2571) (October 2019, 1.3, closed).
+
 ## Observed (1.3.1, not investigated further)
 
 - YSQL backends segfault as they exit, in `yb::rpc::ThreadPool::Impl::Shutdown()`, popping a
