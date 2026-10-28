@@ -586,9 +586,16 @@ places, and assertions carry no location.
   2026-10-27: `io_delay=none`, one PIT write, a 1 ms timer slack, RDTSC in KVM's fastpath).
   Remaining exits: PIC port I/O, single-steps for hard stops.
 - Big systems: holders (parked VMs that make branching cheap) need memory that a YugabyteDB
-  hunt (7 GB VMs) leaves too little of; branching then replays to the moment. Next: smaller
-  holders (pages shared with their timeline, or written to disk at once), or fewer, better
-  placed.
+  hunt (7 GB VMs) leaves too little of; branching then replays to the moment. Kafka's hunts
+  made none in 180 of 207 timelines (run 67) and in all of run 68's (15 GB available of the 16
+  they want; 19 GB of srv3's tmpfs /tmp were stale check files): each new timeline replayed
+  its parent from the start, minutes, while workers waited (8.8 of 16 busy). Done
+  (2026-10-28): while memory runs low, holders go to the run's directory instead
+  (holders.Disk): a child forked at the hold point writes the moment's pages changed since the
+  timeline's previous one, the timeline going on meanwhile; a node maker loads it, replaying on
+  from there as a holder would; a timeline's files go with its holders. `--holders-on-disk`
+  puts every holder there (the e2e tree check verifies each such node against a replay's).
+  Next: measure a Kafka hunt with them (timelines per hour, workers busy).
 - Setup is one core before branches fan out: start branch workers as soon as the snapshot exists,
   and run independent e2e checks concurrently.
 

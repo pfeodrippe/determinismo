@@ -1800,6 +1800,27 @@ fn check_tree(context: *Context) !void {
     if (!verified) std.debug.print("{s}\n", .{lines_with(context.arena, one, &.{
         "verify",
     }) catch ""});
+    // Holders on disk (as while memory runs low): nodes loaded from the run's directory, each
+    // the one a replay makes, and their files gone with the run.
+    const disk_data = try std.fmt.allocPrint(arena, "{s}/tree-disk-data", .{context.scratch});
+    std.Io.Dir.cwd().deleteTree(context.io, disk_data) catch {};
+    const on_disk = try explore(context, &(common ++ [_][]const u8{
+        "--jobs", "2", "--data", disk_data, "--holders-on-disk", "--verify-holders",
+    }));
+    const disk_count = parse_branches(on_disk, &parallel);
+    const disk_nodes = held_nodes(on_disk);
+    const disk_verified = std.mem.indexOf(u8, on_disk, "DIFFERENT") == null and
+        std.mem.indexOf(u8, on_disk, "ns: the same") != null;
+    const disk_left = try run_kept(context, &.{ "find", disk_data, "-path", "*/holders/*", "-type", "f" });
+    expect_all(context, &.{
+        .{ "64 timelines with holders on disk", disk_count == 64 },
+        .{ "nodes loaded from disk", disk_nodes > 0 },
+        .{ "each the one a replay makes (--verify-holders)", disk_verified },
+        .{ "no holder file left once the run ended", disk_left.stdout.len == 0 },
+    }, "tree: {d} nodes from holders on disk, each the one a replay makes; none left after", .{disk_nodes});
+    if (!disk_verified or disk_nodes == 0) std.debug.print("{s}\n", .{lines_with(context.arena, on_disk, &.{
+        "verify", "holder", "disk",
+    }) catch ""});
     // Branch points: a timeline from a node starts with the injector told where the news came
     // from, and its first fault involves that node.
     const aim = try branches_aimed(context, tree_events, parallel[0..parallel_count]);

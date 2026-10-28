@@ -115,6 +115,8 @@ const usage =
     \\                            varying speeds by default, as Antithesis's with faults)
     \\                            [--verify-holders]   (remake every node an in-run snapshot made
     \\                            by a replay and compare them, to check holders; slower)
+    \\                            [--holders-on-disk]   (every in-run snapshot written to the
+    \\                            run's directory, as while memory runs low: to check them)
     \\                            [--data <dir>]   (the host's runs, where this one goes:
     \\                            $DETERMINISMO_DATA, else ~/.determinismo; serve shows them)
     \\                            [--events-dir <dir>]   (every branch's events, for query, and
@@ -289,6 +291,8 @@ const Arguments = struct {
     /// Remake every tree node an in-run snapshot made (holders.zig) by a replay, and print how
     /// the two differ in what the guest can see ("verify ... DIFFERENT"): a check of holders.
     verify_holders: bool = false,
+    /// Every holder on disk (holders.Disk), as while memory runs low: what checks use.
+    holders_on_disk: bool = false,
     /// The host's runs (runs.zig): an exploration is one of them, in its own directory there.
     data_directory: ?[]const u8 = null,
     /// The run's directory, claimed already (serve's runs); else the exploration claims one.
@@ -1850,6 +1854,8 @@ const Branches = struct {
     seen: ?*const std.AutoHashMapUnmanaged(u64, void) = null,
     /// Where its holders write themselves when it fails (Ladders).
     ladder: ?*const holders.Ladder = null,
+    /// Where its holders go while memory runs low.
+    holders_disk: ?*const holders.Disk = null,
     /// Where the run's timelines end, on average so far (virtual time): its holders' spacing
     /// when neither a horizon nor `--timeline` says how long it runs.
     end_ns_expected: ?u64 = null,
@@ -1950,6 +1956,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .snapshot = capture,
                 .make = .{ .context = &maker, .function = HolderMaker.make },
                 .ladder = branches.ladder,
+                .disk = branches.holders_disk,
+                .disk_always = branches.arguments.holders_on_disk,
             };
             try owner.attach(vm);
         }
@@ -1972,6 +1980,8 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         defer if (vm.tape_fd) |fd| close(fd);
         const time_start_ns = monotonic_ns();
         const outcome = try vm.run_until_exit();
+        // Its last holder on disk complete before the explorer may load it.
+        if (branches.holders != null) owner.disk_wait();
         if (branches.arguments.save_directory != null) try saver.finish();
         // A tree timeline's summary on disk before its line in the record: killed between the
         // two, the resumed run runs it again (once), never takes it as recorded without one.
@@ -2174,7 +2184,16 @@ fn explore_tree(
     const deciding = if (exploration.strategy) |plugin| plugin.decides else false;
     const holding = !deciding;
     if (holding) try registry.init();
-    defer if (holding) registry.release();
+    // While memory runs low, holders go to the run's directory (holders.Disk), on its disk.
+    const disk: ?*const holders.Disk = if (holding) if (branches.arguments.run_directory) |run| disk: {
+        const directory = try std.fs.path.join(arena, &.{ run, "holders" });
+        try std.Io.Dir.cwd().createDirPath(context.io, directory);
+        const made = try arena.create(holders.Disk);
+        made.* = .{ .directory = directory };
+        made.delete(null); // An interrupted run's.
+        break :disk made;
+    } else null else null;
+    defer if (holding) registry.release(disk);
     // The failing timelines' holders go to the run's snapshots (a run's: a directory to keep
     // them). The table of page hashes is shared before the workers fork: their holders write it.
     const ladders: ?*Ladders = if (holding) if (branches.arguments.run_directory) |run| ladders: {
@@ -2220,6 +2239,8 @@ fn explore_tree(
         .hunks_reached = try arena.alloc(bool, if (change) |known| known.hunks.len else 0),
         .candidates = try arena.alloc(Candidate, size),
         .ladders = ladders,
+        .disk = disk,
+        .io = context.io,
         .tape_buffer = if (exploration.strategy != null)
             try arena.create(tape.Overrides)
         else
@@ -2286,6 +2307,7 @@ fn explore_tree(
             mine.plan = (&place)[0..1];
             if (holding) {
                 mine.holders = registry.explorer;
+                mine.holders_disk = disk;
                 mine.seen = &state.seen;
                 if (ladders) |known| mine.ladder = &known.ladder;
                 if (state.ends_count > 0) mine.end_ns_expected = state.ends_ns_sum / state.ends_count;
@@ -2746,6 +2768,9 @@ const TreeState = struct {
     next_index: u32 = 0,
     /// The failing timelines' holders written to disk (with a run directory).
     ladders: ?*Ladders = null,
+    /// Where holders go while memory runs low (with a run directory).
+    disk: ?*const holders.Disk = null,
+    io: std.Io,
     /// Where the timelines that ran to their end ended (virtual time): their sum and count, for
     /// a timeline's expected end (holders' spacing).
     ends_ns_sum: u64 = 0,
@@ -2957,6 +2982,7 @@ fn tree_judge(
     var making_count: u32 = 0;
     var finished: u32 = 0;
     var held: u32 = 0;
+    var held_disk: u32 = 0; // Of them, from holders on disk.
     for (returns) |back| {
         var earlier = false;
         const parent = for (plan.items) |entry| {
@@ -2984,18 +3010,21 @@ fn tree_judge(
             finished += 1;
         }
         // A holder of the parent at the moment, or a little before it: no replay from the
-        // parent's start.
+        // parent's start. One on disk is loaded by a node maker, as a replay's node is made.
+        var from_disk: ?holders.Held = null;
         if (state.holding and !earlier) if (state.registry.take(back.branch, back.vtime_ns)) |taken| {
-            makings[making_count] = .{
-                .back = back,
-                .parent = parent,
-                .held = true,
-                .pid = taken.pid,
-                .socket = taken.socket,
-            };
-            making_count += 1;
-            held += 1;
-            continue;
+            if (taken.disk) |on_disk| from_disk = on_disk else {
+                makings[making_count] = .{
+                    .back = back,
+                    .parent = parent,
+                    .held = true,
+                    .pid = taken.pid,
+                    .socket = taken.socket,
+                };
+                making_count += 1;
+                held += 1;
+                continue;
+            }
         };
         // A node made by a replay holds a copy of its VM's memory, gigabytes, claimed once made
         // (nodes_claim_refresh): VMs wait while nodes fill memory. Up to half the host's, so
@@ -3019,7 +3048,17 @@ fn tree_judge(
             // Its start snapshot is gone (an earlier generation's), or was never made (a resumed
             // run's recorded timeline): replayed along its path.
             .chain_from = if ((earlier or parent.snapshot == state.setup) and parent.path.len > 0) state.setup else null,
+            .disk = if (from_disk) |on_disk| .{
+                .held = on_disk,
+                .branch = back.branch,
+                .disk = state.disk.?,
+                .io = state.io,
+            } else null,
         };
+        if (from_disk != null) {
+            held += 1;
+            held_disk += 1;
+        }
         try node_make_start(arena, vm, options, &makings[making_count], overrides);
         making_count += 1;
     }
@@ -3035,10 +3074,10 @@ fn tree_judge(
         if (summary.failing_count > 0) try ladders.consider(arena, state.registry, summary);
     };
     // Their memory: this generation's (the ones in flight keep theirs).
-    if (state.holding) state.registry.release_listed(members);
+    if (state.holding) state.registry.release_listed(members, state.disk);
     if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
         const held_node = making.snapshot orelse continue;
-        if (!making.held) continue;
+        if (!making.held and making.disk == null) continue;
         var replayed: NodeMaking = .{ .back = making.back, .parent = making.parent };
         try node_make_start(arena, vm, options, &replayed, null);
         node_make_finish(arena, &replayed);
@@ -3099,8 +3138,8 @@ fn tree_judge(
         });
     }
     std.debug.print("[determinismo] tree: generation {d}: {d} branches, {d} new behaviors " ++
-        "({d} known); {d} moments returned to ({d} from in-run snapshots)\n", .{
-        generation, done.len, reached.count(), state.seen.count(), made, held,
+        "({d} known); {d} moments returned to ({d} from in-run snapshots), {d} from disk\n", .{
+        generation, done.len, reached.count(), state.seen.count(), made, held, held_disk,
     });
     summaries.count = 0;
     plan.clearRetainingCapacity();
@@ -3426,6 +3465,9 @@ const NodeMaking = struct {
     chain_from: ?*const Snapshot = null,
     /// Made by a holder (else by a replay).
     held: bool = false,
+    /// Loaded from a holder on disk (holders.Disk), then replayed on to the moment as a holder
+    /// does; a replay from the parent's start when it cannot be loaded.
+    disk: ?DiskHeld = null,
     pid: linux.pid_t = 0,
     socket: linux.fd_t = -1,
     /// Null when the moment could not be reached (the child said why).
@@ -3460,6 +3502,13 @@ fn node_make_start(
         const at = making.back.vtime_ns;
         var from = parent.snapshot;
         const seed = parent.seed;
+        if (making.disk) |on_disk| if (disk_node(arena, vm, options, on_disk, seed, at)) |snapshot| {
+            pool.give(cpu);
+            fd_pass.send(pair[1], snapshot.memory_fd) catch linux.exit_group(1);
+            write_all(pair[1], std.mem.asBytes(snapshot));
+            linux.exit_group(0);
+        } else |err| std.debug.print("[determinismo] tree: holder {d}ns of branch {d} not loaded " ++
+            "from disk ({s}): a replay\n", .{ on_disk.held.vtime_ns, parent.index, @errorName(err) });
         if (making.chain_from) |setup| {
             from = setup;
             for (parent.path, 0..) |segment, depth| {
@@ -3489,6 +3538,31 @@ fn node_make_start(
     close(pair[1]);
     making.pid = @intCast(pid);
     making.socket = pair[0];
+}
+
+/// A holder on disk, for a node maker to load.
+const DiskHeld = struct { held: holders.Held, branch: u32, disk: *const holders.Disk, io: std.Io };
+
+/// The node at `vtime_ns` from a holder on disk: its snapshot itself at its own moment, else a
+/// replay on from it as the holder would have made (HolderMaker).
+fn disk_node(
+    arena: std.mem.Allocator,
+    vm: *VM,
+    options: *const VM.Options,
+    on_disk: DiskHeld,
+    seed: u64,
+    vtime_ns: u64,
+) !*const Snapshot {
+    const held = on_disk.held;
+    var name_buffer: [Snapshot.disk_name_max]u8 = undefined;
+    const name = holders.Disk.name(&name_buffer, on_disk.branch, held.vtime_ns);
+    const loaded = try arena.create(Snapshot);
+    try loaded.disk_load(arena, on_disk.io, on_disk.disk.directory, name, &.{});
+    if (vtime_ns == held.vtime_ns) return loaded;
+    var from_hold = options.*;
+    assert(from_hold.from_hold == null);
+    from_hold.from_hold = .{ .idle = held.idle }; // The timeline goes on as it did there.
+    return node_make(arena, vm, &from_hold, loaded, seed, vtime_ns, null, false);
 }
 
 fn node_make_finish(arena: std.mem.Allocator, making: *NodeMaking) void {
@@ -4034,6 +4108,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.verify_holders = true;
             continue;
         }
+        if (std.mem.eql(u8, argv[index], "--holders-on-disk")) {
+            arguments.holders_on_disk = true;
+            continue;
+        }
         if (std.mem.eql(u8, argv[index], "--archive") or std.mem.eql(u8, argv[index], "--no-archive")) {
             arguments.archive = std.mem.eql(u8, argv[index], "--archive");
             arguments.archive_given = true;
@@ -4381,6 +4459,7 @@ test {
     _ = @import("duckdb.zig");
     _ = @import("store.zig");
     _ = @import("cpus.zig");
+    _ = @import("holders.zig");
     _ = @import("checks.zig");
     _ = @import("causality.zig");
     _ = @import("mutate.zig");

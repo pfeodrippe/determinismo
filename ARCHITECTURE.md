@@ -287,6 +287,14 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   registers, memory, branch count and events are the same, and only what the guest cannot see
   may differ (MSRs KVM derives from host time, a past exception's leftovers, unusable segments'
   attributes). The e2e tree check runs it.
+- Holders on disk (`holders.Disk`): while memory runs low (a holder needs twice the reserve
+  available), a run with a directory keeps the moment on disk instead: a child forked at the
+  hold point writes its pages changed since the timeline's previous one there (the snapshot
+  disk format, §8's ladder's), the timeline going on meanwhile; a node maker loads it, and
+  replays on from it as a holder would for a later moment. A timeline's files go with its
+  holders. `--holders-on-disk` puts every holder there; the e2e tree check verifies those nodes
+  against replays too. Memory is the host's, or the process's cgroup limit (a unit's
+  MemoryMax), whichever is less; the reserve is an eighth of a limit under 64 GB.
 - Expected cost: milliseconds per branch. If it becomes the bottleneck → in-kernel VM fork
   (ownership level 2) behind the same "branch" interface.
 
