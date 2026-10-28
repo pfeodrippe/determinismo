@@ -296,6 +296,7 @@ fn replay_one(
     });
     var replayed: []const u8 = "none";
     var why: []const u8 = "";
+    var hazards: []const u8 = "";
     for ([_][]const u8{ result.stdout, result.stderr }) |output| {
         var lines = std.mem.tokenizeScalar(u8, output, '\n');
         while (lines.next()) |line| {
@@ -306,13 +307,21 @@ fn replay_one(
                 replayed = line[start .. std.mem.indexOfScalarPos(u8, line, start, ' ') orelse line.len];
             } else if (std.mem.indexOf(u8, line, "replay diverged from its tape")) |at| {
                 why = line[at..];
+            } else if (std.mem.indexOf(u8, line, "its clock's hazards: ")) |at| {
+                hazards = line[at..];
             }
         }
     }
     if (std.mem.eql(u8, replayed, recorded) and why.len == 0) {
         return std.fmt.allocPrint(arena, "{d} same {s}\n", .{ index, recorded });
     }
-    return std.fmt.allocPrint(arena, "{d} different {s} {s} {s}\n", .{ index, recorded, replayed, why });
+    // Its output beside the results (the last 256 KiB): where it parted, on what CPU, its
+    // clock's hazards, without replaying it again.
+    const log = try std.fmt.allocPrint(arena, "{s}/replay-{d}.log", .{ tapes, index });
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log, .data = result.stderr[result.stderr.len -| 256 << 10 ..] }) catch {};
+    return std.fmt.allocPrint(arena, "{d} different {s} {s} {s}{s}{s}\n", .{
+        index, recorded, replayed, why, if (hazards.len > 0) "; " else "", hazards,
+    });
 }
 
 fn append(path: []const u8, line: []const u8) void {
