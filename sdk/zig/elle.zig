@@ -53,6 +53,11 @@ pub const CheckOptions = struct {
     consistency: []const u8 = "strict-serializable",
     /// Another consistency model for some scenarios' timelines.
     by_scenario: []const ScenarioConsistency = &.{},
+    /// Anomaly types the system is known to allow (Kafka's G0, seen by Jepsen in normal
+    /// operation): found alone, they do not fail the check, and are reported instead ("Elle found
+    /// only anomalies the system is known to allow"), so that the property stays free for what
+    /// is not known.
+    allowed: []const []const u8 = &.{},
     message: []const u8 = "Elle finds no anomaly in the history",
 };
 
@@ -67,7 +72,14 @@ pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerro
             } else options.consistency;
             const verdict = try judge(context, history, options.model, consistency);
             const anomalies = verdict.anomalies[0..@min(verdict.anomalies.len, anomalies_size_max)];
-            sdk.always(verdict.valid != false, options.message, .{
+            const known = verdict.valid == false and verdict.anomaly_types.len > 0 and
+                allowed_only(verdict.anomaly_types, options.allowed);
+            if (options.allowed.len > 0) {
+                sdk.sometimes(known, "Elle found only anomalies the system is known to allow", .{
+                    .anomaly_types = verdict.anomaly_types,
+                });
+            }
+            sdk.always(verdict.valid != false or known, options.message, .{
                 .model = options.model,
                 .consistency = consistency,
                 .ops = verdict.ops,
@@ -80,6 +92,23 @@ pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerro
             });
         }
     }.run;
+}
+
+/// Whether every anomaly type found is one of `allowed`.
+fn allowed_only(found: []const []const u8, allowed: []const []const u8) bool {
+    for (found) |kind| {
+        const listed = for (allowed) |name| {
+            if (std.mem.eql(u8, kind, name)) break true;
+        } else false;
+        if (!listed) return false;
+    }
+    return true;
+}
+
+test allowed_only {
+    try std.testing.expect(allowed_only(&.{"G0"}, &.{"G0"}));
+    try std.testing.expect(!allowed_only(&.{ "G0", "G1a" }, &.{"G0"}));
+    try std.testing.expect(!allowed_only(&.{"G1c"}, &.{}));
 }
 
 pub const Verdict = struct {

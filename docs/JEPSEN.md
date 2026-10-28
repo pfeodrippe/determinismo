@@ -12,7 +12,9 @@ replays exactly, to the moment of every operation in its cycle), the durability-
 (`sync_stall`, `durable_crash`: Jepsen's LazyFS finds the same act-before-fsync bugs, by losing
 unsynced writes), and exploration that returns to the moments that reached new behavior. Checks:
 `sdk.elle` (list-append and rw-register histories, checkers/elle) plus cheap `always` properties
-for guidance as the timeline runs.
+for guidance as the timeline runs. Anomalies a system is known to allow (Kafka's G0, from
+Jepsen's Bufstream analysis) go in the check's `allowed`: found alone they are reported apart,
+and the property stays free for what is not known.
 
 ## Workloads to port (from jepsen-io/jepsen and the suites)
 

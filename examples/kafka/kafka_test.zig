@@ -57,7 +57,11 @@ pub fn main(init: std.process.Init) !void {
         // Each partition a list, each send an append to it, each partition read once faults stop
         // (Jepsen's Kafka checker is Elle too): what the checks below cannot see, transactions
         // ordered one way in a partition and the other way in another (G0, G1c).
-        .checks = .{ .elle = sdk.elle.check(.{ .consistency = "read-committed" }) },
+        // G0 (write cycles) Jepsen saw on Kafka in normal operation, at both isolation levels
+        // (the Bufstream analysis, 2024: "either the documentation is wrong or Kafka's
+        // transaction isolation is broken"); on its own it fills this property (run 67: 14
+        // timelines of 87, G0 alone). Reported apart; anything else fails it.
+        .checks = .{ .elle = sdk.elle.check(.{ .consistency = "read-committed", .allowed = &.{"G0"} }) },
     });
 }
 
