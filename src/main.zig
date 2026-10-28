@@ -2458,8 +2458,10 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summa
     received = received and read_exact(timeline.results, std.mem.asBytes(&count));
     received = received and count <= 1 and summaries.count + count <= summaries.items.len;
     if (received and count == 1) {
+        // Counted once read whole: a worker killed while it wrote leaves part of one (its
+        // holders' pids among the slot's old bytes).
         received = read_exact(timeline.results, std.mem.asBytes(&summaries.items[summaries.count]));
-        summaries.count += 1;
+        if (received) summaries.count += 1;
     }
     _ = linux.close(timeline.results);
     var status: i32 = 0;

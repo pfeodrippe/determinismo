@@ -1844,7 +1844,12 @@ fn runs_discover(server: *Server) !void {
         if (!has_pid and age_s(server.arena, directory) < claim_grace_s) continue;
         const record = run_file(server, id, "record.jsonl") catch "";
         const stopped = if (run_file(server, id, "stopped")) |_| true else |_| false;
-        var run = Run{ .id = id, .pid = 0, .status = recorded_status(record), .stopped = stopped };
+        // How its explorer ended, when a server reaped it (exit_note); else what it recorded.
+        const noted = if (run_file(server, id, "exit")) |text|
+            std.fmt.parseInt(u32, text[0 .. std.mem.indexOfScalar(u8, text, ' ') orelse text.len], 10) catch null
+        else |_|
+            null;
+        var run = Run{ .id = id, .pid = 0, .status = noted orelse recorded_status(record), .stopped = stopped };
         if (host_runs.running_pid(server.arena, directory)) |pid| {
             if (stopped) {
                 _ = linux.kill(pid, .KILL);
@@ -1942,6 +1947,46 @@ fn recorded_status(record: []const u8) u32 {
     return if (record[digit] == '0') 0 else 3; // As explore exits.
 }
 
+/// How a run's explorer ended, kept in its directory (`exit`: the status, then in words) for a
+/// server started later; when not as explore ends (0, 3), said in its output.log too. Only the
+/// parent learns a signal: run 31 (Dgraph, srv3 2026-10-28) ended at 09:15 with nothing in its
+/// output or the kernel's log, and the restarted server could only say it was interrupted.
+fn exit_note(server: *Server, id: u32, bits: u32) void {
+    const signal = bits & 0x7f;
+    const code = (bits >> 8) & 0xff;
+    const status = if (signal == 0) code else 128 + signal;
+    const text = (if (signal == 0)
+        print(server, "{d} exited with status {d}\n", .{ status, code })
+    else
+        print(server, "{d} ended by signal {d} ({s})\n", .{ status, signal, signal_name(signal) })) catch return;
+    const directory = run_directory(server, id) catch return;
+    const cwd = std.Io.Dir.cwd();
+    const path = std.fs.path.join(server.arena, &.{ directory, "exit" }) catch return;
+    cwd.writeFile(server.io, .{ .sub_path = path, .data = text }) catch {};
+    if (signal == 0 and (code == 0 or code == 3)) return;
+    const output = std.fs.path.joinZ(server.arena, &.{ directory, "output.log" }) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .APPEND = true, .CLOEXEC = true };
+    const opened = linux.open(output, flags, 0);
+    if (linux.errno(opened) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    const line = print(server, "[serve] the explorer {s}", .{text[std.mem.indexOfScalar(u8, text, ' ').? + 1 ..]}) catch return;
+    _ = linux.write(fd, line.ptr, line.len);
+}
+
+fn signal_name(signal: u32) []const u8 {
+    return switch (signal) {
+        @backingInt(linux.SIG.KILL) => "SIGKILL: the OOM killer, or a kill",
+        @backingInt(linux.SIG.TERM) => "SIGTERM",
+        @backingInt(linux.SIG.INT) => "SIGINT",
+        @backingInt(linux.SIG.SEGV) => "SIGSEGV",
+        @backingInt(linux.SIG.ABRT) => "SIGABRT: a panic",
+        @backingInt(linux.SIG.BUS) => "SIGBUS",
+        @backingInt(linux.SIG.PIPE) => "SIGPIPE",
+        else => "another signal",
+    };
+}
+
 /// Marks the runs and jobs that ended (the watcher's, under the lock); the runs that ended on
 /// their own (passed or failed: not stopped, not an error) go in `ended`, how many returned.
 fn runs_reap(shared: *Shared, ended: []u32) usize {
@@ -1978,6 +2023,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         if (linux.errno(result) != .SUCCESS or result == 0) continue;
         const bits: u32 = @bitCast(status);
         run.status = if (bits & 0x7f == 0) (bits >> 8) & 0xff else 128 + (bits & 0x7f);
+        exit_note(&server, run.id, bits);
         // What the explorer left in its process group (it leads its session): holders of
         // timelines it stopped waiting for, workers of a killed explorer.
         _ = linux.kill(-run.pid, .KILL);

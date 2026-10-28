@@ -572,10 +572,14 @@ fn check_serve(context: *Context) !void {
     const answer = try curl(context, &.{ "-X", "POST", "-d", asked, url ++ "/runs/1/query" });
     const discovery = try curl(context, &.{url ++ "/runs/1/discovery"});
     const curve = std.mem.indexOf(u8, discovery, "[8,") != null; // A point after 8 branches.
+    // How its explorer ended, for a server started later (bank fails: explore exits 3).
+    const exit_path = try std.fs.path.join(arena, &.{ data, "runs", "1", "exit" });
+    const exit = std.Io.Dir.cwd().readFileAlloc(context.io, exit_path, arena, .limited(256)) catch "";
     expect_all(context, &.{
         .{ "the UI page loads", std.mem.indexOf(u8, page, "<title>determinismo</title>") != null },
         .{ "the discovery curve has a point after 8 branches", curve },
         .{ "the run finished (its summary)", std.mem.indexOf(u8, run, "\"summary\"") != null },
+        .{ "serve kept how its explorer ended", std.mem.startsWith(u8, exit, "3 exited with status 3") },
         .{ "the query answers", std.mem.indexOf(u8, answer, "\"events\":") != null },
         .{ "the query finds events", std.mem.indexOf(u8, answer, "\"events\":0,") == null },
     }, "serve: the UI, a run over HTTP, and a query of its events ({s})", .{
