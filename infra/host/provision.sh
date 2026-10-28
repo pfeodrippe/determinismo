@@ -9,7 +9,7 @@ apt-get update -q
 apt-get -y -q full-upgrade
 apt-get -y -q install \
   build-essential bc bison flex libelf-dev libssl-dev dwarves zstd \
-  linux-headers-amd64 linux-perf msr-tools cpuid numactl \
+  linux-headers-amd64 linux-perf msr-tools cpuid numactl gdb \
   git curl rsync tmux htop sudo nftables unattended-upgrades \
   podman uidmap erofs-utils busybox-static xz-utils cpio file default-jre-headless
 
