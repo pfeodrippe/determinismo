@@ -43,7 +43,19 @@ fn transfers(s: *System.Scenario) void {
 - A driver that loses its server to a fault is not a failure: `sdk.tcp.unavailable(err)` tells
   those errors apart; note them with a `sometimes` and return.
 - `eventually` retries (`sdk.retry`) and ends in `assert_unreachable(...)` if the system never
-  recovers.
+  recovers. It kills the drivers still running as the composer reaches it (Antithesis's rule):
+  a check that needs them done is a `finally` command (faults stop after them).
+- Judge durability directly once faults stop: Elle below strict serializability takes a read
+  missing a committed write for an older snapshot, and the drivers' own reads may never read a
+  key again (Galera lost a committed row, Elle none the wiser). List-append workloads: a
+  `finally` command calling `sdk.elle.final_reads(arena, &history, &reader)`, the reader's
+  `read_list(arena, key)` reading one key's list through any node that answers (see
+  `examples/sql/append.zig`, `examples/mongodb/mongodb_test.zig`). Before declaring a queue
+  drained, wait past the broker's dead-connection detection: a delivery held by a connection
+  that died in the faults comes back only then (RabbitMQ: drain, wait 15 s, drain again).
+- A node's start script is part of the system under test: start it as production does
+  (Galera: the systemd unit's `galera_recovery` before each start, which Jepsen's wrapper and
+  the official image leave out; without it a cluster that crashed whole re-forms with no state).
 - Note each operation before sending it (Jepsen's invocations), then its outcome: the composer
   may end the driver phase and kill drivers mid-call, and an operation that applied but was
   noted only after its answer is neither acknowledged nor unknown (an etcd counter came out one
