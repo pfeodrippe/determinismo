@@ -126,7 +126,9 @@ No power loss was needed:
 - 25.7 s: rabbit-1, with term 1's log alone, elected leader over the two empty members: what
   rabbit-2 and rabbit-3 had confirmed is gone.
 Ra's `ra_directory` registers a server with `dets:insert` into a table opened `{auto_save,
-500}`, with no `dets:sync`: unchanged in ra 2.16.13 (RabbitMQ 4.1.4), 2.17.0, 3.2.0 (its latest
+500}`, with no `dets:sync` and dets' default write cache (`delayed_write` `{3000, 14000}`, OTP 27:
+writes held in memory up to 3 s): a kill within seconds of a registration loses it, a power
+loss within the writeback window too; unchanged in ra 2.16.13 (RabbitMQ 4.1.4), 2.17.0, 3.2.0 (its latest
 release) and main (checked 2026-10-29). Not in rabbitmq-server's or ra's issues (searched:
 `names.dets`, `name_not_registered`, the warning, lost messages with new members). Serve's
 replay of timeline 1005 is exact (events hash 4235bd4f817ed2ec, 2,138 events, the same 23
@@ -139,8 +141,9 @@ A broker that goes down soon after a quorum queue is declared comes back without
 member of the queue: `Quorum queue recovery: configured member of queue 'jepsen' in vhost '/' was
 not found on this node. Starting member as a new one. Context: name_not_registered`. Ra keeps
 which servers a node runs in `names.dets` (ra 2.16.13's `ra_directory`), opened with
-`{auto_save, 500}` and written by `dets:insert` with no `dets:sync`: a registration reaches the
-file up to half a second later, and the disk only at writeback. Hunt run 118 (srv3, 828
+`{auto_save, 500}` and written by `dets:insert` with no `dets:sync`, through dets' default write
+cache (up to 3 s in memory): a registration reaches the file seconds later, and the disk only at
+writeback. Hunt run 118 (srv3, 828
 timelines at first, 1,498 in the end): 502 of ~640 such warnings follow a broker going down within a second of the
 queue's declaration (56 of them plain kills, no power loss), the rest power losses within the
 writeback window. When all three members start as new ones (21 of 1,498 timelines), the queue
