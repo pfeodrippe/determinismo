@@ -137,9 +137,12 @@ time (both restarted after the faults): its own throwaway Mnesia stopped at 26.7
 ("Application mnesia exited with reason: stopped"), its boot proper began at 26.92 s ("Starting
 broker"), and a booting broker makes sure its tables exist, a schema transaction across the
 members it knows, rabbit-2 among them, whose throwaway Mnesia then took a disc table's update
-0.2 s later. Two brokers booting together after an outage, one past its consistency check while
-the other is in it: not shown yet by changing the timeline (e.g. delaying rabbit-1's boot in a
-replay).
+0.2 s later. Shown by changing the timeline: a replay that holds rabbit-1's broker (SIGSTOP)
+from 26.6 s for 3 s moves rabbit-2's failure by those 3 s, to 29.97 s, just after rabbit-1
+goes on (its "Starting broker" later still, at 39.97 s: an earlier step of its boot, its
+Mnesia starting with its directory, is the trigger); held for 0 s, the failure stays at
+27.1 s. rabbit-2's throwaway Mnesia waits in `mnesia:start()` (Mnesia `stopping` meanwhile)
+and dies on what rabbit-1's Mnesia sends it.
 Also: `with_running_or_clean_mnesia` restores `dir` with no `try ... after`, so any exit from
 its fun leaves the node's Mnesia settings at the throwaway ones.
 
