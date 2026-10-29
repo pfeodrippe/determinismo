@@ -198,33 +198,40 @@ the whole timeline (the coverage profile's slower brokers never got one).
   log notes each write's partition, and a committed transaction whose unread writes all sit on
   partitions whose known hang was aborted is that bug's (a `kafka_known_loss` event), not a
   lost or torn one.
-- Redpanda 26.2.6, first hunt (run 177, `redpanda` profile, production mode, 2026-10-29), under
-  investigation: transactions open for good once faults stop ("no transaction stays open once
-  faults stop", timelines 23, 46, 56 of the first 68). Timeline 23: partitions 0 and 3 hold a
-  transaction of producer 1004 at epoch 7 (from offsets 297 and 282) that its coordinator
-  (`kafka_internal/tx/32`, on kafka-3) holds as "status: empty, partitions: {}". Each partition
-  asks to expire it after its 10 s timeout, and the coordinator refuses ("Can not update
-  transaction state from empty to expired as this transition is invalid", 698 times from
-  152 s on), so the last stable offset never moves. Timeline 46 shows the same refusal (from
-  1,128 s). Before it, from 131 s, kafka-1 and kafka-3 lost power several times (crash,
-  durable_crash) and kafka-2 was stopped. Either the coordinator lost the partitions it had
-  added (its log behind the data partitions' after the power losses), or a produce delayed past
-  the transaction's end opened a new one the coordinator never knew (Kafka's KIP-890 class: the
-  client retries up to 1,000 times, under delay and duplication faults). Not TSB-2026-37 (an
-  rm_stm deadlock in 26.1.1 to 26.1.5), nor #8236 (group transactions refused begin_group_tx).
-  What keeps it open, in Redpanda's code (dev): a partition whose transaction timed out asks
-  its coordinator (`rm_stm::do_try_abort_old_tx`) and on any error keeps it, asking again on
-  the next pass; a coordinator holding the transaction as empty answers with an error each time
-  (the transition to expired is invalid). So a partition's transaction its coordinator does not
-  hold as ongoing pins the last stable offset until the producer itself expires. How one comes
-  about: adding partitions, the coordinator calls `begin_tx` on each before persisting the
-  addition (`do_add_partition_to_tx`), and when persisting fails it answers an error without
-  undoing them, counting on the client to retry. The client (`t10626586`) ran its 20
-  transactions, the last two (18: partitions 2, 3; 19: partitions 0, 3, 2) unknown, the commit
-  timed out, and the driver ended there. Causality (6 futures a moment): from 98.7 s none of the
-  futures fails, from 126.7 s every one (three outages between, one of the whole cluster).
-  Next: futures from inside that jump with the `tx` logger at trace (`rpk redpanda admin config
-  log-level set tx -l trace -e 0` on each broker), failing and passing ones compared.
+- Found blind: Redpanda 26.2.6 keeps a transaction open for good when its coordinator crashes
+  between beginning it on the partitions and recording them. First hunt (run 177, `redpanda`
+  profile, production mode, 2026-10-29): "no transaction stays open once faults stop" failed in
+  timelines 23, 46 and 56 of the first 68. Timeline 23, partitions 0 and 3 kept a transaction of
+  producer 1004 (`t10626586`) at epoch 7 open (from offsets 297 and 282 of their logs) that its
+  coordinator (`kafka_internal/tx/32`) held as "status: empty, partitions: {}"; the last stable
+  offset never moved again. How, step by step:
+  1. Causality (6 futures a moment): from 112.7 s 1 future in 6 fails, from 119.7 s all 6.
+  2. A future from 116.0 s with Redpanda's `tx` logger at trace on every broker (`rpk redpanda
+     admin config log-level set tx --host localhost:9644 --level trace --expiry-seconds 0`, and
+     `rpk.additional_start_flags` so restarts keep it), the timeline's own randomness after it,
+     fails the same way, the same transaction at the same offsets. In it the coordinator (kafka-3)
+     is adding partitions 0 and 3 for epoch 7: `do_add_partition_to_tx` sends `begin_tx` to each
+     partition, which records the transaction ("Ignoring duplicate begin_tx" on each retry), and
+     retries the round every 325 ms (116.7 to 117.7 s), another partition of the request
+     answering a retryable error; the addition is persisted (`tm_stm::add_partitions`) only after
+     that loop.
+  3. At 118.0 s all three brokers lose power. Restarted, the coordinator replays its log:
+     epoch 4 aborted, epoch 5 committed then aborted, epochs 6 and 7 empty. Epoch 7's partitions
+     were never recorded.
+  4. Each partition's transaction times out (10 s) and asks its coordinator to abort it
+     (`rm_stm::do_try_abort_old_tx`): the coordinator finds it empty and refuses ("Can not update
+     transaction state from empty to expired as this transition is invalid", from 138.7 s, again
+     every pass), and on any error the partition keeps it open.
+  Nothing of the disk model is involved: the addition was never written, and any crash of the
+  coordinator in that gap does the same. Redpanda's code counts on the client retrying the
+  addition (`begin_tx` is idempotent); a client gone meanwhile (here the driver's last
+  transaction, its commit timed out) never does, and a coordinator that has no record of the
+  transaction does not answer that it was aborted. Not TSB-2026-37 (an rm_stm deadlock in
+  26.1.1 to 26.1.5), nor #8236 (group transactions refused `begin_group_tx`); the refusal's text
+  appears in no Redpanda issue. To see it: run 177's timeline 23 from its tape, the command
+  above at 116 s (`--at-vtime-ms 116000 --exec ... --continue`). Since, each Kafka command runs
+  20 s at most (Redpanda's sat in the client's 10 s timeouts, 80 s a command, past the timeline's
+  hour) and the known-hang loss is an event, not a sometimes (one never true failed this run).
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
