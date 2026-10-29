@@ -79,6 +79,10 @@ pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerro
             const anomalies = verdict.anomalies[0..@min(verdict.anomalies.len, anomalies_size_max)];
             const known = verdict.valid == false and verdict.anomaly_types.len > 0 and
                 allowed_only(verdict.anomaly_types, options.allowed);
+            // Its search gave up: anomalies past it unseen, said (an event, no target).
+            for (verdict.anomaly_types) |kind| if (std.mem.eql(u8, kind, not_anomalies[0])) {
+                sdk.event("elle_cycle_search_timeout", .{ .ops = verdict.ops });
+            };
             if (options.allowed.len > 0) {
                 sdk.sometimes(known, "Elle found only anomalies the system is known to allow", .{
                     .anomaly_types = verdict.anomaly_types,
@@ -210,9 +214,17 @@ test reads_stale {
     try std.testing.expectEqual([2]u64{ 16, 17 }, stale.first[0].read_ns);
 }
 
-/// Whether every anomaly type found is one of `allowed`.
+/// What Elle lists among anomaly types that is none: its cycle search giving up on a large
+/// history (Redpanda's run 177, beside G0 in timelines 157 and 172).
+const not_anomalies = [_][]const u8{"cycle-search-timeout"};
+
+/// Whether every anomaly type found is one of `allowed` (or no anomaly: not_anomalies).
 fn allowed_only(found: []const []const u8, allowed: []const []const u8) bool {
     for (found) |kind| {
+        const none = for (not_anomalies) |name| {
+            if (std.mem.eql(u8, kind, name)) break true;
+        } else false;
+        if (none) continue;
         const listed = for (allowed) |name| {
             if (std.mem.eql(u8, kind, name)) break true;
         } else false;
@@ -225,6 +237,8 @@ test allowed_only {
     try std.testing.expect(allowed_only(&.{"G0"}, &.{"G0"}));
     try std.testing.expect(!allowed_only(&.{ "G0", "G1a" }, &.{"G0"}));
     try std.testing.expect(!allowed_only(&.{"G1c"}, &.{}));
+    try std.testing.expect(allowed_only(&.{ "G0", "cycle-search-timeout" }, &.{"G0"}));
+    try std.testing.expect(!allowed_only(&.{ "G1c", "cycle-search-timeout" }, &.{"G0"}));
 }
 
 pub const Verdict = struct {
