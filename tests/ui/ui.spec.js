@@ -30,9 +30,11 @@ test("a failing property's causality analysis, to its end, and again after a rel
   const branch = Number(await button.getAttribute("data-branch"));
   await button.click();
   const result = element.locator(".causality-result");
-  await expect(result.locator(".group-title")).toContainText(`branch ${branch}`);
+  // The analysis's own heading (once done, the faults that make the failure likelier get theirs).
+  const title = result.locator(".group-title").first();
+  await expect(title).toContainText(`branch ${branch}`);
   // Running until every moment's futures are in (the refinements inside jumps too).
-  await expect(result.locator(".group-title")).not.toContainText("running", { timeout: 15 * 60 * 1000 });
+  await expect(title).not.toContainText("running", { timeout: 15 * 60 * 1000 });
   const analyses = await (await request.get("/runs/1/causality")).json();
   const latest = analyses[analyses.length - 1];
   expect(latest.done).toBe(true);
