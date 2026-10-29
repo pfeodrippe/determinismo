@@ -23,8 +23,9 @@
 
 (def port 7700)
 ;; What `/version` answers: the SDK (sdk/zig/elle.zig) replaces a running service that answers
-;; another. 2: operations' times, and the window the anomalies formed in (window_ns).
-(def version "2")
+;; another. 2: operations' times, and the window the anomalies formed in (window_ns). 3: reads
+;; with a value twice reported here (duplicates).
+(def version "3")
 (def anomalies-size-max 4000)
 
 (defn- operation [m]
@@ -65,17 +66,45 @@
                      v))
                  x))
 
+(defn- duplicates
+  "The list reads that hold a value twice. Appends are unique, so each is an anomaly; Elle crashed
+  on them (a ClassCastException, OpenSearch run 176's timeline 27: a write answered with a
+  conflict had taken effect, and its client appended again), so they are found here and Elle
+  judges the reads with each value once."
+  [operations]
+  (vec (for [o operations
+             :when (= :ok (:type o))
+             [f k v] (:value o)
+             :when (and (= :r f) (sequential? v) (not= (count v) (count (distinct v))))]
+         {:op o :key k :values (vec (keep (fn [[x n]] (when (< 1 n) x)) (frequencies v)))})))
+
+(defn- deduplicated [operations]
+  (map (fn [o]
+         (update o :value
+                 (fn [mops]
+                   (mapv (fn [[f k v :as mop]]
+                           (if (and (= :r f) (sequential? v)) [f k (vec (distinct v))] mop))
+                         mops))))
+       operations))
+
 (defn check [body model consistency]
   (let [operations (->> (string/split-lines body)
                         (remove string/blank?)
                         (map json/read-str)
                         (map operation)
                         closed)
+        twice (when (= model "list-append") (duplicates operations))
         checker (case model
                   "list-append" list-append/check
                   "rw-register" rw-register/check)
         result (checker {:consistency-models [(keyword consistency)]}
-                        (history/history operations))
+                        (history/history (if (seq twice) (deduplicated operations) operations)))
+        result (if (seq twice)
+                 (-> result
+                     (assoc :valid? false)
+                     (update :anomaly-types #(distinct (conj (vec %) :duplicate-elements)))
+                     (assoc-in [:anomalies :duplicate-elements] twice))
+                 result)
         valid (:valid? result)
         formed (window (:anomalies result))
         anomalies (pr-str (shortened (:anomalies result)))]

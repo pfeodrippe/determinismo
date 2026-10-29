@@ -305,7 +305,7 @@ fn answers() bool {
 }
 
 /// checkers/elle/src/elle_service.clj's `version`.
-const service_version = "2";
+const service_version = "3";
 
 fn command(context: *sdk.Check, argv: []const []const u8) !void {
     const result = try std.process.run(context.arena, context.io, .{ .argv = argv });
