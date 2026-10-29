@@ -805,6 +805,17 @@ async function examplesToggle(element) {
   if (state.causalityLoaded !== state.runId) { state.causalityLoaded = state.runId; causalityRefresh(); }
   if (state.examples.has(message)) return examplesDraw(element);
   box.innerHTML = `<div class="muted">Loading examples…</div>`;
+  // determinismo's own: the run's replays (replays.zig), each with where it parted, if it did.
+  if (message === replaysProperty) {
+    try {
+      const replays = await apiJson(`/runs/${state.runId}/sql`, { sql:
+        "SELECT timeline, same, recorded, replayed, why FROM replays ORDER BY same, timeline" });
+      state.examples.set(message, { replays });
+    } catch (error) { state.examples.set(message, { error: error.message }); }
+    const now = [...document.querySelectorAll(".property")].find((other) => other.dataset.message === message);
+    if (now && state.examplesOpen.has(message)) examplesDraw(now);
+    return;
+  }
   const conditions = exampleConditions(message, element.dataset.kind);
   try {
     const failing = conditions.failing ? await query({ condition: conditions.failing, output: "branches", limit: 1000000 }) : [];
@@ -838,6 +849,7 @@ function examplesDraw(element) {
   const loaded = state.examples.get(message);
   if (!loaded) { box.innerHTML = `<div class="muted">Loading examples…</div>`; return; }
   if (loaded.error) { box.innerHTML = `<div class="fail-text">${escape(loaded.error)}</div>`; return; }
+  if (loaded.replays) return replaysDraw(box, loaded.replays);
   const { failing, passing } = loaded;
   const failingBranches = new Set(failing.map((example) => example.branch));
   const rows = [
@@ -864,6 +876,23 @@ function examplesDraw(element) {
     try { localStorage.setItem("causalityOptions", JSON.stringify(causalityOptions)); } catch { /* Kept for this page only. */ }
   }));
   causalityDraw(message);
+}
+
+// The run's sampled timelines replayed from their tapes: the same history, or where they parted
+// (the last checkpoint both passed, the first differing line), and whether another build
+// recorded them.
+const replaysProperty = "timelines replay to their recorded history";
+function replaysDraw(box, replays) {
+  const parted = replays.filter((row) => !row.same).length;
+  box.innerHTML = replays.length ? `<table><tr><th>Timeline</th><th>Replay</th><th>Recorded</th><th>Replayed</th><th>Where</th></tr>
+    ${replays.slice(0, 40).map((row) => `<tr class="clickable" data-branch="${row.timeline}">
+      <td class="mono">${row.timeline}</td><td class="${row.same ? "pass-text" : "fail-text"}">${row.same ? "the same" : "parted"}</td>
+      <td class="mono">${escape(row.recorded || "")}</td><td class="mono">${escape(row.replayed || "")}</td>
+      <td style="white-space:normal">${escape(row.why || "")}</td></tr>`).join("")}
+    </table><div class="muted" style="margin-top:4px">${replays.length} timelines replayed, ${parted} parted. Click one for its logs.</div>`
+    : `<div class="muted">No timeline replayed yet.</div>`;
+  box.querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
+    logsOpen(Number(row.dataset.branch), 0)));
 }
 
 // Findings: what changed since the previous run of the same system and scenario.
