@@ -110,7 +110,14 @@ pub fn running_mark(arena: std.mem.Allocator, directory: []const u8) !void {
     const opened = linux.open(path, flags, 0o644);
     if (linux.errno(opened) != .SUCCESS) return error.PidFile;
     const fd: linux.fd_t = @intCast(opened);
-    if (linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) != .SUCCESS) {
+    // Another explorer holds it for good; a probe (running_pid: serve's, a queue's) for an
+    // instant, retried past: one taken as another explorer's failed serve's run 187 at its start.
+    const locked = for (0..lock_attempts_max) |_| {
+        if (linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS) break true;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    } else false;
+    if (!locked) {
         _ = linux.close(fd);
         return error.RunRunning; // Another explorer has it.
     }
@@ -126,6 +133,8 @@ pub fn running_mark(arena: std.mem.Allocator, directory: []const u8) !void {
 
 /// The pid file this process holds (locked) for the run it explores.
 var running_fd: ?linux.fd_t = null;
+/// Tries at the pid file's lock, 10 ms apart: a second.
+const lock_attempts_max = 100;
 
 /// In a child forked from the explorer: its copy of the pid file closed. A flock is the open
 /// file's, held while any process keeps it: a worker or holder outliving a killed explorer kept
