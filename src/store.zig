@@ -160,8 +160,9 @@ fn schema_ensure(connection: *duckdb.Connection, arena: std.mem.Allocator) !void
     const asked = "SELECT version FROM schema_version";
     const known = connection.row(Version, arena, asked, .{}) catch null;
     if (known) |found| if (found.version == schema_version) return;
-    // Version 3 lacks only the timelines' output (the logging property): added in place, its
-    // timelines' left empty (a rebuild would ingest every run's events again, gigabytes).
+    // Version 3 lacks only the timelines' output (the logging property): added in place, and
+    // filled from timelines.jsonl by the next ingest (a rebuild would ingest every run's events
+    // again, gigabytes).
     if (known) |found| if (found.version == 3) {
         try connection.exec(
             \\ALTER TABLE timelines ADD COLUMN output_bytes UBIGINT;
@@ -340,6 +341,19 @@ pub fn ingest(
         \\    why: 'VARCHAR', path: 'STRUCT(branch UINTEGER, seed UBIGINT, vtime_ns UBIGINT)[]',
         \\    output_bytes: 'UBIGINT', output_span_ns: 'UBIGINT'}})
     , .{timelines});
+    // Timelines ingested under schema 3 lack their output (the logging property's): taken from
+    // the file, once, so runs from before the property show it too.
+    const Missing = struct { count: u64 };
+    const missing_sql = "SELECT count(*) FROM timelines WHERE output_span_ns IS NULL";
+    const missing = (try connection.row(Missing, arena, missing_sql, .{})).?;
+    if (missing.count > 0) try connection.exec(try std.fmt.allocPrintSentinel(arena,
+        \\UPDATE timelines SET output_bytes = given.output_bytes,
+        \\    output_span_ns = given.output_span_ns
+        \\FROM (SELECT "index", any_value(output_bytes) AS output_bytes,
+        \\          any_value(output_span_ns) AS output_span_ns
+        \\      FROM {s} WHERE output_span_ns IS NOT NULL GROUP BY "index") AS given
+        \\WHERE timelines.branch = given."index" AND timelines.output_span_ns IS NULL
+    , .{timelines_read}, 0));
     const Arrived = struct { index: u32 };
     const arrived = try connection.rows(Arrived, arena, try std.fmt.allocPrintSentinel(arena,
         \\SELECT DISTINCT "index" FROM {s}
@@ -809,10 +823,14 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
     try testing.expectEqual(0, after[0].failing);
 }
 
-test "a version 3 database gains the timelines' output in place" {
+test "a version 3 database gains the timelines' output in place, filled by the next ingest" {
+    const io = testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     var failure: duckdb.Failure = .{};
     var database = try duckdb.Database.open(":memory:", .{ .threads = 1 }, &failure);
     defer database.close();
@@ -832,4 +850,15 @@ test "a version 3 database gains the timelines' output in place" {
         \\SELECT branch, (SELECT version FROM schema_version), output_bytes FROM timelines
     , .{})).?;
     try testing.expectEqual(Kept{ .branch = 7, .version = 4, .output = null }, kept);
+
+    // Its line in timelines.jsonl has the output (an exploration writes it): the next ingest,
+    // with nothing new arrived, fills it.
+    const timelines_path = try std.fs.path.join(arena, &.{ directory, "timelines.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = "{\"index\":7," ++
+        "\"outcome\":\"shutdown\",\"path\":[],\"output_bytes\":5,\"output_span_ns\":9}\n" });
+    try testing.expectEqual(0, try ingest(&connection, arena, io, directory));
+    const filled = (try connection.row(Kept, arena,
+        \\SELECT branch, (SELECT version FROM schema_version), output_bytes FROM timelines
+    , .{})).?;
+    try testing.expectEqual(Kept{ .branch = 7, .version = 4, .output = 5 }, filled);
 }
