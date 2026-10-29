@@ -773,7 +773,7 @@ places, and assertions carry no location.
   (2026-10-29): Kafka's run 173 kept 355 GB of them (1,094 files of 3 GB VMs, diffs or not) and
   filled srv3's disk, every run's writes failing (the e2e suite's with NoSpaceLeft); stopped,
   it left 209 GB (SIGTERM runs no defers). Since, holders and ladders on disk leave their
-  filesystem the larger of 100 GB and 20% free (past it a node costs a replay, as with no
+  filesystem the larger of 100 GB and 10% free (past it a node costs a replay, as with no
   memory), and serve deletes a run's holders once its explorer ended. OpenSearch's run 176
   kept 82 GB in 20 minutes, 36 files: most timelines keep one holder, and a timeline's first
   is a whole dump (a fresh chain: 2.3 GB of a 4 GB VM's nonzero pages), siblings returned to

@@ -674,9 +674,10 @@ fn machine_forget(vm: *VM) void {
 
 /// Snapshots on disk (holders, ladders) leave their filesystem at least the larger of these
 /// free: a Kafka hunt's holders took 355 GB in an hour and filled srv3's disk (run 173, every
-/// run's writes failing with NoSpaceLeft).
+/// run's writes failing with NoSpaceLeft). A fifth was too much: srv3's 875 GB disk at 175 GB
+/// free made none (e2e `runs`).
 const disk_reserve_min = 100 << 30;
-const disk_reserve_percent = 20;
+const disk_reserve_percent = 10;
 
 /// Whether the filesystem holding `directory` has more free than its reserve.
 fn disk_room(directory: []const u8) bool {
