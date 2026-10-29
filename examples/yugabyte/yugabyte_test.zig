@@ -71,6 +71,13 @@ fn describe_profile(
     comptime crashing_backends: bool,
 ) !void {
     const build: sdk.schema.Build = .{ .context = ".", .dockerfile = dockerfile };
+    // Causality's explanation: glog's verbosity up in every master and tablet server, at
+    // runtime (yb-ts-cli set_flag; a restart resets it).
+    // (The servers listen on the node's IPv4 address, /etc/hosts': a node's own name resolves to
+    // its link-local IPv6 address first.)
+    profile.explain = "for n in yb1 yb2 yb3; do a=$(awk -v n=$n '$2 == n { print $1; exit }' /etc/hosts); " ++
+        "for p in 7100 9100; do det-nodes exec $n /home/yugabyte/bin/yb-ts-cli --server_address=$a:$p " ++
+        "set_flag --force v 1; done; done";
     inline for (node_names) |name| {
         profile.node(@field(System.Name, name), .{
             .build = build,

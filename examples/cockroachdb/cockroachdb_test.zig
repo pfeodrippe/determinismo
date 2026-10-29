@@ -37,6 +37,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn describe(d: *System.Describe) !void {
     const default = try d.profile("default");
+    // Causality's explanation: the transaction and replica code's logs up in every node, at
+    // runtime (crdb_internal.set_vmodule; a restart resets it).
+    default.explain = "for n in crdb-1 crdb-2 crdb-3; do det-nodes exec $n /cockroach/cockroach sql --insecure " ++
+        "--host=$n:26257 -e \"SELECT crdb_internal.set_vmodule('txn*=2,replica*=2,store*=1')\"; done";
     inline for (node_names) |name| {
         default.node(@field(System.Name, name), .{
             .image = image,
