@@ -46,6 +46,9 @@ pub fn main(init: std.process.Init) !void {
 
 fn describe(d: *System.Describe) !void {
     const profile = try d.profile("default");
+    // Causality's explanation: the error log's notes (Group Replication's), persisted.
+    profile.explain = "for n in n1 n2 n3; do det-nodes exec $n mysql -uroot -e " ++
+        "\"SET PERSIST log_error_verbosity = 3\"; done";
     inline for (node_names, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = .{ .context = ".", .dockerfile = "examples/mysql-gr/Dockerfile" },

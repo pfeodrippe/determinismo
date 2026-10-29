@@ -35,6 +35,9 @@ const System = sdk.System(Nodes);
 const client_port = 7000;
 const controller_port = 9093;
 const redpanda_rpc_port = 33145;
+const redpanda_explain = "for n in kafka-1 kafka-2 kafka-3; do det-nodes exec $n rpk redpanda config set " ++
+    "rpk.additional_start_flags \"[--logger-log-level=tx=trace]\"; det-nodes exec $n rpk redpanda admin " ++
+    "config log-level set tx --host localhost:9644 --level trace --expiry-seconds 0; done";
 const topic = "jepsen";
 const partitions = 4;
 const replicas = 3;
@@ -96,6 +99,10 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     // Redpanda speaks Kafka's protocol: its brokers in place of Kafka's, the same client and
     // checks.
     const redpanda = comptime std.mem.eql(u8, profile_name, "redpanda");
+    // Causality's explanation: Redpanda's transaction logger at trace, in the running brokers
+    // and in their start flags (an outage restarts them), as the one that explained run 177's
+    // open transaction.
+    if (redpanda) profile.explain = redpanda_explain;
     const build: sdk.schema.Build = .{
         .context = ".",
         .dockerfile = if (comptime std.mem.eql(u8, profile_name, "kafka-4.4-coverage"))

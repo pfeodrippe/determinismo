@@ -59,6 +59,10 @@ pub fn main(init: std.process.Init) !void {
 fn describe(d: *System.Describe) !void {
     inline for (.{ .{ "default", "PATRONI_SYNC=true" }, .{ "async", "PATRONI_SYNC=false" } }) |entry| {
         const profile = try d.profile(entry[0]);
+        // Causality's explanation: PostgreSQL's log at debug1, persisted (postgresql.auto.conf
+        // outlives restarts).
+        profile.explain = "for n in pg1 pg2 pg3; do det-nodes exec $n psql -U postgres -h /var/run/postgresql " ++
+            "-c \"ALTER SYSTEM SET log_min_messages = debug1\" -c \"SELECT pg_reload_conf()\"; done";
         inline for (node_names, 1..) |name, id| {
             profile.node(@field(System.Name, name), .{
                 .build = .{ .context = ".", .dockerfile = "examples/patroni/Dockerfile" },

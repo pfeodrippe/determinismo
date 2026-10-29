@@ -64,6 +64,11 @@ fn describe(d: *System.Describe) !void {
     }) |entry| {
         const profile = try d.profile(entry[0]);
         const build: sdk.schema.Build = .{ .context = ".", .dockerfile = entry[3] };
+        // Causality's explanation: Paxos's (and Accord's) loggers at trace, in the running
+        // nodes (a restart resets them).
+        profile.explain = "for n in n1 n2 n3; do det-nodes exec $n nodetool setlogginglevel " ++
+            "org.apache.cassandra.service.paxos TRACE; det-nodes exec $n nodetool setlogginglevel " ++
+            "org.apache.cassandra.service.accord TRACE; done";
         inline for (node_names) |name| {
             profile.node(@field(System.Name, name), .{
                 .build = build,
