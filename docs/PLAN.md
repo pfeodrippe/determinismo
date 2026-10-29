@@ -61,13 +61,44 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
+- Assertions guide the tree (2026-10-29, on by default, Antithesis's sometimes-assertions page):
+  a `sometimes` or `reachable` made true weighs 4 times another new behavior in a timeline's
+  novelty, its moment is the frontier's return point ahead of rarer output lines, and its
+  archive cell ranks as one 4 times rarer and keeps up to 4 timelines' moments that reached it,
+  returns going to each in turn (the same rare state from different pasts, as Antithesis
+  restarts tests wherever an assertion is hit, not only where it first was). Antithesis SDK assertions are behaviors now (they
+  were not: a Compose project's own `sometimes` never guided the tree). Rare states marked for
+  it: det-faults marks the aimed node moving (a leader or primary changed, for every SDK's
+  `fault_aim`; computed, so no system is failed for never moving it), and the SQL driver a
+  driver connecting again after refusals. `--no-prefer-sometimes`
+  (serve: `prefer_sometimes: false`) for the benchmark: queued first in the hunt list, the Raft
+  POC (its Antithesis SDK assertions now behaviors) 20 minutes each way, seed 1, timelines to
+  each of its known bugs. A horizon stays off: measured, it hurt (Galera, below).
+
+- Redpanda's second finding (run 177's timeline 56): a partition leader restarted from a local
+  snapshot never arms `rm_stm`'s auto-abort timer for the open transactions the snapshot holds
+  (only a fence batch or a sweep arms it), so with the coordinator's abort given up, the
+  transaction stays open and the last stable offset stuck. Causality's explanation futures (the
+  profile's `explain` command, the `tx` logger at trace inside the jump) showed it; one of
+  them is its own control (partitions with new transactions after the restart sweep, the one
+  without never does). Present in `dev`; recorded in examples/kafka's README.
+
+- The Elle service ran every request on its HTTP server's one thread: a long check kept
+  `/version` from answering within 2 s, and the next check replaced the service (`podman rm
+  -f`), closing the histories it was checking ("host checks run to completion" failed in Group
+  Replication's run 200, timeline 151). Fixed: a pool of 4 threads, and the SDK never replaces a
+  service that is busy (only one absent or of another version), checking again a history whose
+  connection closed. Timeline 151 replayed to judge its history.
+
 - Faults aimed at a node (2026-10-29): `sdk.fault_aim(name)` in every SDK (`det-faults aim`
   underneath for those that run commands): half the injector's draws then pick among the
   faults involving that node, each a named decision. Workloads aim at the node that matters:
   the primary (SQL's `node_names`: Patroni, Group Replication; MongoDB), the transaction
   coordinator (Kafka, Redpanda), the leader (etcd, rqlite, ZooKeeper, ClickHouse Keeper, the NATS
   stream's, PD's for TiDB and SurrealDB). The selftest's `aim` check measures it. Next: whether
-  aimed hunts find what unaimed ones did, sooner (Redpanda's coordinator finding, again).
+  aimed hunts find what unaimed ones did, sooner: Redpanda's re-hunt (seed 1, 2 h, first in the
+  queue) against run 177 without aims, whose first failures came at its 27th timeline (no
+  transaction stays open), 80th (every committed write read) and 151st (Elle) of 185.
 
 - Per-node clock skew (2026-10-29): every node in a time namespace of its own, the guest
   kernel's patch 0005 giving namespaces a realtime offset changeable while tasks run (the vDSO,
@@ -824,10 +855,28 @@ places, and assertions carry no location.
   memory), and serve deletes a run's holders once its explorer ended. OpenSearch's run 176
   kept 82 GB in 20 minutes, 36 files: most timelines keep one holder, and a timeline's first
   is a whole dump (a fresh chain: 2.3 GB of a 4 GB VM's nonzero pages), siblings returned to
-  the same moment writing nearly the same pages. Next: diff a timeline's first holder against
-  the node it started from (kept on disk for the generation), most of its pages unchanged.
+  the same moment writing nearly the same pages. Done (2026-10-29): a timeline whose node was
+  made from a disk holder saves its first one against that holder (its page hashes are saved
+  beside it, `.hashes`), the pages changed since alone; the explorer keeps a holder's files
+  while timelines saved against them are (holders.Lineage), and a chain through timelines
+  stops at 24 snapshots (a fresh dump past it). Group Replication's run 200 had kept 34 files,
+  most of them whole dumps of 1.4 to 1.9 GB, four siblings at one moment among them. The e2e
+  tree check (holders on disk, every node verified against a replay's) covers it. Next: its
+  effect on a big hunt's holders (files, gigabytes, nodes made from disk).
 - Setup is one core before branches fan out: measured, not worth it (YugabyteDB's run 77: boot
   and setup 13.6 s of a 2 h hunt, 0.2%).
+- Efficiency, measured (2026-10-29, Antithesis's "Optimizing"): every run reports virtual per
+  wall time per node (their rule of thumb: above 1), the share of virtual time idle and skipped
+  (little: a busy-wait), clock reads per virtual second, and CPU time by node (det-init's
+  `node_cpu` events; serve's "CPU by node"); the live status carries the first three. Cassandra's
+  smoke: 0.46 virtual per wall second, x 3 nodes 1.4; 38,000 clock reads per virtual second, 98%
+  in KVM's fastpath (not what slows it). Next: the idle share and CPU by node of each system's
+  next run, and what the slow ones (Cassandra, Redpanda, YugabyteDB) spend it on.
+- Background work test-sized (2026-10-29): CockroachDB's ranges split at 64 KiB (512 MiB by
+  default) and its time series off; YugabyteDB current's automatic tablet splitting from 128
+  KiB (memtables flushed at 128 KiB); ScyllaDB current's keyspace on tablets (it was
+  SimpleStrategy's vnodes: its tablets never ran) of 64 KiB, flushed every minute; Cassandra's
+  failure detector at phi 5 and its memtables flushed every minute. Smokes queued.
 
 ## Later
 

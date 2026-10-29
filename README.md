@@ -25,7 +25,9 @@ machines; a replay to a moment and a goroutine dump there explain each
 Blind (no hint of the bug given), each replayed exactly and explained from its timeline; details
 in each example's README, the whole list in [docs/JEPSEN.md](docs/JEPSEN.md):
 - **Redpanda 26.2.6**: a transaction open for good when its coordinator crashes between beginning
-  it on the partitions and recording them ([examples/kafka](examples/kafka/README.md)).
+  it on the partitions and recording them; and one open for good on a partition whose leader
+  restarted from a local snapshot, which never arms its transaction expiry (found with causality's
+  explanation futures) ([examples/kafka](examples/kafka/README.md)).
 - **Galera (galera-4 26.4.24)**: an uncaught `std::out_of_range` in EVS after a power loss undoes
   gvwstate.dat's rename; a joiner whose state transfer is cut starting a new history from its
   half-copied data (a committed row lost); nodes restoring a component under a nil history that
@@ -61,7 +63,8 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   Antithesis's default properties built in (no unexpected container exits, no process crashes,
   no OOM kills, kernel warnings, panics or uncaught exceptions, test commands start, finish and
   exit 0, peak memory under 95%, logging under 200 MB per virtual hour, the fault injector
-  started), and virtual time per wall time.
+  started), and efficiency: virtual time per wall time (and per node), the idle time skipped
+  (little: something busy-waits), clock reads per virtual second and CPU time by node.
 - **Exploration**: snapshot at `setup_complete`, copy-on-write branches on every CPU, shards across
   hosts, branching from any moment of a branch, strategy plugins in any language (decisions and
   events) and outer-loop control through MCP or HTTP.
