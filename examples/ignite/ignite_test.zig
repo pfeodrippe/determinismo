@@ -6,8 +6,10 @@
 //! read-write one (Ignite: serializable), each append a get and a put of the key's list; one
 //! without is read-only (read as of its start time). Jepsen never analyzed Ignite.
 //!
-//! Drivers are client processes: each opens a connection to the client node (IClient.java,
-//! Ignite's Java client behind a line protocol) and runs its transactions there. Outcomes, as
+//! Drivers open connections to the client node (IClient.java, Ignite's Java client behind a
+//! line protocol: one client for all, as an application server holds one, so a read-only
+//! transaction begun after a commit acknowledged through it reads that commit; each with a
+//! client of its own reads in the past, by design) and run their transactions there. Outcomes, as
 //! Ignite documents them: `ok` with the reads; `fail` when nothing was applied (an error before
 //! the commit, or the commit's TransactionException: rolled back); `info` when the commit got
 //! no answer. Once faults stop, every committed append must be in its key's list, read in a

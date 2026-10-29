@@ -30,8 +30,11 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 
 List-append: every key a row of `LISTS (ID BIGINT PRIMARY KEY, VAL VARCHAR)`, its list the text
 `v1,v2,...`. A transaction with an append is read-write, each append a get and a put of the key's
-list in the transaction; one without is read-only. Each driver is a client process with its own
-`IgniteClient` (no retries). Outcomes as Ignite documents them: an error before the commit, or a
+list in the transaction; one without is read-only. The drivers share one `IgniteClient` (no
+retries), as an application server holds one: its observable timestamp covers every commit
+acknowledged through it, so a read-only transaction begun after one reads it. (A read-only
+transaction of a client with no observed timestamp reads at its clock less the maximum clock
+skew and safe time's period: in the past, by design, IGNITE-21098.) Outcomes as Ignite documents them: an error before the commit, or a
 `TransactionException` from the commit, is a rollback; any other error at the commit is unknown.
 
 | Property | Breaks when |

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 // The Ignite client node: Apache Ignite 3's Java client behind a line protocol for determinismo's
-// drivers. Each connection is one client process with its own IgniteClient (to every server,
-// no retries: an operation's outcome is the one it reports), made at its first command.
+// drivers. One IgniteClient (to every server, no retries: an operation's outcome is the one it
+// reports) for all connections, as an application server holds one: its observable timestamp
+// then covers every commit acknowledged through it, so a read-only transaction begun after one
+// reads it (with a client of its own, a read-only transaction reads at its clock less the
+// maximum clock skew and safe time's period: in the past, by design, IGNITE-21098).
 //
 //   setup                        -> ok | error <reason>
 //   txn r:<k> a:<k>:<v> ...      -> ok <read>... | fail <reason> | unknown <reason>
@@ -23,7 +26,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.ignite.client.IgniteClient;
-import org.apache.ignite.client.IgniteClientConnectionException;
 import org.apache.ignite.sql.ResultSet;
 import org.apache.ignite.sql.SqlRow;
 import org.apache.ignite.table.KeyValueView;
@@ -35,6 +37,33 @@ import org.apache.ignite.tx.TransactionOptions;
 public final class IClient {
     private static String[] addresses;
     private static final long timeoutMs = 30_000;
+    private static IgniteClient client;
+    private static KeyValueView<Long, String> lists;
+
+    // Nothing sent until the client connects: a failure here is a definite one.
+    private static synchronized IgniteClient connect() {
+        if (client != null) return client;
+        try {
+            client = IgniteClient.builder()
+                    .addresses(addresses)
+                    .connectTimeout(5_000)
+                    .operationTimeout(timeoutMs)
+                    .retryPolicy(null)
+                    .build();
+        } catch (Exception e) {
+            client = null;
+        }
+        return client;
+    }
+
+    private static synchronized KeyValueView<Long, String> lists(IgniteClient client) {
+        if (lists == null) {
+            Table table = client.tables().table("LISTS");
+            if (table == null) throw new IllegalStateException("no table LISTS");
+            lists = table.keyValueView(Long.class, String.class);
+        }
+        return lists;
+    }
 
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(args[0]);
@@ -61,9 +90,7 @@ public final class IClient {
                 out.println(session.handle(line.trim()));
             }
         } catch (Exception e) {
-            // The driver went away: its client with it.
-        } finally {
-            session.close();
+            // The driver went away.
         }
     }
 
@@ -73,9 +100,6 @@ public final class IClient {
     }
 
     private static final class Session {
-        private IgniteClient client;
-        private KeyValueView<Long, String> lists;
-
         String handle(String line) {
             String[] words = line.split(" ");
             try {
@@ -94,65 +118,39 @@ public final class IClient {
             }
         }
 
-        // Nothing sent until the client connects: a failure here is a definite one.
-        private boolean connect() {
-            if (client != null) return true;
-            try {
-                client = IgniteClient.builder()
-                        .addresses(addresses)
-                        .connectTimeout(5_000)
-                        .operationTimeout(timeoutMs)
-                        .retryPolicy(null)
-                        .build();
-                return true;
-            } catch (Exception e) {
-                client = null;
-                return false;
-            }
-        }
-
-        private KeyValueView<Long, String> lists() {
-            if (lists == null) {
-                Table table = client.tables().table("LISTS");
-                if (table == null) throw new IllegalStateException("no table LISTS");
-                lists = table.keyValueView(Long.class, String.class);
-            }
-            return lists;
-        }
-
         private String setup() {
-            if (!connect()) return "error not connected";
+            IgniteClient client = connect();
+            if (client == null) return "error not connected";
             try {
-                sql("CREATE ZONE IF NOT EXISTS JEPSEN (REPLICAS 3, PARTITIONS 8) STORAGE PROFILES ['default']");
-                sql("CREATE TABLE IF NOT EXISTS LISTS (ID BIGINT PRIMARY KEY, VAL VARCHAR) ZONE JEPSEN");
-                lists();
+                sql(client, "CREATE ZONE IF NOT EXISTS JEPSEN (REPLICAS 3, PARTITIONS 8) STORAGE PROFILES ['default']");
+                sql(client, "CREATE TABLE IF NOT EXISTS LISTS (ID BIGINT PRIMARY KEY, VAL VARCHAR) ZONE JEPSEN");
+                lists(client);
                 return "ok";
             } catch (Exception e) {
-                drop();
                 return "error " + reason(e);
             }
         }
 
-        private void sql(String statement) {
+        private void sql(IgniteClient client, String statement) {
             try (ResultSet<SqlRow> ignored = client.sql().execute(null, statement)) {
                 // DDL: nothing to read.
             }
         }
 
         private String txn(String[] words) {
-            if (!connect()) return "fail not connected";
+            IgniteClient client = connect();
+            if (client == null) return "fail not connected";
             boolean writes = false;
             for (int i = 1; i < words.length; i++) writes |= words[i].startsWith("a:");
             Transaction tx;
             try {
                 tx = client.transactions().begin(new TransactionOptions().readOnly(!writes).timeoutMillis(timeoutMs));
             } catch (Exception e) {
-                drop();
                 return "fail begin: " + reason(e);
             }
             List<String> results = new ArrayList<>();
             try {
-                KeyValueView<Long, String> view = lists();
+                KeyValueView<Long, String> view = lists(client);
                 for (int i = 1; i < words.length; i++) {
                     String[] parts = words[i].split(":");
                     long key = Long.parseLong(parts[1]);
@@ -171,7 +169,6 @@ public final class IClient {
                 } catch (Exception ignored) {
                     // Ignite rolls back what it does not see committed.
                 }
-                if (e instanceof IgniteClientConnectionException) drop();
                 return "fail " + reason(e);
             }
             try {
@@ -180,7 +177,6 @@ public final class IClient {
                 // Ignite's word: rolled back.
                 return "fail commit: " + reason(e);
             } catch (Exception e) {
-                drop();
                 return "unknown commit: " + reason(e);
             }
             return "ok " + String.join(" ", results);
@@ -188,36 +184,19 @@ public final class IClient {
 
         // Once faults stop: a key's list, in a read-write transaction of its own.
         private String read(long key) {
-            if (!connect()) return "fail not connected";
+            IgniteClient client = connect();
+            if (client == null) return "fail not connected";
             try {
                 Transaction tx = client.transactions().begin(new TransactionOptions().timeoutMillis(timeoutMs));
                 String list;
                 try {
-                    list = lists().get(tx, key);
+                    list = lists(client).get(tx, key);
                 } finally {
                     tx.rollback();
                 }
                 return "ok [" + (list == null ? "" : list) + "]";
             } catch (Exception e) {
-                drop();
                 return "fail " + reason(e);
-            }
-        }
-
-        // A client that lost its servers is made anew at the next command.
-        private void drop() {
-            close();
-        }
-
-        void close() {
-            lists = null;
-            if (client != null) {
-                try {
-                    client.close();
-                } catch (Exception ignored) {
-                    // Closing what failed.
-                }
-                client = null;
             }
         }
     }
