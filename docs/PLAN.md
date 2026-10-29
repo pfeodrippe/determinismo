@@ -81,8 +81,11 @@ event hashing, the guest module.
   timelines, all Galera's documented trade-off (the log flushed once a second, every node holding
   the newest commits failing within it; README): `default` and `jepsen-recovered` flush at
   every commit now. JVMs: Ignite's C2 compiler had a third of a server's CPU 150 s in, every
-  timeline compiling again from the setup snapshot; a `c1` profile (TieredStopAtLevel=1)
-  measured against the default, side by side.
+  timeline compiling again from the setup snapshot. Side by side, C1 committed 77 transactions
+  in a timeline where C2 committed none, even with a warm-up in setup: the servers, restarted by
+  faults, never served in time. Every JVM workload's image now runs C1
+  (`JAVA_TOOL_OPTIONS=-XX:TieredStopAtLevel=1`: Cassandra, Kafka, ZooKeeper, OpenSearch, Ignite,
+  nREPL, the Clojure examples); their next smokes and hunts confirm it.
 
 - Runs hung at their budget's end (found 2026-10-29, fixed): past the time budget no generation
   is judged, so finished timelines' summaries filled their slots, and the next one went unread;

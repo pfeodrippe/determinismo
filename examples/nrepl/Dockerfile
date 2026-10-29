@@ -3,6 +3,8 @@
 # code (JDK 24+: a line first run is a new behavior for strategies and the tree). Its
 # dependencies are fetched at build time: the guest has no network.
 FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 WORKDIR /app
 COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/
 RUN mkdir -p /sdk/classes && javac -d /sdk/classes /sdk/*.java && \

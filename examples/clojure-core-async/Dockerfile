@@ -5,6 +5,8 @@
 # assertion as it loads, and the coverage agent makes each core.async line first run a new
 # behavior (JDK 24+). Everything is fetched at build time: the guest has no network.
 FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 RUN apk add --no-cache git
 RUN git clone --quiet https://github.com/clojure/core.async /src/core.async && \
     git -C /src/core.async checkout --quiet f281893a53a4f25cad07dd6a09af4ae9c9233a89

@@ -5,6 +5,8 @@
 # on it, with the catalog agent declaring every assertion as its class loads. Everything is
 # fetched at build time: the guest has no network.
 FROM docker.io/library/clojure:temurin-25-tools-deps-alpine
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 RUN apk add --no-cache git maven
 RUN git clone --quiet https://github.com/clojure/clojure /src/clojure && \
     git -C /src/clojure checkout --quiet 31a3138ab25343a619fc3734a503a48affe236d1

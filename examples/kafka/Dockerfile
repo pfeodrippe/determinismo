@@ -16,6 +16,8 @@ COPY examples/kafka/KClient.java /opt/kclient/KClient.java
 RUN javac -cp "/opt/kafka/libs/*" -d /opt/kclient /opt/kclient/KClient.java
 
 FROM docker.io/library/debian:bookworm-slim
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 RUN apt-get update -q \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends openjdk-17-jre-headless \
  && rm -rf /var/lib/apt/lists/*

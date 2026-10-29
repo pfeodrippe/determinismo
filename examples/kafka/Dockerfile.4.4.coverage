@@ -23,6 +23,8 @@ RUN javac -d /sdk/classes /sdk/Determinismo.java /sdk/DeterminismoCoverage.java 
  && jar cfm /sdk/determinismo-coverage.jar /sdk/manifest -C /sdk/classes .
 
 FROM docker.io/library/eclipse-temurin:25-jre
+# C1 only: short timelines and restarted JVMs never repay C2's compiling (examples/ignite/README.md).
+ENV JAVA_TOOL_OPTIONS="-XX:TieredStopAtLevel=1"
 COPY --from=build /opt/kafka /opt/kafka
 COPY --from=build /opt/kclient /opt/kclient
 COPY --from=agent /sdk/determinismo-coverage.jar /opt/det/determinismo-coverage.jar
