@@ -124,6 +124,12 @@ test("the run's timelines replayed as it ran show among determinismo's own prope
   await expect(element.locator(".counts")).toContainText("hit in 1");
   const group = element.locator('xpath=preceding-sibling::div[contains(@class, "group-title")][1]');
   await expect(group).toHaveText("determinismo");
+  // Opened: the timelines replayed, each the same or where it parted.
+  await element.locator(".row").first().click();
+  const row = element.locator(".examples tr.clickable").first();
+  await expect(row.locator("td").first()).toHaveText("15");
+  await expect(row.locator("td.pass-text")).toHaveText("the same");
+  await expect(element.locator(".examples .muted")).toContainText("1 timelines replayed, 0 parted");
 });
 
 test("a run stopped from its page resumes from it, and runs on", async ({ page, request }) => {
