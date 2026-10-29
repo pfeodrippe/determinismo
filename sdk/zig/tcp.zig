@@ -26,6 +26,9 @@ pub const Options = struct {
     timeout_ms: u32 = 1000,
     /// http_with's request body's type (Dgraph, for one, answers only application/json).
     content_type: []const u8 = "application/octet-stream",
+    /// http_with's further header lines, each ending in "\r\n" (SurrealDB's Accept and
+    /// namespace).
+    headers: []const u8 = "",
 };
 
 /// Whether `err` means the server could not be reached or went away (as opposed to a protocol
@@ -209,10 +212,13 @@ pub fn http_with(
     defer connection.close();
     var head_buffer: [512]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buffer, "{s} {s} HTTP/1.0\r\nHost: node\r\n" ++
-        "Content-Length: {d}\r\nContent-Type: {s}\r\n\r\n", .{
+        "Content-Length: {d}\r\nContent-Type: {s}\r\n", .{
         method, path, body.len, options.content_type,
     });
+    assert(options.headers.len == 0 or std.mem.endsWith(u8, options.headers, "\r\n"));
     try connection.write_all(head);
+    try connection.write_all(options.headers);
+    try connection.write_all("\r\n");
     try connection.write_all(body);
     return response_read(&connection, buffer);
 }
