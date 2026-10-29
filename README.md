@@ -51,7 +51,9 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   failing, writes failing, writes acknowledged and never stored, corrupted reads, or a slow
   disk, through device-mapper); faults at durability points (a node's fsyncs held for a while,
   `sync_stall`, or a power loss right at one, `durable_crash`); graceful stops; clock skips, some
-  permanent; custom faults (your programs, run in a node at random times); a baseline of
+  permanent; per-node clock skews (`clock_skew`: one node's realtime clock ahead or behind, the
+  others' as they were, as Jepsen's clock bumps: each node in its own time namespace, a guest
+  kernel patch giving those a realtime offset); custom faults (your programs, run in a node at random times); a baseline of
   latency, jitter and rare drops on every link, always on, and of latency on durable disks; CPU modulation (on by default, as
   Antithesis's with faults, `--no-cpu-modulation` to turn it off: stretches of a slower machine,
   so preemption lands elsewhere); quiet periods requested from
