@@ -115,9 +115,9 @@ print("%d timelines%s%s, failing: %s" % (stats.get("timelines") or 0, busy, repl
 }
 for request in "$@"; do
   wait_run "$current"
-  [ -n "${started_any:-}" ] && echo "$(date +%H:%M) run $current: $(summary "$current")"
+  # Any run waited for, the one given at the start too (run 196 got no line, 2026-10-29).
+  [ "$current" != 0 ] && echo "$(date +%H:%M) run $current: $(summary "$current")"
   current=$(start "$request")
-  started_any=1
   echo "$(date +%H:%M) started run $current: $request"
 done
 wait_run "$current"
