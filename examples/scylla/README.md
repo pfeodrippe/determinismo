@@ -52,8 +52,10 @@ Jepsen's client takes them:
 - `Unavailable`, or a condition not applied: the write did not happen;
 - a timeout, a write failure, a lost connection: it may have.
 
-Elle checks the history for strict serializability. After faults stop, every node must serve a
-SERIAL read again. Faults: the default ones (pauses, partitions, degraded links, sync stalls,
+Elle checks the history for strict serializability. After faults stop (the drivers done), every
+node must serve a SERIAL read again, and every committed append must be in its key's list, read
+at SERIAL (final reads, since 2026-10-29: Elle takes a read missing one for an older state, and
+the drivers may never read a key again). Faults: the default ones (pauses, partitions, degraded links, sync stalls,
 throttling), process kills, restarts and graceful stops.
 
 Profiles: `default`, Jepsen's nemeses (process kills and restarts, graceful stops: Scylla's own

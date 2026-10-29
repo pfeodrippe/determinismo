@@ -85,7 +85,7 @@ fn describe(d: *System.Describe) !void {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("schema", schema_setup);
     s.parallel_driver("append", append);
-    s.eventually("serves", serves);
+    s.finally("final reads", final_reads);
 }
 
 fn addresses(context: *System.Context) [node_names.len][4]u8 {
@@ -311,8 +311,46 @@ fn elle_mops(arena: std.mem.Allocator, mops: []const Mop, read: ?[]const u64) ![
     return out;
 }
 
+/// Once faults stop (the drivers done): every node serves a SERIAL read again, and every
+/// committed append is in its key's list, read at SERIAL (sdk.elle.final_reads): Elle below
+/// takes a read missing one for an older state, and the drivers may never read a key again.
+fn final_reads(context: *System.Context) !void {
+    serves(context);
+    const arena = context.init.arena.allocator();
+    const history: sdk.elle.History = .{};
+    var reader: FinalReader = .{ .addresses = addresses(context) };
+    try sdk.elle.final_reads(arena, &history, &reader);
+}
+
+const FinalReader = struct {
+    addresses: [node_names.len][4]u8,
+
+    pub fn read_list(reader: *FinalReader, arena: std.mem.Allocator, key: u64) ?[]const u64 {
+        for (0..serve_attempts_max) |attempt| {
+            const address = reader.addresses[attempt % reader.addresses.len];
+            if (serial_list(arena, address, key)) |list| return list else |_| {}
+            pause_ms(1000);
+        }
+        return null;
+    }
+};
+
+fn serial_list(arena: std.mem.Allocator, address: [4]u8, key: u64) ![]const u64 {
+    var connection: Cql = undefined;
+    try connection.open(address, port, .{ .timeout_ms = timeout_ms });
+    defer connection.close();
+    var buffer: [query_size_max]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "SELECT value FROM " ++ table ++ " WHERE part = 0 AND id = {d}", .{key}) catch unreachable;
+    const rows = switch (try connection.query(text, .{ .consistency = .serial })) {
+        .rows => |rows| rows,
+        .done => return error.BadReply,
+        .failure => |failure| return failed("final read", failure),
+    };
+    return list_of(arena, &rows);
+}
+
 /// After faults stop, every node serves a SERIAL read again.
-fn serves(context: *System.Context) !void {
+fn serves(context: *System.Context) void {
     for (addresses(context)) |address| {
         _ = sdk.retry(serve_attempts_max, 1000, serial_read, .{address}) catch |err| {
             sdk.assert_unreachable("every node serves SERIAL reads once faults stop", .{ .err = @errorName(err) });
