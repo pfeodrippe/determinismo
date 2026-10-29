@@ -60,9 +60,11 @@ pub fn main(init: std.process.Init) !void {
 /// `default`: the brokers' disks with a host's 30 s writeback window (schema.Node.writeback_s):
 /// RabbitMQ leaves its feature flags file and Mnesia's tables to writeback, and the guest's
 /// strict model (nothing written back unasked) bricked nodes after power losses at any age
-/// (README). `flags-unsynced`: strict, the feature flags finding's profile.
+/// (README). `flags-unsynced`: strict, the feature flags finding's profile. `flags-synced`: the
+/// default with the feature flags file synced as it changes, to look past that finding (every
+/// boot rewrites the file, and hunt run 100 met the finding in 476 of ~700 timelines).
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "flags-unsynced" }) |profile_name| {
+    inline for (.{ "default", "flags-unsynced", "flags-synced" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
@@ -73,7 +75,10 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     inline for (.{ "rabbit-1", "rabbit-2", "rabbit-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}) },
+            .command = if (comptime std.mem.eql(u8, profile_name, "flags-synced"))
+                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), "flags-synced" }
+            else
+                &.{ "broker", std.fmt.comptimePrint("{d}", .{id}) },
             .ready = .{ .tcp = amqp_port },
             .faults = .{ .restart = true, .crash = true, .stop = true },
             .writeback_s = if (strict) null else 30,

@@ -32,6 +32,12 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   any age, hiding the rest: the second smoke (run 76, four timelines) lost all three brokers in
   two, by 30 s. A power loss within 30 s of a write still loses it, as on a real host.
 - `flags-unsynced`: strict (no window), the feature flags finding's profile.
+- `flags-synced`: the default, with the feature flags file kept as an atomic replace would
+  keep it (start.sh: each new content synced and a good copy renamed in; an empty file at start
+  gets the last good one back), to look past the feature flags finding: every boot rewrites the
+  file, so a power loss within 30 s of any restart bricked a broker, in 476 of hunt run 100's
+  ~700 timelines. Syncing within a second was not enough (a broker losing power again a second
+  after a restart).
 
 ## The workload and its properties
 

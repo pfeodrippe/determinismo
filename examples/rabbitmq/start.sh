@@ -5,6 +5,8 @@
 # start one after another, so every node's one peer is rabbit-1, which forms the cluster: the
 # others join it. Discovery dials every peer listed, and peers not started yet held a node in
 # it past its readiness wait (60 s). Its data in /var/lib/rabbitmq (the node's disk).
+# start.sh broker <id> flags-synced: the feature flags file kept as an atomic replace would keep
+# it (the flags-synced profile: past the feature flags finding).
 # start.sh client: the client node on port 7000.
 set -e
 case "$1" in
@@ -24,6 +26,30 @@ CONF
   chmod 600 /var/lib/rabbitmq/.erlang.cookie
   chown -R rabbitmq:rabbitmq /var/lib/rabbitmq 2>/dev/null || true
   export RABBITMQ_NODENAME=rabbit@rabbit-$id HOME=/var/lib/rabbitmq
+  # RabbitMQ rewrites its feature flags file in place (truncated, written, never synced) at
+  # every boot, and a power loss before it reaches the disk leaves it empty: the node never
+  # boots again (README: Findings). Hunt run 100 met it in 476 of ~700 timelines, which hid
+  # the rest. The flags-synced profile works it around as an atomic replace would: each new
+  # content is synced and a copy kept (written aside, synced, renamed in), and a node starting
+  # with an empty file gets the last good one back. (Syncing alone, within a second, was not
+  # enough: a broker losing power again within a second of a restart, its smoke's 2 of 4.)
+  if [ "${3:-}" = "flags-synced" ]; then
+    flags=/var/lib/rabbitmq/mnesia/rabbit@rabbit-$id-feature_flags
+    good=/var/lib/rabbitmq/feature_flags.good
+    if [ -f "$flags" ] && [ ! -s "$flags" ] && [ -s "$good" ]; then
+      cp "$good" "$flags" && sync "$flags"
+    fi
+    (last=; while :; do
+       if [ -s "$flags" ]; then
+         now=$(cksum < "$flags")
+         if [ "$now" != "$last" ] && sync "$flags" && cp "$flags" "$good.tmp" && sync "$good.tmp" \
+           && mv "$good.tmp" "$good" && sync -f "$good"; then
+           last=$now
+         fi
+       fi
+       sleep 0.2
+     done) &
+  fi
   # As the image's own entrypoint runs it: the rabbitmq user.
   exec gosu rabbitmq rabbitmq-server
   ;;
