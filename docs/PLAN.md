@@ -360,6 +360,12 @@ event hashing, the guest module.
   its dequeues, and losses are judged after a complete drain only. flags-synced (answered B)
   looks past the feature flags finding (476 of ~700 timelines): a good copy kept, as an atomic
   replace would; hunted next.
+- RabbitMQ findings (2026-10-29, hunt run 118, flags-synced, 1,498 timelines): confirmed
+  messages lost when two quorum queue members restart as new ones (Ra's names.dets registration
+  not synced, kills within half a second of the declaration; timeline 1005, 23 of 34, exact
+  replay); a quorum queue whose three members all do never serves again (21 timelines); a boot's
+  throwaway Mnesia dying on a peer's schema update (82), shown by holding the peer in a replay.
+  Queued: ra-synced (Ra syncing each registration) against run 118; queue_khepri.
 - Known crashes by output (2026-10-29): det-core matches a crashing process's node output
   against its known exits; Galera declares its by-design abort (all 114 of run 97's crash
   failures), so the crash property fails on other crashes alone.
