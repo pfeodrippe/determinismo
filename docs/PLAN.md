@@ -34,8 +34,9 @@ To make pluggable (none changes what a timeline does, only what is looked at or 
    the narrowest jump to failure, the command (one that turns the system's logs up) run at
    their moment and the timeline's own randomness after it, each one's events kept and whether
    it failed (`{"explained": [...]}`; e2e `until`). By hand it explained Redpanda's open
-   transaction (run 177: `tx` at trace from 116 s). Next: the UI's analysis view lists them,
-   each future's logs a click away.
+   transaction (run 177: `tx` at trace from 116 s). The UI's analysis view takes the command
+   ("explain with") and lists the futures, each one's logs filtered by a text (serve's
+   `/causality/<n>/explained/<k>/logs`); checked in Chrome on run 179.
 3. **Behaviors and cells**: what counts as a new behavior (events.zig's keys) and the
    Go-Explore archive's cell and score: today fixed in Zig; a plugin mapping a timeline's
    summary to cells and weights, offline (between generations), so timelines pay nothing.
