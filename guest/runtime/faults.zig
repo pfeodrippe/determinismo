@@ -322,12 +322,22 @@ fn leftovers_check(system: *const schema.System) void {
         });
     }
     var links_down: u32 = 0;
-    for (network.down) |row| {
-        for (row) |down| links_down += @intFromBool(down);
+    // The links still down, by name ("runner-raft-1 raft-2-raft-3"), as many as fit.
+    var names_buffer: [256]u8 = undefined;
+    var names: std.Io.Writer = .fixed(&names_buffer);
+    for (network.down, 0..) |row, a| {
+        for (row, 0..) |down, b| {
+            if (!down) continue;
+            links_down += 1;
+            names.print("{s}{s}-{s}", .{
+                if (links_down == 1) "" else " ", endpoint_name(system, a), endpoint_name(system, b),
+            }) catch {};
+        }
     }
     sdk.assert_computed(.always, links_down == 0 and network.count == 0, "faults leave nothing behind once they stop", .{
         .node = "",
         .left = if (links_down > 0) "links down" else if (network.count > 0) "network faults under way" else "",
+        .links = names.buffered(),
     });
 }
 
@@ -1669,7 +1679,13 @@ fn network_refresh(system: *const schema.System) void {
         if (down == network.down[a][b]) continue;
         const state: nodes.LinkState = if (down) .down else .up;
         const from = endpoint_name(system, a);
-        nodes.link_set(system, from, endpoint_name(system, b), state) catch continue;
+        const to = endpoint_name(system, b);
+        // A failure leaves the link as it was, and the next refresh tries again: said, since a
+        // link left down after faults stop was all run 100 (timeline 360) could tell.
+        nodes.link_set(system, from, to, state) catch |err| {
+            sdk.event("link_set_failed", .{ .from = from, .to = to, .state = @tagName(state), .err = @errorName(err) });
+            continue;
+        };
         network.down[a][b] = down;
     };
     for (0..endpoints) |a| for (0..endpoints) |b| {
