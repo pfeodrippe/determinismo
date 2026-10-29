@@ -169,3 +169,7 @@ its fun leaves the node's Mnesia settings at the throwaway ones.
   closed, repairing" after the power loss, without the table its peers then say they have), 36 other
   boots ending `mnesia_not_running` (a table load from a peer killed midway, for one), 5 other.
   Mnesia not coming back after power losses, in its several ways, is what is left.
+- 2026-10-29: scenario `queue_khepri` (with `flags-synced`): the cluster switched to Khepri,
+  RabbitMQ's Raft-based metadata store, during setup (`rabbitmqctl enable_feature_flag --opt-in
+  khepri_db`). Smoke (srv3, 8 timelines): no broker lost (on Mnesia, about one timeline in three
+  loses one), 7 clean, one drain not finishing. Hunted next.

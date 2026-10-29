@@ -53,7 +53,7 @@ const line_size_max = 512;
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
-        .scenarios = .{ .queue = queue_scenario },
+        .scenarios = .{ .queue = queue_scenario, .queue_khepri = queue_khepri_scenario },
     });
 }
 
@@ -108,6 +108,30 @@ fn queue_scenario(s: *System.Scenario) void {
     s.parallel_driver("enqueue", enqueues);
     s.parallel_driver("dequeue", dequeues);
     s.eventually("drain", drained);
+}
+
+/// The same queue on Khepri, RabbitMQ's Raft-based metadata store in place of Mnesia: the
+/// khepri_db feature flag enabled once the cluster formed, before any fault (hunt run 118: 155
+/// of 160 broker losses were Mnesia not coming back after power losses).
+fn queue_khepri_scenario(s: *System.Scenario) void {
+    s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
+    s.setup("queue", queue_declared_khepri);
+    s.parallel_driver("enqueue", enqueues);
+    s.parallel_driver("dequeue", dequeues);
+    s.eventually("drain", drained);
+}
+
+fn queue_declared_khepri(context: *System.Context) !void {
+    _ = try sdk.retry(setup_attempts_max, 500, cluster_formed, .{context});
+    _ = try sdk.retry(setup_attempts_max, 500, khepri_enabled, .{context});
+    _ = try sdk.retry(setup_attempts_max, 500, queue_declare, .{context});
+}
+
+fn khepri_enabled(context: *System.Context) !void {
+    var buffer: [4096]u8 = undefined;
+    const node = &context.nodes.@"rabbit-1";
+    const result = try node.exec_output(&.{ "rabbitmqctl", "-q", "enable_feature_flag", "--opt-in", "khepri_db" }, &buffer);
+    if (result.status != 0) return error.KhepriNotEnabled;
 }
 
 const Client = struct {
