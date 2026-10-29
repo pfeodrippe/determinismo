@@ -13,6 +13,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const serve = @import("serve.zig");
+const replays = @import("replays.zig");
 
 const sample_default = 8;
 const jobs_default = 2;
@@ -27,6 +28,8 @@ const Timeline = struct {
     hazards: []const u8 = "",
     /// Its tape was recorded by another build of determinismo: parting may be the build's doing.
     other_build: bool = false,
+    /// Where its events parted from the run's (replays.parting), when the run's are at hand.
+    parted: []const u8 = "",
     status: u8 = 0,
     /// When nothing was replayed: how the replay ended (its last lines), so that a replay that
     /// could not start says why instead of passing for a divergence.
@@ -44,6 +47,8 @@ const Work = struct {
     self: []const u8,
     rest: []const []const u8,
     tape_directory: []const u8,
+    /// The run's events (a run directory's `events`): each replay's are compared with them.
+    events: ?[]const u8 = null,
     timelines: []Timeline,
     next: std.atomic.Value(usize) = .init(0),
 };
@@ -57,6 +62,7 @@ pub fn run(
     var record_path: ?[]const u8 = null;
     var tape_directory: ?[]const u8 = null;
     var run_directory: ?[]const u8 = null;
+    var events_directory: ?[]const u8 = null;
     var sample: usize = sample_default;
     var jobs: usize = jobs_default;
     var named: std.ArrayList(u32) = .empty;
@@ -92,6 +98,7 @@ pub fn run(
         rest = options;
         record_path = record_path orelse try std.fs.path.join(arena, &.{ directory, "record.jsonl" });
         tape_directory = tape_directory orelse try std.fs.path.join(arena, &.{ directory, "tapes" });
+        events_directory = try std.fs.path.join(arena, &.{ directory, "events" });
     }
     const record = record_path orelse return usage();
     const tapes = tape_directory orelse return usage();
@@ -137,6 +144,7 @@ pub fn run(
         .self = self,
         .rest = rest.items,
         .tape_directory = tapes,
+        .events = events_directory,
         .timelines = chosen,
     };
     const threads = try arena.alloc(std.Thread, @min(jobs, chosen.len));
@@ -151,7 +159,7 @@ pub fn run(
             continue;
         }
         failed += 1;
-        std.debug.print("  FAIL timeline {d} does not replay: recorded {s}, replayed {s}{s}{s}{s}{s}{s}\n", .{
+        std.debug.print("  FAIL timeline {d} does not replay: recorded {s}, replayed {s}{s}{s}{s}{s}{s}{s}\n", .{
             timeline.index,
             timeline.events_hash,
             if (timeline.replayed_hash.len > 0) timeline.replayed_hash else "nothing",
@@ -160,6 +168,7 @@ pub fn run(
             if (timeline.hazards.len > 0) "; " else "",
             timeline.hazards,
             if (timeline.other_build) "; recorded by another build of determinismo" else "",
+            timeline.parted,
         });
         if (timeline.ended.len > 0) std.debug.print("    {s}\n", .{timeline.ended});
         if (timeline.recent.len > 0) std.debug.print("{s}", .{timeline.recent});
@@ -244,6 +253,24 @@ fn replay(work: *Work, timeline: *Timeline) !void {
     try argv.appendSlice(arena, &.{ work.self, "explore" });
     try argv.appendSlice(arena, work.rest);
     try argv.appendSlice(arena, &.{ "--tape", try tape_path(arena, work.tape_directory, timeline.index) });
+    // Its events beside the tapes, compared with the run's if it parts (kept then, as evidence).
+    const replay_events: ?[]const u8 = if (work.events != null)
+        try std.fmt.allocPrint(arena, "{s}/verify-{d}-events", .{ work.tape_directory, timeline.index })
+    else
+        null;
+    if (replay_events) |directory| try argv.appendSlice(arena, &.{ "--events-dir", directory });
+    defer if (replay_events) |directory| {
+        if (std.mem.eql(u8, timeline.replayed_hash, timeline.events_hash) and timeline.diverged.len == 0) {
+            std.Io.Dir.cwd().deleteTree(work.io, directory) catch {};
+        } else {
+            timeline.parted = replays.parting(
+                arena,
+                work.io,
+                std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ work.events.?, timeline.index }) catch "",
+                std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ directory, timeline.index }) catch "",
+            );
+        }
+    };
     const result = try std.process.run(arena, work.io, .{
         .argv = argv.items,
         .stdout_limit = .limited(64 << 20),

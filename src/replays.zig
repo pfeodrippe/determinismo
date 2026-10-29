@@ -372,7 +372,7 @@ fn replay_one(
 /// Where a replay's events part from the run's: the last checkpoint both passed (one per second
 /// of virtual time, Events.checkpoint) and the first line that differs on each side; "" when
 /// either file cannot be read or they do not differ.
-fn parting(arena: std.mem.Allocator, io: std.Io, recorded_path: []const u8, replayed_path: []const u8) []const u8 {
+pub fn parting(arena: std.mem.Allocator, io: std.Io, recorded_path: []const u8, replayed_path: []const u8) []const u8 {
     const limit: std.Io.Limit = .limited(1 << 30);
     const recorded = std.Io.Dir.cwd().readFileAlloc(io, recorded_path, arena, limit) catch return "";
     const replayed = std.Io.Dir.cwd().readFileAlloc(io, replayed_path, arena, limit) catch return "";
