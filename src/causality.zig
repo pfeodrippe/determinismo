@@ -849,9 +849,9 @@ fn failure_find(
     };
 }
 
-/// Where it was decided: each jump of `jump_min` or more between neighboring moments, with the
-/// faults injected in it and the code first run there (coverage events naming source lines),
-/// from the timeline's events (text, or with --json a final {"decided": [...]} line).
+/// Where it was decided: each jump of `jump_min` or more (jumps_find), with the faults injected
+/// in it and the code first run there (coverage events naming source lines), from the
+/// timeline's events (text, or with --json a final {"decided": [...]} line).
 fn decided_print(analysis: *Analysis, out: *std.Io.Writer, json: bool) !void {
     const events = analysis.failure.events orelse return;
     const arena = analysis.arena;
@@ -866,12 +866,17 @@ fn decided_print(analysis: *Analysis, out: *std.Io.Writer, json: bool) !void {
         faults: std.ArrayList([]const u8) = .empty,
         code: std.ArrayList([]const u8) = .empty,
     };
+    const probabilities = try arena.alloc(f64, points.len);
+    for (points, probabilities) |point, *probability| probability.* = wilson(point.failing, point.futures).probability;
+    const spans = try arena.alloc([2]usize, points.len);
     var jumps: std.ArrayList(Jump) = .empty;
-    for (points[0..points.len -| 1], points[@min(1, points.len)..]) |a, b| {
-        const pa = wilson(a.failing, a.futures).probability;
-        const pb = wilson(b.failing, b.futures).probability;
-        if (@abs(pb - pa) < analysis.request.jump_min) continue;
-        try jumps.append(arena, .{ .from_ms = a.vtime_ms, .to_ms = b.vtime_ms, .from = pa, .to = pb });
+    for (jumps_find(probabilities, analysis.request.jump_min, spans)) |span| {
+        try jumps.append(arena, .{
+            .from_ms = points[span[0]].vtime_ms,
+            .to_ms = points[span[1]].vtime_ms,
+            .from = probabilities[span[0]],
+            .to = probabilities[span[1]],
+        });
     }
     if (jumps.items.len == 0) return;
     var lines = std.mem.tokenizeScalar(u8, events, '\n');
@@ -922,6 +927,44 @@ fn decided_print(analysis: *Analysis, out: *std.Io.Writer, json: bool) !void {
         for (jump.code.items[0..shown]) |code| try out.print("    first run {s}\n", .{code});
         if (jump.code.items.len > shown) try out.print("    ... {d} more lines first run\n", .{jump.code.items.len - shown});
     }
+}
+
+/// The jumps of a curve (its moments' probabilities, in time order): each stretch where it goes
+/// one way only (flat steps included) and moves `jump_min` or more in all, as [first, last]
+/// moments. Refinement splits a jump into steps of a future or two each (12% with 8 futures):
+/// none of them a jump between neighbors, the rise from 50% to 100% is one all the same.
+fn jumps_find(probabilities: []const f64, jump_min: f64, spans: [][2]usize) []const [2]usize {
+    assert(spans.len >= probabilities.len);
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start + 1 < probabilities.len) {
+        var end = start + 1;
+        const rising = probabilities[end] >= probabilities[start];
+        while (end + 1 < probabilities.len) : (end += 1) {
+            const step = probabilities[end + 1] - probabilities[end];
+            if ((rising and step < 0) or (!rising and step > 0)) break;
+        }
+        if (@abs(probabilities[end] - probabilities[start]) >= jump_min) {
+            spans[count] = .{ start, end };
+            count += 1;
+        }
+        start = end;
+    }
+    return spans[0..count];
+}
+
+test jumps_find {
+    var spans: [16][2]usize = undefined;
+    // The e2e's refined curve (2026-10-29): 50% at 1801 ms rising a future at a time to 100%.
+    const refined = [_]f64{ 0.5, 0.5, 0.625, 0.75, 0.875, 1, 0.875, 1, 1, 1, 1 };
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 5 }}, jumps_find(&refined, 0.2, &spans));
+    // A jump between neighbors, and a fall.
+    const steep = [_]f64{ 0.1, 0.1, 0.9, 0.9, 0.2 };
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 3 }, .{ 3, 4 } }, jumps_find(&steep, 0.2, &spans));
+    // Noise under the threshold, and too few moments.
+    const flat = [_]f64{ 0.5, 0.625, 0.5, 0.625 };
+    try std.testing.expectEqual(@as(usize, 0), jumps_find(&flat, 0.2, &spans).len);
+    try std.testing.expectEqual(@as(usize, 0), jumps_find(&.{1}, 0.2, &spans).len);
 }
 
 /// A failing evaluation of the property (declarations, `hit` false, are not): an always kind
