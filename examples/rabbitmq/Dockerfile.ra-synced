@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# The image of Dockerfile with Ra's directory made durable: ra_directory (ra 2.16.13, the one
+# RabbitMQ 4.1.4 ships) rebuilt with a dets:sync after each registration, as the fix for a quorum
+# queue's members forgetting themselves would make it (README). The ra-synced profile.
+FROM docker.io/library/rabbitmq:4.1.4 AS ra
+RUN apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://github.com/rabbitmq/ra/archive/refs/tags/v2.16.13.tar.gz | tar xz -C /tmp
+WORKDIR /tmp/ra-2.16.13
+RUN sed -i 's/ok = dets:insert(DirRev, {ServerName, UId});/ok = dets:insert(DirRev, {ServerName, UId}), ok = dets:sync(DirRev);/; s/ok = dets:insert(DirRev, {ServerName, UId}),$/ok = dets:insert(DirRev, {ServerName, UId}), ok = dets:sync(DirRev),/' src/ra_directory.erl \
+ && test "$(grep -c 'ok = dets:sync(DirRev)' src/ra_directory.erl)" -eq 2 \
+ && erlc -I src -I include -pa /opt/rabbitmq/plugins/ra-2.16.13/ebin -o /tmp src/ra_directory.erl
+
+FROM docker.io/library/rabbitmq:4.1.4
+RUN apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends python3 python3-pika \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=ra /tmp/ra_directory.beam /opt/rabbitmq/plugins/ra-2.16.13/ebin/ra_directory.beam
+COPY examples/rabbitmq/rclient.py /opt/rclient/rclient.py
+COPY examples/rabbitmq/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+ENTRYPOINT ["/usr/local/bin/start.sh"]

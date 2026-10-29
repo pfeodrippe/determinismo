@@ -64,18 +64,23 @@ pub fn main(init: std.process.Init) !void {
 /// default with the feature flags file synced as it changes, to look past that finding (every
 /// boot rewrites the file, and hunt run 100 met the finding in 476 of ~700 timelines).
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "flags-unsynced", "flags-synced" }) |profile_name| {
+    inline for (.{ "default", "flags-unsynced", "flags-synced", "ra-synced" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
 
 fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     const strict = comptime std.mem.eql(u8, profile_name, "flags-unsynced");
-    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/rabbitmq/Dockerfile" };
+    // ra-synced: flags-synced with Ra's directory made durable (Dockerfile.ra-synced).
+    const ra_synced = comptime std.mem.eql(u8, profile_name, "ra-synced");
+    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = if (ra_synced)
+        "examples/rabbitmq/Dockerfile.ra-synced"
+    else
+        "examples/rabbitmq/Dockerfile" };
     inline for (.{ "rabbit-1", "rabbit-2", "rabbit-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = if (comptime std.mem.eql(u8, profile_name, "flags-synced"))
+            .command = if (comptime std.mem.eql(u8, profile_name, "flags-synced") or ra_synced)
                 &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), "flags-synced" }
             else
                 &.{ "broker", std.fmt.comptimePrint("{d}", .{id}) },

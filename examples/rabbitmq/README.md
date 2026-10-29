@@ -129,6 +129,10 @@ timelines) the queue goes on. The same on Mnesia and Khepri (`queue_khepri`'s sm
 in rabbitmq-server's issues: #10007 (2023, closed), the same warning when a node was down
 while the queue was declared; here every node was up.
 
+`ra-synced` (Dockerfile.ra-synced): ra_directory rebuilt from ra 2.16.13 with a `dets:sync`
+after each registration, as the fix would be. Smoke (8 timelines): no member forgotten. A hunt
+of it against run 118 is queued.
+
 ### Found blind: after a power loss, a boot's throwaway Mnesia takes a schema update and dies (being read)
 
 Hunt run 118 (srv3, 2026-10-29, `flags-synced`): with the feature flags finding out of the way,
