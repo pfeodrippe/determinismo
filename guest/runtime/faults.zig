@@ -32,7 +32,8 @@
 //! "direction": "both"}, {"kind": "degrade", "node": "a", "peer": "b", "flavor": "delay_loss"},
 //! {"kind": "clog", "node": "a", "direction": "inbound"}, {"kind": "throttle", "node": "a",
 //! "cpu_percent": 10}, {"kind": "clock_skip", "skip_ms": 500, "forward": true} (permanent),
-//! {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
+//! {"kind": "clock_skew", "node": "a", "skip_ms": 300, "forward": false} (with "strobe_ms": 50,
+//! coming and going), {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
 //! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); {"kind": "outage",
 //! "nodes": ["a", "b"]} (every node that allows crashes when none are named); restart, crash,
 //! durable_crash, wipe, stop, process_pause, thread_pause, process_kill, isolate and partition
