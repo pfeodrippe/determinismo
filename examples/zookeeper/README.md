@@ -75,3 +75,6 @@ says what else made a server exit.
   delete in the multi). The servers' disks have a 30 s writeback window (`writeback_s`): their
   snapshots are never synced, and under the guest's strict model a power loss at any age left
   a server unbootable, not only within 30 s of a snapshot as on a real host.
+- 2026-10-29, first hunt (run 178, 3.9.6, seed 1, tree): 490 timelines until its discovery
+  plateaued (2 h 10 min), nothing failing; 16 of 16 replays the same. Next: the `known` profile
+  (3.9.1, before ZOOKEEPER-4785's fix) for its blind rediscovery.
