@@ -1681,10 +1681,16 @@ fn network_refresh(system: *const schema.System) void {
         const from = endpoint_name(system, a);
         const to = endpoint_name(system, b);
         // A failure leaves the link as it was, and the next refresh tries again: said, since a
-        // link left down after faults stop was all run 100 (timeline 360) could tell.
+        // link left down after faults stop was all run 100 (timeline 360) could tell. Bringing
+        // up a link whose interface or namespace is gone is done, though: a node restarting
+        // makes its links anew, up (run 123: hundreds of such failures, 7 timelines ending
+        // their faults with a link marked down that no longer existed).
         nodes.link_set(system, from, to, state) catch |err| {
-            sdk.event("link_set_failed", .{ .from = from, .to = to, .state = @tagName(state), .err = @errorName(err) });
-            continue;
+            const gone = err == error.NoSuchInterface or err == error.NoSuchNamespace;
+            if (!(gone and state == .up)) {
+                sdk.event("link_set_failed", .{ .from = from, .to = to, .state = @tagName(state), .err = @errorName(err) });
+                continue;
+            }
         };
         network.down[a][b] = down;
     };
