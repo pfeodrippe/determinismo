@@ -360,12 +360,12 @@ event hashing, the guest module.
   its dequeues, and losses are judged after a complete drain only. flags-synced (answered B)
   looks past the feature flags finding (476 of ~700 timelines): a good copy kept, as an atomic
   replace would; hunted next.
-- Disk model under suspicion (2026-10-29): Galera run 123's lineage of timeline 402 ends with
-  InnoDB's undo page ahead of its redo log ("LSN ... is in the future"), though InnoDB syncs
-  the redo before writing any page (both flush paths read). Either a third way of writing
-  pages or durable crashes (two at n2's syncs, 2.5 s apart) losing synced data. Next: replay
-  the lineage to just before each durable crash and compare the redo log's synced end with
-  the undo page's LSN; then the durable crash's handling of two syncs close together.
+- Galera, found blind (2026-10-29, run 123): a joiner whose state transfer is cut is left a
+  primary component of one (its donor left gracefully), saves it, and after a restart
+  `pc.recovery` starts a new history from its half-copied data; nodes with newer data join it by
+  SST (committed row lost, read by replay; examples/galera/README.md). Not the disk model, first
+  suspected. Next: the append workload's final reads of every key once faults stop (Elle then
+  sees lost appends; it missed this one), and a fork from timeline 265 to measure how often.
 - RabbitMQ findings (2026-10-29, hunt run 118, flags-synced, 1,498 timelines): confirmed
   messages lost when two quorum queue members restart as new ones (Ra's names.dets registration
   not synced, kills within half a second of the declaration; timeline 1005, 23 of 34, exact

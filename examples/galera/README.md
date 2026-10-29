@@ -80,6 +80,62 @@ replay of it is exact (events hash 060f1a0443c319fd, 9,444 events, the same abor
 the same hunt, independently: timeline 51 (branched from timeline 20 at 250 s, another lineage),
 n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
 
+## Found blind: a joiner whose state transfer is cut starts a new cluster from its half-copied data
+
+Hunt run 123 (srv3, 2026-10-29, `jepsen-dirsync`: MariaDB 12.1.2, galera-4 26.4.24, seed 3).
+**Committed data lost**, read by replay (`POST /runs/123/replay`, `det-nodes exec <node> mariadb`):
+in timeline 236 at 31.75 s, n1 and n2 are at `wsrep_last_committed` 8 (history `d5703534`) and
+both hold the committed row `txn2` id 5 (`740831188221968`); in timeline 265 (branched from 236
+at 46.75 s) at 68 s the primary component is n3 alone, serving a new history (`f1c25642`, seqno 2)
+with empty tables.
+
+How, from the nodes' error logs (timeline 265):
+
+1. n3 rejoins at 46.16 s by state transfer, an rsync SST from n2 (`Group state: ea2ebd5f…:2`,
+   `Local state: d5703534…:6`).
+2. At 46.75 s n2 shuts down gracefully, mid-transfer. A graceful leave takes n2 out of the quorum,
+   so n3, still a joiner, is left a primary component of one: `save pc into disk`, `New
+   COMPONENT: primary = yes, … memb_num = 1`, `State: JOINER`, `Shifting JOINER -> OPEN`. Its
+   gvwstate.dat now names a primary component of n3 alone.
+3. n3 restarts (48.1 s) with no state (`Found saved state: 00000000-…:-1, safe_to_bootstrap:
+   0`). `pc.recovery` (on by default) restores the saved component (`restore pc from disk
+   successfully`), and with all its members present (itself) Galera bootstraps: `Quorum: No node
+   with complete state`, `Bootstrapped primary … found: 1`, `Starting new group from scratch:
+   ef20522b…` (51.12 s), `GCache history reset`. InnoDB starts on whatever the cut transfer left
+   in the data directory, and the node serves (`ready for connections`, 67.83 s).
+4. n2, which held the newest data, rejoins at 57.94 s into n3's new history and takes an SST
+   from n3 (`Group state: f1c25642…:2`, `Local state: ea2ebd5f…:2`): its data is replaced by n3's.
+
+Timeline 402 is the same path with another end. n2's SST from n3 is cut when n3 stops gracefully
+(134.79 s; n3's rsync of the undo tablespaces fails). n2 is left a primary of one: gcomm saves
+the primary view (`save pc into disk`) while GCS reports `Quorum: No node with complete state`,
+`Failed to establish quorum`, `Received NON-PRIMARY`. n2 restarts, restores that view, and at
+142.61 s starts a new group from scratch on a directory with n3's data files and redo log but
+its own undo tablespaces. InnoDB refuses it (`log sequence number 78921 is in the future`, `you
+may have copied the InnoDB tablespace but not the ib_logfile0`) and aborts. All 34 "no process
+crashes: mariadbd" failures of the run are this: InnoDB in 25 (timelines 402-443, one lineage),
+Aria in 9 (`Aria recovery failed`, timelines 340-375, another).
+
+In the run, a node that had gone from joiner to open, with no state transfer received since,
+started a new group from scratch 327 times in 130 of the 632 timelines. It came up serving within
+20 s in 252 of them, and another node then joined its group in 134. The design restores the last
+primary component when all its members are back: the last node standing, with the newest state,
+starts again (timeline 236's n2 at 42.83 s, by design). A joiner without a complete state was never
+meant to be one: `safe_to_bootstrap: 0` is not consulted on this path, and GCS itself reports no
+node with complete state.
+
+Elle found no anomaly: the workload reads keys only inside its random transactions (58
+operations in timeline 265), and none read key 5 after the loss. Next: final reads of every key
+once faults stop, so a lost append is an anomaly Elle reports.
+
+Known? Related: mariadb-corporation/galera#549 (open since 2019), "rsync crashed while syncing in
+the donor node, receiver node become safe_to_bootstrap=1", where an operator could bootstrap
+from a cut transfer's receiver. Here nothing asks an operator: `pc.recovery` bootstraps it. Not
+found in MariaDB's Jira (searched `pc.recovery` with joiner, gvwstate with SST, "new group from
+scratch"); Galera's own tracker (codership/galera-bugs) is not public. A fix: never save a
+primary view to gvwstate.dat while the node's state is incomplete (a joiner), or have
+`pc.recovery` bootstrap only a node with a complete state.
+
 ## Status
 
 - Hunt run 58 (srv3, 2026-10-28, `jepsen` profile, 12.1.2, seed 2, 2 h): 532 timelines, Elle
@@ -102,30 +158,11 @@ n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
   durable. Smoke (4 timelines): no node restored an incarnation twice (n2 restarted 19 times, 19
   incarnations), where without it most timelines repeat one. A hunt of it, against run 97, tells
   whether the rename causes the EVS abort.
-- Hunt run 123 (srv3, 2026-10-29, `jepsen-dirsync`, seed 3 as run 97): **no EVS abort in 545
-  timelines** (run 97: 8 of 299) and no "claims to come from same view" warning (run 97: 6):
-  with gvwstate.dat's rename durable, the abort is gone, as the cause predicts. Its 34
-  "no process crashes: mariadbd" failures are storage engines that will not start after a
-  power loss (each then aborts, the signal 11 in `abort()`): InnoDB in 25 (17 of them
-  `Page [page id: space=3, page number=0] log sequence number 78921 is in the future! Current
-  system log sequence number 77734` on `undo003`, "Data structure corruption"), Aria in 9
-  ("Aria recovery failed"). Observed, not yet understood: a page on disk ahead of the redo
-  log that should cover it breaks write-ahead logging, either in InnoDB (Jepsen's
-  configuration flushes the log about once a second, `innodb_flush_log_at_trx_commit = 0`,
-  which may lose recent commits but should never corrupt) or in determinismo's disk model
-  (whether it can make a page durable before an earlier, unsynced log write). The settings
-  (read in the image): data and redo both unbuffered (`innodb_flush_method O_DIRECT`,
-  `innodb_log_file_buffering OFF`), redo synced about once a second, doublewrite on, 3 undo
-  tablespaces. A power loss here is ext4's shutdown without a log flush: an O_DIRECT write that
-  completed survives, unless it landed in space the file had reserved but never written (an
-  unwritten extent), whose conversion is a journal update lost without a sync or ext4's 5 s
-  commit, as on a real ext4. A hypothesis, not checked: the redo log's last O_DIRECT writes into
-  such space lost before its once-a-second sync, while a page they cover (written after them)
-  was kept. Checked since: the redo log is reserved so (a fresh `ib_logfile0`: blocks 12 on in
-  unwritten extents, `filefrag -v`), but both ways InnoDB 12.1.2 writes pages, directly and
-  through doublewrite (buf0flu.cc, buf0dblwr.cc), make the log durable first
-  (`log_write_up_to(lsn, true)`, a sync), and the startup rebuild of undo tablespaces only runs
-  when their number changes (it did not). So the page reached the disk another way, or the
-  disk model lost redo that had been synced: the lineage's node had two durable crashes (at a
-  sync: before it at 117.42 s, after it at 119.86 s) in the two minutes before, and a durable
-  crash once left a disk dropping writes (PLAN, 2026-10-28). Determinismo's first, then.
+- Hunt run 123 (srv3, 2026-10-29, `jepsen-dirsync`, seed 3 as run 97): 632 timelines, **no EVS
+  abort** (run 97: 8 of 299) and no "claims to come from same view" warning (run 97: 6): with
+  gvwstate.dat's rename durable, the abort is gone, as the cause predicts. Its 34 "no process
+  crashes: mariadbd" failures are the finding above (storage engines refusing a data directory
+  half copied from another node), not determinismo's disk model as first suspected: InnoDB
+  writes no page before its redo is durable (`log_write_up_to(lsn, true)` on both of 12.1.2's
+  page write paths, buf0flu.cc and buf0dblwr.cc), and the page "in the future" was another
+  node's.
