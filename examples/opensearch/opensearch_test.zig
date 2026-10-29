@@ -4,8 +4,10 @@
 //! its list in `v`. A read is a realtime GET (the copy's latest, not the last refresh's); an
 //! append reads the document and writes it back conditioned on what it read (`if_seq_no`,
 //! `if_primary_term`: OpenSearch's optimistic concurrency control), again on a conflict. One
-//! operation a transaction (documents have no transactions across them), so strict
-//! serializability is each key's history linearizable. Jepsen's Elasticsearch analyses (1.1.0,
+//! operation a transaction (documents have no transactions across them). Its reads may see a
+//! write before it is acknowledged, on one copy before another (Elasticsearch's documented read
+//! model): Elle judges the history serializable, and every read must list each append
+//! acknowledged before it began (`realtime_reads`). Jepsen's Elasticsearch analyses (1.1.0,
 //! 1.5.0, before OpenSearch forked) lost acknowledged writes to partitions; replication has since
 //! taken sequence numbers and primary terms.
 //!
@@ -46,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
         .scenarios = .{ .append = append_scenario },
-        .checks = .{ .elle = sdk.elle.check(.{ .consistency = "strict-serializable" }) },
+        .checks = .{ .elle = sdk.elle.check(.{ .consistency = "serializable", .realtime_reads = true }) },
     });
 }
 

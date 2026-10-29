@@ -32,8 +32,9 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 
 Each key is a document, its list in `v`. A read is a realtime GET; an append reads the document
 and writes it back conditioned on what it read (`if_seq_no`, `if_primary_term`), again on a
-conflict, creating it when it is not there (`op_type=create`). One operation a transaction:
-strict serializability is each key's history linearizable. Recorded for Elle:
+conflict, creating it when it is not there (`op_type=create`). One operation a transaction.
+Elle judges the history serializable, and a direct check holds what reads promise beyond that:
+each lists every append acknowledged before it began. Recorded for Elle:
 - `ok`: the write acknowledged, or the read answered;
 - `fail`: nothing written (refused, a conflict five times, no answer to the read before it);
 - `info`: the write got no answer.
@@ -49,7 +50,8 @@ acknowledged ones, is.
 
 | Property | Breaks when |
 |---|---|
-| Elle finds no anomaly in the history (strict serializable) | lost or reordered appends, stale reads, a refused write that took effect |
+| Elle finds no anomaly in the history (serializable) | lost or reordered appends, a refused write that took effect, cycles |
+| every append acknowledged before a read began is in it | a stale read of an acknowledged write, an acknowledged append lost (the final reads) |
 | the cluster serves again once faults stop | it never elects a cluster manager or never assigns the shard |
 
 Faults: the default ones in bursts with quiet stretches, restarts, power losses (at the nodes'
@@ -64,3 +66,10 @@ syncs too, and outages of several at once) and graceful stops.
   runs from the guest's start). Third (run 98): keystore kept; the final reads went to os-1
   alone, which was still restarting a minute after faults stopped: they now list the documents
   through any node, wait two minutes, and give up on a node down for good.
+- 2026-10-29, first hunt (run 176, `opensearch.json`, 335 timelines in 50 minutes): 28 failed
+  Elle at strict serializability, every one G-single-item-realtime. Timeline 19's: a read on
+  one copy listed an append at 88.83 s, a read begun after it (89.09 s) on another copy did not,
+  and the append was acknowledged only at 89.19 s: the documented read model (a write seen
+  before its acknowledgment, copies apart until then), no acknowledged write missed. Since,
+  Elle judges serializability and `realtime_reads` the reads' promise directly (above), so
+  that a stale read of an acknowledged append still fails.
