@@ -97,3 +97,18 @@ in 67, level 5 in 17, a tetris (four lines at once) in 19; level 10 and 80 lines
 The rules: the level lags its lines in 484 timelines (every one that cleared 5 lines), and one
 hard drop placed two pieces in 25, the scoring player keeping its stacks low and so stuck at
 the spawn row far less often than random placement (138 of 728).
+
+## Returning to the deepest games (deepest.py), run 161
+
+Antithesis's quest went on from the deepest states. `deepest.py` (a strategy that only chooses
+returns) did that here: just after each timeline's deepest improvement of the generation (fewer
+holes than any game before at N pieces, or K lines cleared). Run 161 (srv3, 2026-10-29, the
+scoring player, seed 1, 512 timelines, as run 119 with the explorer's own returns): games that
+cleared 10 lines in 369 timelines (run 119: 443), 20 in 186 (305), 30 in 90 (214), 40 in 50
+(145), 60 in 35 (67). Worse at every depth. Few timelines improved anything in a generation,
+so it returned to one or two moments where the explorer returns to three, and the explorer used
+just those: the rest of each generation went to fresh games. Since then the explorer fills a
+strategy's short answer with its own choices (docs/PLUGINS.md), and `deepest.py` fills its own
+with the deepest milestone each candidate reached at all, after the generation's improvements.
+On the way, a hang in every tree with such a strategy: the forked in-run snapshots kept the
+plugin's pipe, and each timeline waited for its plugin to exit (fixed, e2e tree).
