@@ -198,6 +198,21 @@ the whole timeline (the coverage profile's slower brokers never got one).
   log notes each write's partition, and a committed transaction whose unread writes all sit on
   partitions whose known hang was aborted is that bug's (a `kafka_known_loss` event), not a
   lost or torn one.
+- Redpanda 26.2.6, first hunt (run 177, `redpanda` profile, production mode, 2026-10-29), under
+  investigation: transactions open for good once faults stop ("no transaction stays open once
+  faults stop", timelines 23, 46, 56 of the first 68). Timeline 23: partitions 0 and 3 hold a
+  transaction of producer 1004 at epoch 7 (from offsets 297 and 282) that its coordinator
+  (`kafka_internal/tx/32`, on kafka-3) holds as "status: empty, partitions: {}". Each partition
+  asks to expire it after its 10 s timeout, and the coordinator refuses ("Can not update
+  transaction state from empty to expired as this transition is invalid", 698 times from
+  152 s on), so the last stable offset never moves. Timeline 46 shows the same refusal (from
+  1,128 s). Before it, from 131 s, kafka-1 and kafka-3 lost power several times (crash,
+  durable_crash) and kafka-2 was stopped. Either the coordinator lost the partitions it had
+  added (its log behind the data partitions' after the power losses), or a produce delayed past
+  the transaction's end opened a new one the coordinator never knew (Kafka's KIP-890 class: the
+  client retries up to 1,000 times, under delay and duplication faults). Not TSB-2026-37 (an
+  rm_stm deadlock in 26.1.1 to 26.1.5). Next: causality on timeline 23 (where it was decided),
+  then the coordinator's and the partitions' logs at that moment.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
