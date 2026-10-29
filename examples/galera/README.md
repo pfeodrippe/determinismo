@@ -226,3 +226,13 @@ will say whether it still happens.
   position (`WSREP: Recovered position d43f1730…:8`). A node that finds no primary component
   within gcomm's wait gives up starting (`failed to reach primary view`, by design, started
   again): a known exit.
+- Hunt run 196 (srv3, 2026-10-29, `jepsen-dirsync` with final reads, seed 3, stopped at its
+  plateau after 2 h): 715 timelines, 434 failing. "No primary component runs under a nil
+  history" in 345 (the finding above); final reads never reaching a node in 210 (the cluster
+  waiting for an operator after a whole-cluster crash with no position: the caveat above);
+  **acknowledged appends lost in the final read in 120**, every one of them in a timeline where
+  a node started a new group from scratch ("Starting new group from scratch", 109 also under a
+  nil history), none elsewhere: the new history the joiner and nil-history findings above
+  begin, not another loss. Unexpected exits (117) and mariadbd crashes (86) are the known exits
+  and aborts above. Next: `jepsen-recovered` (run queued), whose restarts recover their
+  position, against these.
