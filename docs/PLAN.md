@@ -71,7 +71,8 @@ event hashing, the guest module.
   Khepri ra-synced, hyperthreads, OpenSearch and Redpanda again, ZooKeeper known, YugabyteDB
   outages; smokes, one after another: Cassandra 5.0.9 (ready on its storage port since its first
   smoke), its Accord scenario (6.0-alpha2), ClickHouse Keeper, rqlite (`snapshots`), Apache
-  Ignite 3.1, SurrealDB 3.3 on TiKV: new systems Jepsen never analyzed (docs/JEPSEN.md).
+  Ignite 3.1, SurrealDB 3.3 on TiKV, Kafka 4.4's share groups: new systems and features Jepsen
+  never analyzed (docs/JEPSEN.md).
 
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
