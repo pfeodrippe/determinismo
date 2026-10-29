@@ -108,6 +108,15 @@ pub fn NodeSpec(comptime Name: type) type {
         privileged: bool = false,
         /// Process limits (Docker's names: .{ .name = "nofile", .soft = 65536, .hard = 65536 }).
         ulimits: ?[]const schema.Ulimit = null,
+        /// Processes (by command name) whose crashes the system is known to have: counted, not
+        /// failed (schema.Node.crashes_known).
+        crashes_known: []const []const u8 = &.{},
+        /// A writeback window in seconds: the node's disk synced that often, as a host's flusher
+        /// would (schema.Node.writeback_s); null: strict, nothing written back unasked.
+        writeback_s: ?u32 = null,
+        /// Exits the system is known to make, by what the node wrote last: counted, not failed
+        /// (schema.Node.exits_known).
+        exits_known: []const []const u8 = &.{},
     };
 }
 
@@ -409,6 +418,9 @@ pub fn System(comptime Nodes: type) type {
                         .memory_max_mib = spec.memory_max_mib,
                         .privileged = spec.privileged,
                         .ulimits = spec.ulimits,
+                        .crashes_known = spec.crashes_known,
+                        .writeback_s = spec.writeback_s,
+                        .exits_known = spec.exits_known,
                     });
                 } else if (Field == Node) {
                     const message = "profile {s}: node {s} is not optional\n";

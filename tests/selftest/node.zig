@@ -171,7 +171,11 @@ fn serve(client: linux.fd_t) void {
     const size = linux.read(client, &buffer, buffer.len);
     if (linux.errno(size) != .SUCCESS or size == 0) return;
     const line = std.mem.trim(u8, buffer[0..size], "\r\n");
-    if (std.mem.eql(u8, line, "die")) linux.exit_group(3);
+    if (std.mem.eql(u8, line, "die")) {
+        const said = "dying as told\n";
+        _ = linux.write(2, said, said.len);
+        linux.exit_group(3);
+    }
     if (mutant) {
         for (buffer[0..size]) |*byte| byte.* = std.ascii.toUpper(byte.*);
     }

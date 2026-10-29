@@ -266,6 +266,9 @@ fn node_resolve(
         .privileged = node.privileged,
         .ulimits = node.ulimits,
         .antithesis_library = node.antithesis_library,
+        .crashes_known = node.crashes_known,
+        .writeback_s = node.writeback_s,
+        .exits_known = node.exits_known,
     };
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|

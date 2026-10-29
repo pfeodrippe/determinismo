@@ -70,6 +70,7 @@ pub fn main(init: std.process.Init) !void {
             .oom = oom,
             .crash = crash,
             .disk = disk,
+            .writeback = writeback,
             .durability = durability,
             .inject = inject,
             .readdress = readdress,
@@ -79,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
             .controller = @import("controller.zig").scenario,
             .maze = maze,
             .records = records_scenario,
+            .flood = flood_scenario,
             .ending = ending_scenario,
             .sinks = sinks_scenario,
         },
@@ -100,6 +102,22 @@ fn describe(d: *System.Describe) !void {
         .env = &.{"DET_MUTANT=1"},
         .ready = .{ .tcp = port },
         .faults = quiet,
+    });
+    // The crash scenario's segfault declared known: counted, not failed.
+    const known_crash = try d.profile("known-crash");
+    known_crash.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = quiet,
+        .crashes_known = &.{"det-selftest-node"},
+    });
+    // The node_exit scenario's exit declared known, by what the node says as it dies.
+    const known_exit = try d.profile("known-exit");
+    known_exit.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = quiet,
+        .exits_known = &.{"dying as told"},
     });
     const memory = try d.profile("memory");
     memory.node(.echo, .{
@@ -156,6 +174,15 @@ fn describe_faulted(d: *System.Describe) !void {
         .env = &.{"DET_DURABLE=1"},
         .ready = .{ .tcp = port },
         .faults = crashes,
+    });
+    // A durable node with a 1 s writeback window, for the "writeback" scenario.
+    const windowed = try d.profile("writeback");
+    windowed.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .env = &.{"DET_DURABLE=1"},
+        .ready = .{ .tcp = port },
+        .faults = crashes,
+        .writeback_s = 1,
     });
     // Faults the scenario asks for: the injector runs (it may pause or stop the node).
     const injectable = try d.profile("injectable");
@@ -316,6 +343,28 @@ fn segfault(context: *System.Context) !void {
     _ = try node.exec(&.{ "/bin/det-selftest-node", "crash" });
 }
 
+fn flood_scenario(s: *System.Scenario) void {
+    s.singleton_driver("flood", flood);
+}
+
+/// 40 MB of output in moments, as a node looping on an error writes it: the output forwarder
+/// keeps 8 MB and the rate, drops the rest and says so (output_dropped), and the logging
+/// property fails.
+fn flood(_: *System.Context) !void {
+    var line: [100]u8 = undefined;
+    @memset(&line, 'x');
+    line[line.len - 1] = '\n';
+    var buffer: [64 * 1024]u8 = undefined;
+    for (0..buffer.len / line.len) |index| @memcpy(buffer[index * line.len ..][0..line.len], &line);
+    const usable = buffer.len / line.len * line.len;
+    var written: usize = 0;
+    while (written < 40 * 1000 * 1000) {
+        const result = linux.write(1, &buffer, usable);
+        if (linux.errno(result) != .SUCCESS) return error.WriteFailed;
+        written += result;
+    }
+}
+
 fn records_scenario(s: *System.Scenario) void {
     s.singleton_driver("record", records_make);
 }
@@ -344,6 +393,26 @@ fn squares_check(check: *sdk.Check, records: []const Square) !void {
 
 fn disk(s: *System.Scenario) void {
     s.singleton_driver("disk_faults", disk_faults);
+}
+
+fn writeback(s: *System.Scenario) void {
+    s.singleton_driver("writeback_window", writeback_window);
+}
+
+/// A node with a writeback window (1 s, the "writeback" profile): a file it wrote without
+/// syncing is on its disk once the window passed, as a host's flusher would have put it, and a
+/// crash keeps it. (Strict nodes lose it: "disk".)
+fn writeback_window(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    const status = echo.exec(&.{ "/bin/det-selftest-node", "unsynced", "/data/windowed" }) catch 1;
+    sdk.sleep_ms(2500);
+    try echo.crash();
+    try sdk.retry(100, 100, answers, .{echo.address});
+    const kept = file_present(&echo, "/data/windowed");
+    sdk.always(status == 0 and kept, "a crash keeps what was written before a node's writeback " ++
+        "window", .{ .written = status == 0, .kept = kept });
+    sdk.stop_faults(0);
 }
 
 fn durability(s: *System.Scenario) void {

@@ -20,6 +20,15 @@ const sdk = @import("determinismo");
 /// A line longer than this is cut into several events.
 const line_size_max = 2048;
 const read_size = 4096;
+/// Output kept, as events and in the log file, at Antithesis's logging rate (200 MB an hour of
+/// virtual time, the logging property's), with a burst: a node looping on an error (Redpanda's
+/// controller, run 83: 4 GB of events in one timeline, its run's page slow while serve took
+/// them in, and the log file in the guest's memory) has the rest dropped, counted in an
+/// `output_dropped` event, so the property still sees it. Lines dropped are not checked for
+/// language properties (a panic in a flood).
+const kept_bytes_per_s = 200 * 1000 * 1000 / 3600;
+const kept_burst_bytes = 8 * 1000 * 1000;
+const report_every_ns = 10 * std.time.ns_per_s;
 
 pub const Pipes = struct { stdout: [2]linux.fd_t, stderr: [2]linux.fd_t };
 
@@ -94,6 +103,7 @@ fn run(source: []const u8, log_path: [:0]const u8, stdout: linux.fd_t, stderr: l
         .{ .fd = stderr, .name = "stderr" },
     };
     var batch: Batch = .{ .source = source, .device = device };
+    var budget: Budget = .{ .at_ns = monotonic_ns() };
     while (streams[0].open or streams[1].open) {
         var polls: [2]linux.pollfd = undefined;
         var polled: [2]*Stream = undefined;
@@ -119,12 +129,66 @@ fn run(source: []const u8, log_path: [:0]const u8, stdout: linux.fd_t, stderr: l
                 stream.partial_size = 0;
                 continue;
             }
+            if (!budget.take(size)) {
+                budget.dropped_bytes += size;
+                budget.dropped_lines += std.mem.count(u8, buffer[0..size], "\n");
+                stream.partial_size = 0; // Its rest is dropped too.
+                // Said every 10 s while dropping: a node flooding to its timeline's end has its
+                // forwarder killed before it would say it.
+                if (budget.seen_ns -| budget.reported_ns >= report_every_ns) budget.report(&batch);
+                continue;
+            }
+            budget.report(&batch);
             if (log) |fd| _ = linux.write(fd, &buffer, size);
             lines_split(&batch, stream, buffer[0..size]);
         }
         batch.flush(); // What one read brought: one request.
     }
+    budget.report(&batch);
     batch.flush();
+}
+
+/// A token bucket over virtual time (kept_bytes_per_s, kept_burst_bytes), and what it dropped
+/// since it last said so.
+const Budget = struct {
+    tokens: u64 = kept_burst_bytes,
+    at_ns: u64,
+    dropped_bytes: u64 = 0,
+    dropped_lines: u64 = 0,
+    reported_ns: u64 = 0,
+    /// The last moment a read was weighed: the reports' cadence.
+    seen_ns: u64 = 0,
+
+    fn take(budget: *Budget, size: u64) bool {
+        const now = monotonic_ns();
+        const earned = (now -| budget.at_ns) * kept_bytes_per_s / std.time.ns_per_s;
+        if (earned > 0) {
+            budget.tokens = @min(kept_burst_bytes, budget.tokens + earned);
+            budget.at_ns = now;
+        }
+        budget.seen_ns = now;
+        if (budget.tokens < size) return false;
+        budget.tokens -= size;
+        return true;
+    }
+
+    fn report(budget: *Budget, batch: *Batch) void {
+        if (budget.dropped_bytes == 0) return;
+        batch.event(.{ .event = "output_dropped", .details = .{
+            .source = batch.source,
+            .bytes = budget.dropped_bytes,
+            .lines = budget.dropped_lines,
+        } });
+        budget.dropped_bytes = 0;
+        budget.dropped_lines = 0;
+        budget.reported_ns = budget.seen_ns;
+    }
+};
+
+fn monotonic_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
 
 fn lines_split(batch: *Batch, stream: *Stream, bytes: []const u8) void {

@@ -81,6 +81,7 @@ pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
         }
     }
     try hosts_write("/etc/hosts", system);
+    host_settings();
     for (system.nodes) |*node| {
         try start(arena, system, node);
         try ready_wait(node);
@@ -437,6 +438,18 @@ fn writeback_relax() void {
         .{ "/proc/sys/vm/dirty_expire_centisecs", "8640000" },
         .{ "/proc/sys/vm/dirty_background_ratio", "50" },
         .{ "/proc/sys/vm/dirty_ratio", "80" },
+    };
+    for (settings) |setting| file_write(setting[0], setting[1]) catch {};
+}
+
+/// What systems' documentation asks of every host, set once before any node starts (whatever
+/// their disks): the memory-map count OpenSearch's and Elasticsearch's (their bootstrap checks
+/// refuse to form a cluster below it), the asynchronous I/O events Redpanda's (Seastar reserves
+/// them per shard).
+fn host_settings() void {
+    const settings = [_][2][:0]const u8{
+        .{ "/proc/sys/vm/max_map_count", "262144" },
+        .{ "/proc/sys/fs/aio-max-nr", "1048576" },
     };
     for (settings) |setting| file_write(setting[0], setting[1]) catch {};
 }
@@ -951,6 +964,35 @@ fn thread_stopped(pid: linux.pid_t, tid: linux.pid_t) bool {
 pub const State = enum { running, paused, stopped };
 
 /// Whether the node runs, is frozen, or has no live main process.
+/// A host's flusher for nodes that declare a writeback window (schema.Node.writeback_s): every
+/// second of virtual time, each such node whose window passed since its last has its disk synced
+/// (syncfs), so a power loss drops what was written in the last window only. Runs as long as the
+/// guest (det-nodes writeback, from init). A node down (its disk unmounted) is skipped.
+pub fn writeback_loop(system: *const schema.System) noreturn {
+    var last_s: [schema.nodes_max]u64 = @splat(0);
+    var now_s: u64 = 0;
+    while (true) {
+        sleep_ns(std.time.ns_per_s);
+        now_s += 1;
+        for (system.nodes, 0..) |node, index| {
+            const window_s = node.writeback_s orelse continue;
+            if (now_s - last_s[index] < window_s) continue;
+            last_s[index] = now_s;
+            writeback(node.name);
+        }
+    }
+}
+
+fn writeback(name: []const u8) void {
+    var paths: Paths = undefined;
+    paths.init(name) catch return;
+    if (!exists(paths.mounted)) return;
+    const fd = linux.open(paths.layer, directory_flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.syscall1(.syncfs, @as(usize, @intCast(fd)));
+}
+
 pub fn state_of(name: []const u8) State {
     if (pid_read(name) == null) return .stopped;
     var paths: Paths = undefined;

@@ -1505,6 +1505,37 @@ fn check_builtin_properties(context: *Context) !void {
     });
     const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
     expect(context, crash_caught, "built-in properties catch a crash (SIGSEGV) in a node", .{});
+    // Declared known (schema.Node.crashes_known): counted as a sometimes, not failed.
+    const known = try explore(context, &.{
+        "--program", program, "--profile", "known-crash", "--scenario", "crash", "--seed", "1", "--branches", "1",
+    });
+    expect_all(context, &.{
+        .{ "no crash property fails", std.mem.indexOf(u8, known, "FAIL \"no process crashes") == null },
+        .{ "the known crash is counted", std.mem.indexOf(u8, known, "a process crash the system is known to have: det-selftest-node") != null },
+    }, "a crash the system declares known is counted, not failed", .{});
+    // An exit declared known by what the node wrote last: counted, not failed.
+    const known_exit = try explore(context, &.{
+        "--program", program, "--profile", "known-exit", "--scenario", "node_exit", "--seed", "1", "--branches", "1",
+    });
+    expect_all(context, &.{
+        .{ "no exit property fails", std.mem.indexOf(u8, known_exit, "FAIL \"no unexpected container exits\"") == null },
+        .{ "the known exit is counted", std.mem.indexOf(u8, known_exit, "an exit the system is known to make: dying as told") != null },
+    }, "an exit the system declares known (by its output) is counted, not failed", .{});
+    // A command writes 40 MB in moments: the forwarder keeps 8 MB and the rate, and says what it
+    // dropped; the logging property fails; the events are far smaller than the output.
+    const flood_events = try std.fs.path.join(context.arena, &.{ context.scratch, "flood-events" });
+    std.Io.Dir.cwd().deleteTree(context.io, flood_events) catch {};
+    const flooded = try explore(context, &.{
+        "--program", program, "--scenario", "flood", "--seed", "1", "--branches", "1", "--events-dir", flood_events,
+    });
+    const dropped = try query_count(context, &.{ flood_events, "event=output_dropped" });
+    const flood_file = try std.fs.path.join(context.arena, &.{ flood_events, "branch-0.jsonl" });
+    const flood_size = (std.Io.Dir.cwd().statFile(context.io, flood_file, .{}) catch null);
+    expect_all(context, &.{
+        .{ "the forwarder said what it dropped", dropped > 0 },
+        .{ "the logging property fails", std.mem.indexOf(u8, flooded, "FAIL always                hit in    1/1 branches, failing in    0  logging output stays under 200 MB") != null },
+        .{ "the events are under 20 MB", flood_size != null and flood_size.?.size < 20 * 1000 * 1000 },
+    }, "40 MB of output in moments: 8 MB kept, the rest dropped and counted, the logging property failing", .{});
     try check_core_dump(context, program);
 }
 
@@ -2069,12 +2100,22 @@ fn check_disk(context: *Context) !void {
     }
     expect_all(context, &.{
         .{ "every disk property passes in all 3 timelines", passes },
-        .{ "an outage's property passes in all 3 timelines", outage_passes },
+        .{ "the outages' properties (power losses, kills) pass in all 3 timelines", outage_passes },
         .{ "the outage is logged as one fault", outages > 0 },
         .{ "a timeline replays exactly", same },
     }, "disk: a crash keeps what was synced and loses the rest, a wipe loses both; dropped " ++
         "writes vanish, refused ones fail, a slow disk is slow, and it works again; an outage " ++
         "takes two nodes down at once, each keeping what it synced; a timeline replays exactly", .{});
+    // A node with a writeback window (its disk synced every second, as a host's flusher would)
+    // keeps across a crash what it wrote without syncing before the window: the strict nodes
+    // above lose it.
+    const windowed = try explore(context, &.{
+        "--program", program, "--profile", "writeback", "--scenario", "writeback", "--seed", "1", "--branches", "2",
+    });
+    expect(context, has_lines(windowed, &.{
+        "PASS always                hit in    2/2 branches, failing in    0  a crash keeps what was " ++
+            "written before a node's writeback window",
+    }), "disk: a node with a writeback window keeps, after a crash, what it wrote before it", .{});
     if (!passes or !outage_passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_skipped", "fault_heal_failed", "fault_inject_refused", "det-nodes",
     }) catch ""});

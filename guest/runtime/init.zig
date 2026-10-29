@@ -71,9 +71,24 @@ fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
         const names = arena.alloc([]const u8, system.nodes.len) catch return 1;
         for (system.nodes, names) |node, *name| name.* = node.name;
         node_names = names;
+        const exits = arena.alloc([]const []const u8, system.nodes.len) catch return 1;
+        for (system.nodes, exits) |node, *texts| texts.* = node.exits_known;
+        exits_known = exits;
+        var known: std.ArrayList([]const u8) = .empty;
+        for (system.nodes) |node| known.appendSlice(arena, node.crashes_known) catch {};
+        crashes_known = known.items;
     } else |_| {}
     // Antithesis's output sinks in the nodes, as events, until the timeline ends.
     sinks_pid = spawn(&.{bin ++ "det-sinks"});
+    // Nodes with a writeback window: their disks synced that often, for good (nodes.zig), from
+    // before they start: setup can be long (OpenSearch's took 77 s), and a loop begun after it
+    // left everything written meanwhile unsynced at the first power loss (run 92).
+    if (nodes.system_load(arena)) |system| {
+        const windowed = for (system.nodes) |node| {
+            if (node.writeback_s != null) break true;
+        } else false;
+        if (windowed) _ = spawn(&.{ bin ++ "det-nodes", "writeback" });
+    } else |_| {}
     const pid_up = spawn(&.{ bin ++ "det-nodes", "up" });
     const status_up = wait_for(pid_up);
     if (status_up != 0) {
@@ -289,9 +304,44 @@ fn wait_for(pid: linux.pid_t) u32 {
 /// remove its pidfile first, so an exit of the process a pidfile names is unexpected.
 const node_exit_property = "no unexpected container exits";
 var node_names: []const []const u8 = &.{};
+const known_exit_prefix = "an exit the system is known to make: ";
+/// Each node's known exits (schema.Node.exits_known), in node_names' order.
+var exits_known: []const []const []const u8 = &.{};
+const output_tail_max = 64 * 1024;
+
+/// The known exit the node's last output names, if one. Its forwarder may not have written its
+/// last lines yet when the exit is seen: looked for again, for 200 ms.
+fn exit_known(index: usize, name: []const u8) ?[]const u8 {
+    if (index >= exits_known.len or exits_known[index].len == 0) return null;
+    for (0..20) |_| {
+        if (exit_known_now(index, name)) |text| return text;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    return null;
+}
+
+fn exit_known_now(index: usize, name: []const u8) ?[]const u8 {
+    var path_buffer: [nodes.path_size_max]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/run/det/nodes/{s}/output.log", .{name}, 0) catch return null;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const end = linux.lseek(@intCast(fd), 0, linux.SEEK.END);
+    if (linux.errno(end) != .SUCCESS) return null;
+    const size: u64 = @intCast(end);
+    var tail: [output_tail_max]u8 = undefined;
+    const offset = size -| tail.len;
+    const read = linux.pread(@intCast(fd), &tail, tail.len, @intCast(offset));
+    if (linux.errno(read) != .SUCCESS) return null;
+    for (exits_known[index]) |text| {
+        if (std.mem.indexOf(u8, tail[0..read], text) != null) return text;
+    }
+    return null;
+}
 
 fn orphan_reaped(pid: linux.pid_t, status: u32) void {
-    for (node_names) |name| {
+    for (node_names, 0..) |name, index| {
         if (nodes.pid_recorded(name) != pid) continue;
         const code = if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f);
         // As Antithesis judges a container's exit: 0, SIGKILL and SIGTERM are expected; and any
@@ -300,6 +350,13 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
         const signaled = code == 128 + 9 or code == 128 + 15;
         const expected = code == 0 or signaled or nodes.disk_failing(name);
         const details = .{ .node = name, .status = code };
+        if (!expected) if (exit_known(index, name)) |text| {
+            var property_buffer: [known_exit_prefix.len + 128]u8 = undefined;
+            const shown = text[0..@min(text.len, 128)];
+            const property = std.fmt.bufPrint(&property_buffer, known_exit_prefix ++ "{s}", .{shown}) catch return;
+            sdk.assert_computed(.sometimes, true, property, details);
+            return;
+        };
         sdk.assert_computed(.always, expected, node_exit_property, details);
         return;
     }
@@ -316,6 +373,9 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
 /// client's rpc_tp_Transact thread is postgres's). A timeline without any crash passes
 /// `crash_property`.
 const oom_property = "the kernel kills no process for lack of memory";
+const known_crash_prefix = "a process crash the system is known to have: ";
+/// The processes whose crashes the system's nodes declare known (schema.Node.crashes_known).
+var crashes_known: []const []const u8 = &.{};
 const crash_property = "no process crashes (segfault, illegal instruction, ...)";
 const crash_property_prefix = "no process crashes: ";
 const kernel_property = "the kernel reports no warnings, BUGs or hung tasks";
@@ -341,6 +401,20 @@ fn kernel_check() void {
             }
             const record = kmsg_record(buffer[0..size]) orelse continue;
             const problem = kernel_problem(record.text) orelse continue;
+            if (problem == .crash) {
+                const process = crash_process_of(crashes, record.text);
+                // By name, or its start: a command name (comm) is 15 characters at most.
+                const known = for (crashes_known) |name| {
+                    if (std.mem.startsWith(u8, process, name)) break true;
+                } else false;
+                if (known) {
+                    var known_buffer: [known_crash_prefix.len + 64]u8 = undefined;
+                    const property = std.fmt.bufPrint(&known_buffer, known_crash_prefix ++ "{s}", .{process}) catch
+                        continue;
+                    sdk.assert_computed(.sometimes, true, property, .{ .kernel_us = record.time_us, .line = record.text });
+                    continue;
+                }
+            }
             seen.set(problem, true);
             var crash_buffer: [crash_property_prefix.len + 64]u8 = undefined;
             const property = switch (problem) {

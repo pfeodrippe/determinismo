@@ -81,6 +81,24 @@ pub const Node = struct {
     /// projects have it, as on Antithesis. Off by default: a static program with Antithesis's
     /// Go SDK (K3s, through etcd) cannot load a library, and the SDK stops it when one is there.
     antithesis_library: bool = false,
+    /// Processes (by command name) whose crashes the system is known to have: such a crash is
+    /// counted ("a process crash the system is known to have: <name>", a sometimes) instead of
+    /// failing "no process crashes: <name>" in every timeline, which left a run's failing
+    /// timelines saying nothing (YugabyteDB 1.3.1's YSQL backends crash on their way out: run
+    /// 77, every timeline). Another process's crash still fails.
+    crashes_known: []const []const u8 = &.{},
+    /// A writeback window, in seconds: the guest writes nothing back unasked (a power loss drops
+    /// every write never synced, however old), but this node's disk is synced that often, as a
+    /// host's flusher writes dirty data back within ~30 s: a power loss drops the last window's
+    /// writes only. For systems that leave their own metadata to writeback (RabbitMQ's feature
+    /// flags and Mnesia tables bricked nodes after power losses at any age). Null: strict.
+    writeback_s: ?u32 = null,
+    /// Exits the system is known to make, by what the node wrote last (a substring of its
+    /// output's last 64 KB): such an exit is counted ("an exit the system is known to make:
+    /// <text>", a sometimes) instead of failing "no unexpected container exits" in nearly every
+    /// timeline (ZooKeeper's servers that lost power before their first snapshot reached the
+    /// disk refuse to start: ZOOKEEPER-3220). Another exit still fails.
+    exits_known: []const []const u8 = &.{},
 };
 
 /// Where a node's root filesystem comes from: exactly one field is set.
@@ -298,6 +316,9 @@ pub const Resolved = struct {
     privileged: bool = false,
     ulimits: ?[]const Ulimit = null,
     antithesis_library: bool = false,
+    crashes_known: []const []const u8 = &.{},
+    writeback_s: ?u32 = null,
+    exits_known: []const []const u8 = &.{},
 };
 
 pub fn node_address(index: u32) [4]u8 {

@@ -186,6 +186,9 @@ pub fn emit(events: *Events, moment: Moment, data: []const u8) !void {
             if (checks and events.checks_start_ns == null) events.checks_start_ns = moment.vtime_ns;
             events.check_event(name.string, value.object.get("details"));
         }
+        if (name == .string and std.mem.eql(u8, name.string, "output_dropped")) {
+            events.on_output_dropped(value.object.get("details"));
+        }
         if (name == .string) {
             const size: u8 = @intCast(@min(name.string.len, events.last_event_name.len));
             @memcpy(events.last_event_name[0..size], name.string[0..size]);
@@ -421,6 +424,16 @@ fn on_output(events: *Events, output: std.json.Value) void {
     if (output != .object) return;
     const text = string_field(output.object, "text") orelse return;
     events.output_bytes += text.len;
+}
+
+/// Output the guest's forwarder dropped over its rate (guest/runtime/output.zig): still output,
+/// for the logging property.
+fn on_output_dropped(events: *Events, details: ?std.json.Value) void {
+    const found = details orelse return;
+    if (found != .object) return;
+    const bytes = found.object.get("bytes") orelse return;
+    if (bytes != .integer or bytes.integer < 0) return;
+    events.output_bytes += @intCast(bytes.integer);
 }
 
 fn on_lifecycle(events: *Events, moment: Moment, lifecycle: std.json.Value) void {
