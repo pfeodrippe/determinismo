@@ -156,7 +156,9 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
             // The controller's port (Redpanda's RPC port): open at once. The broker's opens once
             // the quorum formed, which needs the nodes started after this one.
             .ready = .{ .tcp = if (redpanda) redpanda_rpc_port else controller_port },
-            .faults = .{ .restart = true, .crash = true, .stop = true },
+            // Clock skews too: coordinators expire transactions by their wall clocks, and the
+            // logs' safety must not depend on the brokers' clocks agreeing.
+            .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
         });
     }
     profile.node(.kclient, .{

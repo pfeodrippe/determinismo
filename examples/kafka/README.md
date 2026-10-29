@@ -103,6 +103,10 @@ Setup creates the topic and starts one producer before faults begin: Kafka creat
 transaction coordinators' topic at the first producer's start, and under faults that can take
 the whole timeline (the coverage profile's slower brokers never got one).
 
+Since 2026-10-29 the brokers' clocks are skewed too (`clock_skew`, one broker's realtime clock
+ahead or behind by up to 10 s for a while, sometimes strobing): transaction coordinators expire
+transactions by their wall clocks, and the logs' safety must not depend on clocks agreeing.
+
 ## Share groups (queues for Kafka)
 
 Scenario `share`, on the `kafka-4.4` profiles (share groups are KIP-932, production-ready since
