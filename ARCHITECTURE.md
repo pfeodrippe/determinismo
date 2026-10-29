@@ -183,7 +183,15 @@ vCPU threads pinned; `isolcpus`/`nohz_full` for VM cores; `mitigations=` and
   *steerability only* (determinism must never depend on them):
   - kernel RNG and vDSO `getrandom` pull from the platform;
   - scheduler hooks for thread-starvation faults;
-  - `CLOCK_REALTIME` offsets for clock-skip faults (RDTSC is unaffected, as in Antithesis).
+  - `CLOCK_REALTIME` offsets for clock-skip faults (RDTSC is unaffected, as in Antithesis);
+  - per-node realtime offsets (patch 0005, implemented): each node runs in a time namespace of
+    its own, and namespaces get a `realtime` offset (CLOCK_REALTIME, its coarse form and TAI)
+    changeable while tasks run, through `/proc/<pid>/timens_offsets`: the vDSO applies it (its
+    timens page, rewritten in place, not preempted on the one vCPU), the syscalls add it, and
+    absolute deadlines on those clocks (clock_nanosleep, POSIX timers, timerfd, futex waits) are
+    converted to the host's. The `clock_skew` fault (Jepsen's bumps and strobes) sets it;
+    monotonic clocks and RDTSC are untouched. Deterministic: the offsets change only at the
+    injector's decisions.
 - **Guest runtime** (implemented in Zig, `guest/runtime/`):
   - `det-init` (PID 1): mounts, loads `det_guest.ko` (`/dev/determinismo`), mounts the system disk
     (`/det`: the program and `system.json`), starts the nodes, runs the scenario named by
