@@ -12,8 +12,9 @@ moves chosen by the platform, steered toward deeper games, every timeline replay
   timer's gravity as a `tick`) from lines on stdin, the game's state after each on stdout. A game
   per TCP connection (socat, port 7000).
 - **The player** (`tetris_test.zig`): a tactic like Antithesis's, a piece at a time: maybe a hold
-  (1 in 8), a rotation (`tetris.rotation`), a column (`tetris.column`), some gravity ticks, maybe a
-  nudge under an overhang (soft drops then a step aside), a hard drop. Every choice is a named
+  (1 in 16), a placement among the three best the game's own projection allows
+  (`tetris.placement`), some gravity ticks, maybe a nudge under an overhang (soft drops then a
+  step aside), a hard drop. Every choice is a named
   decision: strategies steer them, replays repeat them. How far a game gets is guidance (`sometimes`
   over 40 lines, levels 5 and 10). No faults: what varies is the player.
 - **The rules, checked after every move**: lines rise by four at most; the stack changes by whole
@@ -44,11 +45,15 @@ bar to hard drop blocks, sometimes you will drop 2", put down to keyboards. This
 the code that does it with one key press; #7 does not say whether its stacks were near the top,
 so it may not be the only cause.
 
-## Read in the source, not reached yet
+## Found: the level lags its lines
 
-- `update-score` sets the level from the lines *before* the move's clear: the level lags its
-  lines by a move. "The level is the one the lines give" checks it, but no game has cleared
-  the 5 lines level 1 needs yet.
+"The level is the one the lines give" fails once games clear lines (3 of 4 timelines with the
+scoring player): at 5 lines the level is still 0, at 15 still 1, through the next piece's
+moves. `update-score` sets the level from the lines *before* the move's clear, so it catches
+up at the next shift down; in the browser game, a gravity step later. Minor, and real.
+
+## Read in the source, not explored
+
 - `main.jank`'s gravity, `(nth frames 0 (:level world))`, is always `frames`'s first: `nth`'s third
   argument is the default, not the index, and pieces fall as fast at every level. The harness
   leaves the frontend's timing out, so this one is not explored.
@@ -65,8 +70,13 @@ quest kept, per depth bucket, the state with the best objective and went on from
 - A guidance assertion per depth, "no holes after N pieces" (its distance the holes): each power
   of two closer at any depth is a new behavior the tree returns to. Run 112: games from 25 to
   about 30 pieces on average and lines from 0.06 to about 0.6 per game, the best 42 pieces; a
-  plateau after some 16 generations. Deeper games want a better player (a tactic choosing
-  among the placements that leave fewest holes) or a strategy that keeps each depth's best.
+  plateau after some 16 generations.
+- The player since: the harness reports where the piece would land for each rotation and
+  column (`probes`: tetris.core's own projection), the player scores each landing as classic
+  Tetris players are scored (Dellacherie's features, El-Tetris's weights: height, lines,
+  holes, bumpiness) and a named decision picks among the best three. Its first four games:
+  10 to 20 lines, level 2, about 80 pieces, where random placement cleared a line now and
+  then.
 
 ## jank 0.1 (2026-10) met on the way
 

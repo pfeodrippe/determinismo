@@ -54,6 +54,7 @@ const State = struct {
     paused: bool = false,
     piece_x: i64 = 0,
     piece_y: i64 = 0,
+    piece_r: i64 = 0,
     player: [4][2]i64 = undefined,
     player_count: u32 = 0,
     board: [cells_max][2]i64 = undefined,
@@ -85,24 +86,21 @@ fn play(context: *System.Context) !void {
 fn piece_play(connection: *tcp.Connection, start: State) !State {
     var state = start;
     var moves: u32 = 0;
-    if (sdk.random_below_named("tetris.hold", 8) == 0) {
+    if (sdk.random_below_named("tetris.hold", 16) == 0) {
         state = try move(connection, state, "hold");
         moves += 1;
         if (state.over) return state;
     }
-    const rotations = [_][]const u8{ "none", "right", "twice", "left" };
-    switch (sdk.decide("tetris.rotation", &rotations)) {
-        0 => {},
-        1 => state = try move(connection, state, "rotr"),
-        2 => {
-            state = try move(connection, state, "rotr");
-            state = try move(connection, state, "rotr");
-        },
-        3 => state = try move(connection, state, "rotl"),
-        else => unreachable,
+    // Where to put it: the game says where it would land for each rotation and column, the
+    // best three by a classic evaluation are the options, and a named decision picks one.
+    const target = try placement_choose(connection, &state);
+    const turns = @mod(target.r - state.piece_r, 4);
+    if (turns == 3) {
+        state = try move(connection, state, "rotl");
+    } else for (0..@intCast(turns)) |_| {
+        state = try move(connection, state, "rotr");
     }
-    const columns = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
-    const column: i64 = @intCast(sdk.decide("tetris.column", &columns));
+    const column = target.x;
     while (moves < moves_per_piece_max and state.piece_x != column and !state.over) : (moves += 1) {
         const before = state.piece_x;
         state = try move(connection, state, if (column < state.piece_x) "left" else "right");
@@ -112,7 +110,7 @@ fn piece_play(connection: *tcp.Connection, start: State) !State {
     const ticks = sdk.random_below_named("tetris.ticks", 3);
     for (0..ticks) |_| state = try move(connection, state, "tick");
     // Now and then, slide under an overhang: down a few rows, then a step aside.
-    if (sdk.random_below_named("tetris.nudge", 6) == 0) {
+    if (sdk.random_below_named("tetris.nudge", 12) == 0) {
         for (0..1 + sdk.random_below_named("tetris.nudge_rows", 8)) |_| {
             state = try move(connection, state, "down");
         }
@@ -121,6 +119,89 @@ fn piece_play(connection: *tcp.Connection, start: State) !State {
     }
     if (state.over) return state;
     return move(connection, state, "drop");
+}
+
+const Placement = struct { r: i64, x: i64, score: i64 };
+const placement_options_max = 3;
+
+/// The player's tactic, as Antithesis's Tetris quest's mimicked good players: every landing
+/// the game reports (`probes`: tetris.core's own projection for each rotation and column) is
+/// scored, and a named decision picks among the best three. Without a landing (none fits), the
+/// piece goes where it is.
+fn placement_choose(connection: *tcp.Connection, state: *State) !Placement {
+    try connection.write_all("probes\n");
+    const probes = try connection.read_line();
+    var best: [placement_options_max]Placement = undefined;
+    var count: usize = 0;
+    if (std.mem.startsWith(u8, probes, "probes ")) {
+        var entries = std.mem.tokenizeScalar(u8, probes["probes ".len..], ' ');
+        var index: i64 = 0;
+        while (entries.next()) |entry| : (index += 1) {
+            if (std.mem.eql(u8, entry, "-")) continue;
+            var landing: [4][2]i64 = undefined;
+            var scratch: State = .{};
+            const cells = cells_parse(entry, &landing, &scratch);
+            if (scratch.off_board or cells != 4) continue;
+            const placement: Placement = .{ .r = @divFloor(index, width), .x = @mod(index, width), .score = score_of(state, &landing) };
+            // Kept sorted, best first.
+            var at = count;
+            while (at > 0 and best[at - 1].score < placement.score) : (at -= 1) {
+                if (at < placement_options_max) best[at] = best[at - 1];
+            }
+            if (at < placement_options_max) {
+                best[at] = placement;
+                count = @min(count + 1, placement_options_max);
+            }
+        }
+    }
+    // The state line follows the landings, unchanged.
+    state.* = try state_read(connection);
+    if (count == 0) return .{ .r = state.piece_r, .x = state.piece_x, .score = 0 };
+    const names = [_][]const u8{ "best", "second", "third" };
+    return best[sdk.decide("tetris.placement", names[0..count])];
+}
+
+/// The board after the piece lands there (full rows cleared), scored as classic Tetris players
+/// are (Dellacherie's features, El-Tetris's weights, by 100): -51 per row of total column
+/// height, +76 per line cleared, -36 per hole, -18 per step of bumpiness.
+fn score_of(state: *const State, landing: *const [4][2]i64) i64 {
+    var filled: [height][width]bool = @splat(@splat(false));
+    for (state.board[0..state.board_count]) |cell| filled[@intCast(cell[1])][@intCast(cell[0])] = true;
+    for (landing) |cell| filled[@intCast(cell[1])][@intCast(cell[0])] = true;
+    var kept: [height][width]bool = @splat(@splat(false));
+    var lines: i64 = 0;
+    var to: usize = height;
+    var from: usize = height;
+    while (from > 0) {
+        from -= 1;
+        const full = for (filled[from]) |cell| {
+            if (!cell) break false;
+        } else true;
+        if (full) {
+            lines += 1;
+            continue;
+        }
+        to -= 1;
+        kept[to] = filled[from];
+    }
+    var heights: [width]i64 = @splat(0);
+    var holes: i64 = 0;
+    for (0..width) |x| {
+        var top: ?usize = null;
+        for (0..height) |y| {
+            if (kept[y][x]) {
+                if (top == null) top = y;
+            } else if (top != null) holes += 1;
+        }
+        heights[x] = if (top) |y| @intCast(height - y) else 0;
+    }
+    var aggregate: i64 = 0;
+    var bumpiness: i64 = 0;
+    for (heights, 0..) |column_height, x| {
+        aggregate += column_height;
+        if (x + 1 < width) bumpiness += @intCast(@abs(column_height - heights[x + 1]));
+    }
+    return -51 * aggregate + 76 * lines - 36 * holes - 18 * bumpiness;
 }
 
 /// Sends a move, reads the state after it, and checks the game's rules across it.
@@ -271,6 +352,7 @@ fn state_parse(line: []const u8) State {
             _ = parts.next(); // Its type.
             state.piece_x = number(i64, parts.next() orelse "", &state);
             state.piece_y = number(i64, parts.next() orelse "", &state);
+            state.piece_r = number(i64, parts.next() orelse "", &state);
         }
         if (std.mem.eql(u8, key, "player")) state.player_count = cells_parse(value, &state.player, &state);
         if (std.mem.eql(u8, key, "board")) state.board_count = cells_parse(value, &state.board, &state);

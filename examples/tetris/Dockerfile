@@ -21,13 +21,13 @@ WORKDIR /opt/tetris
 # jank's default optimization: with -O 2 its compiler segfaults on the game (jank 0.1, 2026-10).
 RUN jank --module-path src compile --name tetris-harness tetris.harness \
  && cp target/tetris-harness /usr/local/bin/tetris-harness \
- && printf 'tick\ndrop\nquit\n' | /usr/local/bin/tetris-harness
+ && printf 'tick\nprobes\ndrop\nquit\n' | /usr/local/bin/tetris-harness
 
 FROM docker.io/library/ubuntu:24.04
 RUN apt-get update -q \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends socat \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/tetris-harness /usr/local/bin/tetris-harness
-RUN printf 'tick\ndrop\nquit\n' | /usr/local/bin/tetris-harness
+RUN printf 'tick\nprobes\ndrop\nquit\n' | /usr/local/bin/tetris-harness
 EXPOSE 7000
 ENTRYPOINT ["socat", "TCP-LISTEN:7000,reuseaddr,fork", "EXEC:/usr/local/bin/tetris-harness"]

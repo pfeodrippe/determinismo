@@ -58,13 +58,36 @@ std::string tetris_read_line()
          " player=" (cells (core/get-positions player))
          " board=" (cells positions))))
 
+; Where the piece would come to rest, rotated to r and moved to column x at its row, by the
+; game's own rules (core/projection), or nil where it cannot be put: for the player's tactic.
+(defn landing [world r x]
+  (let [player (assoc (:player world) :r r :x x)
+        positions (core/get-positions player)]
+    (when (and (not (core/collision? world positions))
+               (= 0 (core/out-of-bounds world :x positions))
+               (= 0 (core/out-of-bounds world :y positions)))
+      (core/projection (assoc world :player player)))))
+
+; "probes" and the 40 landings, rotation by rotation, column by column: cells, or "-".
+(defn probes-line [world]
+  (str "probes "
+       (clojure.string/join
+        " "
+        (for [r (range 4) x (range 10)]
+          (let [cells-at (landing world r x)]
+            (if cells-at (cells cells-at) "-"))))))
+
 (defn -main [& _]
   (loop [world (core/start)]
     (println (state-line world))
     (cpp/tetris_flush)
     (let [line (str (cpp/tetris_read_line))]
-      (if (= line "quit")
-        nil
+      (cond
+        (= line "quit") nil
+        ; The landings line, then the state line (unchanged), as after any move.
+        (= line "probes") (do (println (probes-line world))
+                              (recur world))
+        :else
         (let [action (get actions line)
               next-world (if action
                            (try
