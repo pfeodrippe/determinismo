@@ -185,26 +185,14 @@ fn transact(
         sdk.event("surrealdb_reply", .{ .status = response.status, .body = clip(response.body) });
         return .unknown;
     };
-    // BEGIN, a result per mop, COMMIT.
-    if (results.len != mops.len + 2) {
-        sdk.event("surrealdb_reply", .{ .status = response.status, .body = clip(response.body) });
-        return .unknown;
-    }
-    const commit = results[mops.len + 1];
-    for (results[0 .. mops.len + 1]) |result| {
-        if (result.ok() or result.not_executed()) continue;
-        // A statement before the commit failed: the transaction was cancelled.
-        sdk.event("surrealdb_statement_error", .{ .message = clip(result.message()) });
-        return .not_committed;
-    }
-    if (!commit.ok()) {
-        if (std.mem.indexOf(u8, commit.message(), "can be retried") != null) {
-            // A conflict found at the commit: SurrealDB's word that nothing was written.
-            sdk.event("surrealdb_conflict", .{ .message = clip(commit.message()) });
-            return .not_committed;
-        }
-        sdk.event("surrealdb_commit_error", .{ .message = clip(commit.message()) });
-        return .unknown;
+    const outcome = classify(results, mops.len);
+    if (outcome != .committed) {
+        sdk.event("surrealdb_refused", .{
+            .outcome = @tagName(outcome),
+            .commit = if (results.len == mops.len + 2) clip(results[mops.len + 1].message()) else "",
+            .body = clip(response.body),
+        });
+        return outcome;
     }
     for (mops, results[1 .. mops.len + 1], 0..) |mop, result, index| {
         if (mop.append) continue;
@@ -214,6 +202,23 @@ fn transact(
         };
     }
     return .committed;
+}
+
+/// A transaction's outcome by its COMMIT's result (BEGIN, a result per mop, COMMIT): committed;
+/// not, when the commit says a statement before it failed ("aborted due to a prior error") or it
+/// found a conflict ("can be retried": SurrealDB's word that nothing was written); unknown for
+/// any other error there, whatever the statements say.
+fn classify(results: []const Result, mops: usize) Outcome {
+    if (results.len != mops + 2) return .unknown;
+    const commit = results[mops + 1];
+    if (commit.ok()) {
+        for (results[0 .. mops + 1]) |result| if (!result.ok()) return .unknown;
+        return .committed;
+    }
+    const message = commit.message();
+    if (std.mem.indexOf(u8, message, "prior error") != null) return .not_committed;
+    if (std.mem.indexOf(u8, message, "can be retried") != null) return .not_committed;
+    return .unknown;
 }
 
 /// One transaction: BEGIN, a statement per mop, COMMIT.
@@ -361,4 +366,16 @@ test "results as SurrealDB 3.3 answers them" {
     try std.testing.expect(failed[1].not_executed());
     try std.testing.expect(!failed[2].ok() and !failed[2].not_executed());
     try std.testing.expectEqualStrings("An error occurred: x", failed[2].message());
+    try std.testing.expectEqual(Outcome.committed, classify(ok, 3));
+    try std.testing.expectEqual(Outcome.not_committed, classify(failed, 2));
+    // A conflict at the commit; any other error there may have committed.
+    const conflict = try results_parse(arena,
+        \\[{"result":null,"status":"OK"},{"result":[],"status":"OK"},{"result":"Failed to commit transaction due to a read or write conflict. This transaction can be retried","status":"ERR"}]
+    );
+    try std.testing.expectEqual(Outcome.not_committed, classify(conflict, 1));
+    const lost = try results_parse(arena,
+        \\[{"result":null,"status":"OK"},{"result":"There was a problem with the datastore: connection lost","status":"ERR"},{"result":"There was a problem with the datastore: connection lost","status":"ERR"}]
+    );
+    try std.testing.expectEqual(Outcome.unknown, classify(lost, 1));
+    try std.testing.expectEqual(Outcome.unknown, classify(lost, 2));
 }
