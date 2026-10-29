@@ -19,7 +19,14 @@ const sdk = @import("determinismo");
 const cores_directory = "/run/det/cores";
 /// "<thread id> <process name>" per crash: the kernel's crash line names the thread
 /// ("rpc_tp_Transact[5471]: segfault ..."), det-init's crash property the process (init.zig).
+/// Then "\t<text>" when the node's last output names one of its known exits
+/// (schema.Node.exits_known): a crash on its way down that the system declares known (Galera's
+/// abort after "State transfer cannot be completed"), whose signal 11 inside abort() looks
+/// like any other crash.
 pub const crashes_path = "/run/det/crashes";
+const system_path = "/det/system.json"; // nodes.zig's.
+const system_size_max = 4 * 1024 * 1024;
+const output_tail_max = 64 * 1024;
 const cores_size_max = 256 * 1024 * 1024;
 /// All of a timeline's cores.
 const cores_total_max = 512 * 1024 * 1024;
@@ -42,9 +49,9 @@ pub fn main(init: std.process.Init) !u8 {
     // is a crash of postgres).
     var process_buffer: [name_size_max]u8 = undefined;
     const process = process_name(pid, &process_buffer) orelse command;
-    crash_record(tid, process);
     var node_buffer: [name_size_max]u8 = undefined;
     const node = node_of(pid, &node_buffer);
+    crash_record(tid, process, known_of(init.arena.allocator(), node));
     var path_buffer: [256]u8 = undefined;
     const format = cores_directory ++ "/{s}-{s}-{d}.core";
     const path = try std.fmt.bufPrintSentinel(&path_buffer, format, .{ node, command, pid }, 0);
@@ -348,14 +355,68 @@ fn process_name(pid: linux.pid_t, buffer: *[name_size_max]u8) ?[]const u8 {
     return sanitized(buffer, name);
 }
 
-fn crash_record(tid: linux.pid_t, process: []const u8) void {
-    var line_buffer: [name_size_max + 16]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buffer, "{d} {s}\n", .{ tid, process }) catch return;
+fn crash_record(tid: linux.pid_t, process: []const u8, known: ?[]const u8) void {
+    var line_buffer: [name_size_max + 16 + known_size_max]u8 = undefined;
+    const shown = if (known) |text| text[0..@min(text.len, known_size_max - 1)] else "";
+    const line = std.fmt.bufPrint(&line_buffer, "{d} {s}{s}{s}\n", .{
+        tid, process, if (known != null) "\t" else "", shown,
+    }) catch return;
     const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
     const fd = linux.open(crashes_path, flags, 0o644);
     if (linux.errno(fd) != .SUCCESS) return;
     defer _ = linux.close(@intCast(fd));
     _ = linux.write(@intCast(fd), line.ptr, line.len); // One write: atomic under O_APPEND.
+}
+
+const known_size_max = 128;
+
+/// The node's known exit (schema.Node.exits_known) its last output names, if one. The node's
+/// output forwarder may not have written its last lines yet: looked for again, for 200 ms.
+fn known_of(arena: std.mem.Allocator, node: []const u8) ?[]const u8 {
+    const source = file_read(arena, system_path, system_size_max) orelse return null;
+    const system = sdk.schema.parse(sdk.schema.System, arena, source) catch return null;
+    const spec = system.node(node) orelse return null;
+    if (spec.exits_known.len == 0) return null;
+    var path_buffer: [256]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/run/det/nodes/{s}/output.log", .{node}, 0) catch
+        return null;
+    for (0..20) |_| {
+        const tail = tail_read(arena, path, output_tail_max) orelse return null;
+        for (spec.exits_known) |text| {
+            if (std.mem.indexOf(u8, tail, text) != null) return text;
+        }
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    return null;
+}
+
+fn file_read(arena: std.mem.Allocator, path: [:0]const u8, size_max: usize) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const buffer = arena.alloc(u8, size_max) catch return null;
+    var size: usize = 0;
+    while (size < buffer.len) {
+        const read = linux.read(@intCast(fd), buffer[size..].ptr, buffer.len - size);
+        if (linux.errno(read) != .SUCCESS or read == 0) break;
+        size += read;
+    }
+    return buffer[0..size];
+}
+
+/// The last `size_max` bytes of a file.
+fn tail_read(arena: std.mem.Allocator, path: [:0]const u8, size_max: usize) ?[]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    const end = linux.lseek(@intCast(fd), 0, linux.SEEK.END);
+    if (linux.errno(end) != .SUCCESS) return null;
+    const buffer = arena.alloc(u8, size_max) catch return null;
+    const offset: u64 = @as(u64, @intCast(end)) -| size_max;
+    const read = linux.pread(@intCast(fd), buffer.ptr, buffer.len, @intCast(offset));
+    if (linux.errno(read) != .SUCCESS) return null;
+    return buffer[0..read];
 }
 
 fn sanitized(buffer: *[name_size_max]u8, text: []const u8) []const u8 {

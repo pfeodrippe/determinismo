@@ -402,7 +402,17 @@ fn kernel_check() void {
             const record = kmsg_record(buffer[0..size]) orelse continue;
             const problem = kernel_problem(record.text) orelse continue;
             if (problem == .crash) {
-                const process = crash_process_of(crashes, record.text);
+                const crash = crash_of(crashes, record.text);
+                // A crash on a known way down, by what its node printed last (det-core matched
+                // it then): the known exit's property, as its exit would have been.
+                if (crash.known) |text| {
+                    var known_exit_buffer: [known_exit_prefix.len + 128]u8 = undefined;
+                    const property = std.fmt.bufPrint(&known_exit_buffer, known_exit_prefix ++ "{s}", .{text}) catch
+                        continue;
+                    sdk.assert_computed(.sometimes, true, property, .{ .kernel_us = record.time_us, .line = record.text });
+                    continue;
+                }
+                const process = crash.process;
                 // By name, or its start: a command name (comm) is 15 characters at most.
                 const known = for (crashes_known) |name| {
                     if (std.mem.startsWith(u8, process, name)) break true;
@@ -420,7 +430,7 @@ fn kernel_check() void {
             const property = switch (problem) {
                 .oom_kill => oom_property,
                 .crash => std.fmt.bufPrint(&crash_buffer, crash_property_prefix ++ "{s}", .{
-                    crash_process_of(crashes, record.text),
+                    crash_of(crashes, record.text).process,
                 }) catch crash_property,
                 .kernel => kernel_property,
             };
@@ -449,17 +459,29 @@ fn kmsg_record(record: []const u8) ?KmsgRecord {
 
 const crashes_path = "/run/det/crashes"; // cores.zig's.
 
+const Crash = struct {
+    process: []const u8,
+    /// The known exit its node's last output named (cores.zig), if one.
+    known: ?[]const u8 = null,
+};
+
 /// The process of a crash line: the one det-core recorded for its thread ("<tid> <process>"
-/// lines), else the name the line gives.
-fn crash_process_of(crashes: []const u8, text: []const u8) []const u8 {
-    const tid = crash_thread(text) orelse return crash_process(text);
+/// lines, then "\t<known exit>" when its node's output named one), else the name the line gives.
+fn crash_of(crashes: []const u8, text: []const u8) Crash {
+    // "prog: thread: potentially unexpected fatal signal 11." names no thread: the same crash
+    // as its "traps:"/"segfault" line, or a crash with no other line (an abort's signal 6). Its
+    // process's last record says whether it was a known way down.
+    const tid = crash_thread(text) orelse return crash_by_process(crashes, crash_process(text));
     var lines = std.mem.tokenizeScalar(u8, crashes, '\n');
     while (lines.next()) |line| {
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
         const recorded = std.fmt.parseInt(u32, line[0..space], 10) catch continue;
-        if (recorded == tid and space + 1 < line.len) return line[space + 1 ..];
+        if (recorded != tid or space + 1 >= line.len) continue;
+        const rest = line[space + 1 ..];
+        const tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return .{ .process = rest };
+        return .{ .process = rest[0..tab], .known = rest[tab + 1 ..] };
     }
-    return crash_process(text);
+    return .{ .process = crash_process(text) };
 }
 
 /// The thread id in "prog[42]: ..." and "traps: prog[42] ...".
@@ -469,13 +491,39 @@ fn crash_thread(text: []const u8) ?u32 {
     return std.fmt.parseInt(u32, text[open + 1 .. close], 10) catch null;
 }
 
-test crash_process_of {
-    const crashes = "5471 postgres\n812 yb-tserver\n";
+fn crash_by_process(crashes: []const u8, process: []const u8) Crash {
+    var found: Crash = .{ .process = process };
+    var lines = std.mem.tokenizeScalar(u8, crashes, '\n');
+    while (lines.next()) |line| {
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const rest = line[space + 1 ..];
+        const tab = std.mem.indexOfScalar(u8, rest, '\t');
+        const recorded = rest[0 .. tab orelse rest.len];
+        // The record has the command name, which the kernel cuts at 15 characters; the line
+        // the program's ("det-selftest-node" for "det-selftest-no").
+        if (recorded.len == 0 or !std.mem.startsWith(u8, process, recorded)) continue;
+        found.known = if (tab) |at| rest[at + 1 ..] else null;
+    }
+    return found;
+}
+
+test crash_of {
+    const crashes = "5471 postgres\n812 yb-tserver\n3679 mariadbd\tneed to abort\n";
     const line = "rpc_tp_Transact[5471]: segfault at 0 ip 00007f5766f6db19 sp 00007f572affce70 error 4";
-    try std.testing.expectEqualStrings("postgres", crash_process_of(crashes, line));
-    try std.testing.expectEqualStrings("yb-tserver", crash_process_of(crashes, "traps: rpc_worker[812] general protection fault"));
-    try std.testing.expectEqualStrings("other", crash_process_of(crashes, "other[9]: segfault at 0 ip 0"));
-    try std.testing.expectEqualStrings("yb-tserver", crash_process_of(crashes, "yb-tserver: tablet-bootstra: potentially unexpected fatal signal 6."));
+    try std.testing.expectEqualStrings("postgres", crash_of(crashes, line).process);
+    try std.testing.expect(crash_of(crashes, line).known == null);
+    try std.testing.expectEqualStrings("yb-tserver", crash_of(crashes, "traps: rpc_worker[812] general protection fault").process);
+    try std.testing.expectEqualStrings("other", crash_of(crashes, "other[9]: segfault at 0 ip 0").process);
+    try std.testing.expectEqualStrings("yb-tserver", crash_of(crashes, "yb-tserver: tablet-bootstra: potentially unexpected fatal signal 6.").process);
+    const galera = crash_of(crashes, "traps: mariadbd[3679] general protection fault ip:7f8f1d38c9a2");
+    try std.testing.expectEqualStrings("mariadbd", galera.process);
+    try std.testing.expectEqualStrings("need to abort", galera.known.?);
+    // The same crash's line with no thread: by its process's last record.
+    const signal = crash_of(crashes, "mariadbd: mariadbd: potentially unexpected fatal signal 11.");
+    try std.testing.expectEqualStrings("need to abort", signal.known.?);
+    try std.testing.expect(crash_of(crashes, "postgres: worker: potentially unexpected fatal signal 6.").known == null);
+    const cut = crash_of("46 det-selftest-no\tcrashing as told\n", "det-selftest-node: det-selftest-no: potentially unexpected fatal signal 11.");
+    try std.testing.expectEqualStrings("crashing as told", cut.known.?);
 }
 
 /// The process a crash line names: "prog[42]: segfault at ...", "traps: prog[42] general

@@ -176,6 +176,14 @@ fn serve(client: linux.fd_t) void {
         _ = linux.write(2, said, said.len);
         linux.exit_group(3);
     }
+    // The node itself crashes, after saying so (Galera's abort after "need to abort").
+    if (std.mem.eql(u8, line, "crash")) {
+        const said = "crashing as told\n";
+        _ = linux.write(2, said, said.len);
+        const pause = linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null); // Its output forwarded first, as a real one's.
+        crash();
+    }
     if (mutant) {
         for (buffer[0..size]) |*byte| byte.* = std.ascii.toUpper(byte.*);
     }

@@ -1632,6 +1632,20 @@ fn check_builtin_properties(context: *Context) !void {
         .{ "no exit property fails", std.mem.indexOf(u8, known_exit, "FAIL \"no unexpected container exits\"") == null },
         .{ "the known exit is counted", std.mem.indexOf(u8, known_exit, "an exit the system is known to make: dying as told") != null },
     }, "an exit the system declares known (by its output) is counted, not failed", .{});
+    // A crash of the node's own process after it printed a known exit's text (Galera's abort
+    // after "need to abort"): counted with it, the crash and the exit both, not failed.
+    const known_crash_said = try explore(context, &.{
+        "--program", program, "--profile", "known-exit", "--scenario", "node_crash", "--seed", "1", "--branches", "1",
+    });
+    const unknown_crash_said = try explore(context, &.{
+        "--program", program, "--scenario", "node_crash", "--seed", "1", "--branches", "1",
+    });
+    expect_all(context, &.{
+        .{ "no crash property fails", std.mem.indexOf(u8, known_crash_said, "FAIL \"no process crashes") == null },
+        .{ "no exit property fails", std.mem.indexOf(u8, known_crash_said, "FAIL \"no unexpected container exits\"") == null },
+        .{ "the known way down is counted", std.mem.indexOf(u8, known_crash_said, "an exit the system is known to make: crashing as told") != null },
+        .{ "without it, the crash fails its property", std.mem.indexOf(u8, unknown_crash_said, "FAIL \"no process crashes") != null },
+    }, "a crash after a known exit's text (by its output) is counted, not failed", .{});
     // A command writes 40 MB in moments: the forwarder keeps 8 MB and the rate, and says what it
     // dropped; the logging property fails; the events are far smaller than the output.
     const flood_events = try std.fs.path.join(context.arena, &.{ context.scratch, "flood-events" });

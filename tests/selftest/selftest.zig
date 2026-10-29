@@ -6,6 +6,8 @@
 //!              echo node answers in uppercase: the tests catch the mutant)
 //!   node_exit  a driver makes the node exit: the built-in property
 //!              "no unexpected container exits" must fail
+//!   node_crash the node's own process crashes after saying so: known by that text in profile
+//!              "known-exit", a failing crash otherwise
 //!   oom        (profile "memory") a command in the echo node exceeds its memory limit: the
 //!              built-in property "the kernel kills no process for lack of memory" must fail
 //!   stress     drivers hammer clocks, sleeps, yields, page faults and forks at once, and report
@@ -67,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
         .scenarios = .{
             .steady = steady,
             .node_exit = node_exit,
+            .node_crash = node_crash,
             .oom = oom,
             .crash = crash,
             .disk = disk,
@@ -117,7 +120,7 @@ fn describe(d: *System.Describe) !void {
         .binary = "zig-out/bin/det-selftest-node",
         .ready = .{ .tcp = port },
         .faults = quiet,
-        .exits_known = &.{"dying as told"},
+        .exits_known = &.{ "dying as told", "crashing as told" },
     });
     const memory = try d.profile("memory");
     memory.node(.echo, .{
@@ -331,6 +334,19 @@ fn quiet_period(context: *System.Context) !void {
 
 fn node_exit(s: *System.Scenario) void {
     s.singleton_driver("kill_echo", tell_die);
+}
+
+/// The echo node's own process crashes after saying so: known (by that output) in the
+/// known-exit profile, a crash and an exit otherwise.
+fn node_crash(s: *System.Scenario) void {
+    s.singleton_driver("crash_echo", tell_crash);
+}
+
+fn tell_crash(context: *System.Context) !void {
+    var reply: [16]u8 = undefined;
+    _ = request(context.nodes.echo.?.address, "crash\n", &reply) catch {}; // It crashes instead.
+    const pause = linux.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&pause, null); // Let the runtime see the crash.
 }
 
 /// A process in the echo node dies of SIGSEGV: "no process crashes" must fail.
