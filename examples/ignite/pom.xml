@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- The client node's dependencies: Apache Ignite 3's Java client, resolved at the image's build. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>determinismo</groupId>
+  <artifactId>iclient</artifactId>
+  <version>1</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.ignite</groupId>
+      <artifactId>ignite-client</artifactId>
+      <version>3.1.0</version>
+    </dependency>
+  </dependencies>
+</project>
