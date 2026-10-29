@@ -756,7 +756,16 @@ places, and assertions carry no location.
   timeline's previous one, the timeline going on meanwhile; a node maker loads it, replaying on
   from there as a holder would; a timeline's files go with its holders. `--holders-on-disk`
   puts every holder there (the e2e tree check verifies each such node against a replay's).
-  Next: measure a Kafka hunt with them (timelines per hour, workers busy).
+  Next: measure a Kafka hunt with them (timelines per hour, workers busy). Measured unbounded
+  (2026-10-29): Kafka's run 173 kept 355 GB of them (1,094 files of 3 GB VMs, diffs or not) and
+  filled srv3's disk, every run's writes failing (the e2e suite's with NoSpaceLeft); stopped,
+  it left 209 GB (SIGTERM runs no defers). Since, holders and ladders on disk leave their
+  filesystem the larger of 100 GB and 20% free (past it a node costs a replay, as with no
+  memory), and serve deletes a run's holders once its explorer ended. OpenSearch's run 176
+  kept 82 GB in 20 minutes, 36 files: most timelines keep one holder, and a timeline's first
+  is a whole dump (a fresh chain: 2.3 GB of a 4 GB VM's nonzero pages), siblings returned to
+  the same moment writing nearly the same pages. Next: diff a timeline's first holder against
+  the node it started from (kept on disk for the generation), most of its pages unchanged.
 - Setup is one core before branches fan out: measured, not worth it (YugabyteDB's run 77: boot
   and setup 13.6 s of a 2 h hunt, 0.2%).
 
