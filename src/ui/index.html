@@ -248,7 +248,10 @@ function cpuByNode(run) {
 // A run's efficiency figure: its summary's once it ended, else its explorer's live status; "–"
 // for runs from before they were measured.
 function efficiencyOf(run, key, format) {
-  const source = run.summary && run.summary[key] !== undefined ? run.summary
+  const summary = run.summary || {};
+  // A summary records the nodes and virtual per wall; their product is the per-node figure.
+  if (key === "per_node" && summary.nodes && summary.vtime_per_wall) return format(summary.nodes * summary.vtime_per_wall);
+  const source = summary[key] !== undefined ? summary
     : run.progress && run.progress[key] !== undefined ? run.progress : null;
   return source ? format(source[key]) : "–";
 }
