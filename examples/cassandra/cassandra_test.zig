@@ -23,6 +23,7 @@ const System = sdk.System(Nodes);
 
 const node_names = [_][]const u8{ "n1", "n2", "n3" };
 const port = 9042;
+const storage_port = 7000;
 const table = "jepsen_keyspace.lists";
 /// Drivers number themselves here (in the runner, under a lock): values must be unique per key
 /// and fit CQL's int.
@@ -74,7 +75,9 @@ fn describe(d: *System.Describe) !void {
                 .build = build,
                 .command = &.{name},
                 .env = &.{"CASSANDRA_COMMITLOG_SYNC=" ++ entry[2]},
-                .ready = .{ .tcp = port },
+                // The storage port, which a node opens alone: CQL's opens only after gossip
+                // with a peer, or 30 s without one (the first node waited on the others).
+                .ready = .{ .tcp = storage_port },
                 .faults = .{
                     .restart = true,
                     .crash = entry[1],
