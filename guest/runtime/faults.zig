@@ -751,6 +751,8 @@ const NodeFault = struct {
     /// The process or thread stopped (process_pause, thread_pause); for a pod fault, a process
     /// of the pod (its network namespace).
     pid: linux.pid_t = 0,
+    /// thread_pause: its stop reported (a thread in a kernel wait stops only as it returns).
+    stopped: bool = false,
     /// The pod's cgroup (pod faults), and for pod_partition the other one's, its process, and
     /// the two pods' addresses.
     pod: Pod = .{},
@@ -859,7 +861,7 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         },
         .throttle => nodes.cpu_limit(name, null) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
-        .thread_pause => _ = linux.ptrace(ptrace_detach, fault.pid, 0, 0, 0),
+        .thread_pause => thread_release(fault.pid, fault.stopped),
         // The pod may be gone (killed, rescheduled), its cgroup and namespace with it: said.
         .pod_pause => fault.pod.write("cgroup.freeze", "0") catch |err| if (fault.pod.exists()) {
             sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
@@ -1206,6 +1208,7 @@ fn node_start_again(system: *const schema.System, name: []const u8) void {
 }
 
 fn node_expire(system: *const schema.System, now_ns: u64) void {
+    threads_release_pending(0);
     for (&nodes_faulted) |*slot| {
         const fault = &(slot.* orelse continue);
         if (fault.grace_end_ns) |grace_end_ns| if (grace_end_ns <= now_ns) {
@@ -1237,7 +1240,11 @@ fn node_next_end() ?u64 {
 
 fn node_heal(system: *const schema.System) void {
     for (&nodes_faulted) |*slot| node_end(system, slot);
+    threads_release_pending(threads_release_wait_ns);
 }
+
+/// How long healing waits for paused threads to stop so they can be let go.
+const threads_release_wait_ns = 5 * std.time.ns_per_s;
 
 /// An outage begins: its nodes all frozen first (none runs on while the others go down), then
 /// each crashed (or killed, `power` false), each holding its own slot until the fault's end,
@@ -1469,9 +1476,60 @@ fn thread_stop(applied: *const Applied, fault: *NodeFault) !void {
         _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
         return error.Ptrace;
     }
-    var status: i32 = 0;
-    _ = linux.wait4(tid, &status, wait_all, null); // Stopped.
+    // Stopped at its next return to user space: one in a kernel wait (a sync held, a page fault)
+    // stops only when it ends. Not waited for (run 177's timeline 24: 31 s, the injector stalled
+    // meanwhile): the pause begins when the thread stops.
     fault.pid = tid;
+    fault.stopped = thread_stopped(tid);
+}
+
+/// Whether the tracee `tid` reported its stop, or exited (polled, never waited for).
+fn thread_stopped(tid: linux.pid_t) bool {
+    var status: i32 = 0;
+    const result = linux.wait4(tid, &status, wait_all | linux.W.NOHANG, null);
+    return linux.errno(result) != .SUCCESS or result == tid;
+}
+
+/// Threads paused whose pause ended before they stopped: detached once they do (a seized thread
+/// is detached only stopped), each pass of the injector's loop (threads_release_pending).
+var threads_pending: [threads_pending_max]linux.pid_t = undefined;
+var threads_pending_count: u32 = 0;
+const threads_pending_max = 64;
+
+fn thread_release(tid: linux.pid_t, stopped: bool) void {
+    if (stopped or thread_stopped(tid)) {
+        _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
+        return;
+    }
+    if (threads_pending_count == threads_pending_max) {
+        // Never expected (one pause a node at a time): waited for rather than left stopped.
+        var status: i32 = 0;
+        _ = linux.wait4(tid, &status, wait_all, null);
+        _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
+        return;
+    }
+    threads_pending[threads_pending_count] = tid;
+    threads_pending_count += 1;
+}
+
+/// The pending threads that stopped meanwhile, detached; with `wait_ns`, waiting that long at
+/// most for the rest (faults stop: none left stopped, leftovers_check says so if one is).
+fn threads_release_pending(wait_ns: u64) void {
+    const deadline_ns = monotonic_ns() + wait_ns;
+    while (true) {
+        var kept: u32 = 0;
+        for (threads_pending[0..threads_pending_count]) |tid| {
+            if (thread_stopped(tid)) {
+                _ = linux.ptrace(ptrace_detach, tid, 0, 0, 0);
+                continue;
+            }
+            threads_pending[kept] = tid;
+            kept += 1;
+        }
+        threads_pending_count = kept;
+        if (kept == 0 or monotonic_ns() >= deadline_ns) return;
+        sleep_ns(std.time.ns_per_ms);
+    }
 }
 
 /// Runs the node's fault program to completion (its duration is its own); nothing to undo.
