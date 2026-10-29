@@ -347,6 +347,8 @@ fn everything_read(context: *System.Context) !void {
     // transaction's writes there are that bug's loss (KAFKA-20734 skipped their commit marker
     // after the commit was acknowledged), counted apart (runs 173's timelines 27 and 72).
     var known_aborted: [partitions]bool = @splat(false);
+    // Partitions a hang still holds after the abort: their writes past it cannot be read.
+    var behind_hang: [partitions]bool = @splat(false);
     const history: sdk.elle.History = .{};
     const process = sdk.elle.process_new();
     // Read once no transaction is open: commit markers still on their way after the faults
@@ -390,8 +392,14 @@ fn everything_read(context: *System.Context) !void {
             const aborted = client.request("abort-open {s} {d}", .{ topic, partition }) catch "no answer";
             sdk.event("kafka_hanging_aborted", .{ .partition = partition, .reply = aborted });
             known_aborted[partition] = explained;
-            _ = sdk.retry(stable_attempts_max, 500, partition_stable, .{ context, partition }) catch {};
-        } else |_| {};
+            // Still open (Redpanda has no KIP-664 abort: "The node does not support
+            // WRITE_TXN_MARKERS", run 177's timeline 83): a committed read stops at the hang,
+            // what is past it unread and unjudged, not lost.
+            const cleared = if (sdk.retry(stable_attempts_max, 500, partition_stable, .{ context, partition })) |_| true else |_| false;
+            behind_hang[partition] = !cleared;
+        } else |_| {
+            behind_hang[partition] = true;
+        };
     }
     for (0..partitions) |partition| {
         const unread = [_]sdk.elle.Mop{.{ .read = .{ .key = partition, .list = null } }};
@@ -412,16 +420,26 @@ fn everything_read(context: *System.Context) !void {
     var torn: u64 = 0;
     var duplicated: u64 = 0;
     var known_lost: u64 = 0;
+    var unjudged: u64 = 0;
     var example: ?Transaction = null;
     for (noted) |transaction| {
         var seen: usize = 0;
         // Unread writes on partitions whose known hang was aborted: that bug's.
         var unread_known: usize = 0;
+        // Unread writes behind a hang still open: not judged.
+        var unread_hung: usize = 0;
         for (transaction.values, transaction.partitions) |value, partition| {
             const times = read.get(value) orelse 0;
             if (times > 0) seen += 1;
             if (times > 1) duplicated += 1;
-            if (times == 0 and partition < partitions and known_aborted[partition]) unread_known += 1;
+            if (times > 0 or partition >= partitions) continue;
+            if (behind_hang[partition]) {
+                unread_hung += 1;
+            } else if (known_aborted[partition]) unread_known += 1;
+        }
+        if (unread_hung > 0 and seen + unread_known + unread_hung == transaction.values.len) {
+            unjudged += 1;
+            continue;
         }
         if (transaction.outcome == .committed and unread_known > 0 and
             seen + unread_known == transaction.values.len)
@@ -459,6 +477,7 @@ fn everything_read(context: *System.Context) !void {
     // An event, as the hang itself (kafka_known_hang): a sometimes would be a target, failing
     // every run where the bug never struck (Redpanda's run 177).
     if (known_lost > 0) sdk.event("kafka_known_loss", .{ .transactions = known_lost });
+    if (unjudged > 0) sdk.event("kafka_behind_hang", .{ .transactions = unjudged });
     sdk.always(torn == 0, "a transaction's writes are read all or none", details);
     sdk.always(duplicated == 0, "no write is read twice", details);
 }
