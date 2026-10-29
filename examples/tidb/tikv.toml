@@ -14,6 +14,13 @@ raft-election-timeout-ticks = 10
 region-max-keys = 5
 region-split-keys = 3
 
+# No disk reserve: by default TiKV keeps 5 GB free and refuses every write ("tikv disk full",
+# NotAllowedOnFull) on a disk smaller than that, as a node's disk is here (the guest's memory):
+# SurrealDB's first smoke never got past "still starting up" for 750 s.
+[storage]
+reserve-space = "0MB"
+reserve-raft-space = "0MB"
+
 # Three TiKVs share the machine: small caches (by default each takes 45% of its memory).
 [storage.block-cache]
 capacity = "128MB"
