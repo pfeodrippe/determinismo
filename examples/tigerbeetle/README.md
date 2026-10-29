@@ -17,8 +17,9 @@ that lost its disk, then runs it (`--development`, a 64 MiB grid cache: a replic
 hence 12 GiB VMs).
 
 Drivers create accounts and transfers through `tigerbeetle repl`, in a random replica's node,
-and note in the runner every one TigerBeetle acknowledged, and the transfers whose fate is
-unknown (no answer within 10 seconds: a TigerBeetle client never gives up, Jepsen's #206).
+and note in the runner every transfer before it is sent and every one TigerBeetle
+acknowledged; one sent and never acknowledged has an unknown fate (no answer within 10 seconds:
+a TigerBeetle client never gives up, Jepsen's #206; or its driver killed as its phase ended).
 Once faults stop: every acknowledged account and transfer is there as created, and each
 account's posted debits and credits are its acknowledged transfers plus some unknown ones.
 

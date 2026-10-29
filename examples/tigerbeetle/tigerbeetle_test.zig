@@ -153,9 +153,12 @@ fn transfer_many(context: *System.Context) !void {
         const amount = 1 + sdk.random_below(100);
         const command = try std.fmt.allocPrint(arena, "create_transfers id={d} debit_account_id={d} " ++
             "credit_account_id={d} amount={d} ledger=1 code=1;", .{ id, debit, credit, amount });
+        // Noted before it is sent, as Jepsen's invocations: a driver killed as its phase ends,
+        // during the request, leaves a transfer that may have been posted (an etcd counter, so
+        // noted only after, came out one over).
+        note("i {d} {d} {d} {d}\n", .{ id, debit, credit, amount });
         const output = request(&repl, arena, command) catch |err| {
             sdk.sometimes(true, "a transfer got no answer", .{ .err = @errorName(err) });
-            note("u {d} {d} {d} {d}\n", .{ id, debit, credit, amount });
             continue;
         };
         if (failure(output)) |reason| {
@@ -202,6 +205,7 @@ fn everything_survives(context: *System.Context) !void {
     var accounts: std.ArrayList(u64) = .empty;
     var acked: std.ArrayList(Transfer) = .empty;
     var unknown: std.ArrayList(Transfer) = .empty;
+    var invoked: std.ArrayList(Transfer) = .empty;
     var lines = std.mem.tokenizeScalar(u8, log, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
@@ -211,7 +215,13 @@ fn everything_survives(context: *System.Context) !void {
         if (std.mem.eql(u8, kind, "a")) try accounts.append(arena, numbers[0]);
         const transfer: Transfer = .{ .id = numbers[0], .debit = numbers[1], .credit = numbers[2], .amount = numbers[3] };
         if (std.mem.eql(u8, kind, "t")) try acked.append(arena, transfer);
-        if (std.mem.eql(u8, kind, "u")) try unknown.append(arena, transfer);
+        if (std.mem.eql(u8, kind, "i")) try invoked.append(arena, transfer);
+    }
+    // Invoked and never acknowledged: unknown (no answer, or a driver killed during it).
+    var acked_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    for (acked.items) |transfer| try acked_ids.put(arena, transfer.id, {});
+    for (invoked.items) |transfer| {
+        if (!acked_ids.contains(transfer.id)) try unknown.append(arena, transfer);
     }
     try accounts.append(arena, 1);
     const waited_start_ns = monotonic_ns();
