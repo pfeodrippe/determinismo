@@ -1,0 +1,76 @@
+#!/bin/bash
+# patroni-start <id>: node pg<id> of three. etcd (a member of pg1..pg3's cluster, restarted if it
+# exits, as its service would be), then Patroni, which runs PostgreSQL: the first node to take
+# the bootstrap lock initializes the database, the others clone it and follow the leader.
+# PATRONI_SYNC=true (the default profile): synchronous_mode, a commit acknowledged once a standby
+# has it; false: Patroni's default, asynchronous standbys.
+set -e
+id=$1
+name=pg$id
+mkdir -p /var/lib/postgresql/etcd /var/lib/postgresql/data
+chown -R postgres:postgres /var/lib/postgresql
+(
+  while true; do
+    gosu postgres etcd --name "e$id" --data-dir /var/lib/postgresql/etcd \
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls "http://$name:2379" \
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls "http://$name:2380" \
+      --initial-cluster e1=http://pg1:2380,e2=http://pg2:2380,e3=http://pg3:2380 \
+      --initial-cluster-state new --initial-cluster-token patroni --log-level warn || true
+    sleep 1
+  done
+) &
+cat > /etc/patroni.yml <<CONFIG
+scope: jepsen
+name: $name
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: $name:8008
+etcd3:
+  hosts: pg1:2379,pg2:2379,pg3:2379
+bootstrap:
+  dcs:
+    # Failovers within seconds (ttl >= loop_wait + 2 retry_timeout): more of them in a timeline.
+    ttl: 15
+    loop_wait: 3
+    retry_timeout: 5
+    maximum_lag_on_failover: 1048576
+    synchronous_mode: ${PATRONI_SYNC:-true}
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - local all all trust
+    - host replication replicator 0.0.0.0/0 trust
+    - host all all 0.0.0.0/0 trust
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: $name:5432
+  data_dir: /var/lib/postgresql/data/patroni
+  bin_dir: /usr/lib/postgresql/18/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: replicator
+    superuser:
+      username: postgres
+      password: postgres
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+  # Written into pg_hba.conf at every start: the one bootstrap writes is never synced, and a
+  # power loss soon after left initdb's (local only) behind, every client refused (third smoke).
+  pg_hba:
+    - local all all trust
+    - host replication replicator 0.0.0.0/0 trust
+    - host all all 0.0.0.0/0 trust
+CONFIG
+mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql /etc/patroni.yml
+exec gosu postgres /opt/patroni/bin/patroni /etc/patroni.yml
