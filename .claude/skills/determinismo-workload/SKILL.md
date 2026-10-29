@@ -42,6 +42,10 @@ fn transfers(s: *System.Scenario) void {
   in a node. Protocol clients stay in the example (see `examples/bank/resp.zig`).
 - A driver that loses its server to a fault is not a failure: `sdk.tcp.unavailable(err)` tells
   those errors apart; note them with a `sometimes` and return.
+- A `sometimes` is a target, cataloged as the program starts: one never true fails the run.
+  What may rightly never happen (a known bug's signature, a rare documented behavior, a budget
+  running out) is an `sdk.event`, searchable and no property (Redpanda's run 177 failed on a
+  Kafka-only sometimes).
 - `eventually` retries (`sdk.retry`) and ends in `assert_unreachable(...)` if the system never
   recovers. It kills the drivers still running as the composer reaches it (Antithesis's rule):
   a check that needs them done is a `finally` command (faults stop after them).
