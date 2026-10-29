@@ -151,6 +151,22 @@ coordinated crashes may come partly from this. The `jepsen-recovered` profile (1
 and `default` (13.0.2) start with the systemd unit's recovery (`start`, `GALERA_RECOVER=1`):
 whether the joiner's bootstrap and its losses remain there is the next hunt.
 
+That hunt (run 202, `jepsen-recovered`, seed 1, 2026-10-29): three timelines lost committed
+appends (13, 126, 160), none through a joiner's bootstrap; each after every node holding the
+newest commits failed within the second InnoDB's log waits to be flushed
+(`innodb_flush_log_at_trx_commit = 0`, Jepsen's setting and MariaDB's recommendation for Galera,
+durability resting on the cluster). Timeline 13, explained by causality (analysis 0: no future
+fails from 35.3 s, 6 of 15 from 40.3 s, 13 of 16 from 45.2 s): n2 stops at 35.58 s and n1 at
+37.21 s, so n3 is a primary component of one from 37.22 s (`New COMPONENT: primary = yes ...
+memb_num = 1`), the newest commits on it alone until the others are synced; n3 is killed at
+43.77 s, its last second with it. Recovered positions after: n3 84, n1 38, n2 6; n3, the
+newest, resumes as the primary (111.55 s, no new history), and key 4 reads 26 of its 30
+committed appends. Timelines 126 and 160 had all three nodes lose power at once. Galera
+documents exactly this: with the log flushed once a second, a commit survives unless every
+node that holds it fails within that second. Since then `jepsen-recovered` and `default`
+flush at every commit (`GALERA_FLUSH_AT_COMMIT=1`), so a loss there is not this one; the
+`jepsen` profiles keep Jepsen's setting.
+
 Known? Related: mariadb-corporation/galera#549 (open since 2019), "rsync crashed while syncing in
 the donor node, receiver node become safe_to_bootstrap=1", where an operator could bootstrap
 from a cut transfer's receiver. Here nothing asks an operator: `pc.recovery` bootstraps it. Not

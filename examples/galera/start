@@ -23,4 +23,10 @@ if [ "$GALERA_RECOVER" = 1 ] && [ -d /var/lib/mysql/mysql ]; then
   position=$(galera_recovery)
   if [ -n "$position" ]; then arguments+=("$position"); fi
 fi
+# With GALERA_FLUSH_AT_COMMIT=1, InnoDB's log flushed at every commit: a commit then survives
+# every node that held it failing at once. By default (Jepsen's, MariaDB's recommendation for
+# Galera) it is flushed once a second, durability resting on the cluster: Galera documents that
+# a whole primary failing within that second loses its last commits (hunt run 202's three
+# losses, README).
+if [ "$GALERA_FLUSH_AT_COMMIT" = 1 ]; then arguments+=(--innodb-flush-log-at-trx-commit=1); fi
 exec docker-entrypoint.sh "${arguments[@]}"

@@ -48,7 +48,10 @@ pub fn main(init: std.process.Init) !void {
 /// wrapper does (no position recovery), to measure what determinismo finds blind of what Jepsen
 /// reported. `jepsen-dirsync`: 12.1.2 with gvwstate.dat's rename made durable (dirsync.c), to
 /// tell whether that rename causes the EVS abort (README). `jepsen-recovered`: that, with the
-/// systemd unit's position recovery, to tell Galera's own behavior from the wrapper's.
+/// systemd unit's position recovery, to tell Galera's own behavior from the wrapper's. `default`
+/// and `jepsen-recovered` flush InnoDB's log at every commit: with it once a second (Jepsen's,
+/// the `jepsen` profiles) a whole primary failing within that second loses its last commits, as
+/// Galera documents (run 202), which hid any other loss.
 fn describe(d: *System.Describe) !void {
     inline for (.{
         .{ "default", "examples/galera/Dockerfile", true },
@@ -66,7 +69,7 @@ fn describe(d: *System.Describe) !void {
             };
             profile.node(@field(System.Name, name), .{
                 .build = .{ .context = ".", .dockerfile = entry[1] },
-                .env = &(if (entry[2]) env ++ .{"GALERA_RECOVER=1"} else env),
+                .env = &(if (entry[2]) env ++ .{ "GALERA_RECOVER=1", "GALERA_FLUSH_AT_COMMIT=1" } else env),
                 .ready = .{ .tcp = port },
                 // The others join the cluster n1 started.
                 .after = if (first) &.{} else &.{.n1},
