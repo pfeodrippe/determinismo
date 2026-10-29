@@ -1212,6 +1212,9 @@ const CausalityRequest = struct {
     moments_max: u32 = 40,
     jump_min: f64 = 0.2,
     gap_min_ms: u64 = 20,
+    /// A future not failing this long past the failure's moment ends there; null: causality's
+    /// default (the failure's distance from the setup snapshot), 0: every future to its end.
+    horizon_ms: ?u64 = null,
     /// A planner plugin: a command, `tcp://host:port`, or `@<name>` (an uploaded strategy
     /// executable, PUT /strategies/<name>). Null: the built-in one.
     planner: ?[]const u8 = null,
@@ -1385,6 +1388,7 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
+    if (asked.horizon_ms) |ms| try argv.appendSlice(server.arena, &.{ "--horizon-ms", try print(server, "{d}", .{ms}) });
     // Asked for, or the profile's own (its test program's `explain`, in the run's pin).
     if (asked.explain_exec orelse system_explain(server, run.id)) |command| {
         try argv.appendSlice(server.arena, &.{ "--explain-exec", command });

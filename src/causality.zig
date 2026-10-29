@@ -5,7 +5,7 @@
 //!   determinismo causality <machine and system options> --seed <s> --branch <n>
 //!       [--tape <branch n's tape>] --property '<message>' [--points <k>] [--futures <m>]
 //!       [--refine <rounds>] [--snapshots <dir>] [--failure-ms <ms> --snapshot-ms <ms>]
-//!       [--jobs <futures at once>] [--json]
+//!       [--horizon-ms <ms>] [--jobs <futures at once>] [--json]
 //!
 //! With its tape, branch n is the one explored (a tree's branch starts inside its ancestors:
 //! the tape has its path); without, the n-th branch from the setup snapshot.
@@ -78,6 +78,12 @@ const Request = struct {
     /// Futures at once (`--jobs`): 0, one per CPU of the host's pool (an analysis someone
     /// waits for); fewer for one in the background, beside a hunt.
     jobs: u32 = 0,
+    /// A future not failing this long past the failure's moment (virtual time) ends there, as
+    /// not failing (`--horizon-ms`): by default the failure's own distance from the setup
+    /// snapshot, so futures of a bug decided early in an hour-long timeline do not each run to
+    /// its end (Ignite's run 215: a failure at 101 s of 1085); a property judged at the end
+    /// fails there, past every future's end anyway. 0: every future to its end.
+    horizon_ms: ?u64 = null,
     /// Only save the first round's moments to disk (`--save-only`): serve snapshots a failure
     /// as soon as it is found, and a later analysis forks its futures right away.
     save_only: bool = false,
@@ -626,6 +632,11 @@ fn moments_analyze(analysis: *Analysis, moments_all: []const Moment) !void {
             });
             // A verdict: the future stops at its first match, which counts.
             if (request.verdict) |verdict| try argv.appendSlice(scratch, &.{ "--until", verdict });
+            const failure = owner.failure;
+            const horizon_ms = request.horizon_ms orelse failure.failure_ms - failure.snapshot_ms;
+            if (horizon_ms > 0) try argv.appendSlice(scratch, &.{
+                "--timeline-limit", try std.fmt.allocPrint(scratch, "{d}ms", .{failure.failure_ms + horizon_ms}),
+            });
             _ = try std.process.run(scratch, io, .{ .argv = argv.items });
             const source = try std.Io.Dir.cwd().readFileAlloc(io, record, scratch, .limited(1 << 24));
             const failing: u32 = if (request.verdict != null)
@@ -868,6 +879,7 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             eql(u8, flag, "--jump-min") or eql(u8, flag, "--gap-min-ms") or
             eql(u8, flag, "--moments-max") or eql(u8, flag, "--verdict") or
             eql(u8, flag, "--failure-ms") or eql(u8, flag, "--snapshot-ms") or eql(u8, flag, "--jobs") or
+            eql(u8, flag, "--horizon-ms") or
             eql(u8, flag, "--explain-exec") or eql(u8, flag, "--explain-dir");
         if (!ours) {
             try rest.append(arena, flag);
@@ -906,6 +918,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             request.snapshot_ms = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, flag, "--jobs")) {
             request.jobs = try std.fmt.parseInt(u32, value, 10);
+        } else if (eql(u8, flag, "--horizon-ms")) {
+            request.horizon_ms = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, flag, "--explain-exec")) {
             request.explain_exec = value;
         } else if (eql(u8, flag, "--explain-dir")) {
