@@ -58,8 +58,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   any node or command (`$DETERMINISMO_STOP_FAULTS <seconds>`, or the Antithesis name
   `$ANTITHESIS_STOP_FAULTS`; 0 ends one).
 - **Exact replay and its records**: tapes with checkpoints (a replay stops where it diverges)
-  that refuse other inputs (kernel, disks, CPU model, determinism ABI); JSON results; regression
-  scripts that carry a failure's shape to new seeds and new builds.
+  that refuse other inputs (kernel, disks, CPU model, determinism ABI) and say when another
+  build recorded them; every run replays a sample of its own timelines as it goes, and one that
+  parts says where (each timeline's events carry a checkpoint per second of virtual time); JSON
+  results; regression scripts that carry a failure's shape to new seeds and new builds.
 - **Debugging in the multiverse**: causality analysis (how likely the bug was at each moment
   of a failing timeline, from forked futures: where it jumps is where it was decided); stop a
   branch at the first event matching a condition (`--until`), or some time before it
@@ -78,14 +80,16 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   timelines that reach something new and changes the decisions of the process that got there
   (it solves a 1-in-10000 maze in about 100 branches, in Python or Java under faults in about
   200), and parallel workers share one corpus.
-- **Searching the multiverse**: every branch's events, node and command output included, with
+- **Searching the multiverse**: every branch's events, node and command output and the kernel's
+  own lines (a power loss's ext4 journal, the OOM killer) included, with
   `determinismo query` (HTTP, MCP too): conditions on any field, and Antithesis-style temporal
   ones, "failures preceded by a fault within 1s", "with no fault before", each match with the
   moment to branch from; Antithesis's event sets with `determinismo events` (filter, with_last,
   with_next with timeouts, union, intersect, difference, narrow, and any program as map or
   fold).
-- **Oracles beyond assertions**: TLA+ trace validation of a branch's abstract states with TLC;
-  mutation testing with mutant profiles.
+- **Oracles beyond assertions**: Elle on list-append histories, and final reads once faults
+  stop (every committed append still there: `sdk.elle.final_reads`); TLA+ trace validation of a
+  branch's abstract states with TLC; mutation testing with mutant profiles.
 - **A web UI** (`determinismo serve`, then open it): runs live, properties with their failing
   and passing examples, a multiverse map of every timeline with its faults and failures,
   search, a timeline's logs up to any moment, and a command run at that exact moment; a
