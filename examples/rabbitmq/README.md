@@ -132,8 +132,14 @@ is in `rabbit_mnesia:check_cluster_consistency/2` → `with_running_or_clean_mne
 throwaway Mnesia: dir unset, RAM schema, "to prevent joining cluster and/or corrupting data",
 then restores both. At 27.1 s that throwaway Mnesia applies a schema update for a disc table
 (`rabbit_node_maintenance_states`), which it can only put in its default directory, and dies;
-the boot fails on it. Where the update comes from is still open: the peers, which count
-rabbit-2 a cluster member, are the likely source (a disc table's copy pushed to a member).
+the boot fails on it. Where the update comes from: most likely rabbit-1, booting at the same
+time (both restarted after the faults): its own throwaway Mnesia stopped at 26.70 s
+("Application mnesia exited with reason: stopped"), its boot proper began at 26.92 s ("Starting
+broker"), and a booting broker makes sure its tables exist, a schema transaction across the
+members it knows, rabbit-2 among them, whose throwaway Mnesia then took a disc table's update
+0.2 s later. Two brokers booting together after an outage, one past its consistency check while
+the other is in it: not shown yet by changing the timeline (e.g. delaying rabbit-1's boot in a
+replay).
 Also: `with_running_or_clean_mnesia` restores `dir` with no `try ... after`, so any exit from
 its fun leaves the node's Mnesia settings at the throwaway ones.
 
