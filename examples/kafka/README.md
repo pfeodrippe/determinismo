@@ -239,7 +239,14 @@ the whole timeline (the coverage profile's slower brokers never got one).
   hour) and the known-hang loss is an event, not a sometimes (one never true failed this run);
   and the judge counts this hang apart as it does KAFKA-20734's (`kafka_known_hang`, issue
   `redpanda-orphan-begin-tx`: the partition's own "is unknown:tx::errc::invalid_txn_state"), so
-  later hunts see the hangs it does not explain.
+  later hunts see the hangs it does not explain. By its end (177 timelines) the run had 19
+  timelines with a transaction open for good; 28 "the guest finishes" (the commands' 80 s,
+  fixed since), 9 injector stalls (a thread pause waiting on its thread, fixed since), and three
+  judge artifacts: timeline 83's one "lost" committed write sat behind such a hang, which the
+  judge could not abort (Redpanda has no KIP-664 abort: "The node does not support
+  WRITE_TXN_MARKERS"; writes behind a hang the judge cannot clear are unjudged since), and
+  timelines 157 and 172 were G0 (allowed, as for Kafka) beside Elle's cycle search timing out
+  (no anomaly since, an `elle_cycle_search_timeout` event).
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
