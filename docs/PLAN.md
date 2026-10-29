@@ -384,8 +384,9 @@ event hashing, the guest module.
   time. Old runs replayed by a newer host part from their tapes; new runs replay (1 of 96
   sampled parted, above). Done since: tapes and the run's record carry the build that made them
   (`host`, a hash of the explorer's executable), and a replay by another build says so. Kafka's
-  holders against replays (next.sh's check, 32 timelines): no holder node was compared, memory
-  short (12 to 13 GB available, 16 wanted), so holders went to disk; still open.
+  holders against replays (next.sh's check, a tree of 32 timelines, holders on disk as memory
+  was short): 6 holder nodes made and each the same as the node a replay makes ("verify #20 at
+  698.17 s: the same"); run 68's timeline 98, which parted from every replay, not seen again.
 - `eventually` endings kill the drivers as soon as the composer reaches them (after its 4 to 63
   starts, pauses under 20 ms): RabbitMQ's run 118 drove a median 26.6 s, under 10 s in 274 of
   1,494 timelines. Antithesis's composer may start one any time after a driver started, killing
