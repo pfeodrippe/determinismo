@@ -123,7 +123,9 @@ use them in other repositories.
   `wipe` starts it fresh from its image. `disk` makes its disk fail for a while (I/O errors,
   write errors, lost writes, corrupted reads, slowness); an exit then is expected, and a node
   that exited or whose filesystem went read-only starts again at the fault's end.
-  `--faults +restart,+crash,+disk` adds kinds to every node,
+  `--faults +restart,+crash,+disk` adds kinds to every node (`+clock_skew`: one node's realtime
+  clock ahead or behind for a while, for systems that order by clocks; any system, a Compose
+  project's too),
   `--no-faults client,monitor` takes them all from some (an Antithesis launch's
   `exclude_faults`).
 - Verbose systems: `explore --retroactive 'Applied block'` leaves such output lines out of the
