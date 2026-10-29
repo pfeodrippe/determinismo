@@ -1073,9 +1073,11 @@ function codeFirstRun(events) {
 }
 function faultName(event) {
   const d = (event.event && event.event.details) || {};
-  const kind = [d.kind, d.flavor].filter(Boolean).join(" ");
+  // An outage of kills (nodes without power losses) says so; a process fault names its process.
+  const kind = [d.kind, d.kind === "outage" && d.power === false ? "kill" : "", d.flavor].filter(Boolean).join(" ");
+  const process = d.process ? ` (${d.process})` : "";
   // A pod fault (Kubernetes) names its pod, not the node it runs in.
-  return `${kind || "fault"}${d.pod ? " " + d.pod + (d.peer_pod ? "↔" + d.peer_pod : "") : d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}`;
+  return `${kind || "fault"}${d.pod ? " " + d.pod + (d.peer_pod ? "↔" + d.peer_pod : "") : d.node ? " " + d.node + (d.peer ? "↔" + d.peer : "") : ""}${process}`;
 }
 // Text to the clipboard: the Clipboard API where the page is a secure context, else a selected
 // textarea and the copy command (serve is often reached over plain HTTP, at a Tailscale address,
