@@ -59,7 +59,17 @@ delivery, devices, CPUID and MSR filtering, branch counting), the decision strea
 partition, pause or crash is applied in the guest), snapshots and their restore, tapes and
 event hashing, the guest module.
 
-## Open issues (2026-10-28)
+## Open issues (2026-10-29)
+
+- Redpanda: timeline 56 of run 177, a transaction its coordinator knew and was aborting while a
+  partition had no leader, open for good; trace futures from 745 to 760 s all passed (a narrow
+  window): causality, then a future inside its jump with the tx logger up.
+- e2e under load: coverage (synced workers), parallel, script, ending and ui's causality analysis
+  fail when other units share the reserved cores (2026-10-29's suite beside smokes); coverage
+  passed alone, the others to run alone too.
+- Hunts queued after Galera's run 196: MySQL Group Replication, Galera jepsen-recovered, RabbitMQ
+  Khepri ra-synced, hyperthreads, OpenSearch and Redpanda again, ZooKeeper known, YugabyteDB
+  outages; smokes: Cassandra 5.0.9, its Accord scenario (6.0-alpha2), ClickHouse Keeper.
 
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
