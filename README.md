@@ -20,6 +20,28 @@ off the main loop change a new leader's term (#695), carried to replicas with di
 machines; a replay to a moment and a goroutine dump there explain each
 ([tests/antithesis-compat](tests/antithesis-compat/README.md)).
 
+### Found in real systems
+
+Blind (no hint of the bug given), each replayed exactly and explained from its timeline; details
+in each example's README, the whole list in [docs/JEPSEN.md](docs/JEPSEN.md):
+- **Redpanda 26.2.6**: a transaction open for good when its coordinator crashes between beginning
+  it on the partitions and recording them ([examples/kafka](examples/kafka/README.md)).
+- **Galera (galera-4 26.4.24)**: an uncaught `std::out_of_range` in EVS after a power loss undoes
+  gvwstate.dat's rename; a joiner whose state transfer is cut starting a new history from its
+  half-copied data (a committed row lost); nodes restoring a component under a nil history that
+  never start again ([examples/galera](examples/galera/README.md)).
+- **RabbitMQ 4.1.4**: confirmed messages lost when quorum queue members restart as new ones (Ra's
+  registration not synced); nodes that never boot again after a power loss
+  ([examples/rabbitmq](examples/rabbitmq/README.md)).
+- **Dgraph v1.1.1**: an alpha panicking on a tablet move; a replica serving a predicate without
+  its index after replaying a tablet move ([examples/dgraph](examples/dgraph/README.md)).
+- **Apache Kafka 3.8.0**: a broker that never starts again after a power loss soon after its
+  format; **TigerBeetle**: a reformatted replica asserting as it rejoins after having been primary.
+- Rediscovered blind: PostgreSQL 12.3's G2-item at Serializable, NATS 2.12.1's lost
+  acknowledged messages, MySQL's Repeatable Read anomalies, TiDB 2.1.7's lost updates, MongoDB's
+  SERVER-48307, ScyllaDB's #7258, Redis-Raft's crashes, Kafka's KAFKA-20979, KAFKA-20734 and
+  KAFKA-18137, etcd's #22498, YugabyteDB's #2571.
+
 Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
 
 - **A deterministic machine**: a Zig VMM on a patched KVM where guest time is a function of
