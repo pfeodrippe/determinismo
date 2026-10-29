@@ -232,6 +232,7 @@ fn transactions(context: *System.Context) !void {
         const count = 1 + sdk.random_below(sends_max);
         const commit = sdk.random_below(abort_one_in) != 0;
         var values: [sends_max]u64 = undefined;
+        var placed: [sends_max]u8 = undefined;
         var mops: [sends_max]sdk.elle.Mop = undefined;
         var buffer: [256]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
@@ -239,6 +240,7 @@ fn transactions(context: *System.Context) !void {
             // Unique: the client, its transaction, the send.
             values[position] = (id << 12) | (sequence << 3) | position;
             const partition = sdk.random_below(partitions);
+            placed[position] = @intCast(partition);
             mops[position] = .{ .append = .{ .key = partition, .value = values[position] } };
             try writer.print(" {d}:{d}", .{ partition, values[position] });
         }
@@ -247,7 +249,7 @@ fn transactions(context: *System.Context) !void {
             if (commit) "commit" else "abort", topic, writer.buffered(),
         }) catch {
             // No answer: the transaction may have committed, and the connection is done.
-            note("u", values[0..count]);
+            note("u", values[0..count], placed[0..count]);
             try history.info(arena, process, mops[0..count]);
             sdk.sometimes(true, "a transaction got no answer", .{});
             return;
@@ -260,7 +262,7 @@ fn transactions(context: *System.Context) !void {
             "f"
         else
             "u";
-        note(kind, values[0..count]);
+        note(kind, values[0..count], placed[0..count]);
         switch (kind[0]) {
             'c' => try history.ok(arena, process, mops[0..count]),
             'a', 'f' => try history.fail(arena, process, mops[0..count]),
@@ -275,13 +277,14 @@ fn transactions(context: *System.Context) !void {
     }
 }
 
-/// One transaction's outcome and values, appended to the runner's log in one write:
-/// "<c|a|f|u> <value> <value>...".
-fn note(kind: []const u8, values: []const u64) void {
-    var buffer: [128]u8 = undefined;
+/// One transaction's outcome and writes, appended to the runner's log in one write:
+/// "<c|a|f|u> <partition>:<value> <partition>:<value>...".
+fn note(kind: []const u8, values: []const u64, placed: []const u8) void {
+    std.debug.assert(values.len == placed.len);
+    var buffer: [192]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     writer.writeAll(kind) catch return;
-    for (values) |value| writer.print(" {d}", .{value}) catch return;
+    for (values, placed) |value, partition| writer.print(" {d}:{d}", .{ partition, value }) catch return;
     writer.writeByte('\n') catch return;
     const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
     const fd = linux.open(txns_path, flags, 0o644);
@@ -293,7 +296,7 @@ fn note(kind: []const u8, values: []const u64) void {
 // Checks --------------------------------------------------------------------------------------
 
 const Outcome = enum { committed, aborted, failed, unknown };
-const Transaction = struct { outcome: Outcome, values: []const u64 };
+const Transaction = struct { outcome: Outcome, values: []const u64, partitions: []const u8 };
 
 /// Whether a broker, as transaction coordinator, skipped the partition's markers taking it for
 /// deleted (KAFKA-20734's log line), from the brokers' output (the guest's node logs).
@@ -322,6 +325,10 @@ fn everything_read(context: *System.Context) !void {
     const noted = try transactions_parse(arena, log);
     // Every value read, and how often.
     var read: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    // Partitions whose hang a known bug explains, aborted so they could be read: a committed
+    // transaction's writes there are that bug's loss (KAFKA-20734 skipped their commit marker
+    // after the commit was acknowledged), counted apart (runs 173's timelines 27 and 72).
+    var known_aborted: [partitions]bool = @splat(false);
     const history: sdk.elle.History = .{};
     const process = sdk.elle.process_new();
     // Read once no transaction is open: commit markers still on their way after the faults
@@ -362,6 +369,7 @@ fn everything_read(context: *System.Context) !void {
             defer client.connection.close();
             const aborted = client.request("abort-open {s} {d}", .{ topic, partition }) catch "no answer";
             sdk.event("kafka_hanging_aborted", .{ .partition = partition, .reply = aborted });
+            known_aborted[partition] = explained;
             _ = sdk.retry(stable_attempts_max, 500, partition_stable, .{ context, partition }) catch {};
         } else |_| {};
     }
@@ -383,13 +391,23 @@ fn everything_read(context: *System.Context) !void {
     var lost: u64 = 0;
     var torn: u64 = 0;
     var duplicated: u64 = 0;
+    var known_lost: u64 = 0;
     var example: ?Transaction = null;
     for (noted) |transaction| {
         var seen: usize = 0;
-        for (transaction.values) |value| {
+        // Unread writes on partitions whose known hang was aborted: that bug's.
+        var unread_known: usize = 0;
+        for (transaction.values, transaction.partitions) |value, partition| {
             const times = read.get(value) orelse 0;
             if (times > 0) seen += 1;
             if (times > 1) duplicated += 1;
+            if (times == 0 and partition < partitions and known_aborted[partition]) unread_known += 1;
+        }
+        if (transaction.outcome == .committed and unread_known > 0 and
+            seen + unread_known == transaction.values.len)
+        {
+            known_lost += 1;
+            continue;
         }
         const torn_here = seen > 0 and seen < transaction.values.len;
         if (torn_here) torn += 1;
@@ -418,6 +436,9 @@ fn everything_read(context: *System.Context) !void {
     };
     sdk.always(aborted_read == 0, "no write of an aborted transaction is ever read", details);
     sdk.always(lost == 0, "every write of a committed transaction is read", details);
+    sdk.sometimes(known_lost > 0, "a committed transaction's writes are lost to a known hang (KAFKA-20734)", .{
+        .transactions = known_lost,
+    });
     sdk.always(torn == 0, "a transaction's writes are read all or none", details);
     sdk.always(duplicated == 0, "no write is read twice", details);
 }
@@ -435,9 +456,16 @@ fn transactions_parse(arena: std.mem.Allocator, log: []const u8) ![]const Transa
             else => .unknown,
         };
         var values: std.ArrayList(u64) = .empty;
-        while (fields.next()) |field| try values.append(arena, std.fmt.parseInt(u64, field, 10) catch continue);
+        var placed: std.ArrayList(u8) = .empty;
+        while (fields.next()) |field| {
+            const colon = std.mem.indexOfScalar(u8, field, ':') orelse continue;
+            const partition = std.fmt.parseInt(u8, field[0..colon], 10) catch continue;
+            const value = std.fmt.parseInt(u64, field[colon + 1 ..], 10) catch continue;
+            try values.append(arena, value);
+            try placed.append(arena, partition);
+        }
         if (values.items.len == 0) continue;
-        try noted.append(arena, .{ .outcome = outcome, .values = values.items });
+        try noted.append(arena, .{ .outcome = outcome, .values = values.items, .partitions = placed.items });
     }
     return noted.items;
 }
@@ -470,10 +498,11 @@ fn partition_read(context: *System.Context, arena: std.mem.Allocator, partition:
 test transactions_parse {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const noted = try transactions_parse(arena.allocator(), "c 1 2\na 3\nu 4 5 6\nf 7\n");
+    const noted = try transactions_parse(arena.allocator(), "c 0:1 3:2\na 1:3\nu 2:4 2:5 0:6\nf 1:7\n");
     try std.testing.expectEqual(4, noted.len);
     try std.testing.expectEqual(Outcome.committed, noted[0].outcome);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, noted[0].values);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 3 }, noted[0].partitions);
     try std.testing.expectEqual(Outcome.aborted, noted[1].outcome);
     try std.testing.expectEqual(Outcome.unknown, noted[2].outcome);
     try std.testing.expectEqual(Outcome.failed, noted[3].outcome);

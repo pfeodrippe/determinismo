@@ -189,7 +189,15 @@ the whole timeline (the coverage profile's slower brokers never got one).
   merged and not yet released (2026-10-28). Not new; in the latest release, and found in the
   second timeline of a four-timeline smoke. Since, a hang whose partition a coordinator logged
   as skipped this way is KAFKA-20734's: the property holds, a `kafka_known_hang` event counts
-  it, and only the hangs it does not explain fail.
+  it, and only the hangs it does not explain fail. Its loss too: in hunt run 173
+  (`kafka-4.4-coverage`, 2026-10-29, 123 timelines) 7 timelines (27, 72, 100 to 103, 113) failed
+  "every write of a committed transaction is read" and "a transaction's writes are read all or
+  none", each a transaction committed and acknowledged whose writes on the hung partition were
+  gone once the judge aborted the hang to read past it (the commit marker the coordinator
+  skipped), each with its known hang aborted. Since, the
+  log notes each write's partition, and a committed transaction whose unread writes all sit on
+  partitions whose known hang was aborted is that bug's (a sometimes, "a committed
+  transaction's writes are lost to a known hang (KAFKA-20734)"), not a lost or torn one.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
