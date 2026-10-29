@@ -29,6 +29,7 @@
 //! Drivers are ordinary functions: share them between scenarios and programs like any code.
 //! See schema.zig for the two commands every test program answers.
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
@@ -845,7 +846,9 @@ pub fn output(value: anytype) void {
 /// Code coverage for strategies: build the program with `sanitize_coverage_trace_pc_guard` set
 /// on its compile step, and reference this (`comptime { _ = sdk.coverage; }`). Each edge then
 /// emits a "coverage" event the first time a process runs it, which strategies such as
-/// det-strategy-mutate use to keep timelines that reach new code. Same events as the C SDK's.
+/// det-strategy-mutate use to keep timelines that reach new code. Same events as the C SDK's:
+/// the edge as the source line it is on ("line <file>:<n>", from the program's own debug
+/// information, for targeted runs and the causality analysis's code), "edge <n>" without one.
 pub const coverage = struct {
     var next: u32 = 1;
     /// Edges the SDK runs while reporting one are reported later, when they run again.
@@ -880,10 +883,75 @@ pub const coverage = struct {
         if (guard.* == 0 or busy) return;
         busy = true;
         defer busy = false;
-        var name_buffer: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buffer, "edge {d}", .{guard.*}) catch unreachable;
+        var name_buffer: [512]u8 = undefined;
+        const name = line_of(@returnAddress(), &name_buffer) orelse
+            std.fmt.bufPrint(&name_buffer, "edge {d}", .{guard.*}) catch unreachable;
         guard.* = 0;
         event("coverage", .{ .name = name });
+    }
+
+    /// The program's own line table, read once, apart from std.debug's: its SelfInfo is shared
+    /// (a lock, an arena), and an edge inside the stack unwinding a SafeAllocator does at each
+    /// allocation would wait for the lock that unwinding holds (det-maze-zig hung). Its own
+    /// file, Io, allocators and DWARF: nothing the program may be in the middle of.
+    const Lines = struct {
+        arena: std.heap.ArenaAllocator,
+        text: std.heap.ArenaAllocator,
+        elf: std.debug.ElfFile,
+        /// Where the executable is in memory, less where it says it is (0 unless PIE).
+        load_offset: usize,
+    };
+    var lines: ?Lines = null;
+    var lines_failed = false;
+
+    /// "line <file>:<n>" for a code address (a return address: the call is just before it), or
+    /// null without debug information there.
+    fn line_of(address: usize, buffer: []u8) ?[]const u8 {
+        @disableInstrumentation();
+        const known = lines_get() orelse return null;
+        defer _ = known.text.reset(.retain_capacity);
+        const dwarf: *std.debug.Dwarf = if (known.elf.dwarf) |*opened| opened else return null;
+        const vaddr = address -% known.load_offset -% 1;
+        const unit = dwarf.findCompileUnit(builtin.cpu.arch.endian(), vaddr) catch return null;
+        const location = dwarf.getLineNumberInfo(
+            known.arena.allocator(),
+            known.text.allocator(),
+            builtin.cpu.arch.endian(),
+            unit,
+            vaddr,
+        ) catch return null;
+        if (location.line == 0) return null;
+        return std.fmt.bufPrint(buffer, "line {s}:{d}", .{ location.file_name, location.line }) catch null;
+    }
+
+    fn lines_get() ?*Lines {
+        @disableInstrumentation();
+        if (lines) |*known| return known;
+        if (lines_failed) return null;
+        lines_failed = true; // Until it is read: once only, whatever happens.
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        const file = std.Io.Dir.cwd().openFile(io, "/proc/self/exe", .{}) catch return null;
+        defer file.close(io);
+        var elf = std.debug.ElfFile.load(arena.allocator(), io, file, null, &.none) catch return null;
+        if (elf.dwarf) |*dwarf| {
+            dwarf.open(arena.allocator(), builtin.cpu.arch.endian()) catch return null;
+        } else return null;
+        var offset: ?usize = null;
+        std.posix.dl_iterate_phdr(&offset, error{}, struct {
+            fn first(info: *std.posix.dl_phdr_info, _: usize, found: *?usize) error{}!void {
+                if (found.* == null) found.* = info.addr; // The program comes first.
+            }
+        }.first) catch {};
+        lines = .{
+            .arena = arena,
+            .text = .init(std.heap.page_allocator),
+            .elf = elf,
+            .load_offset = offset orelse 0,
+        };
+        lines_failed = false;
+        return &lines.?;
     }
 };
 

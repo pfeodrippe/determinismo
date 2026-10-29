@@ -284,7 +284,7 @@ fn check_coverage(context: *Context) !void {
     };
     const mazes = [_]Maze{
         .{ .label = "C, one worker", .system = &c, .jobs = 1, .branches = 300 },
-        .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 300 },
+        .{ .label = "Zig, one worker", .system = &zig, .jobs = 1, .branches = 300, .lines = "\"name\":\"line [^\"]*tests/selftest/maze.zig:[0-9]+" },
         .{ .label = "C, 4 synced workers", .system = &c, .jobs = 4, .branches = 300 },
         .{ .label = "Python, 8 synced workers", .system = &python, .jobs = 8, .branches = 1000 },
         .{ .label = "Java, 8 synced workers", .system = &java, .jobs = 8, .branches = 1000 },
@@ -292,7 +292,14 @@ fn check_coverage(context: *Context) !void {
     for (mazes, 0..) |maze, index| try check_maze(context, maze, index);
 }
 
-const Maze = struct { label: []const u8, system: []const []const u8, jobs: u32, branches: u32 };
+const Maze = struct {
+    label: []const u8,
+    system: []const []const u8,
+    jobs: u32,
+    branches: u32,
+    /// What its coverage events must match (an extended regular expression): edges as lines.
+    lines: ?[]const u8 = null,
+};
 
 fn check_maze(context: *Context, maze: Maze, index: usize) !void {
     const arena = context.arena;
@@ -312,7 +319,14 @@ fn check_maze(context: *Context, maze: Maze, index: usize) !void {
         "--strategy", strategy,
         "--tape-dir", tapes,
     });
+    const events = try std.fmt.allocPrint(arena, "{s}/maze-{d}-events", .{ context.scratch, index });
+    if (maze.lines != null) try arguments.appendSlice(arena, &.{ "--events-dir", events });
     const report = try explore(context, arguments.items);
+    if (maze.lines) |pattern| {
+        const found = try run_kept(context, &.{ "grep", "-rlE", pattern, events });
+        expect(context, found.stdout.len > 0, "coverage ({s}): its edges are reported as source " ++
+            "lines (\"line <file>:<n>\")", .{maze.label});
+    }
     const branches = try arena.alloc(Branch, maze.branches); // One line per branch.
     const count = parse_branches(report, branches);
     const solved = for (branches[0..count]) |branch| {

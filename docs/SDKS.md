@@ -54,7 +54,8 @@ Each edge, line or block reports itself once, the first time a process runs it. 
 (C, C++, Rust) whose unstripped binary is in the image's `/symbols` reports the source lines of
 its edges, for targeted runs (`--changed`): keep the debug information (`-g`; for Rust, a
 release profile with `debug = true` and `strip = false`: Cargo strips it by default since 1.77,
-whatever `RUSTFLAGS` ask).
+whatever `RUSTFLAGS` ask). Zig programs report their edges' lines from their own debug
+information wherever they run (not stripped: Zig keeps it but in ReleaseSmall).
 
 ## Antithesis's SDKs
 
