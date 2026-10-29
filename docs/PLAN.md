@@ -330,6 +330,10 @@ event hashing, the guest module.
   a coordinator crashing between begin_tx and recording the partitions leaves the transaction
   open for good (examples/kafka/README.md), explained with causality and a trace-logged future
   from inside its jump (a command at the moment raising the logger, kept across restarts).
+  Patroni 4.1.0 (examples/patroni, 2026-10-29): PostgreSQL 18.6 with etcd beside it on each of
+  three nodes, synchronous_mode, Jepsen's list-append through the primary; smokes fixed a start
+  deadlock (Patroni waits for an etcd quorum: nodes ready on etcd's peer port) and its unsynced
+  bootstrap pg_hba.conf (clients refused after an early power loss); first hunt queued.
 - Writeback windows (2026-10-29, the user's choice): the guest writes nothing back unasked, so a
   power loss drops every write never synced, however old (Antithesis keeps "durably synced
   filesystem changes" too). Strict stays the default; a node may declare `writeback_s` (its disk
