@@ -1414,17 +1414,6 @@ fn command_explore(
         const source = try cwd.readFileAlloc(context.io, path, context.arena, .unlimited);
         const scratch = try context.arena.alloc(u8, 64 * 1024);
         const header = try tape.parse(source, scratch, overrides);
-        // Recorded before the composer took the timeline limit (2026-10-29): no driver cap in the
-        // guest, so the command line without it.
-        if (header.inputs != exploration.inputs) if (cmdline_without_limit(context.arena, options.cmdline)) |legacy| {
-            const now = options.cmdline;
-            options.cmdline = legacy;
-            if (inputs_hash(options, arguments) == header.inputs) {
-                exploration.inputs = header.inputs;
-                std.debug.print("[determinismo] the tape was recorded before the composer took the " ++
-                    "timeline limit: replayed without it, as it ran\n", .{});
-            } else options.cmdline = now;
-        };
         if (header.inputs != exploration.inputs) {
             std.debug.print("[determinismo] the tape was recorded with inputs {x:0>16}; " ++
                 "these are {x:0>16} (kernel, initramfs, command line, disks or CPU modulation " ++
@@ -4216,26 +4205,6 @@ fn close(fd: linux.fd_t) void {
 /// What a timeline depends on besides its decisions: the kernel and initramfs bytes, the
 /// command line (scenario included) and the disks. Disks are named by their content (image IDs,
 /// system hashes), so their names stand for their bytes; other disks are hashed by path.
-/// The command line without `det.timeline_limit_ms=` (runs recorded before the composer took it
-/// had none); null when it has none.
-fn cmdline_without_limit(arena: std.mem.Allocator, cmdline: []const u8) ?[]const u8 {
-    const key = " det.timeline_limit_ms=";
-    const start = std.mem.indexOf(u8, cmdline, key) orelse return null;
-    const end = std.mem.indexOfScalarPos(u8, cmdline, start + 1, ' ') orelse cmdline.len;
-    return std.mem.concat(arena, u8, &.{ cmdline[0..start], cmdline[end..] }) catch null;
-}
-
-test cmdline_without_limit {
-    const arena = std.testing.allocator;
-    const without = cmdline_without_limit(arena, "quiet det.scenario=txn det.timeline_limit_ms=3600000").?;
-    defer arena.free(without);
-    try std.testing.expectEqualStrings("quiet det.scenario=txn", without);
-    const middle = cmdline_without_limit(arena, "quiet det.timeline_limit_ms=60000 det.timeline_ms=5000").?;
-    defer arena.free(middle);
-    try std.testing.expectEqualStrings("quiet det.timeline_ms=5000", middle);
-    try std.testing.expectEqual(@as(?[]const u8, null), cmdline_without_limit(arena, "quiet det.scenario=txn"));
-}
-
 fn inputs_hash(options: *const VM.Options, arguments: *const Arguments) u64 {
     var hasher = std.hash.Wyhash.init(0x696e70757473);
     hasher.update(options.kernel);
