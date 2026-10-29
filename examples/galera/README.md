@@ -113,5 +113,13 @@ n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
   log that should cover it breaks write-ahead logging, either in InnoDB (Jepsen's
   configuration flushes the log about once a second, `innodb_flush_log_at_trx_commit = 0`,
   which may lose recent commits but should never corrupt) or in determinismo's disk model
-  (whether it can make a page durable before an earlier, unsynced log write). Next: replay
-  one to the power loss and compare what each file had synced.
+  (whether it can make a page durable before an earlier, unsynced log write). The settings
+  (read in the image): data and redo both unbuffered (`innodb_flush_method O_DIRECT`,
+  `innodb_log_file_buffering OFF`), redo synced about once a second, doublewrite on, 3 undo
+  tablespaces. A power loss here is ext4's shutdown without a log flush: an O_DIRECT write that
+  completed survives, unless it landed in space the file had reserved but never written (an
+  unwritten extent), whose conversion is a journal update lost without a sync or ext4's 5 s
+  commit, as on a real ext4. A hypothesis, not checked: the redo log's last O_DIRECT writes into
+  such space lost before its once-a-second sync, while a page they cover (written after them)
+  was kept. Next: the redo log's extents (filefrag) and its last writes before the power loss,
+  by replay.
