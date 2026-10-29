@@ -76,7 +76,9 @@ const Kind = enum {
     /// A power loss of several nodes at the same moment (a rack's, a datacenter's; Jepsen's
     /// kill of a majority or of all): each keeps what it synced, and all start again at its end.
     /// Systems that acknowledge before a sync, counting on their replicas (Galera's
-    /// recommended settings, Kafka's), lose acknowledged writes only so.
+    /// recommended settings, Kafka's), lose acknowledged writes only so. For nodes that allow
+    /// restarts but not power losses, a kill of several at once instead (`power` false): Jepsen
+    /// found YugabyteDB 1.3.1's #2125 killing every master together.
     outage,
     /// A power loss at a durability point: its fsyncs and sync writes are decisions, and the
     /// one picked crashes the node there (before its data is on disk, or just after).
@@ -155,6 +157,8 @@ const Fault = struct {
     endpoints: [endpoints_max]bool = @splat(false),
     /// For custom: the program in the node.
     program: []const u8 = "",
+    /// For outage: power losses (false: kills, the nodes allowing restarts).
+    power: bool = true,
 };
 
 /// Set by the SIGTERM handler; checked between steps so a stop never leaves a fault applied.
@@ -180,6 +184,23 @@ fn busy_begin() void {
     if (busy_since_ns.load(.monotonic) == 0) busy_since_ns.store(monotonic_ns(), .monotonic);
 }
 
+/// What the main loop is doing ("apply crash kafka-1", "end restart kafka-3", "heal"), for the
+/// watchdog to say with a stall: run 68's (srv3, a 34 s stall in timeline 98) said only how long.
+/// A diagnostic: the watchdog's copy may catch it mid-write.
+var doing_buffer: [96]u8 = undefined;
+var doing_size = std.atomic.Value(u8).init(0);
+
+fn doing_set(comptime phase: []const u8, kind: ?Kind, node: []const u8) void {
+    doing_size.store(0, .release);
+    const text = std.fmt.bufPrint(&doing_buffer, phase ++ "{s}{s}{s}{s}", .{
+        if (kind != null) " " else "",
+        if (kind) |known| @tagName(known) else "",
+        if (node.len > 0) " " else "",
+        node,
+    }) catch doing_buffer[0..0];
+    doing_size.store(@intCast(text.len), .release);
+}
+
 fn busy_end() void {
     busy_since_ns.store(0, .monotonic);
 }
@@ -194,7 +215,13 @@ fn watchdog() void {
         const busy = monotonic_ns() -| since;
         if (busy < stall_ns) continue;
         stall_reported.store(true, .monotonic);
-        sdk.assert_computed(.always, false, stall_property, .{ .busy_ms = busy / std.time.ns_per_ms });
+        var doing: [96]u8 = undefined;
+        const size = doing_size.load(.acquire);
+        @memcpy(doing[0..size], doing_buffer[0..size]);
+        sdk.assert_computed(.always, false, stall_property, .{
+            .busy_ms = busy / std.time.ns_per_ms,
+            .doing = doing[0..size],
+        });
     }
 }
 
@@ -272,6 +299,7 @@ pub fn main(init: std.process.Init) !void {
         apply(arena, &system, &applied);
     }
     busy_begin();
+    doing_set("heal", null, "");
     node_heal(&system);
     network_stop(&system);
     leftovers_check(&system);
@@ -325,6 +353,7 @@ fn fault_names(arena: std.mem.Allocator, faults: []const Fault) ![]const []const
     for (faults, names) |fault, *name| {
         var text: std.ArrayList(u8) = .empty;
         try text.appendSlice(arena, @tagName(fault.kind));
+        if (fault.kind == .outage and !fault.power) try text.appendSlice(arena, " kill");
         for ([_][]const u8{ fault.node, fault.peer, fault.program }) |part| {
             if (part.len == 0) continue;
             try text.append(arena, ' ');
@@ -359,8 +388,13 @@ const Applied = struct {
     /// For partition_groups: each endpoint's group (runner first), group_none for those left out.
     /// (u16, not u8: JSON writes byte arrays as strings.)
     groups: [endpoints_max]u16 = @splat(group_none),
-    /// For outage: the nodes that lose power (runner first, never it).
+    /// For outage: the nodes that lose power, or are killed (`power` false) (runner first,
+    /// never it).
     outage: [endpoints_max]bool = @splat(false),
+    power: bool = true,
+    /// For process_pause, thread_pause and process_kill: the process's command name, as it was
+    /// (which of a node's processes is the question: a master or a backend).
+    process: []const u8 = "",
     /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
     injected: bool = false,
     disk: ?nodes.DiskFault = null,
@@ -419,7 +453,10 @@ fn draw(fault: *const Fault) Applied {
             applied.skip_ns = sdk.random_below(clock_skip_ns_max);
             applied.permanent = sdk.random_below(4) == 0;
         },
-        .outage => applied.outage = outage_draw(fault.endpoints),
+        .outage => {
+            applied.outage = outage_draw(fault.endpoints);
+            applied.power = fault.power;
+        },
         .partition_groups => {
             applied.disruption = sdk.random_choice(Disruption, std.enums.values(Disruption));
             applied.groups = groups_draw(fault.endpoints);
@@ -593,11 +630,18 @@ fn faults_collect(
     }
     var crashable: [endpoints_max]bool = @splat(false);
     var crashable_count: u32 = 0;
+    var restartable: [endpoints_max]bool = @splat(false);
+    var restartable_count: u32 = 0;
     for (system.nodes, 1..) |node, index| {
         crashable[index] = node.faults.crash;
         crashable_count += @intFromBool(node.faults.crash);
+        restartable[index] = node.faults.restart;
+        restartable_count += @intFromBool(node.faults.restart);
     }
     if (crashable_count >= 2) faults_add(faults, &count, .{ .kind = .outage, .endpoints = crashable });
+    if (restartable_count >= 2) {
+        faults_add(faults, &count, .{ .kind = .outage, .endpoints = restartable, .power = false });
+    }
     if (scenario.clock_skip) faults_add(faults, &count, .{ .kind = .clock_skip });
     const networked = for (faults[0..count]) |fault| switch (fault.kind) {
         .isolate, .partition, .degrade, .partition_groups, .clog => break true,
@@ -646,6 +690,8 @@ fn faults_add(faults: *[faults_max]Fault, count: *u32, fault: Fault) void {
 /// Applies one fault for its duration and undoes it, even when stopped meanwhile. The event
 /// carries everything about it, so that `determinismo script` can put it in a script.
 fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const Applied) void {
+    doing_set("apply", applied.kind, applied.node);
+    defer doing_set("wait", null, "");
     switch (applied.kind) {
         .pause,
         .restart,
@@ -699,7 +745,22 @@ const NodeFault = struct {
     peer: Pod = .{},
     peer_pid: linux.pid_t = 0,
     addresses: [2]nodes.Address = undefined,
+    /// The stopped process's command name (process_pause, thread_pause), for its event.
+    command: [16]u8 = undefined,
+    command_size: u8 = 0,
 };
+
+/// A process's command name (/proc/<pid>/comm), into `buffer`.
+fn command_of(pid: linux.pid_t, buffer: *[16]u8) []const u8 {
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/comm", .{pid}, 0) catch return "";
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return "";
+    defer _ = linux.close(@intCast(fd));
+    const size = linux.read(@intCast(fd), buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return "";
+    return std.mem.trimEnd(u8, buffer[0..size], "\n");
+}
 var nodes_faulted: [schema.nodes_max]?NodeFault = @splat(null);
 /// For starting nodes again when their fault ends (set once faults start).
 var arena_active: ?std.mem.Allocator = null;
@@ -742,6 +803,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     slot.* = fault;
     // A pod fault's event names its pod (kept in the slot, which the event reads).
     const node_fault = &slot.*.?;
+    if (node_fault.command_size > 0) node_fault.applied.process = node_fault.command[0..node_fault.command_size];
     if (node_fault.pod.path_size > 0) node_fault.applied.pod = node_fault.pod.name();
     if (node_fault.peer.path_size > 0) node_fault.applied.peer_pod = node_fault.peer.name();
     sdk.event("fault", node_fault.applied);
@@ -751,6 +813,8 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
     const fault = slot.* orelse return;
     slot.* = null;
     const name = fault.applied.node;
+    doing_set("end", fault.applied.kind, name);
+    defer doing_set("wait", null, "");
     switch (fault.applied.kind) {
         .pause => nodes.freeze(name, .thawed) catch {},
         .sync_stall => durable_disarm(name),
@@ -1116,6 +1180,7 @@ fn readdress_maybe(system: *const schema.System, node: *const schema.Resolved) v
 fn node_start_again(system: *const schema.System, name: []const u8) void {
     const node = system.node(name) orelse return;
     const arena = arena_active orelse return;
+    doing_set("start again", null, name);
     // Waiting for the node to be ready (60 s at most: nodes.ready_wait) is not a stall: a
     // PostgreSQL recovering after a power loss took over 30 s in 95 timelines of run 43 (srv3),
     // each one failing the property.
@@ -1162,8 +1227,9 @@ fn node_heal(system: *const schema.System) void {
     for (&nodes_faulted) |*slot| node_end(system, slot);
 }
 
-/// An outage begins: its nodes all frozen first (none runs on while the others lose power),
-/// then each crashed, each holding its own slot until the fault's end, when all start again.
+/// An outage begins: its nodes all frozen first (none runs on while the others go down), then
+/// each crashed (or killed, `power` false), each holding its own slot until the fault's end,
+/// when all start again.
 /// A node busy with another fault, or down already, is left out; with fewer than two left
 /// there is no outage.
 fn outage_start(system: *const schema.System, applied: *const Applied) void {
@@ -1186,7 +1252,12 @@ fn outage_start(system: *const schema.System, applied: *const Applied) void {
     var down: u32 = 0;
     for (system.nodes, nodes_faulted[0..count_nodes], taken.outage[1..][0..count_nodes]) |node, *slot, *in| {
         if (!in.*) continue;
-        nodes.crash(node.name) catch |err| {
+        const ended = if (applied.power) nodes.crash(node.name) else killed: {
+            const result = nodes.kill(node.name);
+            nodes.freeze(node.name, .thawed) catch {}; // Its next start runs.
+            break :killed result;
+        };
+        ended catch |err| {
             nodes.freeze(node.name, .thawed) catch {};
             sdk.event("fault_failed", .{ .kind = "outage", .node = node.name, .err = @errorName(err) });
             in.* = false;
@@ -1361,6 +1432,7 @@ fn process_stop(applied: *const Applied, fault: *NodeFault) !void {
     const count = try nodes.processes(applied.node, &pids);
     if (count == 0) return error.NoProcess;
     fault.pid = pids[applied.process_index % count];
+    fault.command_size = @intCast(command_of(fault.pid, &fault.command).len);
     _ = linux.kill(fault.pid, .STOP);
 }
 
@@ -1373,6 +1445,7 @@ fn thread_stop(applied: *const Applied, fault: *NodeFault) !void {
     const count = try nodes.processes(applied.node, &pids);
     if (count == 0) return error.NoProcess;
     const pid = pids[applied.process_index % count];
+    fault.command_size = @intCast(command_of(pid, &fault.command).len);
     var tids: [threads_max]linux.pid_t = undefined;
     const threads = nodes.threads(pid, &tids);
     if (threads == 0) return error.NoThread;
@@ -1425,8 +1498,12 @@ fn apply_process_kill(system: *const schema.System, applied: *const Applied) voi
         others += 1;
     }
     if (others == 0) return;
-    _ = linux.kill(pids[applied.process_index % others], .KILL);
-    sdk.event("fault", applied.*);
+    const pid = pids[applied.process_index % others];
+    var named = applied.*;
+    var command: [16]u8 = undefined;
+    named.process = command_of(pid, &command);
+    _ = linux.kill(pid, .KILL);
+    sdk.event("fault", named);
 }
 
 /// Whether the process's command name (/proc/<pid>/comm) is one of `names`.
@@ -1553,7 +1630,11 @@ fn network_expire(system: *const schema.System, now_ns: u64) void {
         kept += 1;
     }
     network.count = kept;
-    if (changed) network_refresh(system);
+    if (changed) {
+        doing_set("refresh network", null, "");
+        defer doing_set("wait", null, "");
+        network_refresh(system);
+    }
 }
 
 fn network_next_end() ?u64 {
@@ -1933,8 +2014,10 @@ const Request = struct {
     /// disk.
     failure: nodes.DiskFailure = .errors,
     delay_ms: u32 = 50,
-    /// outage: the nodes that lose power (none named: every node that allows crashes).
+    /// outage: the nodes that lose power (none named: every node that allows crashes), or with
+    /// `power` false are killed (none named: every node that allows restarts).
     nodes: []const []const u8 = &.{},
+    power: bool = true,
     /// durable_crash and sync_stall: one durability point in `one_in` is picked.
     one_in: u32 = 1,
     after_sync: bool = false,
@@ -2022,8 +2105,9 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
         },
         .custom => applied.program = request.program,
         .outage => {
-            for (system.nodes, 1..) |node, index| applied.outage[index] = node.faults.crash and
-                request.nodes.len == 0;
+            applied.power = request.power;
+            for (system.nodes, 1..) |node, index| applied.outage[index] = request.nodes.len == 0 and
+                if (request.power) node.faults.crash else node.faults.restart;
             for (request.nodes) |name| {
                 const index = endpoint_index(system, name) orelse return error.UnknownNode;
                 if (index == 0) return error.UnknownNode; // The runner has no power to lose.

@@ -2054,6 +2054,8 @@ fn check_disk(context: *Context) !void {
     const outage_passes = has_lines(report, &.{
         "PASS always                hit in    3/3 branches, failing in    0  an outage takes its " ++
             "nodes down at once, each keeping only what it synced",
+        "PASS always                hit in    3/3 branches, failing in    0  a kill outage takes " ++
+            "its nodes down at once, each keeping even what it did not sync",
     });
     const outages = try query_count(context, &.{ events, "event=fault details.kind=outage" });
     var branches: [3]Branch = undefined;

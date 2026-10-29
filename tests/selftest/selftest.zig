@@ -455,6 +455,22 @@ fn outage(group: []const *const sdk.Node) !void {
     }
     sdk.always(written and kept, "an outage takes its nodes down at once, each keeping only " ++
         "what it synced", .{ .written = written, .kept = kept });
+    // A kill outage (nodes that allow restarts, not power losses): processes killed, the
+    // kernel's page cache kept, so what was not synced survives too.
+    var unsynced_written = true;
+    for (group) |node| {
+        const status = node.exec(&.{ "/bin/det-selftest-node", "unsynced", "/data/killed-unsynced" }) catch 1;
+        unsynced_written = unsynced_written and status == 0;
+    }
+    sdk.fault(.{ .kind = "outage", .nodes = &names, .power = false, .duration_ms = fault_ms });
+    sdk.sleep_ms(fault_ms + 100);
+    var survived = true;
+    for (group) |node| {
+        try sdk.retry(100, 100, answers, .{node.address});
+        survived = survived and file_present(node, "/data/killed-unsynced");
+    }
+    sdk.always(unsynced_written and survived, "a kill outage takes its nodes down at once, each " ++
+        "keeping even what it did not sync", .{ .written = unsynced_written, .kept = survived });
 }
 
 /// The echo node wrote one file synced and one not (DET_DURABLE). After a crash the first is
