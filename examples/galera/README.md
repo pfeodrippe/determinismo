@@ -91,3 +91,14 @@ n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
   about 1,000 of them of unknown outcome (1.2%: a `sometimes` true in most timelines says one
   happened, not that most did); the commit errors were all `Error while appending streaming
   replication fragment (provider status: Not connected to Primary Component)`.
+- Hunt run 97 (srv3, 2026-10-29, `jepsen`, seed 3, with correlated power losses): 299 timelines,
+  "no process crashes: mariadbd" failing in 114, every one Galera's by-design abort above (a
+  state transfer's donor gone), its signal 11 inside `abort()` looking like any crash; the EVS
+  aborts (three lineages) were among them. Since then a crash after a node printed one of its
+  known exits counts with that exit (det-core matches the node's output as it crashes), and
+  every profile declares "State transfer cannot be completed, need to abort": the crash property
+  fails on other crashes alone.
+- `jepsen-dirsync` (2026-10-29): 12.1.2 with `dirsync.c` preloaded, gvwstate.dat's rename made
+  durable. Smoke (4 timelines): no node restored an incarnation twice (n2 restarted 19 times, 19
+  incarnations), where without it most timelines repeat one. A hunt of it, against run 97, tells
+  whether the rename causes the EVS abort.

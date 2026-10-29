@@ -40,11 +40,14 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// `default`: MariaDB 13.0.2. `jepsen`: 12.1.2, the version of Jepsen's analysis, to measure
-/// what determinismo finds blind of what Jepsen reported.
+/// what determinismo finds blind of what Jepsen reported. `jepsen-dirsync`: 12.1.2 with
+/// gvwstate.dat's rename made durable (dirsync.c), to tell whether that rename causes the EVS
+/// abort (README).
 fn describe(d: *System.Describe) !void {
     inline for (.{
         .{ "default", "examples/galera/Dockerfile" },
         .{ "jepsen", "examples/galera/Dockerfile.12.1.2" },
+        .{ "jepsen-dirsync", "examples/galera/Dockerfile.12.1.2-dirsync" },
     }) |entry| {
         const profile = try d.profile(entry[0]);
         inline for (node_names) |name| {
@@ -60,6 +63,11 @@ fn describe(d: *System.Describe) !void {
                 // The others join the cluster n1 started.
                 .after = if (first) &.{} else &.{.n1},
                 .faults = .{ .restart = true, .crash = true, .stop = true },
+                // Galera's own abort when a joiner's state transfer loses its donor: by design
+                // (README), and its signal 11 inside abort() looks like any crash. 114 of hunt run
+                // 97's 299 timelines failed "no process crashes: mariadbd" on it alone, the EVS
+                // aborts hidden among them.
+                .exits_known = &.{"State transfer cannot be completed, need to abort"},
             });
         }
     }

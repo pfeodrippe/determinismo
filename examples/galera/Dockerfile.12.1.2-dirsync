@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Dockerfile.12.1.2 with dirsync.c preloaded into every process: Galera's gvwstate.dat rename made
+# durable, as the fix for the EVS abort would make it (README). The jepsen-dirsync profile.
+FROM docker.io/library/mariadb:12.1.2 AS shim
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+COPY examples/galera/dirsync.c /tmp/dirsync.c
+RUN gcc -O2 -Wall -Werror -shared -fPIC -o /tmp/dirsync.so /tmp/dirsync.c -ldl
+
+FROM docker.io/library/mariadb:12.1.2
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+COPY examples/galera/jepsen.cnf /etc/mysql/conf.d/90-jepsen.cnf
+COPY examples/galera/galera.cnf /etc/mysql/conf.d/99-jepsen-galera.cnf
+COPY examples/galera/start /usr/local/bin/galera-start
+COPY --from=shim /tmp/dirsync.so /usr/local/lib/dirsync.so
+ENV LD_PRELOAD=/usr/local/lib/dirsync.so
+ENTRYPOINT ["/usr/local/bin/galera-start"]
