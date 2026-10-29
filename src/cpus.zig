@@ -271,7 +271,11 @@ pub const Pool = struct {
     /// held.
     fn claim_fits(pool: *Pool, bytes: u64) bool {
         if (bytes == 0) return true;
-        const total = memory_total();
+        // The claims are every run's, host-wide: against the host's memory and reserve. A
+        // cgroup's limit bounds what this process has available (memory_available), not the
+        // host's claims: compared with a session's 24 GB, a hunt's 50 GB of claims kept every
+        // check's VM waiting while the hunt ran (srv3, 2026-10-29).
+        const total = meminfo("MemTotal:");
         if (total == 0) return true; // Unknown: never a reason to wait.
         var claimed: u64 = 0;
         for (pool.host_fds[0..pool.host_count]) |fd| {
@@ -284,7 +288,9 @@ pub const Pool = struct {
             if (linux.pread(fd, &claim, claim.len, 0) == claim.len) claimed += std.mem.bytesToValue(u64, &claim);
         }
         claimed += nodes_claimed(pool.directory_buffer[0..pool.directory_size]);
-        return fits(claimed, bytes, total, if (pool.available_counts) memory_available() else 0, reserve_bytes());
+        if (!fits(claimed, bytes, total, 0, memory_reserve_bytes + sessions_reserve_bytes())) return false;
+        const available = if (pool.available_counts) memory_available() else 0;
+        return fits(0, bytes, std.math.maxInt(u64) / 2, available, reserve_bytes());
     }
 
     /// Whether a priority process waits for the CPU of `slot` (it holds its `priority-<cpu>`
@@ -737,7 +743,8 @@ test "a VM's memory claim counts while its CPU is held" {
     defer other.close();
     holder.available_counts = false; // The claims' accounting alone (fits has the rest).
     other.available_counts = false;
-    const total = memory_total();
+    // The host's: claims are host-wide, whatever this test's cgroup limit (a check's unit).
+    const total = meminfo("MemTotal:");
     if (total == 0) return error.SkipZigTest;
     const saved = claim_bytes;
     defer claim_bytes = saved;
