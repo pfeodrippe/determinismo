@@ -1759,6 +1759,10 @@ fn worker_run(
         linux.exit_group(1);
     };
     var exploration = branches.exploration.*;
+    // The explorer's plugin stays the explorer's: this process starts its own (worker_explore),
+    // and the explorer's pipes kept here (and in this process's holders) would keep that plugin
+    // from seeing the end of its input when the explorer stops it.
+    if (exploration.strategy) |explorer_strategy| explorer_strategy.forget();
     var mine = branches;
     mine.exploration = &exploration;
     mine.worker = worker.worker;

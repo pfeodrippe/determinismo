@@ -2028,6 +2028,34 @@ fn check_tree(context: *Context) !void {
         "replays from its tape (its ancestors' decisions from theirs)", .{
         steered_count, steered_deep.depth, steered_deep.index,
     });
+    // A strategy that only chooses where the tree returns ("decides": false) keeps in-run
+    // snapshots, whose holders must not keep its plugin's pipes: a timeline stopping its plugin
+    // at its end then waited forever (a Tetris tree, srv3 2026-10-29). Under `timeout`, a hang is
+    // this check's failure, named, not the suite's.
+    const returns_tapes = try std.fmt.allocPrint(arena, "{s}/tree-returns-tapes", .{context.scratch});
+    const returns_record = try std.fmt.allocPrint(arena, "{s}/tree-returns.jsonl", .{context.scratch});
+    var returns_argv: std.ArrayList([]const u8) = .empty;
+    try returns_argv.appendSlice(arena, &.{ "timeout", "600", context.determinismo, "explore" });
+    try returns_argv.appendSlice(arena, context.machine);
+    try returns_argv.appendSlice(arena, &(common ++ [_][]const u8{
+        "--jobs",     "2",           "--strategy", "python3 plugins/python/tree_rarity.py",
+        "--tape-dir", returns_tapes, "--record",   returns_record,
+    }));
+    const returned = try run_kept(context, returns_argv.items);
+    const returned_output = try std.mem.concat(arena, u8, &.{ returned.stdout, returned.stderr });
+    var returned_branches: [branches_max]Branch = undefined;
+    const returned_count = parse_branches(returned_output, &returned_branches);
+    const returned_ended = switch (returned.term) {
+        .exited => |code| code == 0 or code == 3,
+        else => false,
+    };
+    expect_all(context, &.{
+        .{ "the run ends (within timeout's 600 s)", returned_ended },
+        .{ "64 timelines", returned_count == 64 },
+        .{ "in-run snapshots made nodes", holders_made(returned_output) },
+    }, "tree with a strategy choosing only its returns: {d} timelines, its holders kept", .{
+        returned_count,
+    });
     // With CPU modulation: holders keep the modulated timelines as they were, their nodes are
     // the ones a replay makes, and a deep timeline replays alone.
     const modulated_tapes = try std.fmt.allocPrint(arena, "{s}/tree-modulated-tapes", .{

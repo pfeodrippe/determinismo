@@ -130,6 +130,15 @@ fn program_find(
     return error.PluginNotFound;
 }
 
+/// In a process forked from the one that started the plugin: its connection closed here, never
+/// waited for. A fork that kept it (a holder, a tree's timeline) would keep the plugin from seeing
+/// the end of its input when its owner stops it, and the owner would wait forever (a Tetris
+/// tree with a returns-only strategy, srv3 2026-10-29: every timeline stuck at its end).
+pub fn forget(strategy: *Strategy) void {
+    _ = linux.close(strategy.to_plugin);
+    _ = linux.close(strategy.from_plugin);
+}
+
 pub fn stop(strategy: *Strategy) void {
     _ = linux.close(strategy.to_plugin); // The plugin sees end of input and exits.
     _ = linux.close(strategy.from_plugin);

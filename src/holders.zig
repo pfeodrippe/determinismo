@@ -426,11 +426,7 @@ pub const Owner = struct {
         const base: ?[]const u8 = if (owner.disk_base_len > 0) owner.disk_base[0..owner.disk_base_len] else null;
         const pid = linux.fork();
         if (pid == 0) {
-            // The worker's machine is not this process's: only its memory and captured state.
-            _ = linux.close(vm.vcpu_fd);
-            _ = linux.close(vm.vm_fd);
-            _ = linux.close(vm.kvm_fd);
-            if (vm.events.log_fd) |fd| _ = linux.close(fd);
+            machine_forget(vm);
             cpus.unpin();
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
             Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, point.idle) catch
@@ -502,11 +498,7 @@ pub const Owner = struct {
     /// The holder: waits for the explorer, then makes the node it asks for and exits (or is
     /// killed: dropped by its timeline, released by the explorer).
     fn serve(owner: *Owner, vm: *VM, listener: linux.fd_t, moment_ns: u64) noreturn {
-        // The worker's machine is not this process's: only its memory and captured state are.
-        _ = linux.close(vm.vcpu_fd);
-        _ = linux.close(vm.vm_fd);
-        _ = linux.close(vm.kvm_fd);
-        if (vm.events.log_fd) |fd| _ = linux.close(fd);
+        machine_forget(vm);
         oom_first();
         // Until the explorer asks, or is gone: a holder outlives its worker, never its explorer
         // (killed, or ended with timelines in flight whose holders it never heard of).
@@ -655,6 +647,17 @@ fn connect(at: *const linux.sockaddr.un) ?linux.fd_t {
 }
 
 /// The kernel's OOM killer takes this process before any other.
+/// In a fork of the worker (a holder, its disk writer): the worker's machine is not this
+/// process's, only its memory and captured state are; nor is the worker's strategy plugin, which
+/// would otherwise never see the end of its input when the worker stops it.
+fn machine_forget(vm: *VM) void {
+    _ = linux.close(vm.vcpu_fd);
+    _ = linux.close(vm.vm_fd);
+    _ = linux.close(vm.kvm_fd);
+    if (vm.events.log_fd) |fd| _ = linux.close(fd);
+    if (vm.strategy) |strategy| strategy.forget();
+}
+
 fn oom_first() void {
     const fd = linux.open("/proc/self/oom_score_adj", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
