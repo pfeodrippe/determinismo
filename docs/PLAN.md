@@ -738,7 +738,8 @@ places, and assertions carry no location.
   timelines; the experiment, 2026-10-29: Kafka run 56's 64 sampled timelines replayed 32 at once with
   hyperthreads on, 38 replayed, 26 parted from their tapes at various events with no clock
   hazard counted; the control with them off, 2026-10-29: the same 38, the same 26 at the same
-  events, so a difference of builds, not hyperthreads; one per core stays for now); memory
+  events, so a difference of builds, not hyperthreads; one per core stays until a fresh run
+  with siblings shared replays every timeline by the same build: queued, after-next3); memory
   admission by claims and by what is available now, the sessions' room held back while one of
   their VMs waits.
 - Busy guests: about 0.85-1x virtual per wall second now (0.3-0.6 before the exit work of
