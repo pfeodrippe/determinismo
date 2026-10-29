@@ -114,6 +114,7 @@ fn describe(d: *System.Describe) !void {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("cluster", cluster_setup);
     s.parallel_driver("append", append);
+    s.finally("final reads", final_reads);
 }
 
 fn address_of(context: *System.Context, name: []const u8) [4]u8 {
@@ -458,6 +459,77 @@ fn find(
     transaction.token_keep(reply);
     if (!Mongo.ok(reply)) return command_failed(reply, "find");
     read.* = list_of(arena, reply) catch return error.Definite;
+}
+
+/// Once faults stop: every committed append in its key's document (sdk.elle.final_reads), read
+/// through any router at majority read concern.
+fn final_reads(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    var reader: FinalReader = .{ .all = routers(context) };
+    defer reader.close();
+    const history: sdk.elle.History = .{};
+    try sdk.elle.final_reads(arena, &history, &reader);
+}
+
+/// Connections the final reads try (a pause after each that fails) before leaving the rest of
+/// the keys unjudged.
+const final_attempts_max = 60;
+const final_pause_ms = 1000;
+
+/// The final reads' connection: to a router drawn at random, reopened after a read fails, until
+/// `final_attempts_max` attempts failed.
+const FinalReader = struct {
+    all: [router_names.len][4]u8,
+    connection: Mongo = undefined,
+    connected: bool = false,
+    attempts: u32 = 0,
+
+    pub fn read_list(reader: *FinalReader, arena: std.mem.Allocator, key: u64) ?[]const u64 {
+        while (reader.attempts < final_attempts_max) {
+            if (!reader.connected) {
+                const address = reader.all[sdk.random_below(reader.all.len)];
+                reader.connection.open(address, port, .{ .timeout_ms = timeout_ms }) catch {
+                    reader.attempts += 1;
+                    sdk.sleep_ms(final_pause_ms);
+                    continue;
+                };
+                reader.connected = true;
+            }
+            if (final_find(arena, &reader.connection, key)) |list| return list else |_| {
+                reader.close();
+                reader.attempts += 1;
+                sdk.sleep_ms(final_pause_ms);
+            }
+        }
+        return null;
+    }
+
+    fn close(reader: *FinalReader) void {
+        if (reader.connected) reader.connection.close();
+        reader.connected = false;
+    }
+};
+
+/// One key's list outside any transaction, at majority read concern.
+fn final_find(arena: std.mem.Allocator, connection: *Mongo, key: u64) ![]const u64 {
+    var buffer: [command_size_max]u8 = undefined;
+    var builder: bson.Builder = .init(&buffer);
+    builder.string("find", collection);
+    builder.document("filter");
+    builder.int64("_id", @intCast(key));
+    builder.close();
+    builder.int32("limit", 1);
+    builder.boolean("singleBatch", true);
+    builder.document("readConcern");
+    builder.string("level", "majority");
+    builder.close();
+    builder.string("$db", database);
+    const reply = try connection.command(try builder.finish());
+    if (!Mongo.ok(reply)) {
+        sdk.event("mongo_error", .{ .command = "find", .code = Mongo.code(reply), .message = Mongo.message(reply) });
+        return error.FindFailed;
+    }
+    return list_of(arena, reply);
 }
 
 /// Inside a transaction, a failed command aborts it: run again when the server says so.
