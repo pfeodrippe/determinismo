@@ -60,6 +60,17 @@ pub fn linked_by(arena: std.mem.Allocator, data: []const u8, name: []const u8, t
     return null;
 }
 
+/// Removes a run's link to its events, record or tapes kept elsewhere (`name`), once that
+/// directory or file was deleted: another run takes the path.
+pub fn link_drop(arena: std.mem.Allocator, data: []const u8, id: u32, name: []const u8) !void {
+    const link = try std.fs.path.joinZ(arena, &.{ try directory_of(arena, data, id), name });
+    const result = linux.unlink(link);
+    switch (linux.errno(result)) {
+        .SUCCESS, .NOENT => {},
+        else => return error.UnlinkFailed,
+    }
+}
+
 /// The run ids there, ascending.
 pub fn ids(arena: std.mem.Allocator, runs_path: []const u8) ![]u32 {
     var found: std.ArrayList(u32) = .empty;

@@ -613,10 +613,18 @@ fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !vo
             const path = asked[1] orelse continue;
             const target = try runs.absolute(arena, path);
             if (try runs.linked_by(arena, data, asked[0], target)) |id| {
-                std.debug.print("error: {s} {s} holds run {d}'s; give another (or delete it)\n", .{
-                    asked[2], path, id,
-                });
-                return error.DirectoryOfAnotherRun;
+                // Deleted since, it is that run's no more: its link goes (or it would show this
+                // run's), and this run takes the path. Still there, it is refused.
+                const target_z = try arena.dupeSentinel(u8, target, 0);
+                const kept = linux.errno(linux.access(target_z, linux.F_OK)) == .SUCCESS;
+                if (kept) {
+                    std.debug.print("error: {s} {s} holds run {d}'s; give another, or delete it " ++
+                        "(its run then keeps none)\n", .{ asked[2], path, id });
+                    return error.DirectoryOfAnotherRun;
+                }
+                try runs.link_drop(arena, data, id, asked[0]);
+                std.debug.print("[determinismo] {s} {s} was run {d}'s, deleted since: that run " ++
+                    "keeps none\n", .{ asked[2], path, id });
             }
         }
         const run = try runs.claim(arena, io, data);

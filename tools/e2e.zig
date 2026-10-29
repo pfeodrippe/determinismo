@@ -1076,6 +1076,19 @@ fn check_runs(context: *Context) !void {
         .{ "serve shows it running", running },
         .{ "serve stopped it", stopped },
     }, "runs: another, running at a terminal, shows running in serve, and serve stops it", .{});
+    // Run 1's events directory deleted, the path is free: another run takes it, and run 1's
+    // link to it goes (it would show the new run's events). The smokes of 2026-10-29 were
+    // refused their own deleted directories.
+    cwd.deleteTree(context.io, elsewhere) catch {};
+    const taken = try explore(context, &(system ++ [_][]const u8{ "--seed", "5", "--branches", "1", "--events-dir", elsewhere }));
+    var link_buffer: [4096]u8 = undefined;
+    const link = try std.fs.path.joinZ(arena, &.{ data, "runs", "1", "events" });
+    const run_1_link = std.os.linux.readlinkat(std.os.linux.AT.FDCWD, link, &link_buffer, link_buffer.len);
+    expect_all(context, &.{
+        .{ "it says the directory was run 1's", std.mem.indexOf(u8, taken, "was run 1's, deleted since") != null },
+        .{ "it ran", std.mem.indexOf(u8, taken, "[branch") != null },
+        .{ "run 1 links it no more", std.os.linux.errno(run_1_link) == .NOENT },
+    }, "runs: a deleted run's events directory is another's to take", .{});
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
