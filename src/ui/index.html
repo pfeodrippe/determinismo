@@ -384,7 +384,7 @@ function liveUpdate() {
     propertiesWire();
   }
   const map = $("#map");
-  if (map) $(".summary", map).textContent = `${state.run.branches.length} timelines from the setup snapshot`;
+  if (map) $(".summary", map).textContent = `${state.run.branches.length} timelines, shortest first, each with its branches below it`;
   // The tree again only when timelines finished since (and every 10 s at most).
   if (map && Date.now() - (state.treeDrawn || 0) > 10000 && state.treeTimelines !== state.run.branches.length) {
     state.treeDrawn = Date.now();
@@ -495,7 +495,7 @@ function render() {
   }
   const body = state.view === "explorer" ? `
     ${sectionHtml("search", "Search", "events of every timeline", searchBody(), isOpen("search"))}
-    ${sectionHtml("map", "Multiverse tree", `${done} timelines from the setup snapshot`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
+    ${sectionHtml("map", "Multiverse map", `${done} timelines, shortest first, each with its branches below it`, `<div id="map-body" class="muted">Loading…</div>`, isOpen("map"))}
     ${sectionHtml("logs", "Logs", logsSummary(), logsBody(), isOpen("logs"))}`
     : state.view === "output" ? `
     ${sectionHtml("output", "Output", "what the explorer says, as it goes", `<pre id="output-body" class="mono muted" style="max-height:70vh;overflow:auto;margin:0;font-size:12px;white-space:pre-wrap">Loading…</pre>`, true)}`
@@ -1294,10 +1294,12 @@ function branchPointTip(point, why) {
     ${why ? `<div class="t-why"><b>Why here</b><br>${escape(why)}</div>` : ""}`;
 }
 
-// Multiverse tree: boot to the setup snapshot is the trunk; every timeline branches from the
+// Multiverse map: boot to the setup snapshot is the trunk; every timeline branches from the
 // snapshot (or, for a fork, from its moment of a parent timeline), with its faults and failed
-// assertions where they happened. Runs forked from this run's timelines are subtrees, drawn
-// under the timeline they branch from.
+// assertions where they happened, and its own branches right below it. Siblings go by how far
+// they (and their branches) ran, shortest first, as Antithesis's multiverse map orders them:
+// many short timelines on top, the few long ones below. Runs forked from this run's timelines
+// are subtrees, drawn under the timeline they branch from.
 async function mapDraw() {
   const body = $("#map-body");
   if (!body || $("#map").classList.contains("closed")) return;
@@ -1349,18 +1351,28 @@ async function mapDraw() {
     if (!kids.has(key)) kids.set(key, []);
     kids.get(key).push(b);
   }
+  // How far a timeline and its branches ran: what siblings are ordered by.
+  const reach = new Map();
+  const reachOf = (b) => {
+    if (!reach.has(b.index)) {
+      reach.set(b.index, b.vtime_ns); // A cycle (none expected) ends here.
+      reach.set(b.index, Math.max(b.vtime_ns, ...(kids.get(b.index) || []).map(reachOf)));
+    }
+    return reach.get(b.index);
+  };
+  const shortestFirst = (a, b) => reachOf(a) - reachOf(b) || a.index - b.index;
   const rows = [];
   const place = (branch, parentRow) => {
     rows.push({ branch, parentRow, parent: parentOf(branch) });
     const at = rows.length - 1;
-    for (const kid of (kids.get(branch.index) || []).sort((a, b) => a.index - b.index)) place(kid, at);
+    for (const kid of (kids.get(branch.index) || []).sort(shortestFirst)) place(kid, at);
     for (const child of children.filter((c) => c.run.from_branch === branch.index)) {
       for (const sub of child.branches.slice().sort((a, b) => a.index - b.index)) {
         rows.push({ branch: sub, child, parentRow: at });
       }
     }
   };
-  for (const b of (kids.get("root") || []).sort((a, b) => a.index - b.index)) place(b, null);
+  for (const b of (kids.get("root") || []).sort(shortestFirst)) place(b, null);
   const snapshotNs = run.snapshot ? run.snapshot.vtime_ns
     : Math.min(...failures.concat(faults).map((e) => e.vtime_ns), ...branches.map((b) => b.vtime_ns)) * 0.98;
   const rootNs = forkedHere ? info.from_vtime_ms * 1e6 : snapshotNs;
@@ -1396,7 +1408,8 @@ async function mapDraw() {
     <div class="legend"><span><i style="background:#9a9eab"></i>boot to snapshot</span>
       <span><i style="background:#3fbf7f"></i>passing timeline</span><span><i style="background:#f0506e"></i>failing timeline</span>
       <span><i style="background:#f0a650"></i>fault</span><span><i style="background:#f0506e;border-radius:50%"></i>failed assertion</span>
-      <span><i style="background:#e6e7eb;border-radius:50%"></i>branch point</span><span><i style="background:#8f7cf7"></i>fork (a subtree: another run)</span></div>
+      <span><i style="background:#e6e7eb;border-radius:50%"></i>branch point</span><span><i style="background:#8f7cf7"></i>fork (a subtree: another run)</span>
+      <span><i style="background:#4cc9f0;border-radius:50%"></i>search result</span></div>
     <div class="map tree" style="cursor:grab;touch-action:none;position:relative"></div>
     <div class="muted">Hover for details and why; click a timeline (or a mark) for its logs at that moment. Scroll to zoom (time and timelines), drag to pan, double-click to see it all.</div>`;
   const container = body.querySelector(".tree");
@@ -1645,6 +1658,19 @@ function treeSvg(model, view, width) {
   };
   for (const e of model.faults) mark(e, "fault");
   for (const e of model.firstFailures) mark(e, "failure");
+  // The last search's matches (searchWire), as Antithesis's map marks them: on top, the
+  // faults faded while a search is shown.
+  const found = state.mapSearch && state.run && state.mapSearch.run === state.run.id ? state.mapSearch.marks : [];
+  const searched = [];
+  for (const e of found) {
+    const row = rowOf.get(e.branch);
+    if (row === undefined || !shown(row) || !inTime(e.vtime_ns)) continue;
+    const parent = rows[row].parent;
+    if (parent && e.vtime_ns <= parent.vtime_ns) continue;
+    searched.push({ e, xx: x(e.vtime_ns), yy: y(row) });
+  }
+  const searchHtml = searched.slice(0, 5000).map(({ e, xx, yy }) =>
+    `<circle class="mark" data-branch="${e.branch}" data-vtime="${e.vtime_ns}" cx="${xx}" cy="${yy}" r="${Math.max(3.5, Math.min(6, rowHeight))}" fill="#4cc9f0" stroke="#15161a" stroke-width="1" style="cursor:pointer" ${tipAttr(`<div class="t-title"><span class="t-dot" style="background:#4cc9f0"></span>Search result</div>#${e.branch} at ${seconds(e.vtime_ns)}<div class="t-foot">Click for its logs</div>`)}></circle>`).join("");
   const marks_max = 2000;
   const markHtml = marks.length <= marks_max
     ? marks.map(({ e, kind, xx, yy }) => kind === "fault"
@@ -1682,7 +1708,7 @@ function treeSvg(model, view, width) {
     ${forkedHere ? "" : `<text x="${snapshotX}" y="${rootPoint.y + 38}" fill="#9a9eab" font-size="10.5" text-anchor="middle">${(snapshotNs / 1e9).toFixed(2)}s</text>`}`;
   const zoomed = whole ? "" : `<text x="${x0 - fan}" y="16" fill="#9a9eab" font-size="10.5">zoomed: ${(view.t0 / 1e9).toFixed(3)}s to ${(view.t1 / 1e9).toFixed(3)}s · timelines ${Math.round(view.r0) + 1} to ${Math.round(view.r1)} of ${rows.length}</text>`;
   return `<svg width="${width}" height="${height}"><defs><clipPath id="tree-clip"><rect x="${x0 - fan}" y="0" width="${x1 - x0 + fan + 2}" height="${height}"/></clipPath></defs>
-    ${trunk}${zoomed}<g clip-path="url(#tree-clip)">${lines}${markHtml}${branchPoints}${forkPoints}</g>${cut}${labels}${ticks}</svg>`;
+    ${trunk}${zoomed}<g clip-path="url(#tree-clip)">${lines}<g opacity="${searched.length ? 0.3 : 1}">${markHtml}</g>${branchPoints}${forkPoints}${searchHtml}</g>${cut}${labels}${ticks}</svg>`;
 }
 
 // Search: conditions and temporal conditions over every timeline (src/query.zig).
@@ -1713,6 +1739,10 @@ function searchWire() {
       $("#q-results").innerHTML = resultsHtml(request.output, results);
       $("#q-results").querySelectorAll("tr.clickable").forEach((row) => row.addEventListener("click", () =>
         logsOpen(Number(row.dataset.branch), Number(row.dataset.vtime))));
+      // Every match as a dot on the map (thinned to a few pixels each, as the faults are).
+      const marks = await query({ ...request, output: "marks", bucket_ns: 1e8, limit: 200000 });
+      state.mapSearch = { run: state.run.id, marks };
+      mapDraw();
     } catch (error) { $("#q-status").innerHTML = `<span class="fail-text">${escape(error.message)}</span>`; }
   };
   button.addEventListener("click", run);
