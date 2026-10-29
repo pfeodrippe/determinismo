@@ -367,6 +367,16 @@ event hashing, the guest module.
   suspected. Done since: the SQL append workloads (Galera, MySQL, PostgreSQL, CockroachDB, TiDB,
   YugabyteDB) end with final reads, a `finally` command: every committed append must be in its
   key's list. Next: a Galera hunt with them (queued after next.sh) for how often.
+- Determinism (2026-10-29): RabbitMQ Khepri hunt run 164 had 1 of its 16 sampled replays
+  diverge (timeline 159, a fresh start from the setup snapshot, no holder): the replays agree
+  with each other (events hash 17185dcd09e975dd, twice), the run's own execution was the odd one
+  (f4f42fedaf402bf6). Same 1,695 events; the first difference at seq 1666 (rabbit-2's output at
+  94.85 s: 0.7 µs later and 34,262 branches fewer in the replay), after a stretch of 30 s with no
+  event at all (from 64.14 s), so it cannot be placed closer after the fact: the original keeps
+  no trace. Recent hunts: 1 diverged of 96 sampled (runs 97, 118, 123, 148, 160, 164). Next: the
+  hyperthreads control (queued: run 56 replayed with SMT off), and a checkpoint every second of
+  virtual time (vtime, branches) in the events, so that the next divergence is placed within a
+  second.
 - `eventually` endings kill the drivers as soon as the composer reaches them (after its 4 to 63
   starts, pauses under 20 ms): RabbitMQ's run 118 drove a median 26.6 s, under 10 s in 274 of
   1,494 timelines. Antithesis's composer may start one any time after a driver started, killing
