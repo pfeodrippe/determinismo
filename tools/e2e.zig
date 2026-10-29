@@ -82,8 +82,14 @@ pub fn main(init: std.process.Init) !void {
             bb = value;
         } else return error.Usage;
     }
-    // Its own: suites run at once (a full one and a single check) do not share files.
-    const scratch = try std.fmt.allocPrint(arena, "/tmp/determinismo-e2e-{d}", .{std.os.linux.getpid()});
+    // Its own: suites run at once (a full one and a single check) do not share files. On disk,
+    // not in /tmp: a tmpfs is memory, and failed checks' files (kept to look at) once held 16
+    // GB of srv3's, short of what the hunts' holders needed. A day after a suite ended, its
+    // files go.
+    const scratches = try std.fs.path.join(arena, &.{ home, ".cache", "determinismo-e2e" });
+    try std.Io.Dir.cwd().createDirPath(init.io, scratches);
+    scratches_sweep(init.io, arena, scratches);
+    const scratch = try std.fmt.allocPrint(arena, "{s}/{d}", .{ scratches, std.os.linux.getpid() });
     std.Io.Dir.cwd().deleteTree(init.io, scratch) catch {};
     try std.Io.Dir.cwd().createDirPath(init.io, scratch);
     // The guest as the suite started: a deploy meanwhile rewrites ~/guest, and the replays of
@@ -124,6 +130,25 @@ pub fn main(init: std.process.Init) !void {
     }
     std.Io.Dir.cwd().deleteTree(init.io, context.scratch) catch {};
     std.debug.print("e2e: all checks passed\n", .{});
+}
+
+/// Deletes the scratch directories (named by their suite's pid) of suites no longer running whose
+/// files are a day old.
+fn scratches_sweep(io: std.Io, arena: std.mem.Allocator, scratches: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, scratches, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    const now_s = std.Io.Clock.real.now(io).toSeconds();
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        const pid = std.fmt.parseInt(std.os.linux.pid_t, entry.name, 10) catch continue;
+        const alive = std.os.linux.errno(std.os.linux.kill(pid, @fromBackingInt(@intCast(0)))) != .SRCH;
+        if (alive) continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        if (now_s - stat.mtime.toSeconds() < std.time.s_per_day) continue;
+        const path = std.fs.path.join(arena, &.{ scratches, entry.name }) catch continue;
+        cwd.deleteTree(io, path) catch {};
+    }
 }
 
 /// Runs the checks whose names contain `only` (all when empty) and counts them.
