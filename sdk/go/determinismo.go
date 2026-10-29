@@ -572,6 +572,18 @@ func StopFaults(seconds float64) {
 	faults(message[:])
 }
 
+// FaultAim aims the fault injector at node from now on, until another call ("" for none): half
+// its faults involve it, each a decision strategies see and replays repeat (a primary, a leader).
+func FaultAim(node string) {
+	name := []byte(node)
+	if len(name) > 32 {
+		name = name[:32]
+	}
+	message := make([]byte, 8, 8+len(name))
+	binary.LittleEndian.PutUint64(message, (1<<61)|uint64(len(name)))
+	faults(append(message, name...))
+}
+
 // Fault is a fault now, from the scenario: Fault(map[string]any{"kind": "pause", "node": "db",
 // "duration_ms": 2000}). Applied, logged and undone like a drawn one (guest/runtime/faults.zig
 // lists the kinds). Only while the fault injector runs.

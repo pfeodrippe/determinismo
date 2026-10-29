@@ -66,7 +66,9 @@ fn transfers(s: *System.Scenario) void {
   over in 83 timelines). Invoked without an outcome counts as unknown.
 - Nodes start one after another, each once it is ready: make readiness something that comes up
   alone (Patroni waits for an etcd quorum before its REST API listens: ready on etcd's peer port,
-  or pg1 waits forever for pg2). Systems that take tens of seconds to recover (elections,
+  or pg1 waits forever for pg2). But where the next node must not start before this one joined
+  (Cassandra: two joining at once choose the same tokens), be ready once joined, with time for
+  it: `.ready = .{ .tcp = 9042, .timeout_s = 240 }` (60 s by default). Systems that take tens of seconds to recover (elections,
   leases, JVMs) need faults in bursts, `s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max =
   30_000 }`, or they never serve during a timeline; and their drivers need enough refused
   connections in a row to outlast a failover.
@@ -74,6 +76,9 @@ fn transfers(s: *System.Scenario) void {
   leases, TSOs): turn on `.faults.clock_skew` (one node's realtime clock skewed for a while),
   with `clock_skew_ms_max` below their documented maximum offset when their safety assumes
   one (YugabyteDB's, CockroachDB's 500 ms): past it they stop nodes or lose safety by design.
+- When the scenario learns which node matters most right now (a primary, a leader), aim the
+  faults at it: `sdk.fault_aim(name)` (half the faults then involve it, decisions replays
+  repeat; "" stops). examples/sql/append.zig's `node_names` does it for `primary_only` drivers.
 - Give each profile an `explain` command when the system can turn its logs up at runtime
   (`profile.explain = "det-nodes exec <node> <set the log level>"`, ones restarts keep too):
   causality runs it in futures inside a failure's jump, and their logs show the mechanism

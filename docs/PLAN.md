@@ -61,6 +61,14 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
+- Faults aimed at a node (2026-10-29): `sdk.fault_aim(name)` in every SDK (`det-faults aim`
+  underneath for those that run commands): half the injector's draws then pick among the
+  faults involving that node, each a named decision. Workloads aim at the node that matters:
+  the primary (SQL's `node_names`: Patroni, Group Replication; MongoDB), the transaction
+  coordinator (Kafka, Redpanda), the leader (etcd, rqlite, ZooKeeper, ClickHouse Keeper, the NATS
+  stream's, PD's for TiDB and SurrealDB). The selftest's `aim` check measures it. Next: whether
+  aimed hunts find what unaimed ones did, sooner (Redpanda's coordinator finding, again).
+
 - Per-node clock skew (2026-10-29): every node in a time namespace of its own, the guest
   kernel's patch 0005 giving namespaces a realtime offset changeable while tasks run (the vDSO,
   the syscalls, absolute deadlines: clock_nanosleep, timers, timerfd, futexes), and the

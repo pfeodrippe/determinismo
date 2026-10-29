@@ -398,6 +398,15 @@ public final class Determinismo {
     faultsCommand("inject", json);
   }
 
+  /**
+   * Aims the fault injector at {@code node} from now on, until another call ("" for none): half
+   * its faults involve it, each a decision strategies see and replays repeat (a primary, a
+   * leader).
+   */
+  public static void faultAim(String node) {
+    faultsCommand("aim", node);
+  }
+
   /** A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of {@code seconds}; 0 ends it. */
   public static void stopFaults(double seconds) {
     String command = System.getenv("DETERMINISMO_STOP_FAULTS");

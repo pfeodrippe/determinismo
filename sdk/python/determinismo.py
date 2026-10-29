@@ -388,6 +388,14 @@ def fault(**request):
     _faults_control(((1 << 63) | len(body)).to_bytes(8, "little") + body)
 
 
+def fault_aim(node):
+    """Aims the fault injector at `node` from now on, until another call ("" for none): half its
+    faults involve it, each a decision strategies see and replays repeat. For the node that
+    matters most at the moment (a primary, a leader), as Jepsen's nemeses target one."""
+    name = node.encode()[:32]
+    _faults_control(((1 << 61) | len(name)).to_bytes(8, "little") + name)
+
+
 def coverage_start(paths=None):
     """Code coverage for strategies (Python 3.12+): from now on, each line of code under `paths`
     (prefixes of file names; None for every file but this SDK's) emits a "coverage" event the

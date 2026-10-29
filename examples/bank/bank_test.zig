@@ -14,6 +14,8 @@
 //! Scenarios, both from the same function with a different account count:
 //!   bank       10 accounts
 //!   bank_hot   2 accounts: every transfer collides
+//!   bank_cold  40 accounts: transfers seldom collide, so a timeline that loses money was
+//!              decided at its colliding transfers (what causality analysis looks for)
 const std = @import("std");
 const assert = std.debug.assert;
 const sdk = @import("determinismo");
@@ -36,7 +38,7 @@ comptime {
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
-        .scenarios = .{ .bank = Bank(10).scenario, .bank_hot = Bank(2).scenario },
+        .scenarios = .{ .bank = Bank(10).scenario, .bank_hot = Bank(2).scenario, .bank_cold = Bank(40).scenario },
     });
 }
 

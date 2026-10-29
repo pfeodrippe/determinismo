@@ -699,6 +699,15 @@ pub fn fault(request: &Value) {
     faults_control(&message);
 }
 
+/// Aims the fault injector at `node` from now on, until another call ("" for none): half its
+/// faults involve it, each a decision strategies see and replays repeat (a primary, a leader).
+pub fn fault_aim(node: &str) {
+    let name = &node.as_bytes()[..node.len().min(32)];
+    let mut message = ((1u64 << 61) | name.len() as u64).to_le_bytes().to_vec();
+    message.extend_from_slice(name);
+    faults_control(&message);
+}
+
 // The macros --------------------------------------------------------------------------------
 
 #[doc(hidden)]

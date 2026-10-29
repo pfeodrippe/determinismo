@@ -28,6 +28,8 @@
 //!   durability (profile "durable") faults at the echo node's durability points: a stall holds
 //!              its syncs; a crash at a sync loses the write when it comes before it, and keeps
 //!              it when it comes just after
+//!   aim        (profile "aimable") the driver aims the injector at the witness node
+//!              (sdk.fault_aim): about three of its pauses in four go there, the rest anywhere
 //!   records    a driver records numbers and their squares (sdk.record), and the host check
 //!              `squares` (run on the host when the timeline ends) asserts every square and the
 //!              count, from the records alone
@@ -86,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
             .flood = flood_scenario,
             .ending = ending_scenario,
             .sinks = sinks_scenario,
+            .aim = aim_scenario,
         },
         .checks = .{ .squares = squares_check },
     });
@@ -198,6 +201,17 @@ fn describe_faulted(d: *System.Describe) !void {
         .ready = .{ .tcp = port },
         .faults = asked,
     });
+    // Two nodes that may be paused, for the "aim" scenario.
+    const aimable = try d.profile("aimable");
+    var pauses = quiet;
+    pauses.pause = true;
+    inline for (.{ .echo, .witness }) |name| {
+        aimable.node(name, .{
+            .binary = "zig-out/bin/det-selftest-node",
+            .ready = .{ .tcp = port },
+            .faults = pauses,
+        });
+    }
     // Restarts that may give it a new address, for the "readdress" scenario.
     const movable = try d.profile("movable");
     var moves = quiet;
@@ -734,6 +748,17 @@ fn realtime_ns() i128 {
     var now: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &now);
     return @as(i128, now.sec) * std.time.ns_per_s + now.nsec;
+}
+
+fn aim_scenario(s: *System.Scenario) void {
+    s.singleton_driver("aim_at_witness", aim_at_witness);
+}
+
+/// Aims the injector at the witness for a while: the e2e check counts where the pauses went.
+fn aim_at_witness(context: *System.Context) !void {
+    sdk.fault_aim(context.nodes.witness.?.name);
+    sdk.sleep_ms(40 * std.time.ms_per_s);
+    sdk.reachable("the driver aimed the faults for a while", .{});
 }
 
 fn hang(s: *System.Scenario) void {

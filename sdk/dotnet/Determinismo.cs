@@ -342,6 +342,12 @@ public static class Lifecycle
     /// </summary>
     public static void Fault(string json) => Run("/opt/determinismo/bin/det-faults", "inject", json);
 
+    /// <summary>
+    /// Aims the fault injector at <paramref name="node"/> from now on, until another call ("" for
+    /// none): half its faults involve it, each a decision strategies see and replays repeat.
+    /// </summary>
+    public static void FaultAim(string node) => Run("/opt/determinismo/bin/det-faults", "aim", node);
+
     /// <summary>A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of <paramref name="seconds"/>; 0 ends it.</summary>
     public static void StopFaults(double seconds) =>
         Run(Environment.GetEnvironmentVariable("DETERMINISMO_STOP_FAULTS") ?? "/opt/determinismo/bin/det-stop-faults",

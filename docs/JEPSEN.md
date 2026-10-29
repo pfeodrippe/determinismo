@@ -10,7 +10,10 @@ before building the workload.
 What determinismo adds to each: the faults run inside one deterministic machine (so an anomaly
 replays exactly, to the moment of every operation in its cycle), the durability-point faults
 (`sync_stall`, `durable_crash`: Jepsen's LazyFS finds the same act-before-fsync bugs, by losing
-unsynced writes), and exploration that returns to the moments that reached new behavior. Checks:
+unsynced writes), and exploration that returns to the moments that reached new behavior. Jepsen's
+own nemeses have equivalents: per-node clock bumps and strobes (`clock_skew`: one node's realtime
+clock ahead or behind, in its own time namespace), kills of a majority or of all (`outage`), and
+faults aimed at the primary or leader the workload finds (`sdk.fault_aim`). Checks:
 `sdk.elle` (list-append and rw-register histories, checkers/elle) plus cheap `always` properties
 for guidance as the timeline runs. Anomalies a system is known to allow (Kafka's G0, from
 Jepsen's Bufstream analysis) go in the check's `allowed`: found alone they are reported apart,

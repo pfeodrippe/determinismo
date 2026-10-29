@@ -202,6 +202,12 @@
   [request]
   (Determinismo/fault (details-json request)))
 
+(defn fault-aim
+  "Aims the fault injector at `node` from now on, until another call (\"\" for none): half its
+  faults involve it, each a decision strategies see and replays repeat (a primary, a leader)."
+  [node]
+  (Determinismo/faultAim (str node)))
+
 (defn stop-faults
   "A quiet period (Antithesis's ANTITHESIS_STOP_FAULTS) of `seconds`; 0 ends it."
   [seconds]

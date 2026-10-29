@@ -78,6 +78,8 @@ void det_catalog_write(int fd);
    fault injector runs (the drivers); otherwise nothing happens. */
 void det_stop_faults(double seconds);
 void det_fault(const char *json);
+/* Faults aimed at `node` from now on ("" for none): half the injector's then involve it. */
+void det_fault_aim(const char *node);
 
 /* Guidance assertions: the compared values in the details, and a guidance event telling
    strategies how far the timeline is from the interesting outcome (lower is closer). `always`
@@ -738,6 +740,17 @@ void det_fault(const char *json) {
   if (length + 8 > sizeof message) return;
   det_u64_le(message, ((uint64_t)1 << 63) | length);
   memcpy(message + 8, json, length);
+  det_faults_control(message, length + 8);
+}
+
+/* Aims the fault injector at `node` from now on, until another call ("" for none): half its
+ * faults involve it, each a decision strategies see and replays repeat (a primary, a leader). */
+void det_fault_aim(const char *node) {
+  unsigned char message[8 + 32];
+  size_t length = strlen(node);
+  if (length > 32) length = 32;
+  det_u64_le(message, ((uint64_t)1 << 61) | length);
+  memcpy(message + 8, node, length);
   det_faults_control(message, length + 8);
 }
 

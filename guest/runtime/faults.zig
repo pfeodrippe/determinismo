@@ -261,6 +261,10 @@ pub fn main(init: std.process.Init) !void {
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "inject")) {
         return inject_request(arguments[2]);
     }
+    // `det-faults aim <node>` ("" for none): as the SDKs' fault_aim, for those that run commands.
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "aim")) {
+        return control_request(aim_flag, arguments[2][0..@min(arguments[2].len, branch_node_max)]);
+    }
     if (arguments.len != 3 or !std.mem.eql(u8, arguments[1], "--scenario")) return error.Usage;
     const system = try nodes.system_load(arena);
     const scenario = system.scenario(arguments[2]) orelse return error.UnknownScenario;
@@ -2057,9 +2061,11 @@ fn sleep_through_ns(duration_ns: u64) void {
 /// A request on the control FIFO is a u64 (little endian): a quiet period in nanoseconds, or,
 /// with its top bit set, the length (low 32 bits) of the JSON fault that follows (`inject`),
 /// or, with `branch_flag`, the length (low 8 bits) of the node name that follows, "" for none
-/// (`branch`). Each fits in one write of at most PIPE_BUF: atomic.
+/// (`branch`), or with `aim_flag` the same for the node the scenario aims faults at (sdk's
+/// `fault_aim`). Each fits in one write of at most PIPE_BUF: atomic.
 const inject_flag: u64 = 1 << 63;
 pub const branch_flag: u64 = 1 << 62;
+pub const aim_flag: u64 = 1 << 61;
 /// The quiet period under way is the pacing's own (no node or command asked for it): a branch
 /// point ends it.
 var quiet_pacing = false;
@@ -2081,6 +2087,13 @@ fn requests_read() u32 {
             const length: usize = @intCast(header & 0xffff_ffff);
             if (at + length > size) break;
             inject(buffer[at..][0..length]);
+            at += length;
+            continue;
+        }
+        if (header & aim_flag != 0) {
+            const length: usize = @intCast(header & 0xff);
+            if (at + length > size) break;
+            aim_set(buffer[at..][0..length]);
             at += length;
             continue;
         }
@@ -2114,22 +2127,32 @@ fn branch_point(node: []const u8) void {
 }
 
 /// The next fault's index: after a branch point, one of those involving its node (a named
-/// decision: strategies see it, tapes replay it), when any does; else any (`fault`).
+/// decision: strategies see it, tapes replay it), when any does; else, while the scenario aims
+/// at a node, one involving it half the time (named decisions too); else any (`fault`).
 fn fault_choose(faults: []const Fault, names: []const []const u8) usize {
     defer branch_node_size = 0;
-    const node = branch_node[0..branch_node_size];
-    if (node.len > 0) {
-        var aimed: [faults_max]usize = undefined;
-        var count: usize = 0;
-        for (faults, 0..) |fault, index| {
-            if (std.mem.eql(u8, fault.node, node) or std.mem.eql(u8, fault.peer, node)) {
-                aimed[count] = index;
-                count += 1;
-            }
-        }
-        if (count > 0) return aimed[sdk.random_below_named("fault.branch_aim", count)];
+    var aimed: [faults_max]usize = undefined;
+    const branched = involving(faults, branch_node[0..branch_node_size], &aimed);
+    if (branched > 0) return aimed[sdk.random_below_named("fault.branch_aim", branched)];
+    if (aim_node_size > 0 and sdk.random_below_named("fault.aim", 2) == 0) {
+        const count = involving(faults, aim_node[0..aim_node_size], &aimed);
+        if (count > 0) return aimed[sdk.random_below_named("fault.aimed", count)];
     }
     return sdk.decide("fault", names);
+}
+
+/// The indices of the faults that involve `node` (theirs, or the other end of a link), into
+/// `aimed`; how many. None for "".
+fn involving(faults: []const Fault, node: []const u8, aimed: *[faults_max]usize) usize {
+    if (node.len == 0) return 0;
+    var count: usize = 0;
+    for (faults, 0..) |fault, index| {
+        if (std.mem.eql(u8, fault.node, node) or std.mem.eql(u8, fault.peer, node)) {
+            aimed[count] = index;
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn quiet_request(duration_ns: u64) void {
@@ -2312,21 +2335,36 @@ const branch_node_max = 32;
 /// The node a branch point aims the next fault at (cleared once drawn).
 var branch_node: [branch_node_max]u8 = undefined;
 var branch_node_size: usize = 0;
+/// The node the scenario aims faults at (sdk's `fault_aim`: a primary, a leader it found), until
+/// it names another or none.
+var aim_node: [branch_node_max]u8 = undefined;
+var aim_node_size: usize = 0;
+
+fn aim_set(node: []const u8) void {
+    aim_node_size = @min(node.len, branch_node_max);
+    @memcpy(aim_node[0..aim_node_size], node[0..aim_node_size]);
+    sdk.event("faults_aim", .{ .node = aim_node[0..aim_node_size] });
+}
 
 fn inject_request(json: []const u8) !void {
-    if (json.len + 8 > request_size_max) return error.RequestTooLarge;
+    return control_request(inject_flag, json);
+}
+
+/// One request on the control FIFO: `flag` with the length of `body`, then `body`.
+fn control_request(flag: u64, body: []const u8) !void {
+    if (body.len + 8 > request_size_max) return error.RequestTooLarge;
     const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
     const fd = linux.open(control_path, flags, 0);
     if (linux.errno(fd) != .SUCCESS) {
-        std.debug.print("det-faults inject: no fault injector is running (faults happen " ++
-            "while drivers run)\n", .{});
+        std.debug.print("det-faults: no fault injector is running (faults happen while " ++
+            "drivers run)\n", .{});
         return error.NoInjector;
     }
     defer _ = linux.close(@intCast(fd));
     var message: [request_size_max]u8 = undefined;
-    std.mem.writeInt(u64, message[0..8], inject_flag | json.len, .little);
-    @memcpy(message[8..][0..json.len], json);
-    const written = linux.write(@intCast(fd), &message, json.len + 8);
+    std.mem.writeInt(u64, message[0..8], flag | body.len, .little);
+    @memcpy(message[8..][0..body.len], body);
+    const written = linux.write(@intCast(fd), &message, body.len + 8);
     if (linux.errno(written) != .SUCCESS) return error.WriteFailed;
 }
 
@@ -2365,6 +2403,30 @@ test faults_collect {
     try std.testing.expectEqualStrings("b", skew.node);
     try std.testing.expectEqual(10 * std.time.ns_per_s, skew.skew_ns_max);
     try std.testing.expectEqual(Kind.restore, faults[25].kind); // The last one.
+}
+
+test fault_choose {
+    const faults = [_]Fault{
+        .{ .kind = .pause, .node = "a" },
+        .{ .kind = .pause, .node = "b" },
+        .{ .kind = .partition, .node = "a", .peer = "b" },
+        .{ .kind = .pause, .node = "c" },
+    };
+    const names = [_][]const u8{ "pause a", "pause b", "partition a b", "pause c" };
+    // Aimed at b: half the draws among its two faults, the other half any (two of four its):
+    // three in four involve it. Not aimed: two in four.
+    for ([_]struct { []const u8, u32, u32 }{ .{ "b", 240, 360 }, .{ "", 140, 260 } }) |case| {
+        // As aim_set sets it (without its event).
+        @memcpy(aim_node[0..case[0].len], case[0]);
+        aim_node_size = case[0].len;
+        defer aim_node_size = 0;
+        var involving_b: u32 = 0;
+        for (0..400) |_| {
+            const fault = faults[fault_choose(&faults, &names)];
+            if (std.mem.eql(u8, fault.node, "b") or std.mem.eql(u8, fault.peer, "b")) involving_b += 1;
+        }
+        try std.testing.expect(involving_b >= case[1] and involving_b <= case[2]);
+    }
 }
 
 test harsher {

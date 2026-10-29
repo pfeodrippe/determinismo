@@ -706,6 +706,24 @@ pub fn fault(request: anytype) void {
     _ = linux.write(@intCast(fd), &message, length + 8); // Atomic: under PIPE_BUF.
 }
 
+/// Aims the injector's faults at `node` from now on, until another call ("" for none): half its
+/// faults involve it (the node itself, or a link of it), the other half any, each a decision
+/// strategies see and replays repeat. For the node a scenario finds that matters most at the
+/// moment (a primary, a leader), as Jepsen's nemeses target one. Only while the injector runs.
+pub fn fault_aim(node: []const u8) void {
+    const control_path = "/opt/determinismo/faults-control"; // faults.zig's control_path.
+    const aim_flag: u64 = 1 << 61; // faults.zig's aim_flag.
+    var message: [8 + 32]u8 = undefined;
+    const size = @min(node.len, 32);
+    std.mem.writeInt(u64, message[0..8], aim_flag | size, .little);
+    @memcpy(message[8..][0..size], node[0..size]);
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const fd = linux.open(control_path, flags, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), &message, 8 + size); // Atomic: under PIPE_BUF.
+}
+
 fn Result(comptime Function: type) type {
     return @typeInfo(Function).@"fn".return_type.?;
 }

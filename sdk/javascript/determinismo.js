@@ -443,6 +443,15 @@ function fault(request) {
   faultsControl(Buffer.concat([header, body]));
 }
 
+/** Aims the fault injector at `node` from now on, until another call ("" for none): half its
+ * faults involve it, each a decision strategies see and replays repeat (a primary, a leader). */
+function faultAim(node) {
+  const name = Buffer.from(node).subarray(0, 32);
+  const header = Buffer.alloc(8);
+  header.writeBigUInt64LE((1n << 61n) | BigInt(name.length));
+  faultsControl(Buffer.concat([header, name]));
+}
+
 // Code coverage ----------------------------------------------------------------------------
 
 /** Code coverage for strategies: from now on, each block of code (V8's precise coverage) in
@@ -671,6 +680,7 @@ module.exports = {
   output,
   stopFaults,
   fault,
+  faultAim,
   coverageStart,
   // Antithesis's TypeScript SDK's names.
   alwaysGreaterThanOrEqualTo: alwaysGreaterThanOrEqual,

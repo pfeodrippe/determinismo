@@ -28,6 +28,7 @@ const Context = struct {
     output_count: u32 = 0,
     /// bank's first timeline of seed 3 that loses money (bank_violating_branch), once found.
     bank_violating: ?[]const u8 = null,
+    bank_cold_violating: ?[]const u8 = null,
 };
 
 /// The first of bank's seed 3 timelines that violates "total balance is conserved", found once
@@ -51,6 +52,30 @@ fn bank_violating_branch(context: *Context) ![]const u8 {
         return context.bank_violating.?;
     }
     expect(context, false, "bank: one of seed 3's first 16 timelines loses money", .{});
+    return error.NoViolatingBranch;
+}
+
+/// A timeline of seed 3's `bank_cold` (40 accounts: collisions seldom) that loses money: its
+/// failure was decided at its colliding transfers, so causality analysis finds a jump. In
+/// `bank`, 10 accounts collide so often that a timeline fails from almost any moment (7 futures
+/// in 8 from its first second, the guest kernel of 2026-10-29): no moment decides it.
+fn bank_cold_violating_branch(context: *Context) ![]const u8 {
+    if (context.bank_cold_violating) |known| return known;
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
+    const report = try explore(context, &.{
+        "--program",  program, "--scenario", "bank_cold", "--seed", "3",
+        "--branches", "32",
+    });
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch ")) continue;
+        if (std.mem.indexOf(u8, line, "FAIL \"total balance is conserved\"") == null) continue;
+        const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+        const index = std.mem.trim(u8, line["[branch ".len..end], " ");
+        context.bank_cold_violating = try context.arena.dupe(u8, index);
+        return context.bank_cold_violating.?;
+    }
+    expect(context, false, "bank_cold: one of seed 3's first 32 timelines loses money", .{});
     return error.NoViolatingBranch;
 }
 
@@ -164,20 +189,21 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "tree", check_tree },                     .{ "disk", check_disk },
         .{ "durability", check_durability },         .{ "mutate", check_mutate },
         .{ "checks", check_host_checks },            .{ "inject", check_inject },
-        .{ "compose", check_compose },               .{ "shards", check_shards },
-        .{ "stress", check_stress },                 .{ "controller", check_controller },
-        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
-        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
-        .{ "profile", check_profile },               .{ "catalog", check_catalog },
-        .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
-        .{ "changed", check_changed },               .{ "readdress", check_readdress },
-        .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
-        .{ "pinned", check_pinned },                 .{ "saved", check_saved },
-        .{ "concurrent", check_concurrent },         .{ "resume", check_resume },
-        .{ "ui", check_ui },                         .{ "runs", check_runs },
-        .{ "kubernetes", check_kubernetes },         .{ "steps", check_steps },
-        .{ "ending", check_ending },                 .{ "sinks", check_sinks },
-        .{ "dotnet", check_dotnet },                 .{ "lines", check_lines },
+        .{ "aim", check_aim },                       .{ "compose", check_compose },
+        .{ "shards", check_shards },                 .{ "stress", check_stress },
+        .{ "controller", check_controller },         .{ "clojure", check_clojure },
+        .{ "k3s", check_k3s },                       .{ "script", check_script },
+        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
+        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
+        .{ "voidstar", check_voidstar },             .{ "changed", check_changed },
+        .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
+        .{ "hang", check_hang },                     .{ "pinned", check_pinned },
+        .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
+        .{ "resume", check_resume },                 .{ "ui", check_ui },
+        .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
+        .{ "steps", check_steps },                   .{ "ending", check_ending },
+        .{ "sinks", check_sinks },                   .{ "dotnet", check_dotnet },
+        .{ "lines", check_lines },
     };
     var ran: u32 = 0;
     inline for (checks) |check| {
@@ -1273,13 +1299,16 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "the command ran at the violation", std.mem.indexOf(u8, outputs[0], "exec_output") != null },
         .{ "the same output twice", std.mem.eql(u8, outputs[0], outputs[1]) },
     }, "until: branch {s} stops at its first violation, the same twice", .{branch});
+    // Causality on a timeline whose failure some moment decided (bank_cold's).
+    const cold_branch = try bank_cold_violating_branch(context);
+    const cold_system = [_][]const u8{ "--program", program, "--scenario", "bank_cold", "--seed", "3" };
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ context.determinismo, "causality" });
     try argv.appendSlice(arena, context.machine);
-    try argv.appendSlice(arena, &system);
+    try argv.appendSlice(arena, &cold_system);
     try argv.appendSlice(arena, &.{
-        "--branch",  branch, "--property", "total balance is conserved", "--points", "4",
-        "--futures", "8",    "--json",
+        "--branch",  cold_branch, "--property", "total balance is conserved", "--points", "4",
+        "--futures", "8",         "--json",
     });
     // Its explanation too: futures inside the jump with a command at their moment (a system's
     // logs turned up there; here, any command), each one's events kept.
@@ -1303,9 +1332,9 @@ fn check_until_and_causality(context: *Context) !void {
     var verdict_argv: std.ArrayList([]const u8) = .empty;
     try verdict_argv.appendSlice(arena, &.{ context.determinismo, "causality" });
     try verdict_argv.appendSlice(arena, context.machine);
-    try verdict_argv.appendSlice(arena, &system);
+    try verdict_argv.appendSlice(arena, &cold_system);
     try verdict_argv.appendSlice(arena, &.{
-        "--branch", branch, "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
+        "--branch", cold_branch, "--verdict", violation, "--points", "4", "--futures", "8", "--refine", "0", "--json",
     });
     const verdict_result = try run_kept(context, verdict_argv.items);
     const verdict = try causality_curve(arena, verdict_result.stdout);
@@ -2235,6 +2264,33 @@ fn check_inject(context: *Context) !void {
     if (!clean or !came_and_went) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_inject_refused", "fault_failed",
     }) catch ""});
+}
+
+/// Faults aimed at a node (sdk.fault_aim): the aim reaches the injector, each draw then decides
+/// whether to aim (`fault.aim`), and about half do (`fault.aimed`, drawn only then); the witness
+/// aimed at gets more pauses than the echo node, which still gets some (a node holds one fault
+/// at a time: draws for a paused node are skipped, so the counts stay closer than the draws).
+fn check_aim(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "aim-events" });
+    _ = try explore(context, &.{
+        "--program",  program, "--profile",    "aimable", "--scenario", "aim", "--seed", "1",
+        "--branches", "4",     "--events-dir", events,
+    });
+    const aims = try query_count(context, &.{ events, "event=faults_aim details.node=witness" });
+    const decided = try query_count(context, &.{ events, "decision.name=fault.aim" });
+    const aimed = try query_count(context, &.{ events, "decision.name=fault.aimed" });
+    const witness = try query_count(context, &.{ events, "event=fault details.node=witness" });
+    const echo = try query_count(context, &.{ events, "event=fault details.node=echo" });
+    expect_all(context, &.{
+        .{ "the aim reached the injector in all 4 timelines", aims == 4 },
+        .{ "draws decided whether to aim", decided >= 20 },
+        .{ "about half aimed", aimed * 10 >= decided * 3 and aimed * 10 <= decided * 7 },
+        .{ "the witness got more pauses", witness > echo },
+        .{ "the echo node still got some", echo > 0 },
+    }, "aim: {d} of {d} draws aimed; {d} pauses of the witness aimed at, {d} of the echo node", .{
+        aimed, decided, witness, echo,
+    });
 }
 
 /// A mutation campaign (determinismo mutate): of two mutants, the one that breaks the sums is

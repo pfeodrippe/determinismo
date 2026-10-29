@@ -67,6 +67,9 @@ export function output(object: { [key: string]: JSONValue }): void;
 
 export function stopFaults(seconds: number): void;
 export function fault(request: { kind: string; [key: string]: JSONValue }): void;
+/** Aims the fault injector at `node` from now on, until another call ("" for none): half its
+ * faults involve it, each a decision strategies see and replays repeat (a primary, a leader). */
+export function faultAim(node: string): void;
 export function coverageStart(options?: { paths?: string[]; intervalMs?: number }): void;
 
 // Antithesis's TypeScript SDK's names.
