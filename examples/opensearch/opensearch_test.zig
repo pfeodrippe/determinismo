@@ -206,9 +206,20 @@ fn read(arena: std.mem.Allocator, address: [4]u8, key: u64, buffer: []u8) ![]con
 }
 
 fn append(arena: std.mem.Allocator, address: [4]u8, key: u64, value: u64, buffer: []u8) Outcome {
-    for (0..conflict_retries) |_| {
-        // Nothing written yet: an error here is a definite failure.
-        const known = document(arena, address, key, buffer) catch return .not_committed;
+    for (0..conflict_retries) |attempt| {
+        // Nothing written yet, or (after a conflict) nothing known written: an error here is a
+        // definite failure.
+        const known = document(arena, address, key, buffer) catch
+            return if (attempt == 0) .not_committed else .unknown;
+        // A conflict can answer a write that took effect: the coordinating node retries it on a
+        // new primary after the old one failed, which already has it (Elasticsearch's resiliency
+        // page, ongoing: "versioned index requests can return a conflict exception even though
+        // they were applied correctly"; run 176's timeline 27 appended its value twice). Values
+        // are unique: one in the list is this append's.
+        if (attempt > 0 and std.mem.indexOfScalar(u64, known._source.v, value) != null) {
+            sdk.sometimes(true, "a conflict answered an append that had taken effect", .{ .key = key });
+            return .committed;
+        }
         var body: std.ArrayList(u8) = .empty;
         body.appendSlice(arena, "{\"v\":[") catch return .not_committed;
         for (known._source.v) |item| body.print(arena, "{d},", .{item}) catch return .not_committed;
@@ -234,7 +245,10 @@ fn append(arena: std.mem.Allocator, address: [4]u8, key: u64, value: u64, buffer
         sdk.event("opensearch_reply", .{ .status = response.status, .body = response.body[0..@min(response.body.len, 400)] });
         return .unknown;
     }
-    return .not_committed;
+    // Conflicts each time: the last may have taken effect too (above).
+    const known = document(arena, address, key, buffer) catch return .unknown;
+    if (std.mem.indexOfScalar(u64, known._source.v, value) != null) return .committed;
+    return .unknown;
 }
 
 // Once faults stop --------------------------------------------------------------------------------

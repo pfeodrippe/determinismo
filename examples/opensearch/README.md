@@ -36,8 +36,9 @@ conflict, creating it when it is not there (`op_type=create`). One operation a t
 Elle judges the history serializable, and a direct check holds what reads promise beyond that:
 each lists every append acknowledged before it began. Recorded for Elle:
 - `ok`: the write acknowledged, or the read answered;
-- `fail`: nothing written (refused, a conflict five times, no answer to the read before it);
-- `info`: the write got no answer.
+- `fail`: nothing written (refused, or no answer to the read before it);
+- `info`: the write got no answer, or conflicts each time with its value never read back (a
+  conflict may answer a write that took effect).
 
 Once faults stop, the index is refreshed and every document read again through each node, into
 the history: an acknowledged append missing there is lost.
@@ -72,4 +73,13 @@ syncs too, and outages of several at once) and graceful stops.
   and the append was acknowledged only at 89.19 s: the documented read model (a write seen
   before its acknowledgment, copies apart until then), no acknowledged write missed. Since,
   Elle judges serializability and `realtime_reads` the reads' promise directly (above), so
-  that a stale read of an acknowledged append still fails.
+  that a stale read of an acknowledged append still fails. By its end (460 timelines) 39 such,
+  and one history Elle crashed on (timeline 27, "host checks run to completion"): key 18 held
+  one append twice. os-1, the shard's primary, was killed with the document's creation copied
+  to the replicas (`max_seq_no [0]`); the coordinating node retried the create on the new
+  primary, which answered 409 "already exists", and the driver read again and appended its
+  value a second time. Known and documented (Elasticsearch's resiliency page, ongoing: a
+  versioned request "can return a conflict exception even though" it was applied), not a
+  finding: an append now counts as committed when, after a conflict, its value is in the
+  document, and the Elle service reports a read holding a value twice (`duplicate-elements`)
+  instead of crashing.
