@@ -217,7 +217,8 @@ fn append(arena: std.mem.Allocator, address: [4]u8, key: u64, value: u64, buffer
         // they were applied correctly"; run 176's timeline 27 appended its value twice). Values
         // are unique: one in the list is this append's.
         if (attempt > 0 and std.mem.indexOfScalar(u64, known._source.v, value) != null) {
-            sdk.sometimes(true, "a conflict answered an append that had taken effect", .{ .key = key });
+            // An event: rare and known, no target (a sometimes is cataloged, and fails unseen).
+            sdk.event("opensearch_conflict_applied", .{ .key = key });
             return .committed;
         }
         var body: std.ArrayList(u8) = .empty;
