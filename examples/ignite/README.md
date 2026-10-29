@@ -19,6 +19,11 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   the three, a 768 MB heap. Setup initializes the cluster (`/management/v1/cluster/init`, all
   three in its management and metastorage groups), then creates the zone (`REPLICAS 3,
   PARTITIONS 8`) and the table through the client node.
+- Every JVM's JIT stops at C1 (`JAVA_TOOL_OPTIONS=-XX:TieredStopAtLevel=1`). C2 took a third of
+  a server's CPU 150 s into a timeline, compiling again in every timeline and every restarted
+  JVM, and the servers restarted too slowly to serve. Side by side (2026-10-30, seed 1, two
+  timelines each), C1's first timeline committed 77 transactions. C2's committed none, even with
+  2,000 warm-up transactions in setup. C1's setup also took half the wall time.
 - Profiles: `default`, Ignite's own settings (table partitions' Raft logs not synced before an
   entry is acknowledged, `raft.fsync = false`: no power losses); `power-loss`, `raft.fsync =
   true`, and power losses too.
