@@ -57,3 +57,19 @@ etcd member on its own disk, outages of several at once), and stalls and power l
   syncing it, and a power loss soon after left initdb's local-only rules. The rules are in
   Patroni's local configuration since (`postgresql.pg_hba`), written at every start. Fourth
   (seed 1, 4 timelines): all passed, 702 operations in timeline 0's history.
+- 2026-10-29, first hunt (run 189, seed 1, tree): 444 timelines until its discovery plateaued,
+  replays 16 of 16 the same; no committed append lost, Elle clean. One failure, in 5 timelines
+  (332, 352 to 355): "no process crashes: postgres", a standby's startup PANICking at every start
+  ("invalid xl_info in checkpoint record", "could not locate a valid checkpoint record at
+  0/2000150"). Timeline 332: Patroni ran pg_rewind on pg3 from the new primary at 83.3 s; pg3 was
+  paused and isolated meanwhile, and pg_rewind failed partway ("unexpected result while fetching
+  remote files"), its WAL already rewritten (segments 3 and 4 at 0 bytes, segment 2 cut to 3 MB,
+  where at 57 s and 61 s, across a power loss, all three were whole). Patroni logged "Failed to
+  rewind because primary pg2 become unreachable" and kept the rewind due (its guard against a
+  damaged attempt, `can_rewind`, looks at pg_control's flags only); the retry at 114 s failed on
+  the damage ("could not read file .../000000010000000000000004: read 0 of 8192"), "Failed to
+  rewind from healthy primary", and Patroni started the standby on that directory, as its
+  default promises ("Otherwise it will try to follow the new leader":
+  `remove_data_directory_on_rewind_failure` off). PostgreSQL's documentation: a target whose
+  pg_rewind failed partway is likely unrecoverable. Documented, not a finding: that PANIC is a
+  known exit since (`exits_known`), so later hunts see the crashes it does not explain.

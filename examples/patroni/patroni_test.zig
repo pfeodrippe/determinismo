@@ -72,6 +72,11 @@ fn describe(d: *System.Describe) !void {
                 // A host's writeback window: Patroni writes files of its own (its configuration,
                 // patroni.dynamic.json) without syncing them; PostgreSQL and etcd sync their own.
                 .writeback_s = 30,
+                // A pg_rewind cut short (its source unreachable) leaves the target's WAL damaged;
+                // Patroni retries, the retry fails on the damage, and by default
+                // (remove_data_directory_on_rewind_failure off) it starts the standby anyway, whose
+                // startup PANICs (SIGABRT) at every start: documented (README), counted apart.
+                .exits_known = &.{"could not locate a valid checkpoint record"},
             });
         }
     }
