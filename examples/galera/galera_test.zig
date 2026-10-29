@@ -108,9 +108,36 @@ fn append(context: *System.Context) !void {
     try sql_append.transactions(arena, &all, options);
 }
 
-/// Every committed append still there once faults stop (run 123 lost one, Elle none the wiser).
+/// Every committed append still there once faults stop (run 123 lost one, Elle none the wiser),
+/// and no node in a primary component without a history: stateless nodes restoring their
+/// component together run under the nil history UUID, and a node that saves it never starts
+/// again (README).
 fn final_reads(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const all = addresses(context);
     try sql_append.final_reads(arena, &all, options);
+    inline for (node_names) |name| history_check(&@field(context.nodes, name), name);
+}
+
+const history_query = "SELECT variable_value FROM information_schema.global_status WHERE " ++
+    "variable_name IN ('wsrep_cluster_state_uuid', 'wsrep_cluster_status') ORDER BY variable_name";
+const nil_history = "00000000-0000-0000-0000-000000000000";
+
+/// The node's cluster history and whether it is in the primary component (a node down or not
+/// answering says nothing).
+fn history_check(node: *const sdk.Node, comptime name: []const u8) void {
+    var buffer: [512]u8 = undefined;
+    const result = node.exec_output(&.{ "mariadb", "-N", "-e", history_query }, &buffer) catch return;
+    if (result.status != 0) return;
+    // The state UUID's line first (ORDER BY its name), then the status's; an empty value is an
+    // empty line (a node not connected has no UUID), kept so the two stay apart.
+    var lines = std.mem.splitScalar(u8, result.output, '\n');
+    const uuid = std.mem.trim(u8, lines.next() orelse return, " \t\r");
+    const status = std.mem.trim(u8, lines.next() orelse return, " \t\r");
+    const primary = std.mem.eql(u8, status, "Primary");
+    sdk.always(!(primary and std.mem.eql(u8, uuid, nil_history)), "no primary component runs under a nil history", .{
+        .node = name,
+        .uuid = uuid,
+        .status = status,
+    });
 }
