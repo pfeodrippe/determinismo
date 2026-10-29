@@ -356,6 +356,7 @@ pub fn build(b: *std.Build) void {
         "guest/runtime/follow.zig",
         "examples/nrepl/bencode.zig",
         "examples/nats/client.zig",
+        "examples/nats/nats_test.zig",
         "examples/sql/append.zig",
         "examples/sql/mysql.zig",
         "examples/mongodb/bson.zig",

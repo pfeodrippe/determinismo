@@ -29,6 +29,23 @@ own disk), and at the servers' syncs, stalls and power losses (`sync_stall`, `du
 | Reads in order, nothing made up | the consumer reads in sequence order, each sequence once, only messages that were published |
 | Replicas converge | after faults, every server's own copy of the stream (its `/jsz`) has the same messages and last sequence |
 
+## Atomic batches (scenario `batch`)
+
+JetStream's atomic batch publishing (2.12.0, ADR-50): on a stream with `allow_atomic`, a batch's
+messages carry `Nats-Batch-Id` and `Nats-Batch-Sequence`, the last `Nats-Batch-Commit: 1`; the
+batch is stored all or nothing, its sequences contiguous. Producers publish batches of two to
+five messages, each answered (a zero-byte ack, the commit's PubAck with the batch's count, or an
+error), and note a batch begun, its commit sent, acknowledged or refused. Once faults stop, the
+stream is read whole:
+
+| Property | Breaks when |
+|---|---|
+| a batch is stored whole or not at all | some of a batch's messages are read, not all |
+| a batch's messages are at consecutive sequences, in order | a whole batch is read with a gap or out of order |
+| a batch never committed stores nothing | a batch whose commit was never sent (an error, a lost connection before it), or was refused, is read |
+| an acknowledged batch is read back whole, at its sequence | an acknowledged batch's messages are missing (in `sync`; `default` may lose them by design), or its last is not at the acknowledged sequence |
+| every stored message is of a batch begun | a message no producer began |
+
 ## Findings
 
 None yet: 8 of 8 timelines pass with `sync`.

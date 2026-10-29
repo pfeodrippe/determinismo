@@ -46,9 +46,14 @@ const fetch_batch = 256;
 const setup_attempts_max = 300;
 const recovery_attempts_max = 120;
 const reply_size_max = 64 * 1024;
+const batch_stream = "batches";
+const batch_subject = "jepsen.batch";
+const batches_path = "/tmp/nats-batches.log";
+const batches_per_driver = 10;
+const batch_size_max = 5;
 
 pub fn main(init: std.process.Init) !void {
-    return System.main(init, .{ .describe = describe, .scenarios = .{ .queue = queue } });
+    return System.main(init, .{ .describe = describe, .scenarios = .{ .queue = queue, .batch = batch } });
 }
 
 fn describe(d: *System.Describe) !void {
@@ -239,24 +244,33 @@ fn messages_survive(context: *System.Context) !void {
         "acknowledgement gave", .{ .moved = moved });
 }
 
-/// The whole stream through a consumer (on a random server): message to sequence. Checks as it
-/// reads that sequences come in order, once each, and messages are ones published.
 fn stream_read(all: *const [servers_count][4]u8, arena: std.mem.Allocator) !std.StringHashMapUnmanaged(u64) {
+    return stream_read_named(all, arena, stream, message_shaped);
+}
+
+/// The whole stream `name` through a consumer (on a random server): message to sequence. Checks
+/// as it reads that sequences come in order, once each, and messages are ones published.
+fn stream_read_named(
+    all: *const [servers_count][4]u8,
+    arena: std.mem.Allocator,
+    comptime name: []const u8,
+    comptime shaped: fn ([]const u8) bool,
+) !std.StringHashMapUnmanaged(u64) {
     var client: Client = undefined;
     try client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms });
     defer client.close();
     var buffer: [reply_size_max]u8 = undefined;
-    const config = "{\"stream_name\":\"" ++ stream ++ "\",\"config\":{\"ack_policy\":\"none\"," ++
+    const config = "{\"stream_name\":\"" ++ name ++ "\",\"config\":{\"ack_policy\":\"none\"," ++
         "\"deliver_policy\":\"all\",\"mem_storage\":true,\"num_replicas\":1," ++
         "\"inactive_threshold\":60000000000}}";
-    const created = try client.request("$JS.API.CONSUMER.CREATE." ++ stream, config, &buffer);
+    const created = try client.request("$JS.API.CONSUMER.CREATE." ++ name, config, &buffer);
     if (created.status != 0) return error.NoResponders;
     const Created = struct { name: []const u8 = "", @"error": ?std.json.Value = null };
     const consumer = std.json.parseFromSliceLeaky(Created, arena, created.payload, .{
         .ignore_unknown_fields = true,
     }) catch return error.BadReply;
     if (consumer.@"error" != null or consumer.name.len == 0) return error.JetStreamError;
-    const next_subject = try std.fmt.allocPrint(arena, "$JS.API.CONSUMER.MSG.NEXT." ++ stream ++ ".{s}", .{consumer.name});
+    const next_subject = try std.fmt.allocPrint(arena, "$JS.API.CONSUMER.MSG.NEXT." ++ name ++ ".{s}", .{consumer.name});
     var read: std.StringHashMapUnmanaged(u64) = .empty;
     var last: u64 = 0;
     var repeated: u64 = 0;
@@ -271,7 +285,7 @@ fn stream_read(all: *const [servers_count][4]u8, arena: std.mem.Allocator) !std.
             const sequence = ack_stream_sequence(message.reply_to) orelse return error.BadReply;
             if (sequence <= last) repeated += 1;
             last = @max(last, sequence);
-            if (!message_shaped(message.payload)) unknown += 1;
+            if (!shaped(message.payload)) unknown += 1;
             try read.put(arena, try arena.dupe(u8, message.payload), sequence);
         }
         if (delivered < fetch_batch) break;
@@ -288,6 +302,249 @@ fn message_shaped(payload: []const u8) bool {
     _ = std.fmt.parseInt(u32, payload[0..dash], 16) catch return false;
     _ = std.fmt.parseInt(u32, payload[dash + 1 ..], 10) catch return false;
     return true;
+}
+
+// Atomic batches -----------------------------------------------------------------------------
+
+/// Atomic batch publishing (JetStream 2.12+, ADR-50: a stream with `allow_atomic`): producers
+/// publish batches of two to five messages ("<producer>-<n>.<i>"), each message with its batch's
+/// id and sequence, the last with `Nats-Batch-Commit: 1`, each answered (a zero-byte ack, the
+/// commit's PubAck, or an error). Noted in the runner (/tmp/nats-batches.log): a batch begun,
+/// its commit sent, acknowledged (count and sequence), refused. Once faults stop, the stream is
+/// read and each batch judged, as ADR-50 promises:
+///   whole or none      a batch's messages are all stored or none are
+///   contiguous         at consecutive sequences, in the batch's order
+///   uncommitted        a batch whose commit was never sent, or was refused, stores nothing
+///   acknowledged       a batch whose commit was acknowledged is read back whole, its last
+///                      message at the acknowledged sequence
+fn batch(s: *System.Scenario) void {
+    s.setup("stream", batch_stream_created);
+    s.parallel_driver("batch", batches_publish);
+    s.eventually("read", batches_whole);
+}
+
+fn batch_stream_created(context: *System.Context) !void {
+    const all = addresses(context);
+    _ = try sdk.retry(setup_attempts_max, 200, batch_stream_create, .{&all});
+}
+
+fn batch_stream_create(all: *const [servers_count][4]u8) !void {
+    var client: Client = undefined;
+    try client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms });
+    defer client.close();
+    const config = "{\"name\":\"" ++ batch_stream ++ "\",\"subjects\":[\"" ++ batch_subject ++ "\"]," ++
+        "\"num_replicas\":3,\"storage\":\"file\",\"allow_direct\":true,\"allow_atomic\":true}";
+    var buffer: [4096]u8 = undefined;
+    const reply = try client.request("$JS.API.STREAM.CREATE." ++ batch_stream, config, &buffer);
+    if (reply.status != 0) return error.NoResponders;
+    if (std.mem.indexOf(u8, reply.payload, "\"error\"") != null) {
+        if (std.mem.indexOf(u8, reply.payload, "already in use") != null) return;
+        sdk.event("nats_error", .{ .command = "stream create", .reply = reply.payload[0..@min(reply.payload.len, 300)] });
+        return error.JetStreamError;
+    }
+}
+
+fn batches_publish(context: *System.Context) !void {
+    const all = addresses(context);
+    var id: [4]u8 = undefined;
+    sdk.random_bytes(&id);
+    var client: Client = undefined;
+    var connected = false;
+    defer if (connected) client.close();
+    for (0..batches_per_driver) |number| {
+        if (!connected) {
+            client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms }) catch |err| {
+                if (!no_answer(err)) return err;
+                continue;
+            };
+            connected = true;
+        }
+        var id_buffer: [32]u8 = undefined;
+        const batch_id = try std.fmt.bufPrint(&id_buffer, "{x}-{d}", .{ id, number });
+        const count = 2 + sdk.random_below(batch_size_max - 1);
+        // Noted before its first message: a driver killed mid-batch leaves it begun.
+        batch_note("i {s} {d}", .{ batch_id, count });
+        batch_publish(&client, batch_id, count) catch |err| {
+            if (!no_answer(err)) return err;
+            sdk.sometimes(true, "a batch message got no answer", .{ .err = @errorName(err) });
+            client.close();
+            connected = false;
+        };
+    }
+}
+
+fn batch_publish(client: *Client, batch_id: []const u8, count: u64) !void {
+    var buffer: [4096]u8 = undefined;
+    for (1..count + 1) |index| {
+        const last = index == count;
+        var headers_buffer: [192]u8 = undefined;
+        const headers = try std.fmt.bufPrint(&headers_buffer, "Nats-Batch-Id: {s}\r\nNats-Batch-Sequence: {d}\r\n{s}", .{
+            batch_id, index, if (last) "Nats-Batch-Commit: 1\r\n" else "",
+        });
+        var payload_buffer: [48]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buffer, "{s}.{d}", .{ batch_id, index });
+        if (last) batch_note("c {s}", .{batch_id});
+        const reply = try client.request_with_headers(batch_subject, headers, payload, &buffer);
+        if (reply.status == 503) return error.NoResponders;
+        if (!last) {
+            if (reply.payload.len == 0) continue; // Taken: on to the next.
+            // Refused before its commit (an error pub ack): the commit is never sent.
+            batch_note("e {s}", .{batch_id});
+            sdk.event("nats_batch_refused", .{ .index = index, .reply = reply.payload[0..@min(reply.payload.len, 300)] });
+            return;
+        }
+        const Ack = struct { seq: u64 = 0, count: u64 = 0, @"error": ?std.json.Value = null };
+        var parse_buffer: [4096]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&parse_buffer);
+        const ack = std.json.parseFromSliceLeaky(Ack, fixed.allocator(), reply.payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.BadReply;
+        if (ack.@"error" != null) {
+            // Its commit refused: ADR-50's word, the batch abandoned.
+            batch_note("f {s}", .{batch_id});
+            sdk.event("nats_batch_refused", .{ .index = index, .reply = reply.payload[0..@min(reply.payload.len, 300)] });
+            return;
+        }
+        if (ack.seq == 0) return error.BadReply;
+        batch_note("o {s} {d} {d}", .{ batch_id, ack.count, ack.seq });
+        sdk.sometimes(true, "a batch was committed", .{});
+    }
+}
+
+/// One line, appended in one write.
+fn batch_note(comptime format: []const u8, arguments: anytype) void {
+    var line_buffer: [96]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, format ++ "\n", arguments) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = linux.open(batches_path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), line.ptr, line.len);
+}
+
+fn batches_read(all: *const [servers_count][4]u8, arena: std.mem.Allocator) !std.StringHashMapUnmanaged(u64) {
+    return stream_read_named(all, arena, batch_stream, batch_message_shaped);
+}
+
+/// "<8 hex digits>-<number>.<number>": a batch's message.
+fn batch_message_shaped(payload: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, payload, '.') orelse return false;
+    _ = std.fmt.parseInt(u32, payload[dot + 1 ..], 10) catch return false;
+    return message_shaped(payload[0..dot]);
+}
+
+fn batches_whole(context: *System.Context) !void {
+    const all = addresses(context);
+    const arena = context.init.arena.allocator();
+    const log = std.Io.Dir.cwd().readFileAlloc(context.init.io, batches_path, arena, .limited(1 << 26)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    const read = sdk.retry(recovery_attempts_max, 250, batches_read, .{ &all, arena }) catch |err| {
+        sdk.assert_unreachable("the stream cannot be read once faults stop", .{ .err = @errorName(err) });
+        return err;
+    };
+    const verdict = try batches_judge(arena, log, &read);
+    sdk.always(verdict.partial == 0, "a batch is stored whole or not at all", verdict);
+    sdk.always(verdict.scattered == 0, "a batch's messages are at consecutive sequences, in order", verdict);
+    sdk.always(verdict.uncommitted_stored == 0, "a batch never committed stores nothing", verdict);
+    sdk.always(verdict.acknowledged_lost == 0, "an acknowledged batch is read back whole, at its sequence", verdict);
+    sdk.always(verdict.invented == 0, "every stored message is of a batch begun", verdict);
+}
+
+const BatchVerdict = struct {
+    begun: u64 = 0,
+    acknowledged: u64 = 0,
+    stored: u64 = 0,
+    partial: u64 = 0,
+    scattered: u64 = 0,
+    uncommitted_stored: u64 = 0,
+    acknowledged_lost: u64 = 0,
+    invented: u64 = 0,
+    example: []const u8 = "",
+};
+
+const Batch = struct {
+    count: u64,
+    commit_sent: bool = false,
+    refused: bool = false,
+    acknowledged: ?struct { count: u64, sequence: u64 } = null,
+    /// Its messages read, by index (1-based): their stream sequences.
+    sequences: [batch_size_max + 1]u64 = @splat(0),
+    stored: u64 = 0,
+};
+
+fn batches_judge(arena: std.mem.Allocator, log: []const u8, read: *const std.StringHashMapUnmanaged(u64)) !BatchVerdict {
+    var batches: std.StringHashMapUnmanaged(Batch) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const kind = fields.next() orelse continue;
+        const batch_id = fields.next() orelse continue;
+        if (kind[0] == 'i') {
+            const count = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+            try batches.put(arena, batch_id, .{ .count = count });
+            continue;
+        }
+        const known = batches.getPtr(batch_id) orelse continue;
+        switch (kind[0]) {
+            'c' => known.commit_sent = true,
+            'e', 'f' => known.refused = true,
+            'o' => {
+                const count = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                const sequence = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                known.acknowledged = .{ .count = count, .sequence = sequence };
+            },
+            else => {},
+        }
+    }
+    var verdict: BatchVerdict = .{ .begun = batches.count() };
+    var messages = read.iterator();
+    while (messages.next()) |entry| {
+        const payload = entry.key_ptr.*;
+        const dot = std.mem.lastIndexOfScalar(u8, payload, '.') orelse continue;
+        const index = std.fmt.parseInt(u64, payload[dot + 1 ..], 10) catch continue;
+        const known = batches.getPtr(payload[0..dot]);
+        if (known == null or index == 0 or index > known.?.count) {
+            if (verdict.example.len == 0) verdict.example = payload;
+            verdict.invented += 1;
+            continue;
+        }
+        known.?.sequences[index] = entry.value_ptr.*;
+        known.?.stored += 1;
+    }
+    var iterator = batches.iterator();
+    while (iterator.next()) |entry| {
+        const known = entry.value_ptr;
+        const batch_id = entry.key_ptr.*;
+        if (known.acknowledged != null) verdict.acknowledged += 1;
+        if (known.stored > 0) verdict.stored += 1;
+        var problem = false;
+        if (known.stored > 0 and known.stored != known.count) {
+            verdict.partial += 1;
+            problem = true;
+        }
+        if (known.stored == known.count) {
+            for (2..known.count + 1) |index| {
+                if (known.sequences[index] == known.sequences[index - 1] + 1) continue;
+                verdict.scattered += 1;
+                problem = true;
+                break;
+            }
+        }
+        if (known.stored > 0 and (!known.commit_sent or known.refused)) {
+            verdict.uncommitted_stored += 1;
+            problem = true;
+        }
+        if (known.acknowledged) |ack| {
+            if (known.stored != known.count or ack.count != known.count or known.sequences[known.count] != ack.sequence) {
+                verdict.acknowledged_lost += 1;
+                problem = true;
+            }
+        }
+        if (problem and verdict.example.len == 0) verdict.example = batch_id;
+    }
+    return verdict;
 }
 
 /// Faults are over: every server's copy of the stream reaches the same messages and last
@@ -335,4 +592,41 @@ fn copy_of(address: [4]u8) !Copy {
         }
     };
     return error.NoCopy;
+}
+
+test batches_judge {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // a: acknowledged, stored whole at 5 and 6. b: committed with no answer, stored with a gap.
+    // c: never committed, one message stored. d: acknowledged at 9, its second message lost.
+    const log =
+        \\i 0000000a-0 2
+        \\c 0000000a-0
+        \\o 0000000a-0 2 6
+        \\i 0000000a-1 3
+        \\c 0000000a-1
+        \\i 0000000a-2 2
+        \\i 0000000a-3 2
+        \\c 0000000a-3
+        \\o 0000000a-3 2 9
+        \\
+    ;
+    var read: std.StringHashMapUnmanaged(u64) = .empty;
+    try read.put(arena, "0000000a-0.1", 5);
+    try read.put(arena, "0000000a-0.2", 6);
+    try read.put(arena, "0000000a-1.1", 10);
+    try read.put(arena, "0000000a-1.2", 12);
+    try read.put(arena, "0000000a-1.3", 13);
+    try read.put(arena, "0000000a-2.1", 14);
+    try read.put(arena, "0000000a-3.1", 8);
+    try read.put(arena, "0000000b-0.1", 15);
+    const verdict = try batches_judge(arena, log, &read);
+    try std.testing.expectEqual(4, verdict.begun);
+    try std.testing.expectEqual(2, verdict.acknowledged);
+    try std.testing.expectEqual(2, verdict.partial); // c and d.
+    try std.testing.expectEqual(1, verdict.scattered); // b.
+    try std.testing.expectEqual(1, verdict.uncommitted_stored); // c.
+    try std.testing.expectEqual(1, verdict.acknowledged_lost); // d.
+    try std.testing.expectEqual(1, verdict.invented);
 }

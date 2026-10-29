@@ -76,6 +76,34 @@ pub const Client = struct {
         return reply_subject;
     }
 
+    /// `request` with headers: `headers` their lines, each ending in "\r\n" (HPUB).
+    pub fn request_with_headers(client: *Client, subject: []const u8, headers: []const u8, payload: []const u8, buffer: []u8) !Reply {
+        const reply_subject = try client.publish_with_headers(subject, headers, payload);
+        return client.next(reply_subject, .reply, buffer);
+    }
+
+    /// `publish` with headers (HPUB): "NATS/1.0", `headers`, an empty line, then the payload.
+    pub fn publish_with_headers(client: *Client, subject: []const u8, headers: []const u8, payload: []const u8) ![]const u8 {
+        assert(headers.len == 0 or std.mem.endsWith(u8, headers, "\r\n"));
+        client.requests += 1;
+        const reply_subject = try std.fmt.bufPrint(&reply_buffer, "{s}.{d}", .{
+            client.inbox[0..client.inbox_len], client.requests,
+        });
+        const version = "NATS/1.0\r\n";
+        const header_size = version.len + headers.len + "\r\n".len;
+        var head_buffer: [256]u8 = undefined;
+        const head = try std.fmt.bufPrint(&head_buffer, "HPUB {s} {s} {d} {d}\r\n", .{
+            subject, reply_subject, header_size, header_size + payload.len,
+        });
+        try client.connection.write_all(head);
+        try client.connection.write_all(version);
+        try client.connection.write_all(headers);
+        try client.connection.write_all("\r\n");
+        try client.connection.write_all(payload);
+        try client.connection.write_all("\r\n");
+        return reply_subject;
+    }
+
     var reply_buffer: [64]u8 = undefined;
 
     /// What `next` waits for: the answer to a request (a message on its reply subject), or what
