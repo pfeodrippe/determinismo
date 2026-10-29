@@ -208,7 +208,9 @@ the whole timeline (the coverage profile's slower brokers never got one).
   producer 1004 (`t10626586`) at epoch 7 open (from offsets 297 and 282 of their logs) that its
   coordinator (`kafka_internal/tx/32`) held as "status: empty, partitions: {}"; the last stable
   offset never moved again. How, step by step:
-  1. Causality (6 futures a moment): from 112.7 s 1 future in 6 fails, from 119.7 s all 6.
+  1. Causality (6 futures a moment): 1 future in 6 fails from 112.7 s, 2 from 116.17 s, all 6
+     from 117.04 s. Between, at 116.49 s, kafka-1 and kafka-3 lost power together; kafka-3 led
+     the coordinator's partition (`tx/32`).
   2. A future from 116.0 s with Redpanda's `tx` logger at trace on every broker (`rpk redpanda
      admin config log-level set tx --host localhost:9644 --level trace --expiry-seconds 0`, and
      `rpk.additional_start_flags` so restarts keep it), the timeline's own randomness after it,
