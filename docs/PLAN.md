@@ -61,6 +61,17 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
+- Per-node clock skew (2026-10-29): every node in a time namespace of its own, the guest
+  kernel's patch 0005 giving namespaces a realtime offset changeable while tasks run (the vDSO,
+  the syscalls, absolute deadlines: clock_nanosleep, timers, timerfd, futexes), and the
+  `clock_skew` fault (one node's CLOCK_REALTIME ahead or behind, 1 ms up to the node's
+  `clock_skew_ms_max`; one in four strobing). The selftest's `inject` check measures it (a
+  5 s skew back, absolute sleeps and futex waits keeping their time, the skew gone at the
+  fault's end) and passed on the patched kernel. On in Cassandra, ScyllaDB, MongoDB, etcd,
+  TiDB, SurrealDB, rqlite, and below the documented maximum offsets in YugabyteDB's current
+  release (400 ms), CockroachDB (300 ms) and Ignite (400 ms). Next: the full e2e suite on the
+  deployed kernel (when the reserved cores are idle).
+
 - Redpanda: timeline 56 of run 177, a transaction its coordinator knew and was aborting while a
   partition had no leader, open for good; trace futures from 745 to 760 s all passed (a narrow
   window): causality, then a future inside its jump with the tx logger up.

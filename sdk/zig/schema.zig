@@ -210,8 +210,9 @@ pub const Faults = struct {
     runner_links: bool = true,
     /// Limit its CPU (a share of one CPU) for a while.
     throttle: bool = true,
-    /// Skew its realtime clock for a while, forward or back, 1 ms to 10 s (Jepsen's clock
-    /// bumps): its CLOCK_REALTIME apart from the other nodes', the monotonic clock untouched.
+    /// Skew its realtime clock for a while, forward or back, 1 ms to 10 s (Jepsen's clock bumps;
+    /// one in four strobes, coming and going every 10 ms to a second): its CLOCK_REALTIME apart
+    /// from the other nodes', the monotonic clock untouched.
     /// For systems ordering by wall clocks (hybrid logical clocks, leases, timestamps). Off by
     /// default: some stop a node on purpose past their maximum offset.
     clock_skew: bool = false,

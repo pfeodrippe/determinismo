@@ -700,6 +700,21 @@ fn faults_on_request(context: *System.Context) !void {
     sdk.always(after_ms != null and @abs(after_ms.?) < 500, "a clock skew ends with its fault", .{
         .skew_ms = after_ms orelse 0,
     });
+    // A strobe: the skew comes and goes every 300 ms while the fault lasts.
+    sdk.fault(.{ .kind = "clock_skew", .node = echo.name, .skip_ms = 5000, .forward = true, .strobe_ms = 300, .duration_ms = 3000 });
+    var skewed: u32 = 0;
+    var unskewed: u32 = 0;
+    for (0..8) |_| {
+        sdk.sleep_ms(120);
+        const sample = realtime_skew_ms(&echo) orelse continue;
+        if (@abs(sample - 5000) < 500) skewed += 1;
+        if (@abs(sample) < 500) unskewed += 1;
+    }
+    sdk.always(skewed > 0 and unskewed > 0, "a strobing clock skew comes and goes", .{
+        .skewed = skewed,
+        .unskewed = unskewed,
+    });
+    sdk.sleep_ms(2500);
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
 }

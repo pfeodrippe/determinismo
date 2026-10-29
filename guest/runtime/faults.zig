@@ -400,6 +400,9 @@ const Applied = struct {
     skip_ns: u64 = 0,
     /// A clock skip that is never undone: skips then stack.
     permanent: bool = false,
+    /// For clock_skew: 0 holds the skew for the fault's duration; otherwise it comes and goes
+    /// every this many nanoseconds (Jepsen's strobe: a clock flipping as a confused NTP might).
+    strobe_ns: u64 = 0,
     disruption: ?Disruption = null,
     direction: ?Direction = null,
     /// For custom: the program in the node, and its exit status (in the event).
@@ -497,6 +500,8 @@ fn draw(fault: *const Fault) Applied {
         .clock_skew => {
             applied.forward = sdk.random_below(2) == 0;
             applied.skip_ns = clock_skew_draw(fault.skew_ns_max);
+            // One in four strobes, flipping every 10 ms to a second.
+            if (sdk.random_below(4) == 0) applied.strobe_ns = (10 + sdk.random_below(991)) * std.time.ns_per_ms;
         },
         .outage => {
             applied.outage = outage_draw(fault.endpoints);
@@ -649,7 +654,7 @@ fn faults_collect(
         if (allowed.clock_skew) faults_add(faults, &count, .{
             .kind = .clock_skew,
             .node = node.name,
-            .skew_ns_max = @max(10, allowed.clock_skew_ms_max) * std.time.ns_per_ms,
+            .skew_ns_max = @as(u64, @max(10, allowed.clock_skew_ms_max)) * std.time.ns_per_ms,
         });
         if (allowed.sync_stall) faults_add(faults, &count, .{ .kind = .sync_stall, .node = node.name });
         if (allowed.process_pause) {
@@ -789,6 +794,9 @@ const NodeFault = struct {
     /// A stop: when what the node left running is killed (its grace period ends), if still
     /// pending.
     grace_end_ns: ?u64 = null,
+    /// A strobing clock skew: when it next comes or goes, and whether it is on now.
+    flip_ns: ?u64 = null,
+    skewed: bool = true,
     /// The process or thread stopped (process_pause, thread_pause); for a pod fault, a process
     /// of the pod (its network namespace).
     pid: linux.pid_t = 0,
@@ -836,6 +844,11 @@ fn skew_ns(applied: *const Applied) i64 {
     return if (applied.forward) size else -size;
 }
 
+fn skew_begin(applied: *const Applied, fault: *NodeFault) !void {
+    try nodes.clock_offset(applied.node, skew_ns(applied));
+    if (applied.strobe_ns > 0) fault.flip_ns = monotonic_ns() + applied.strobe_ns;
+}
+
 fn node_start(system: *const schema.System, applied: *const Applied) void {
     const slot = node_slot(system, applied.node) orelse return;
     if (slot.* != null) return;
@@ -851,7 +864,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .stop => stop_begin(applied.node, &fault),
         .disk => nodes.disk_fail(applied.node, applied.disk.?),
         .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
-        .clock_skew => nodes.clock_offset(applied.node, skew_ns(applied)),
+        .clock_skew => skew_begin(applied, &fault),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
         else => unreachable,
@@ -1265,6 +1278,12 @@ fn node_expire(system: *const schema.System, now_ns: u64) void {
             nodes.kill_remaining(fault.applied.node) catch {};
             slot.*.?.grace_end_ns = null;
         };
+        if (fault.flip_ns) |flip_ns| if (flip_ns <= now_ns and fault.end_ns > now_ns) {
+            const skewed = !fault.skewed;
+            nodes.clock_offset(fault.applied.node, if (skewed) skew_ns(&fault.applied) else 0) catch {};
+            slot.*.?.skewed = skewed;
+            slot.*.?.flip_ns = now_ns + fault.applied.strobe_ns;
+        };
         if (fault.end_ns <= now_ns) node_end(system, slot);
     }
 }
@@ -1284,6 +1303,7 @@ fn node_next_end() ?u64 {
         const fault = slot orelse continue;
         next = @min(next orelse fault.end_ns, fault.end_ns);
         if (fault.grace_end_ns) |grace_end_ns| next = @min(next.?, grace_end_ns);
+        if (fault.flip_ns) |flip_ns| next = @min(next.?, flip_ns);
     }
     return next;
 }
@@ -2139,8 +2159,10 @@ const Request = struct {
     direction: Direction = .both,
     flavor: Degradation = .delay_loss,
     cpu_percent: u8 = 20,
-    /// clock_skip (permanent: later skips stack on it), clock_skew (the node's).
+    /// clock_skip (permanent: later skips stack on it), clock_skew (the node's; with
+    /// strobe_ms, coming and going that often).
     skip_ms: u64 = 0,
+    strobe_ms: u64 = 0,
     forward: bool = true,
     program: []const u8 = "",
     /// disk.
@@ -2238,6 +2260,7 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
         .clock_skew => {
             applied.skip_ns = request.skip_ms * std.time.ns_per_ms;
             applied.forward = request.forward;
+            applied.strobe_ns = request.strobe_ms * std.time.ns_per_ms;
         },
         .custom => applied.program = request.program,
         .outage => {
@@ -2319,21 +2342,28 @@ test faults_collect {
     var resolved = [2]schema.Resolved{ base, base };
     resolved[0].faults = node_faults;
     resolved[1].name = "b";
+    resolved[1].faults = .{ .clock_skew = true };
     const scenario = schema.Scenario{ .name = "s", .commands = &.{}, .clock_skip = true };
     const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{scenario} };
     var faults: [faults_max]Fault = undefined;
     // a: pause, restart, throttle, process pause; with the runner and with b: partition and
-    // degrade both ways (6). b: pause, isolate, throttle, process pause; with the runner:
-    // partition and degrade both ways (3). Thread pauses where process pauses are (2). Sync
-    // stalls (on by default) on both (2). A clog of b (it allows isolation), groups across the
-    // runner, a and b. Clock skip. A restore.
-    try std.testing.expectEqual(@as(u32, 25), faults_collect(&system, &scenario, &faults));
-    const groups = faults[0..25];
+    // degrade both ways (6). b: pause, isolate, throttle, clock skew, process pause; with the
+    // runner: partition and degrade both ways (3). Thread pauses where process pauses are (2).
+    // Sync stalls (on by default) on both (2). A clog of b (it allows isolation), groups across
+    // the runner, a and b. Clock skip. A restore.
+    try std.testing.expectEqual(@as(u32, 26), faults_collect(&system, &scenario, &faults));
+    const groups = faults[0..26];
     const has_groups = for (groups) |fault| {
         if (fault.kind == .partition_groups) break true;
     } else false;
     try std.testing.expect(has_groups);
-    try std.testing.expectEqual(Kind.restore, faults[24].kind); // The last one.
+    // b's clock skews reach its largest, ten seconds by default (10^10 ns: past u32).
+    const skew = for (groups) |fault| {
+        if (fault.kind == .clock_skew) break fault;
+    } else unreachable;
+    try std.testing.expectEqualStrings("b", skew.node);
+    try std.testing.expectEqual(10 * std.time.ns_per_s, skew.skew_ns_max);
+    try std.testing.expectEqual(Kind.restore, faults[25].kind); // The last one.
 }
 
 test harsher {
