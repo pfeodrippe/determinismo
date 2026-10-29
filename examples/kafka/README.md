@@ -201,8 +201,10 @@ the whole timeline (the coverage profile's slower brokers never got one).
 - Found blind: Redpanda 26.2.6 keeps a transaction open for good when its coordinator crashes
   between beginning it on the partitions and recording them. First hunt (run 177, `redpanda`
   profile, production mode, 2026-10-29): "no transaction stays open once faults stop" failed in
-  timelines 23, 46 and 56 of the first 68 (46 with the same refusal below, 56 a coordinator
-  partition without a leader, not yet read). Timeline 23, partitions 0 and 3 kept a transaction of
+  timelines 23, 46 and 56 of the first 68 (46 with the same refusal below). 56 differs: its
+  coordinator knew the transaction and was aborting it while partition 2 had no leader
+  (751 s), then said nothing more, the partition open at 844 s; trace futures from 745, 750 and
+  760 s all passed (a narrow window: causality next, if it comes back). Timeline 23, partitions 0 and 3 kept a transaction of
   producer 1004 (`t10626586`) at epoch 7 open (from offsets 297 and 282 of their logs) that its
   coordinator (`kafka_internal/tx/32`) held as "status: empty, partitions: {}"; the last stable
   offset never moved again. How, step by step:
