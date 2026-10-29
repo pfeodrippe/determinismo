@@ -84,6 +84,9 @@ fn describe(d: *System.Describe) !void {
                     .stop = true,
                     .process_kill = true,
                     .process_kill_names = &.{"java"},
+                    // Paxos's ballots and Accord's timestamps come from the nodes' clocks; their
+                    // safety must not depend on them agreeing.
+                    .clock_skew = true,
                 },
             });
         }

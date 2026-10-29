@@ -68,7 +68,9 @@ fn describe(d: *System.Describe) !void {
                 .ready = .{ .tcp = pd_port },
                 // Within reach of the kernel's limit for each node, not the whole machine's.
                 .memory_max_mib = entry[2],
-                .faults = .{ .restart = true, .crash = true, .stop = true },
+                // PD's timestamps come from its leader's clock: a new leader behind must still
+                // never hand out an older one.
+                .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
             });
         }
     }

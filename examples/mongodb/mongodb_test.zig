@@ -69,7 +69,9 @@ fn describe(d: *System.Describe) !void {
                     "--wiredTigerCacheSizeGB", "0.25",
                 },
                 .ready = .{ .tcp = port },
-                .faults = .{ .restart = true, .crash = true, .stop = true },
+                // Cluster time is a hybrid logical clock: majority writes and reads must not
+                // depend on the members' clocks agreeing.
+                .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
             });
         }
     }

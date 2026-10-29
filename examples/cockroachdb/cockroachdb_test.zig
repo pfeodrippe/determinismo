@@ -53,8 +53,9 @@ fn describe(d: *System.Describe) !void {
                 "--max-sql-memory=64MiB",
             },
             .ready = .{ .tcp = port },
-            // A wipe is left out: a node that lost its store cannot rejoin as itself.
-            .faults = .{ .restart = true, .crash = true, .stop = true },
+            // A wipe is left out: a node that lost its store cannot rejoin as itself. Clocks
+            // skewed within its maximum offset (500 ms; a node past 80% of it stops on purpose).
+            .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true, .clock_skew_ms_max = 300 },
         });
     }
 }

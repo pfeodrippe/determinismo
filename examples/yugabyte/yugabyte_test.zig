@@ -87,6 +87,10 @@ fn describe_profile(
                 .stop = true,
                 .process_kill = true,
                 .process_kill_names = &.{ "yb-master", "yb-tserver" },
+                // The current release's clocks skewed, within its 500 ms maximum
+                // (max_clock_skew_usec): hybrid time's safety assumes no more.
+                .clock_skew = !crashing_backends,
+                .clock_skew_ms_max = 400,
             },
             // 1.3.1's YSQL backends segfault on their way out (README: Observed), in every
             // timeline: counted, so a run's failing timelines say something again.

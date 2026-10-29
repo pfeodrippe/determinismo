@@ -65,7 +65,8 @@ fn describe(d: *System.Describe) !void {
             // PD's client port: the nodes start together, as PD needs a quorum.
             .ready = .{ .tcp = pd_port },
             .memory_max_mib = node_memory_mib,
-            .faults = .{ .restart = true, .crash = true, .stop = true },
+            // PD's timestamps come from its leader's clock (examples/tidb).
+            .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
         });
     }
 }

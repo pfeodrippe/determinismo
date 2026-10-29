@@ -114,7 +114,8 @@ fn members(profile: *System.Profile, comptime dockerfile: []const u8) !void {
             },
             .ready = .{ .tcp = client_port },
             // A wipe is left out: a member that lost its data cannot rejoin as itself, by design.
-            .faults = .{ .restart = true, .crash = true, .stop = true },
+            // Raft's safety must not depend on clocks (leases on the monotonic clock).
+            .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
         });
     }
 }

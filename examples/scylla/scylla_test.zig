@@ -76,6 +76,9 @@ fn describe(d: *System.Describe) !void {
                     .stop = true,
                     .process_kill = true,
                     .process_kill_names = &.{"scylla"},
+                    // LWT ballots come from the nodes' clocks; Paxos's safety must not depend on
+                    // them agreeing.
+                    .clock_skew = true,
                 },
             });
         }

@@ -72,7 +72,8 @@ fn describe(d: *System.Describe) !void {
                 // bootstrapped a cluster together.
                 .ready = .{ .tcp = raft_port },
                 // rqlite syncs its Raft log before acknowledging an entry: power losses too.
-                .faults = .{ .restart = true, .crash = true, .stop = true },
+                // Raft's safety must not depend on clocks.
+                .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
             });
         }
     }

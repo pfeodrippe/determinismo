@@ -66,7 +66,9 @@ fn describe(d: *System.Describe) !void {
                 // The cluster port, open at once: clients are served only once the cluster is
                 // initialized (setup), which needs all three.
                 .ready = .{ .tcp = cluster_port },
-                .faults = .{ .restart = true, .crash = entry[1], .stop = true },
+                // Clocks skewed within the 500 ms its hybrid clocks assume (schema sync's
+                // maximum clock skew).
+                .faults = .{ .restart = true, .crash = entry[1], .stop = true, .clock_skew = true, .clock_skew_ms_max = 400 },
             });
         }
         profile.node(.iclient, .{
