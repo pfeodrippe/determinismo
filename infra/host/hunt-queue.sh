@@ -101,8 +101,16 @@ stats = run.get("stats") or {}
 properties = json.load(urllib.request.urlopen("http://localhost:7878/runs/%d/properties" % run["id"], timeout=60))
 failing = ["%s (%d)" % (p["message"], p.get("timelines_failing") or 0) for p in properties if p.get("status") == "failing"]
 summary = run.get("summary") or {}
-busy = " %.1f of %d workers" % (summary["at_once"], summary["workers"]) if summary.get("workers") else ""
-print("%d timelines,%s failing: %s" % (stats.get("timelines") or 0, busy, "; ".join(failing) or "nothing"))
+busy = ", %.1f of %d workers busy" % (summary["at_once"], summary["workers"]) if summary.get("workers") else ""
+# Its timelines replayed as it ran: a parted one is a determinism bug of the platform.
+replays = ""
+try:
+    asked = json.dumps({"sql": "SELECT count(*) AS n, count(*) FILTER (WHERE same) AS same FROM replays"}).encode()
+    row = json.load(urllib.request.urlopen(urllib.request.Request("http://localhost:7878/runs/%d/sql" % run["id"], data=asked), timeout=60))[0]
+    replays = ", replays %d of %d the same" % (row["same"], row["n"])
+except Exception:
+    pass
+print("%d timelines%s%s, failing: %s" % (stats.get("timelines") or 0, busy, replays, "; ".join(failing) or "nothing"))
 ' 2>/dev/null
 }
 for request in "$@"; do
