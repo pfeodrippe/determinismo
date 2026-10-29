@@ -214,6 +214,8 @@ pub const Pool = struct {
                     if (pool.priority) if (memory_priority_open()) |fd| {
                         _ = linux.flock(fd, std.posix.LOCK.SH);
                     };
+                    // Any VM waiting: holders that keep it out go (holders.zig).
+                    if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.SH);
                 }
                 if (pool.priority) {
                     const now = monotonic_ns();
@@ -246,6 +248,7 @@ pub const Pool = struct {
                 if (pool.priority) if (memory_priority_open()) |fd| {
                     _ = linux.flock(fd, std.posix.LOCK.UN);
                 };
+                if (memory_wanted_open()) |fd| _ = linux.flock(fd, std.posix.LOCK.UN);
             }
             memory_since = null;
             for (0..pool.count) |index| {
@@ -423,6 +426,43 @@ fn memory_priority_open() ?linux.fd_t {
     }
     memory_priority_fd = @intCast(fd);
     return memory_priority_fd;
+}
+
+/// The pool directory's `memory-wanted` file, held shared by every process whose VM waits for
+/// memory (-1: not opened yet, -2: could not be).
+var memory_wanted_fd: linux.fd_t = -1;
+
+fn memory_wanted_open() ?linux.fd_t {
+    if (memory_wanted_fd == -2) return null;
+    if (memory_wanted_fd >= 0) return memory_wanted_fd;
+    var buffer: [96]u8 = undefined;
+    const path = (if (builtin.is_test)
+        std.fmt.bufPrintSentinel(&buffer, "/tmp/determinismo-cpus-test-{d}/memory-wanted", .{linux.getpid()}, 0)
+    else
+        std.fmt.bufPrintSentinel(&buffer, "/tmp/determinismo-cpus-{d}/memory-wanted", .{linux.getuid()}, 0)) catch {
+        memory_wanted_fd = -2;
+        return null;
+    };
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
+    const fd = linux.open(path, flags, 0o600);
+    if (linux.errno(fd) != .SUCCESS) {
+        memory_wanted_fd = -2;
+        return null;
+    }
+    memory_wanted_fd = @intCast(fd);
+    return memory_wanted_fd;
+}
+
+/// Whether a VM waits for memory anywhere on the host (it holds `memory-wanted` shared): a
+/// holder keeping it out goes (holders.zig). Between where holders go by themselves (below the
+/// reserve) and where a VM starts (its size above it), neither moved: a tree's last timeline
+/// waited for ever beside its generation's holders (a 24 GB check, 2026-10-29).
+pub fn memory_wanted_waiting() bool {
+    const fd = memory_wanted_open() orelse return false;
+    const probe = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    if (linux.errno(probe) != .SUCCESS) return true;
+    _ = linux.flock(fd, std.posix.LOCK.UN);
+    return false;
 }
 
 /// Whether a priority process waits for memory: it holds `memory-priority` shared.

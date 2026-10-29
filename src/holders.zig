@@ -524,7 +524,12 @@ pub const Owner = struct {
             if (linux.errno(ready) != .SUCCESS or polled[1].revents != 0) linux.exit_group(0);
             if (polled[0].revents != 0) break;
             const available = cpus.memory_available(); // 0: unknown, never a reason to go.
-            if (available == 0 or available >= keep_available_min()) continue;
+            if (available == 0) continue;
+            // Below the reserve; or a VM waits for memory and a VM this one's size would not fit
+            // (the VMs' memory comes first: cpus.memory_wanted_waiting).
+            const short = available < keep_available_min() or
+                (cpus.memory_wanted_waiting() and available < keep_available_min() + vm.memory.len);
+            if (!short) continue;
             // Going, unless the explorer asked meanwhile.
             const asked = linux.poll(polled[0..1], 1, 0);
             if (linux.errno(asked) == .SUCCESS and polled[0].revents != 0) break;
