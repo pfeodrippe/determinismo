@@ -255,15 +255,26 @@ pub const Verdict = struct {
 
 /// Elle's verdict on a history (JSON lines), from the service on the host.
 pub fn judge(context: *sdk.Check, history: []const u8, model: []const u8, consistency: []const u8) !Verdict {
-    try service_ensure(context);
     var path_buffer: [192]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "/check?model={s}&consistency={s}", .{
         model, consistency,
     });
     const buffer = try context.arena.alloc(u8, tcp.buffer_size);
-    const response = try tcp.http_with(address, port, "POST", path, history, buffer, .{
-        .timeout_ms = timeout_ms,
-    });
+    // The service replaced while it checked this history (another version's check started its
+    // own): checked again by the one that answers now.
+    const response = for (0..judge_attempts_max) |attempt| {
+        try service_ensure(context);
+        break tcp.http_with(address, port, "POST", path, history, buffer, .{
+            .timeout_ms = timeout_ms,
+        }) catch |err| switch (err) {
+            error.ConnectFailed, error.ConnectionClosed => {
+                if (attempt + 1 == judge_attempts_max) return err;
+                std.debug.print("elle: the service went away ({t}): again\n", .{err});
+                continue;
+            },
+            else => return err,
+        };
+    } else unreachable;
     const Answer = struct {
         valid: std.json.Value = .null,
         anomaly_types: []const []const u8 = &.{},
@@ -291,31 +302,58 @@ pub fn judge(context: *sdk.Check, history: []const u8, model: []const u8, consis
 /// The service answers, or is started (built from checkers/elle with podman, relative to where
 /// determinismo runs): once per host, whichever check gets the lock first.
 fn service_ensure(context: *sdk.Check) !void {
-    if (answers()) return;
+    if (service_state() == .current) return;
     const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true };
     const lock = linux.open(start_lock, flags, 0o600);
     if (linux.errno(lock) != .SUCCESS) return error.LockFailed;
     defer _ = linux.close(@intCast(lock));
     while (linux.errno(linux.flock(@intCast(lock), std.posix.LOCK.EX)) == .INTR) {}
-    if (answers()) return; // Another check started it meanwhile.
+    // Busy (checking another run's history, a JVM's collection): it answers in time, and is
+    // never replaced for being slow, which closed the histories it was checking (run 200's
+    // timeline 151, srv3 2026-10-29: "ConnectionClosed").
+    for (0..busy_waits_max) |_| {
+        switch (service_state()) {
+            .current => return, // Another check started it meanwhile.
+            .busy => {
+                const pause: linux.timespec = .{ .sec = 1, .nsec = 0 };
+                _ = linux.nanosleep(&pause, null);
+            },
+            .absent, .other => break,
+        }
+    } else return error.ElleBusy;
     std.debug.print("elle: starting the service on port {d} ({s})\n", .{ port, dockerfile });
     try command(context, &.{ "podman", "build", "-q", "-t", image, "-f", dockerfile, "." });
     _ = std.process.run(context.arena, context.io, .{ .argv = &.{ "podman", "rm", "-f", image } }) catch {};
     try command(context, &.{ "podman", "run", "-d", "--name", image, "--network", "host", image });
     for (0..120) |_| {
-        if (answers()) return;
+        if (service_state() == .current) return;
         const pause: linux.timespec = .{ .sec = 1, .nsec = 0 };
         _ = linux.nanosleep(&pause, null);
     }
     return error.ElleNotAnswering;
 }
 
-/// The service answers, and is this version (checkers/elle's `version`): one of another is
-/// replaced (podman rm -f, then run).
-fn answers() bool {
+const judge_attempts_max = 3;
+/// How long a check waits for a busy service (seconds) before it gives up.
+const busy_waits_max = 600;
+
+/// The service as a check finds it: this version (checkers/elle's `version`) answering; another
+/// version, or none listening (replaced or started: podman rm -f, then run); or listening but
+/// slow to answer (busy: waited for, never replaced).
+const ServiceState = enum { current, other, absent, busy };
+
+fn service_state() ServiceState {
+    return service_state_at(port);
+}
+
+fn service_state_at(at: u16) ServiceState {
     var buffer: [4096]u8 = undefined;
-    const response = tcp.http_with(address, port, "GET", "/version", "", &buffer, .{ .timeout_ms = 2000 }) catch return false;
-    return response.status == 200 and std.mem.indexOf(u8, response.body, "\"version\":\"" ++ service_version ++ "\"") != null;
+    const response = tcp.http_with(address, at, "GET", "/version", "", &buffer, .{ .timeout_ms = 2000 }) catch |err| {
+        return if (err == error.ConnectFailed) .absent else .busy;
+    };
+    const current = response.status == 200 and
+        std.mem.indexOf(u8, response.body, "\"version\":\"" ++ service_version ++ "\"") != null;
+    return if (current) .current else .other;
 }
 
 /// checkers/elle/src/elle_service.clj's `version`.
@@ -565,4 +603,55 @@ test line_write {
         \\{"process":8,"type":"info","f":"txn","time":12,"value":[["w",1,5],["r",2,null],["r",1,5]]}
         \\
     , writer.buffered());
+}
+
+/// A listening socket on a port of the kernel's choosing (`listening`: accepted into its backlog,
+/// never answered unless a thread does).
+fn test_listener() !struct { fd: linux.fd_t, port: u16 } {
+    const socket = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(socket);
+    var bound = linux.sockaddr.in{ .port = 0, .addr = @bitCast(address) };
+    if (linux.errno(linux.bind(fd, @ptrCast(&bound), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 4)) != .SUCCESS) return error.ListenFailed;
+    var size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(fd, @ptrCast(&bound), &size);
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+fn test_answer(fd: linux.fd_t, body: []const u8) void {
+    const accepted = linux.accept4(fd, null, null, linux.SOCK.CLOEXEC);
+    if (linux.errno(accepted) != .SUCCESS) return;
+    const client: linux.fd_t = @intCast(accepted);
+    defer _ = linux.close(client);
+    var request: [1024]u8 = undefined;
+    _ = linux.read(client, &request, request.len);
+    var response: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&response, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{
+        body.len, body,
+    }) catch return;
+    _ = linux.write(client, text.ptr, text.len);
+}
+
+test service_state_at {
+    // Nobody listening: absent (replaced or started).
+    const gone = try test_listener();
+    _ = linux.close(gone.fd);
+    try std.testing.expectEqual(ServiceState.absent, service_state_at(gone.port));
+    // Listening, never answering in time (a long check on its one thread, run 200): busy, waited
+    // for, never replaced.
+    const busy = try test_listener();
+    defer _ = linux.close(busy.fd);
+    try std.testing.expectEqual(ServiceState.busy, service_state_at(busy.port));
+    // Answering: this version, or another.
+    for ([_]struct { []const u8, ServiceState }{
+        .{ "{\"version\":\"" ++ service_version ++ "\"}", .current },
+        .{ "{\"version\":\"1\"}", .other },
+    }) |case| {
+        const answering = try test_listener();
+        defer _ = linux.close(answering.fd);
+        const thread = try std.Thread.spawn(.{}, test_answer, .{ answering.fd, case[0] });
+        defer thread.join();
+        try std.testing.expectEqual(case[1], service_state_at(answering.port));
+    }
 }

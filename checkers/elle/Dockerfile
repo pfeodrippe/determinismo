@@ -11,4 +11,4 @@ RUN mkdir -p /app/classes && clojure -P && \
     echo "$(clojure -Spath)" > /app/classpath && \
     java -cp "$(cat /app/classpath)" clojure.main -e "(compile 'elle-service)"
 EXPOSE 7700
-ENTRYPOINT ["sh", "-c", "cd /app && exec java -XX:ActiveProcessorCount=4 -Xmx1g -cp \"$(cat /app/classpath)\" elle_service"]
+ENTRYPOINT ["sh", "-c", "cd /app && exec java -XX:ActiveProcessorCount=4 -Xmx2g -cp \"$(cat /app/classpath)\" elle_service"]

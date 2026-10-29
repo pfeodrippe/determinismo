@@ -19,14 +19,20 @@
             [jepsen.history :as history])
   (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
            (java.net InetSocketAddress URLDecoder)
-           (java.nio.charset StandardCharsets)))
+           (java.nio.charset StandardCharsets)
+           (java.util.concurrent Executors)))
 
-(def port 7700)
+;; ELLE_PORT: another beside the host's (a test of the service itself).
+(def port (Integer/parseInt (or (System/getenv "ELLE_PORT") "7700")))
 ;; What `/version` answers: the SDK (sdk/zig/elle.zig) replaces a running service that answers
 ;; another. 2: operations' times, and the window the anomalies formed in (window_ns). 3: reads
 ;; with a value twice reported here (duplicates).
 (def version "3")
 (def anomalies-size-max 4000)
+;; Histories checked at once (a run's timelines end together), on as many threads: without an
+;; executor the server ran every handler on its one thread, so a long check kept `/version` from
+;; answering and the SDK replaced the service mid-check (run 200's timeline 151, srv3 2026-10-29).
+(def threads 4)
 
 (defn- operation [m]
   {:process (get m "process")
@@ -147,5 +153,6 @@
                                         (handle [_ exchange]
                                           (try (respond exchange 200 {:version version})
                                                (finally (.close exchange))))))
+    (.setExecutor server (Executors/newFixedThreadPool threads))
     (.start server)
     (println "elle-service on port" port)))
