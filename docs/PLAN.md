@@ -481,6 +481,11 @@ event hashing, the guest module.
      5 of 8, about +4 each, paired t 2.1-2.5), 1 (12 moments) in 136.9, 91.6 and 55.5 (behind on
      every seed). Two is a small, consistent gain on a toy; the default stays 4 until a known
      bug in a real system agrees (Raft's deadlock, etcd's #22498 timelines to first find).
+   - Measured 2026-10-29, `--horizon 60s` on Galera (run 148 against run 97: `jepsen`, seed 3,
+     an hour each, stopped by the plateau rule): 954 timelines against 299, but 52 behaviors
+     against 53 and behind at every point of the hour (46 against 51 at 5%), and Galera's EVS
+     abort in 5 timelines against 16. Not a clean pair (known exits and the link fix landed in
+     between), but nothing for a horizon: hunts keep none.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
