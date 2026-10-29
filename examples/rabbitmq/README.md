@@ -164,6 +164,8 @@ its fun leaves the node's Mnesia settings at the throwaway ones.
 - 2026-10-29: hunt run 118 (`flags-synced`), first 508 timelines: no message lost, none
   dequeued that was never enqueued or refused. 160 lose a broker for good, by their whole
   histories (ancestors included): 82 the throwaway Mnesia's schema update above, 37 the
-  `mnesia_controller` crash on `rabbit_node_maintenance_states` (observed above), 36 other
+  `mnesia_controller` crash on `rabbit_node_maintenance_states` (observed above; timeline 68:
+  rabbit-1's `schema.DAT`, a dets file Mnesia does not sync as it writes it, "not properly
+  closed, repairing" after the power loss, without the table its peers then say they have), 36 other
   boots ending `mnesia_not_running` (a table load from a peer killed midway, for one), 5 other.
   Mnesia not coming back after power losses, in its several ways, is what is left.
