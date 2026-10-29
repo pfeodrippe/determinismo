@@ -236,7 +236,10 @@ the whole timeline (the coverage profile's slower brokers never got one).
   appears in no Redpanda issue. To see it: run 177's timeline 23 from its tape, the command
   above at 116 s (`--at-vtime-ms 116000 --exec ... --continue`). Since, each Kafka command runs
   20 s at most (Redpanda's sat in the client's 10 s timeouts, 80 s a command, past the timeline's
-  hour) and the known-hang loss is an event, not a sometimes (one never true failed this run).
+  hour) and the known-hang loss is an event, not a sometimes (one never true failed this run);
+  and the judge counts this hang apart as it does KAFKA-20734's (`kafka_known_hang`, issue
+  `redpanda-orphan-begin-tx`: the partition's own "is unknown:tx::errc::invalid_txn_state"), so
+  later hunts see the hangs it does not explain.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the

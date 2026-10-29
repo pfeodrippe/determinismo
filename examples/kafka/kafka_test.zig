@@ -309,22 +309,29 @@ fn note(kind: []const u8, values: []const u64, placed: []const u8) void {
 const Outcome = enum { committed, aborted, failed, unknown };
 const Transaction = struct { outcome: Outcome, values: []const u64, partitions: []const u8 };
 
-/// Whether a broker, as transaction coordinator, skipped the partition's markers taking it for
-/// deleted (KAFKA-20734's log line), from the brokers' output (the guest's node logs).
-fn markers_skipped(context: *System.Context, arena: std.mem.Allocator, partition: usize) bool {
+/// The known bug that explains a hang of the partition, if one does, from the brokers' output
+/// (the guest's node logs): KAFKA-20734 (a coordinator skipped its markers taking the partition
+/// for deleted), or Redpanda's transaction left open by a coordinator that crashed between
+/// beginning it on the partitions and recording them (found here, run 177: the partition's every
+/// expiry refused, "is unknown:tx::errc::invalid_txn_state"; the README's Redpanda finding).
+fn hang_known(context: *System.Context, arena: std.mem.Allocator, partition: usize) ?[]const u8 {
     var names: [2][]const u8 = undefined;
-    names[0] = std.fmt.allocPrint(arena, "{s}-{d})", .{ topic, partition }) catch return false;
-    names[1] = std.fmt.allocPrint(arena, "{s}-{d},", .{ topic, partition }) catch return false;
+    names[0] = std.fmt.allocPrint(arena, "{s}-{d})", .{ topic, partition }) catch return null;
+    names[1] = std.fmt.allocPrint(arena, "{s}-{d},", .{ topic, partition }) catch return null;
+    const redpanda_name = std.fmt.allocPrint(arena, "[{{kafka/{s}/{d}}}]", .{ topic, partition }) catch return null;
     for ([_][]const u8{ "kafka-1", "kafka-2", "kafka-3" }) |broker| {
-        const path = std.fmt.allocPrint(arena, "/run/det/nodes/{s}/output.log", .{broker}) catch return false;
+        const path = std.fmt.allocPrint(arena, "/run/det/nodes/{s}/output.log", .{broker}) catch return null;
         const text = std.Io.Dir.cwd().readFileAlloc(context.init.io, path, arena, .limited(1 << 28)) catch continue;
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            if (std.mem.indexOf(u8, line, "these partitions are likely deleted already") == null) continue;
-            for (names) |name| if (std.mem.indexOf(u8, line, name) != null) return true;
+            if (std.mem.indexOf(u8, line, "these partitions are likely deleted already") != null) {
+                for (names) |name| if (std.mem.indexOf(u8, line, name) != null) return "KAFKA-20734";
+            }
+            if (std.mem.indexOf(u8, line, "is unknown:tx::errc::invalid_txn_state") != null and
+                std.mem.indexOf(u8, line, redpanda_name) != null) return "redpanda-orphan-begin-tx";
         }
     }
-    return false;
+    return null;
 }
 
 fn everything_read(context: *System.Context) !void {
@@ -361,11 +368,13 @@ fn everything_read(context: *System.Context) !void {
             producers = try arena.dupe(u8, client.request("producers {s} {d}", .{ topic, partition }) catch "no answer");
             break :reply offsets;
         } else |_| "no connection";
-        // A hang KAFKA-20734 explains (4.3.0, 4.4.0: a partition without a leader for a moment
-        // taken for deleted, its markers skipped; run 89) is that known bug's, counted apart, so
-        // a hunt of 4.4 sees the hangs it does not explain.
-        const explained = !stable and markers_skipped(context, arena, partition);
-        if (explained) sdk.event("kafka_known_hang", .{ .partition = partition, .issue = "KAFKA-20734" });
+        // A hang a known bug explains (KAFKA-20734 in 4.3.0 and 4.4.0: a partition without a
+        // leader for a moment taken for deleted, its markers skipped, run 89; Redpanda's
+        // coordinator crashing between begin_tx and recording, run 177) is that bug's, counted
+        // apart, so a hunt sees the hangs they do not explain.
+        const known = if (stable) null else hang_known(context, arena, partition);
+        const explained = known != null;
+        if (known) |issue| sdk.event("kafka_known_hang", .{ .partition = partition, .issue = issue });
         sdk.always(stable or explained, "no transaction stays open once faults stop", .{
             .partition = partition,
             .reply = reply,
@@ -449,7 +458,7 @@ fn everything_read(context: *System.Context) !void {
     sdk.always(lost == 0, "every write of a committed transaction is read", details);
     // An event, as the hang itself (kafka_known_hang): a sometimes would be a target, failing
     // every run where the bug never struck (Redpanda's run 177).
-    if (known_lost > 0) sdk.event("kafka_known_loss", .{ .transactions = known_lost, .issue = "KAFKA-20734" });
+    if (known_lost > 0) sdk.event("kafka_known_loss", .{ .transactions = known_lost });
     sdk.always(torn == 0, "a transaction's writes are read all or none", details);
     sdk.always(duplicated == 0, "no write is read twice", details);
 }
