@@ -12,6 +12,7 @@
 //! on the CPUs the workers left (so that a short run is checked too, and a long one waits about
 //! one timeline more), then exits.
 const std = @import("std");
+const runs = @import("runs.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const cpus = @import("cpus.zig");
@@ -50,6 +51,7 @@ pub const Verifier = struct {
         if (pid == 0) {
             _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
             if (linux.getppid() != explorer) linux.exit_group(0);
+            runs.running_forget(); // The run is the explorer's: it ends with it.
             _ = linux.setpgid(0, 0); // Its replays with it: stopped as one.
             // Forked while the explorer held its CPU for the setup: its replays (programs of
             // their own, which read their affinity afresh) get every CPU the run was given.

@@ -127,6 +127,14 @@ pub fn running_mark(arena: std.mem.Allocator, directory: []const u8) !void {
 /// The pid file this process holds (locked) for the run it explores.
 var running_fd: ?linux.fd_t = null;
 
+/// In a child forked from the explorer: its copy of the pid file closed. A flock is the open
+/// file's, held while any process keeps it: a worker or holder outliving a killed explorer kept
+/// its run "running" (e2e `resume`: refused its own record; a terminal run's holders, for good).
+pub fn running_forget() void {
+    if (running_fd) |fd| _ = linux.close(fd);
+    running_fd = null;
+}
+
 /// The run's explorer, if it runs: the pid its pid file names, while the file is locked.
 pub fn running_pid(arena: std.mem.Allocator, directory: []const u8) ?linux.pid_t {
     const path = std.fmt.allocPrintSentinel(arena, "{s}/pid", .{directory}, 0) catch return null;

@@ -611,6 +611,18 @@ fn exploration_is_run(arguments: *const Arguments) bool {
 fn run_register(arena: std.mem.Allocator, io: std.Io, arguments: *Arguments) !void {
     const directory = arguments.run_directory orelse claimed: {
         const data = try runs.data_directory(arena, arguments.data_directory);
+        // A resume continues the run whose record it names, once that run's explorer is gone:
+        // its directory again, not another run refused its record (e2e `resume`, 2026-10-29).
+        if (arguments.resume_run) if (arguments.record_path) |path| {
+            if (try runs.linked_by(arena, data, "record.jsonl", try runs.absolute(arena, path))) |id| {
+                const own = try runs.directory_of(arena, data, id);
+                if (runs.running_pid(arena, own) == null) {
+                    try runs.output_tee(arena, try std.fs.path.join(arena, &.{ own, "output.log" }));
+                    std.debug.print("[determinismo] run {d} resumed: {s}\n", .{ id, own });
+                    break :claimed own;
+                }
+            }
+        };
         // Never over another run's events, record or tapes: they would be its no more.
         for ([_]struct { []const u8, ?[]const u8, []const u8 }{
             .{ "events", arguments.events_directory, "--events-dir" },
@@ -2499,6 +2511,7 @@ fn oom_before_the_host() void {
 fn child_dies_with(explorer: linux.pid_t) void {
     _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
     if (linux.getppid() != explorer) linux.exit_group(1); // It died before the prctl.
+    runs.running_forget(); // The run is the explorer's: it ends with it.
 }
 
 /// Starts the one timeline of `branches.plan` in a child process: a worker of one timeline, on a
