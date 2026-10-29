@@ -316,7 +316,12 @@ event hashing, the guest module.
   ZOOKEEPER-4785's fix, for blind rediscovery), OpenSearch 3.9.0 (examples/opensearch:
   list-append on documents with optimistic concurrency, Elle; never Jepsen-tested under its
   name), Redpanda v26.2.6 (kafka-test's `redpanda` profile: Kafka's protocol, the same client and
-  checks), Kafka 4.4.0 (kafka-test's `kafka-4.4` and `kafka-4.4-coverage` profiles).
+  checks), Kafka 4.4.0 (kafka-test's `kafka-4.4` and `kafka-4.4-coverage` profiles). First hunts
+  (2026-10-29): Kafka 4.4 (run 173) only KAFKA-20734 (now counted apart); OpenSearch (run 176,
+  460 timelines) no finding, judged as its reads promise since; Redpanda (run 177) found blind:
+  a coordinator crashing between begin_tx and recording the partitions leaves the transaction
+  open for good (examples/kafka/README.md), explained with causality and a trace-logged future
+  from inside its jump (a command at the moment raising the logger, kept across restarts).
 - Writeback windows (2026-10-29, the user's choice): the guest writes nothing back unasked, so a
   power loss drops every write never synced, however old (Antithesis keeps "durably synced
   filesystem changes" too). Strict stays the default; a node may declare `writeback_s` (its disk
