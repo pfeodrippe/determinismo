@@ -103,6 +103,29 @@ Setup creates the topic and starts one producer before faults begin: Kafka creat
 transaction coordinators' topic at the first producer's start, and under faults that can take
 the whole timeline (the coverage profile's slower brokers never got one).
 
+## Share groups (queues for Kafka)
+
+Scenario `share`, on the `kafka-4.4` profiles (share groups are KIP-932, production-ready since
+Kafka 4.2, enabled by 4.4's default format, `share.version=2`): producers (idempotent, acks=all)
+send unique values to topic `queue` (three partitions, three replicas), share consumers of one
+group poll it, acknowledge every record ACCEPT and commit (`commitSync`). SClient.java, beside
+KClient on port 7001, is that client; the group reads from the beginning
+(`share.auto.offset.reset=earliest`, set in setup, where the first poll also starts the share
+coordinator). Each poll's deliveries are noted with the driver's clock just before its request
+and just after its answer, so an order between two consumers' polls is certain. Once faults
+stop, a drain polls until 45 polls in a row deliver nothing (past the 30 s acquisition locks of
+consumers that went away), and:
+
+| Property | Breaks when |
+|---|---|
+| a record whose acceptance committed is not delivered again | a poll sent after another consumer's commit of that record returned hands it out (Kafka: an acknowledged record is never acquired again) |
+| every acknowledged record is delivered | a produced record no consumer or the drain ever gets (archived after the delivery limit counts too: 5 acquisitions without acceptance) |
+| every delivered record was produced | a delivery of a value never sent |
+| the queue drains once faults stop | consumers still get records after 600 polls |
+
+Records delivered more than once before an acceptance committed are at-least-once delivery,
+by design: counted in an event (`kafka_share_redelivered`).
+
 ## Status
 
 - 2026-10-28 (srv3): the hunts so far hardly ran the workload. Run 56 committed a transaction

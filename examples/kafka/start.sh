@@ -5,7 +5,8 @@
 # node the same cluster); `flushed` forces each write to disk before it is acknowledged
 # (README: Profiles); `coverage` (Dockerfile.coverage's image) runs the broker with determinismo's
 # coverage agent on its coordinators, replication and log.
-# start.sh client: the client node on port 7000.
+# start.sh client: the client node on port 7000 (KClient), and on 7001 SClient, share groups'
+# client, in the images of Kafka 4.2 and later.
 set -e
 case "$1" in
 broker)
@@ -82,6 +83,11 @@ BOOTSTRAP
     --set redpanda.empty_seed_starts_cluster=false
   ;;
 client)
+  # Share groups' client (Kafka 4.2+ images only) beside it, on 7001.
+  if [ -f /opt/kclient/SClient.class ]; then
+    java -Xms64m -Xmx192m -cp "/opt/kclient:/opt/kafka/libs/*" SClient 7001 \
+      kafka-1:9092,kafka-2:9092,kafka-3:9092 &
+  fi
   exec java -Xms128m -Xmx256m -cp "/opt/kclient:/opt/kafka/libs/*" KClient 7000 \
     kafka-1:9092,kafka-2:9092,kafka-3:9092
   ;;

@@ -13,8 +13,8 @@ RUN curl -fsSL -o /tmp/kafka.tgz https://archive.apache.org/dist/kafka/4.4.0/kaf
  && echo "${KAFKA_SHA512}  /tmp/kafka.tgz" | sha512sum -c - \
  && mkdir /opt/kafka && tar -xzf /tmp/kafka.tgz -C /opt/kafka --strip-components=1 \
  && rm /tmp/kafka.tgz
-COPY examples/kafka/KClient.java /opt/kclient/KClient.java
-RUN javac -cp "/opt/kafka/libs/*" -d /opt/kclient /opt/kclient/KClient.java
+COPY examples/kafka/KClient.java examples/kafka/SClient.java /opt/kclient/
+RUN javac -cp "/opt/kafka/libs/*" -d /opt/kclient /opt/kclient/KClient.java /opt/kclient/SClient.java
 
 FROM docker.io/library/eclipse-temurin:25-jdk AS agent
 COPY sdk/java/Determinismo.java sdk/java/DeterminismoCoverage.java /sdk/

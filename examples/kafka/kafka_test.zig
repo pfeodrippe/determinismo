@@ -33,6 +33,8 @@ const Nodes = struct {
 const System = sdk.System(Nodes);
 
 const client_port = 7000;
+/// SClient's (share groups), in the client node of Kafka 4.2 and later.
+const share_port = 7001;
 const controller_port = 9093;
 const redpanda_rpc_port = 33145;
 const redpanda_explain = "for n in kafka-1 kafka-2 kafka-3; do det-nodes exec $n rpk redpanda config set " ++
@@ -58,11 +60,26 @@ const stable_attempts_max = 120;
 /// A transaction's answer at most: the producer's own timeouts are 10 s (KClient.java).
 const timeout_ms = 30_000;
 const line_size_max = 512;
+const share_topic = "queue";
+const share_partitions = 3;
+const share_group = "jepsen";
+const share_path = "/tmp/kafka-share.log";
+const produces_per_driver = 20;
+const consumes_per_driver = 20;
+/// A poll answers up to 1 s, a commit 10 s more (SClient.java).
+const share_timeout_ms = 30_000;
+/// The drain ends after this many empty polls in a row (each up to a second): past the records'
+/// acquisition locks (30 s by default), which consumers that went away may still hold.
+const drain_empty_max = 45;
+const drain_polls_max = 600;
+const share_reply_size_max = 64 * 1024;
+/// Violations reported one by one; past these, counted.
+const share_reported_max = 8;
 
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
         .describe = describe,
-        .scenarios = .{ .txn = txn_scenario },
+        .scenarios = .{ .txn = txn_scenario, .share = share_scenario },
         // Each partition a list, each send an append to it, each partition read once faults stop
         // (Jepsen's Kafka checker is Elle too): what the checks below cannot see, transactions
         // ordered one way in a partition and the other way in another (G0, G1c).
@@ -171,6 +188,11 @@ const Client = struct {
 
     fn open(client: *Client, context: *System.Context) !void {
         try client.connection.open(context.nodes.kclient.address, client_port, .{ .timeout_ms = timeout_ms });
+    }
+
+    /// To SClient, the share groups' client.
+    fn open_share(client: *Client, context: *System.Context) !void {
+        try client.connection.open(context.nodes.kclient.address, share_port, .{ .timeout_ms = share_timeout_ms });
     }
 
     /// One request line, one reply line (valid until the next request).
@@ -309,6 +331,234 @@ fn note(kind: []const u8, values: []const u64, placed: []const u8) void {
     if (linux.errno(fd) != .SUCCESS) return;
     defer _ = linux.close(@intCast(fd));
     _ = linux.write(@intCast(fd), writer.buffered().ptr, writer.buffered().len);
+}
+
+// Share groups --------------------------------------------------------------------------------
+
+/// Queues for Kafka (KIP-932, Kafka 4.2 and later; the `kafka-4.4` profiles): producers send
+/// unique values to topic `queue`, share consumers of one group poll it, acknowledge every record
+/// (ACCEPT) and commit. Each poll's deliveries are noted with the driver's clock around its
+/// request (/tmp/kafka-share.log). Once faults stop, a drain delivers what is left, and:
+///   accepted once   a record whose acceptance committed is not delivered again: a poll begun
+///                   after that commit returned never hands it out
+///   none lost       every acknowledged record is delivered
+///   none invented   every delivered record was produced
+fn share_scenario(s: *System.Scenario) void {
+    s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
+    s.setup("queue", queue_created);
+    s.parallel_driver("produce", share_produce);
+    s.parallel_driver("consume", share_consume);
+    s.finally("drain", share_drained);
+}
+
+/// The topic, the group reading from the beginning, and its share coordinator (its state topic
+/// made at the first poll), before faults begin.
+fn queue_created(context: *System.Context) !void {
+    _ = try sdk.retry(setup_attempts_max, 500, share_topic_create, .{context});
+    _ = try sdk.retry(setup_attempts_max, 500, share_request_ok, .{ context, "group " ++ share_group });
+    _ = try sdk.retry(setup_attempts_max, 500, share_request_ok, .{ context, "consume " ++ share_group ++ " " ++ share_topic });
+}
+
+fn share_topic_create(context: *System.Context) !void {
+    var client: Client = undefined;
+    try client.open(context);
+    defer client.connection.close();
+    const reply = try client.request("create {s} {d} {d}", .{ share_topic, share_partitions, replicas });
+    if (std.mem.eql(u8, reply, "ok") or std.mem.eql(u8, reply, "exists")) return;
+    sdk.event("kafka_error", .{ .command = "create", .reply = reply });
+    return error.NotCreated;
+}
+
+fn share_request_ok(context: *System.Context, line: []const u8) !void {
+    var client: Client = undefined;
+    try client.open_share(context);
+    defer client.connection.close();
+    const reply = try client.request("{s}", .{line});
+    if (std.mem.startsWith(u8, reply, "ok")) return;
+    sdk.event("kafka_error", .{ .command = line, .reply = reply });
+    return error.NotDone;
+}
+
+fn share_produce(context: *System.Context) !void {
+    var id: u64 = undefined;
+    sdk.random_bytes(std.mem.asBytes(&id));
+    id &= 0xff_ffff;
+    var client: Client = undefined;
+    client.open_share(context) catch |err| {
+        if (tcp.unavailable(err)) return;
+        return err;
+    };
+    defer client.connection.close();
+    for (0..produces_per_driver) |sequence| {
+        // Unique: the producer, its send.
+        const value = (id << 12) | sequence;
+        // Noted before it is sent: a driver killed mid-send leaves it invoked, not invented.
+        share_note("i {d}", .{value});
+        const reply = client.request("produce " ++ share_topic ++ " {d}", .{value}) catch return;
+        if (std.mem.eql(u8, reply, "ok")) {
+            share_note("o {d}", .{value});
+            sdk.sometimes(true, "a record was acknowledged", .{});
+        } else sdk.sometimes(true, "a record's outcome is unknown", .{ .reply = reply });
+    }
+}
+
+fn share_consume(context: *System.Context) !void {
+    var client: Client = undefined;
+    client.open_share(context) catch |err| {
+        if (tcp.unavailable(err)) return;
+        return err;
+    };
+    defer client.connection.close();
+    for (0..consumes_per_driver) |_| {
+        _ = share_poll(&client) catch return;
+    }
+}
+
+/// One `consume`: its deliveries noted, "d <sent ns> <answered ns> <delivery count> <c|x>
+/// <value>", one write each. How many it delivered.
+fn share_poll(client: *Client) !usize {
+    const sent_ns = monotonic_ns();
+    const reply = try client.request("consume " ++ share_group ++ " " ++ share_topic, .{});
+    const answered_ns = monotonic_ns();
+    if (!std.mem.startsWith(u8, reply, "ok")) {
+        sdk.event("kafka_share_reply", .{ .reply = reply[0..@min(reply.len, 300)] });
+        return 0;
+    }
+    var delivered: usize = 0;
+    var records = std.mem.tokenizeScalar(u8, reply["ok".len..], ' ');
+    while (records.next()) |record| {
+        var fields = std.mem.splitScalar(u8, record, ':');
+        const value = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+        const count = std.fmt.parseInt(u16, fields.next() orelse continue, 10) catch continue;
+        const committed = fields.next() orelse continue;
+        share_note("d {d} {d} {d} {s} {d}", .{ sent_ns, answered_ns, count, committed, value });
+        if (std.mem.eql(u8, committed, "c")) sdk.sometimes(true, "a consumer's acceptance committed", .{});
+        delivered += 1;
+    }
+    return delivered;
+}
+
+fn share_note(comptime format: []const u8, arguments: anytype) void {
+    var buffer: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, format ++ "\n", arguments) catch return;
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = linux.open(share_path, flags, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), line.ptr, line.len);
+}
+
+/// Once faults stop: the queue drained by a consumer of the group, then the log judged.
+fn share_drained(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    var client: Client = undefined;
+    _ = try sdk.retry(read_attempts_max, 500, Client.open_share, .{ &client, context });
+    defer client.connection.close();
+    var empty: u32 = 0;
+    var polls: u32 = 0;
+    while (empty < drain_empty_max and polls < drain_polls_max) : (polls += 1) {
+        const delivered = share_poll(&client) catch {
+            client.connection.close();
+            _ = try sdk.retry(read_attempts_max, 500, Client.open_share, .{ &client, context });
+            empty = 0;
+            continue;
+        };
+        empty = if (delivered == 0) empty + 1 else 0;
+    }
+    sdk.always(empty == drain_empty_max, "the queue drains once faults stop", .{ .polls = polls });
+    const log = std.Io.Dir.cwd().readFileAlloc(context.init.io, share_path, arena, .limited(1 << 26)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    const verdict = try share_judge(arena, log);
+    sdk.always(verdict.redelivered == 0, "a record whose acceptance committed is not delivered again", verdict);
+    sdk.always(verdict.lost == 0, "every acknowledged record is delivered", verdict);
+    sdk.always(verdict.invented == 0, "every delivered record was produced", verdict);
+    // Delivered more than once before an acceptance committed: at-least-once, by design.
+    if (verdict.delivered_again > 0) sdk.event("kafka_share_redelivered", .{ .records = verdict.delivered_again });
+}
+
+const ShareVerdict = struct {
+    produced: u64 = 0,
+    acknowledged: u64 = 0,
+    delivered: u64 = 0,
+    delivered_again: u64 = 0,
+    redelivered: u64 = 0,
+    lost: u64 = 0,
+    invented: u64 = 0,
+    /// The first violation's record, and (redelivered) the moments at stake.
+    example_value: u64 = 0,
+    example_committed_ns: u64 = 0,
+    example_delivered_sent_ns: u64 = 0,
+    example_delivery_count: u16 = 0,
+};
+
+const Delivery = struct { sent_ns: u64, answered_ns: u64, count: u16, committed: bool };
+
+fn share_judge(arena: std.mem.Allocator, log: []const u8) !ShareVerdict {
+    var invoked: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var acknowledged: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var deliveries: std.AutoHashMapUnmanaged(u64, std.ArrayList(Delivery)) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const kind = fields.next() orelse continue;
+        switch (kind[0]) {
+            'i', 'o' => {
+                const value = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                try (if (kind[0] == 'i') &invoked else &acknowledged).put(arena, value, {});
+            },
+            'd' => {
+                const sent_ns = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                const answered_ns = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                const count = std.fmt.parseInt(u16, fields.next() orelse continue, 10) catch continue;
+                const committed = std.mem.eql(u8, fields.next() orelse continue, "c");
+                const value = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+                const entry = try deliveries.getOrPut(arena, value);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(arena, .{ .sent_ns = sent_ns, .answered_ns = answered_ns, .count = count, .committed = committed });
+            },
+            else => {},
+        }
+    }
+    var verdict: ShareVerdict = .{
+        .produced = invoked.count(),
+        .acknowledged = acknowledged.count(),
+        .delivered = deliveries.count(),
+    };
+    var iterator = deliveries.iterator();
+    while (iterator.next()) |entry| {
+        const value = entry.key_ptr.*;
+        const list = entry.value_ptr.items;
+        if (list.len > 1) verdict.delivered_again += 1;
+        if (!invoked.contains(value)) {
+            if (verdict.invented == 0 and verdict.redelivered == 0) verdict.example_value = value;
+            verdict.invented += 1;
+        }
+        // The earliest moment an acceptance of it had committed, by the driver's clock.
+        var committed_ns: ?u64 = null;
+        for (list) |delivery| if (delivery.committed) {
+            committed_ns = @min(committed_ns orelse delivery.answered_ns, delivery.answered_ns);
+        };
+        const after = committed_ns orelse continue;
+        for (list) |delivery| if (delivery.sent_ns > after) {
+            if (verdict.redelivered == 0) {
+                verdict.example_value = value;
+                verdict.example_committed_ns = after;
+                verdict.example_delivered_sent_ns = delivery.sent_ns;
+                verdict.example_delivery_count = delivery.count;
+            }
+            verdict.redelivered += 1;
+            break;
+        };
+    }
+    var acknowledged_values = acknowledged.keyIterator();
+    while (acknowledged_values.next()) |value| {
+        if (deliveries.contains(value.*)) continue;
+        if (verdict.lost == 0 and verdict.redelivered == 0 and verdict.invented == 0) verdict.example_value = value.*;
+        verdict.lost += 1;
+    }
+    return verdict;
 }
 
 // Checks --------------------------------------------------------------------------------------
@@ -539,6 +789,35 @@ fn partition_read(context: *System.Context, arena: std.mem.Allocator, partition:
     var items = std.mem.tokenizeScalar(u8, reply[prefix.len..], ',');
     while (items.next()) |item| try values.append(arena, try std.fmt.parseInt(u64, item, 10));
     return values.items;
+}
+
+test share_judge {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 1 delivered twice before its acceptance committed (by design); 2 accepted at 200, then
+    // handed out by a poll sent at 300; 3 acknowledged, never delivered; 9 never produced.
+    const verdict = try share_judge(arena,
+        \\i 1
+        \\o 1
+        \\i 2
+        \\o 2
+        \\i 3
+        \\o 3
+        \\d 10 20 1 x 1
+        \\d 30 40 2 c 1
+        \\d 100 200 1 c 2
+        \\d 300 400 2 c 2
+        \\d 500 600 1 c 9
+    );
+    try std.testing.expectEqual(3, verdict.produced);
+    try std.testing.expectEqual(2, verdict.delivered_again); // 1 and 2.
+    try std.testing.expectEqual(1, verdict.redelivered);
+    try std.testing.expectEqual(1, verdict.lost);
+    try std.testing.expectEqual(1, verdict.invented);
+    try std.testing.expectEqual(2, verdict.example_value);
+    try std.testing.expectEqual(200, verdict.example_committed_ns);
+    try std.testing.expectEqual(300, verdict.example_delivered_sent_ns);
 }
 
 test transactions_parse {
