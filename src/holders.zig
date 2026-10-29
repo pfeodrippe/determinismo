@@ -518,8 +518,8 @@ pub const Owner = struct {
     }
 
     /// The origin's name, its page hashes in `hashes`, once a timeline (its first disk holder):
-    /// null when it has none, its hashes are missing (written by an older build, or failed), or
-    /// its chain is long enough already (a load reads every base).
+    /// null when it has none, its writer failed, or its chain is long enough already (a load
+    /// reads every base).
     fn origin_take(owner: *Owner, disk: *const Disk, hashes: []u64) ?[]const u8 {
         const origin = owner.disk_origin orelse return null;
         owner.disk_origin = null;

@@ -1225,8 +1225,7 @@ const SummaryHeader = extern struct {
     trace_hash: u64,
     last_pull_ns: u64,
     cut: u8,
-    /// The behaviors' layout (summary_format): another build's are not read (their timelines
-    /// run again on resume).
+    /// The behaviors' layout (summary_format): another build's are refused.
     format: u8 = summary_format,
     reserved: [6]u8 = @splat(0),
 };
@@ -1258,7 +1257,7 @@ fn summaries_index(arena: std.mem.Allocator, bytes: []const u8, out: *std.AutoHa
     var at: usize = 0;
     while (bytes.len - at >= @sizeOf(SummaryHeader)) {
         const header = std.mem.bytesToValue(SummaryHeader, bytes[at..][0..@sizeOf(SummaryHeader)]);
-        if (header.format != summary_format) break; // Another build's: run again.
+        if (header.format != summary_format) return error.SummariesOfAnotherBuild;
         if (header.behavior_count > Events.behavior_count_max) return error.BadSummaries;
         const size = @sizeOf(SummaryHeader) + header.behavior_count * @sizeOf(Events.Behavior);
         if (bytes.len - at < size) break;

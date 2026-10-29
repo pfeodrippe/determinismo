@@ -61,6 +61,18 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
+- jank's nREPL server (the user's ask, 2026-10-29): jank (Clojure on LLVM, 0.1 from its own
+  repository, as examples/tetris installs it) serves nREPL; drive it as examples/nrepl drives
+  nrepl/nrepl, the same bencode client (examples/nrepl/client.zig) and properties (an
+  evaluation returns its value; a session's `*1` is its own while others evaluate; every answered
+  request ends `done`; an interrupted evaluation ends interrupted or done; after faults a new
+  session evaluates), and jank's own: definitions seen across sessions, `load-file`, completions
+  and `describe`, an evaluation's error answered rather than crashing the server (jank 0.1
+  segfaulted on uncaught errors and on `sort` of an empty collection in the Tetris work), many
+  sessions and long evaluations at once. Concurrent clients, process kills and pauses, restarts;
+  a jank segfault is a crash the platform reports with its core dump. In progress: its server's
+  command and ops, then examples/jank-nrepl.
+
 - Smokes of the new systems (2026-10-29, late): ClickHouse Keeper and Ignite pass; rqlite's
   image failed to build (`chmod` as the image's own user: `COPY --chmod` now); SurrealDB never
   got past "still starting up" in 750 s, every write refused by TiKV as disk full (its 5 GB
@@ -78,8 +90,8 @@ event hashing, the guest module.
   never reached it) while the explorer waited for it to exit. Redpanda's run 177 sat so for
   eleven hours with 107 GB of holders, Group Replication's run 200 from its budget's end,
   stalling the hunt queue behind it. The explorer reads every summary now, dropping (and its
-  holders) one with no slot. Next: an e2e check that runs past its budget with more timelines
-  finishing than a generation holds.
+  holders) one with no slot; a unit test pins it (a worker's summary larger than a pipe, no slot,
+  the pipe's read end held elsewhere).
 
 - Timelines past the hour (2026-10-29): the composer draws 4 to 63 driver starts and a
   parallelism of 1 to 32, so many starts one at a time of a slow system's drivers ran on until

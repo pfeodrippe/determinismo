@@ -199,7 +199,6 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
         .{ "hang", check_hang },                     .{ "pinned", check_pinned },
         .{ "slow", check_slow },                     .{ "sought", check_sought },
-        .{ "budget", check_budget },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -2485,34 +2484,6 @@ fn check_durability(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});
-}
-
-/// A tree past its time budget, with more timelines finishing then than its generation has room
-/// for: every one's results read, the run ends (runs 177 and 200 hung so for hours: a worker
-/// blocked writing its unread summary while the explorer waited for it). Under `timeout`, a
-/// hang is this check's failure, named.
-fn check_budget(context: *Context) !void {
-    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(context.arena, &.{ "timeout", "300", context.determinismo, "explore" });
-    try argv.appendSlice(context.arena, context.machine);
-    try argv.appendSlice(context.arena, &.{
-        "--program",    program, "--scenario", "slow", "--seed",           "1",
-        "--time-budget", "20s",  "--generation", "4",  "--jobs",           "4",
-        "--timeline-limit", "60s",
-    });
-    const result = try run_kept(context, argv.items);
-    const output = try std.mem.concat(context.arena, u8, &.{ result.stdout, result.stderr });
-    var branches: [branches_max]Branch = undefined;
-    const count = parse_branches(output, &branches);
-    const ended = switch (result.term) {
-        .exited => |code| code == 0 or code == 3,
-        else => false,
-    };
-    expect_all(context, &.{
-        .{ "the run ends past its budget (within timeout's 300 s)", ended },
-        .{ "more timelines than one generation", count > 4 },
-    }, "budget: a tree past its budget reads every timeline's results and ends ({d} timelines)", .{count});
 }
 
 /// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just
