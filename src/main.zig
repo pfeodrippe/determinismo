@@ -2706,12 +2706,23 @@ fn timeline_wait(running: []const Running, multiverse: *report.Multiverse, summa
     var count: u32 = 0;
     var received = read_exact(timeline.results, std.mem.asBytes(results));
     received = received and read_exact(timeline.results, std.mem.asBytes(&count));
-    received = received and count <= 1 and summaries.count + count <= summaries.items.len;
+    received = received and count <= 1;
     if (received and count == 1) {
+        // Read whole even with no slot left (past the time budget no generation is judged, and
+        // they fill): unread, the worker blocks writing it, other processes holding the pipe's
+        // read end, while this waits for the worker to exit (runs 177 and 200 hung so for hours).
+        const room = summaries.count < summaries.items.len;
+        const scratch = if (room) null else try std.heap.page_allocator.create(Summary);
+        defer if (scratch) |summary| std.heap.page_allocator.destroy(summary);
+        const slot = if (scratch) |summary| summary else &summaries.items[summaries.count];
         // Counted once read whole: a worker killed while it wrote leaves part of one (its
         // holders' pids among the slot's old bytes).
-        received = read_exact(timeline.results, std.mem.asBytes(&summaries.items[summaries.count]));
-        if (received) summaries.count += 1;
+        received = read_exact(timeline.results, std.mem.asBytes(slot));
+        if (received and room) summaries.count += 1;
+        // Dropped: its holders, which no generation will take, go now.
+        if (received and !room) for (slot.holders[0..@min(slot.holder_count, slot.holders.len)]) |held| {
+            if (!held.disk) holders.kill(held.pid);
+        };
     }
     _ = linux.close(timeline.results);
     var status: i32 = 0;

@@ -691,7 +691,7 @@ pub const Written = enum { written, gone, failed };
 /// Ends a holder and waits for it (it may have been waited for already, by its worker). Never
 /// a pid of 0 or less: kill(0) is the caller's own process group (the explorer and every
 /// worker, without a trace), kill(-1) every process of the user.
-fn kill(pid: linux.pid_t) void {
+pub fn kill(pid: linux.pid_t) void {
     if (pid <= 0) {
         std.debug.print("[determinismo] a holder with pid {d}: not signalled\n", .{pid});
         return;
