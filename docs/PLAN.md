@@ -107,8 +107,8 @@ event hashing, the guest module.
 - Worker utilization (2026-10-28): Kafka hunt run 67's 16 workers ran 8.8 timelines at once by
   their wall times; trees now integrate timelines running over the loop's wall time and print,
   record (summary: workers, at_once, memory_wait_ns) and show it live (status.json, the UI's
-  Utilization). Next: from the next hunts, whether the idle share is memory (memory_wait) or
-  the tree's own waits, and act on it.
+  Utilization). Measured (2026-10-29): 15.0 to 15.4 of 16 workers busy in runs 173 (Kafka
+  4.4), 176 (OpenSearch), 177 (Redpanda) and 178 (ZooKeeper): nothing left to act on.
 - Reserved cores need memory (2026-10-28): a Kafka hunt held all but 9 GiB of srv3's 125
   (VMs and holders), so the checks on the reserved cores ran one VM at a time (e2e parallel
   failed at 1.0 timelines at once; ui's causality analysis did not finish in 15 minutes).
@@ -574,8 +574,8 @@ in ANTITHESIS.md yet.
    the clock.
 5. **Retroactive logging**: done (`--retroactive '<text>'`): verbose lines stay out of an
    exploration's events and come back in a replay.
-6. **Agent skills**: properties, workload and debug are in `.claude/skills/`. Left: a
-   mutation-testing skill (with item 7), and trying each on a system it has not seen.
+6. **Agent skills**: properties, workload, debug and mutants are in `.claude/skills/`. Left:
+   trying each on a system it has not seen.
 7. **Mutation testing campaigns** (antithesis.com/blog/2026/mutation-testing): an agent reads the
    code and writes subtle mutants (races, wrong ordering; not syntax that only panics), one
    patch each; determinismo explores each mutant and reports per property whether it was
@@ -600,8 +600,9 @@ as hints of where bugs hide. To get there:
 1. **Labeled decisions**: done (`decide` and `random_below_named` in every SDK; det-faults names
    its faults, waits and durations; strategies get the label with the pull). An LLM strategy
    uses them (plugins/python/llm.py, Claude Haiku 5.5 through the `claude` CLI; remote over TCP).
-2. **Branching mid-timeline**: done in the explorer itself (`--branching tree`, see "Now").
-   Left: strategies choosing the moments to return to.
+2. **Branching mid-timeline**: done in the explorer itself (`--branching tree`, see "Now"),
+   and strategies choose the moments to return to (`returns`, docs/PLUGINS.md; a short answer
+   filled by the explorer's own).
 3. **Reference strategies with real guidance:**
    - Go-Explore: an archive of cells (the features reached, with the moment that reached them),
      pick by rarity, return by snapshot, explore with labeled decisions.
