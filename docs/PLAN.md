@@ -469,6 +469,12 @@ event hashing, the guest module.
      (timeline 5493, two moments deep, after the fresh one). So: count each variant's finds from
      moments apart from fresh ones, and compare variants over more seeds; the double vote needs
      returns that keep the off-loop heartbeat's timing (tests/antithesis-compat/README.md).
+   - Measured 2026-10-29, bench/tree.py (the maze, 400 timelines, seeds 1-8, srv3, my cores):
+     `--return-branches` 4 (3 moments a generation) reached the digits in 161.5, 110.6 and 69.1
+     timelines on average, 2 (6 moments) in 165.2, 115.2 and 73.0 (per seed: ahead in 6, 5 and
+     5 of 8, about +4 each, paired t 2.1-2.5), 1 (12 moments) in 136.9, 91.6 and 55.5 (behind on
+     every seed). Two is a small, consistent gain on a toy; the default stays 4 until a known
+     bug in a real system agrees (Raft's deadlock, etcd's #22498 timelines to first find).
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
    strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
