@@ -1,0 +1,82 @@
+; SPDX-License-Identifier: MIT
+; A headless driver of djblue/tetris's game (tetris.core, as its jank frontend runs it): moves
+; in, one per line on stdin, and after each the game's state on stdout, one line. The raylib
+; frontend's input and drawing are left out; what it does to the game is here: the same actions
+; through core/update-player, gravity as its timer's tick (a shift down without a source).
+(ns tetris.harness
+  (:require [clojure.string]
+            [tetris.core :as core]))
+
+; jank has no read-line or flush yet ("TODO: port read-line", "TODO: port flesh", thrown;
+; uncaught in -main, a segfault): a line from stdin and the flush of stdout through C++.
+(cpp/raw "#include <cstdio>
+#include <iostream>
+#include <string>
+void tetris_flush()
+{
+  std::cout.flush();
+  std::fflush(stdout);
+}
+std::string tetris_read_line()
+{
+  std::string line;
+  if(!std::getline(std::cin, line))
+  { return std::string(\"quit\"); }
+  return line;
+}")
+
+(def actions
+  {"left" {:type :player-shift :direction :left}
+   "right" {:type :player-shift :direction :right}
+   "rotr" {:type :player-rotate :direction :right}
+   "rotl" {:type :player-rotate :direction :left}
+   "down" {:type :player-shift-down :source :user}
+   "tick" {:type :player-shift-down}
+   "drop" {:type :player-drop}
+   "hold" {:type :player-hold}
+   "pause" {:type :player-toggle-pause}
+   "restart" {:type :player-restart}})
+
+; Joining what sort returns for nothing segfaults (jank 0.1, 2026-10): an empty board is "".
+(defn cells [positions]
+  (if (empty? positions)
+    ""
+    (->> (keys positions)
+         (map (fn [[x y]] (str x "," y)))
+         sort
+         (clojure.string/join ";"))))
+
+(defn state-line [world]
+  (let [{:keys [player lines score level positions pause?]} world]
+    (str "lines=" lines
+         " score=" score
+         " level=" level
+         " over=" (if (core/game-over? world) 1 0)
+         " paused=" (if pause? 1 0)
+         " held=" (or (some-> (:hold world) name) "-")
+         " piece=" (name (:type player)) "," (:x player) "," (:y player) "," (:r player)
+         " player=" (cells (core/get-positions player))
+         " board=" (cells positions))))
+
+(defn -main [& _]
+  (loop [world (core/start)]
+    (println (state-line world))
+    (cpp/tetris_flush)
+    (let [line (str (cpp/tetris_read_line))]
+      (if (= line "quit")
+        nil
+        (let [action (get actions line)
+              next-world (if action
+                           (try
+                             (core/update-player world action)
+                             ; A jank error (a case without its clause, say), or C++'s.
+                             (catch cpp/jank.runtime.object_ref e
+                               (println (str "error " line " " e))
+                               (cpp/tetris_flush)
+                               world)
+                             (catch cpp/std.exception e
+                               (println (str "error " line " " (.what e)))
+                               (cpp/tetris_flush)
+                               world))
+                           world)]
+          (recur next-world))))))
