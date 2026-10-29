@@ -41,6 +41,9 @@ const setup_attempts_max = 300;
 /// Draining once faults stop: the queue read until every node answered empty this many times
 /// in a row (a node just back may not serve yet), with a minute of attempts for errors.
 const empty_streak = 3;
+/// How long a drained queue is left before it is drained again: past two of rclient's 5 s
+/// heartbeats, after which the broker closes a connection that died and returns its deliveries.
+const settle_ms = 15_000;
 const drain_attempts_max = 120;
 /// A node failing every dequeue for this long (virtual time) is left out of the drain: a dead
 /// one costs a connection timeout each time.
@@ -284,6 +287,8 @@ fn drained(context: *System.Context) !void {
     var left: [brokers]bool = @splat(false);
     var dequeued: u64 = 0;
     var at: usize = 0;
+    // Whether every node said empty once already, `settle_ms` ago.
+    var settled = false;
     const done = while (dequeued < drain_dequeues_max) {
         var serving: u32 = 0;
         var empty: u32 = 0;
@@ -293,12 +298,23 @@ fn drained(context: *System.Context) !void {
             empty += @intFromBool(streak >= empty_streak);
         }
         if (serving == 0) break false;
-        if (empty == serving) break true;
+        if (empty == serving) {
+            if (settled) break true;
+            // A message delivered on a connection that died in the faults returns to the queue
+            // only once the broker notices the connection gone: every node empty again after
+            // that, before the queue counts as drained (run 160, timeline 1234: one the drain
+            // missed so was judged lost; replays that ran the drain longer dequeued it).
+            sdk.sleep_ms(settle_ms);
+            streaks = @splat(0);
+            settled = true;
+            continue;
+        }
         while (left[at]) at = (at + 1) % brokers;
         const answered = if (client.request("dequeue {d} {s}", .{ at + 1, queue })) |reply| switch (dequeue_noted(reply)) {
             .value => value: {
                 dequeued += 1;
                 streaks = @splat(0);
+                settled = false;
                 break :value true;
             },
             .empty => empty: {

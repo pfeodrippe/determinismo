@@ -155,8 +155,20 @@ in rabbitmq-server's issues: #10007 (2023, closed), the same warning when a node
 while the queue was declared; here every node was up.
 
 `ra-synced` (Dockerfile.ra-synced): ra_directory rebuilt from ra 2.16.13 with a `dets:sync`
-after each registration, as the fix would be. Smoke (8 timelines): no member forgotten. A hunt
-of it against run 118 is queued.
+after each registration, as the fix would be. Smoke (8 timelines): no member forgotten. Hunt
+run 160 (srv3, 2026-10-29, seed 1 as run 118, 1,647 timelines): **no member forgot itself**
+(`name_not_registered` in none; run 118: 657 of 1,498), as the cause predicts. What remains is
+Mnesia's: 583 timelines with a broker that would not boot, most on the throwaway Mnesia below
+(`{case_clause,{error,{node_not_running,'rabbit@rabbit-2'}}}` in
+`rabbit_mnesia:with_running_or_clean_mnesia/1`, right after `Application mnesia exited with
+reason: {killed,...}`), the others `mnesia_not_running`, `failed_waiting_for_tables` (the
+documented wait for the last node down) and `{error,shutdown}`; and 446 timelines whose queue
+could not be drained, its live members waiting for those tables. Its one "every confirmed message
+is dequeued" failure (timeline 1234) was the drain's: the leader never changed (term 1 all
+along), no message reached the delivery limit (rabbit-1's counters), and replays that ran the
+drain longer dequeued the message. A delivery held by a connection that died in the faults comes
+back only once the broker notices; the drain now waits 15 s (past two of rclient's 5 s
+heartbeats) and drains again before it counts the queue empty.
 
 ### Found blind: after a power loss, a boot's throwaway Mnesia takes a schema update and dies (being read)
 
