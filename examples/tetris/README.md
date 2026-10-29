@@ -112,3 +112,11 @@ strategy's short answer with its own choices (docs/PLUGINS.md), and `deepest.py`
 with the deepest milestone each candidate reached at all, after the generation's improvements.
 On the way, a hang in every tree with such a strategy: the forked in-run snapshots kept the
 plugin's pipe, and each timeline waited for its plugin to exit (fixed, e2e tree).
+
+Run 163 (the same, with `deepest.py` filling its answer with each timeline's deepest milestone):
+games that cleared 10 lines in 435 timelines, 20 in 292, 30 in 197, 40 in 124, 60 in 5. Close
+to the explorer's own returns up to 30 lines (run 119: 443, 305, 214), behind past them (145 and
+67). Returning to where a game went deepest returns to a high stack late in the game; the
+explorer's own rule (just after a timeline's rarest new behavior, the generation's finds weighed
+by how few timelines found them) keeps more kinds of games going and gets further. It stays the
+default; `deepest.py` stays an example of a returns-only strategy.
