@@ -386,6 +386,62 @@ pub fn disk_save(
     }
 }
 
+/// `<directory>/<name>.hashes`: its pages' hashes (`hashes` once disk_save wrote it: the whole
+/// snapshot's), so that a snapshot made later from it (a timeline's node loaded from it) saves
+/// against it, the pages that changed alone. Plain system calls: it runs in a forked child.
+pub fn disk_hashes_save(hashes: []const u64, directory: []const u8, name: []const u8) !void {
+    const linux = std.os.linux;
+    var path_buffer: [4096]u8 = undefined;
+    const pid = linux.getpid();
+    const part = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/{s}.hashes.part{d}", .{ directory, name, pid }, 0);
+    const fd = try file_create(part);
+    defer _ = linux.close(fd);
+    try pwrite_all(fd, std.mem.sliceAsBytes(hashes), 0);
+    var final_buffer: [4096]u8 = undefined;
+    const final = try std.fmt.bufPrintSentinel(&final_buffer, "{s}/{s}.hashes", .{ directory, name }, 0);
+    if (linux.errno(linux.rename(part, final)) != .SUCCESS) return error.Rename;
+}
+
+/// Reads `<directory>/<name>.hashes` into `hashes` (its pages' count exactly).
+pub fn disk_hashes_load(hashes: []u64, directory: []const u8, name: []const u8) !void {
+    const linux = std.os.linux;
+    var path_buffer: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/{s}.hashes", .{ directory, name }, 0);
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.HashesMissing;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    // Exactly its size: another machine's are refused.
+    const size = linux.lseek(fd, 0, linux.SEEK.END);
+    if (linux.errno(size) != .SUCCESS or size != hashes.len * @sizeOf(u64)) return error.HashesDiffer;
+    try pread_all(fd, std.mem.sliceAsBytes(hashes), 0);
+}
+
+/// How many snapshots `<directory>/<name>` takes to load (it and its bases), from their headers.
+pub fn disk_chain_depth(directory: []const u8, name: []const u8) !u32 {
+    const linux = std.os.linux;
+    var current_buffer: [disk_name_max]u8 = undefined;
+    @memcpy(current_buffer[0..name.len], name);
+    var current: []const u8 = current_buffer[0..name.len];
+    var depth: u32 = 1;
+    while (depth <= disk_chain_max) : (depth += 1) {
+        var path_buffer: [4096]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/{s}.state", .{ directory, current }, 0);
+        const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) return error.SnapshotMissing;
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+        var header: DiskHeader = undefined;
+        try pread_all(fd, std.mem.asBytes(&header), 0);
+        if (!std.mem.eql(u8, &header.magic, &disk_magic)) return error.NotASnapshot;
+        const base = header.base_name();
+        if (base.len == 0) return depth;
+        @memcpy(current_buffer[0..base.len], base);
+        current = current_buffer[0..base.len];
+    }
+    return error.SnapshotChainTooLong;
+}
+
 /// The hashes of `memory`'s pages, into `hashes` (what disk_save compares with).
 pub fn pages_hash(memory: []align(page_size) const u8, backing_fd: std.os.linux.fd_t, hashes: []u64) !void {
     assert(hashes.len == memory.len / page_size);
@@ -649,5 +705,39 @@ fn restore_msrs(snapshot: *const Snapshot, fd: std.os.linux.fd_t) !void {
         var one: kvm.Msrs(1) = .{ .count = 1, .entries = .{entry} };
         const written = try kvm.ioctl(fd, kvm.SET_MSRS, @intFromPtr(&one));
         if (written != 1) std.log.debug("MSR 0x{x} not restorable", .{entry.index});
+    }
+}
+
+test "a snapshot's page hashes round-trip, and its chain's depth is read from the headers" {
+    const linux = std.os.linux;
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-snapshot-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    defer _ = linux.rmdir(directory_z);
+    const hashes = [_]u64{ 0, 7, 9, 0 };
+    try disk_hashes_save(&hashes, directory, "h1-5");
+    var read: [4]u64 = undefined;
+    try disk_hashes_load(&read, directory, "h1-5");
+    try std.testing.expectEqualSlices(u64, &hashes, &read);
+    var longer: [5]u64 = undefined; // Another machine's size: refused.
+    try std.testing.expectError(error.HashesDiffer, disk_hashes_load(&longer, directory, "h1-5"));
+    // h3-9 on h2-7 on h1-5 (headers alone: what the depth reads).
+    for ([_][2][]const u8{ .{ "h1-5", "" }, .{ "h2-7", "h1-5" }, .{ "h3-9", "h2-7" } }) |entry| {
+        var header: DiskHeader = .{ .memory_size = 4 * page_size, .check_used = 0, .idle = 0 };
+        @memcpy(header.base[0..entry[1].len], entry[1]);
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}.state", .{ directory, entry[0] }, 0);
+        const fd = try file_create(file);
+        defer _ = linux.close(fd);
+        try pwrite_all(fd, std.mem.asBytes(&header), 0);
+    }
+    try std.testing.expectEqual(@as(u32, 3), try disk_chain_depth(directory, "h3-9"));
+    try std.testing.expectEqual(@as(u32, 1), try disk_chain_depth(directory, "h1-5"));
+    try std.testing.expectError(error.SnapshotMissing, disk_chain_depth(directory, "h9-1"));
+    for ([_][]const u8{ "h1-5.hashes", "h1-5.state", "h2-7.state", "h3-9.state" }) |name| {
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ directory, name }, 0);
+        _ = linux.unlink(file);
     }
 }

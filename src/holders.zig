@@ -91,6 +91,51 @@ pub const Held = extern struct {
 /// Where a run's holders go while memory runs low (Owner.disk_hold): `h<timeline>-<ns>` each,
 /// the pages changed since the timeline's previous one (Snapshot.disk_save's chain), deleted
 /// with the timeline's holders (Registry), dropped ones too (bases of later ones).
+/// A disk holder: its timeline and moment (Disk.name).
+pub const Origin = struct { branch: u32, vtime_ns: u64 };
+
+/// A chain through timelines' disk holders (a timeline's first on its origin) this long at
+/// most: deeper, a timeline starts a fresh one (a whole dump), a load reading every base.
+const origin_chain_max = 3 * per_timeline_max;
+
+/// Which timelines' disk holders others' are saved against (Owner.disk_origin): a timeline's
+/// files go once its generation is judged and no timeline whose chain reaches them is left.
+pub const Lineage = struct {
+    base_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    dependents: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Judged, kept for their dependents.
+    pending: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    /// `child` starts from a node made from a disk holder of `parent`.
+    pub fn depend(lineage: *Lineage, arena: std.mem.Allocator, child: u32, parent: u32) !void {
+        assert(child != parent);
+        try lineage.base_of.put(arena, child, parent);
+        const entry = try lineage.dependents.getOrPut(arena, parent);
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    }
+
+    /// `branch`'s generation is judged: its files go, unless a timeline depends on them (then
+    /// with the last one's), and so on up its chain.
+    pub fn release(lineage: *Lineage, arena: std.mem.Allocator, disk: *const Disk, branch: u32) !void {
+        var current = branch;
+        while (true) {
+            if ((lineage.dependents.get(current) orelse 0) > 0) {
+                try lineage.pending.put(arena, current, {});
+                return;
+            }
+            disk.delete(current);
+            _ = lineage.pending.remove(current);
+            _ = lineage.dependents.remove(current);
+            const parent = (lineage.base_of.fetchRemove(current) orelse return).value;
+            const count = lineage.dependents.getPtr(parent) orelse return;
+            assert(count.* > 0);
+            count.* -= 1;
+            if (count.* > 0 or !lineage.pending.contains(parent)) return;
+            current = parent;
+        }
+    }
+};
+
 pub const Disk = struct {
     directory: []const u8,
 
@@ -270,6 +315,11 @@ pub const Owner = struct {
     disk_base: [Snapshot.disk_name_max]u8 = undefined,
     disk_base_len: u32 = 0,
     disk_chain: u32 = 0,
+    /// The disk holder this timeline's node was made from (Lineage keeps it): its first holder
+    /// on disk saves against it, the pages changed since alone, not a whole dump (four siblings
+    /// returned to one moment each wrote 1.9 GB of nearly the same pages, run 200, srv3).
+    disk_origin: ?Origin = null,
+    origin_name: [Snapshot.disk_name_max]u8 = undefined,
     disk_writer: linux.pid_t = 0,
     hold: VM.Hold = undefined,
     /// The moment armed (as the explorer will ask for it), and whether it follows a behavior
@@ -426,8 +476,13 @@ pub const Owner = struct {
         // A chain of at most a timeline's holders: loading one reads its bases too.
         if (owner.disk_chain == per_timeline_max) owner.disk_base_len = 0;
         if (owner.disk_base_len == 0) {
-            @memset(hashes, 0); // A fresh table: every page written.
             owner.disk_chain = 0;
+            if (owner.origin_take(disk, hashes)) |origin| {
+                @memcpy(owner.disk_base[0..origin.len], origin);
+                owner.disk_base_len = @intCast(origin.len);
+                std.debug.print("[determinismo] holders: timeline {d}'s first on disk saved " ++
+                    "against its origin {s}\n", .{ owner.branch, origin });
+            } else @memset(hashes, 0); // A fresh table: every page written.
         }
         try owner.snapshot.capture(vm);
         var name_buffer: [Snapshot.disk_name_max]u8 = undefined;
@@ -440,6 +495,8 @@ pub const Owner = struct {
             const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
             Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, hashes, disk.directory, name, base, point.idle) catch
                 linux.exit_group(1);
+            // For the timelines whose nodes are made from it (their first holders' base).
+            Snapshot.disk_hashes_save(hashes, disk.directory, name) catch linux.exit_group(1);
             linux.exit_group(0);
         }
         if (linux.errno(pid) != .SUCCESS) return;
@@ -458,6 +515,19 @@ pub const Owner = struct {
         owner.made += 1;
         owner.kept_count += 1;
         if (owner.kept_count > per_timeline_max) owner.drop();
+    }
+
+    /// The origin's name, its page hashes in `hashes`, once a timeline (its first disk holder):
+    /// null when it has none, its hashes are missing (written by an older build, or failed), or
+    /// its chain is long enough already (a load reads every base).
+    fn origin_take(owner: *Owner, disk: *const Disk, hashes: []u64) ?[]const u8 {
+        const origin = owner.disk_origin orelse return null;
+        owner.disk_origin = null;
+        const name = Disk.name(&owner.origin_name, origin.branch, origin.vtime_ns);
+        const depth = Snapshot.disk_chain_depth(disk.directory, name) catch return null;
+        if (depth >= origin_chain_max) return null;
+        Snapshot.disk_hashes_load(hashes, disk.directory, name) catch return null;
+        return name;
     }
 
     /// Whether the last disk holder's writer is done (waiting for it with `wait`). One that
@@ -776,5 +846,47 @@ test "a timeline's holders on disk go, and only its own" {
         var file_buffer: [128]u8 = undefined;
         const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ directory, name }, 0);
         try std.testing.expect(linux.errno(linux.access(file, std.posix.F_OK)) != .SUCCESS);
+    }
+}
+
+test "a holder others' are saved against stays until the last of them goes" {
+    var path_buffer: [64]u8 = undefined;
+    const directory_z = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/determinismo-lineage-test-{d}", .{linux.getpid()}, 0);
+    const directory: []const u8 = directory_z;
+    _ = linux.mkdir(directory_z, 0o755);
+    defer _ = linux.rmdir(directory_z);
+    const disk: Disk = .{ .directory = directory };
+    defer disk.delete(null);
+    // Timeline 1's holder; 2 and 3 start from it; 4 from 2's.
+    for ([_][]const u8{ "h1-5.mem", "h1-5.hashes", "h2-7.mem", "h3-8.mem", "h4-9.mem" }) |name| {
+        var file_buffer: [128]u8 = undefined;
+        const file = try std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ directory, name }, 0);
+        const fd = linux.open(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.close(@intCast(fd));
+    }
+    const there = struct {
+        fn there(at: []const u8, name: []const u8) bool {
+            var file_buffer: [128]u8 = undefined;
+            const file = std.fmt.bufPrintSentinel(&file_buffer, "{s}/{s}", .{ at, name }, 0) catch return false;
+            return linux.errno(linux.access(file, std.posix.F_OK)) == .SUCCESS;
+        }
+    }.there;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lineage: Lineage = .{};
+    try lineage.depend(arena, 2, 1);
+    try lineage.depend(arena, 3, 1);
+    try lineage.depend(arena, 4, 2);
+    try lineage.release(arena, &disk, 1); // Judged: kept for 2 and 3.
+    try std.testing.expect(there(directory, "h1-5.mem") and there(directory, "h1-5.hashes"));
+    try lineage.release(arena, &disk, 2); // Kept for 4.
+    try lineage.release(arena, &disk, 3); // Gone; 1 still kept for 2.
+    try std.testing.expect(!there(directory, "h3-8.mem"));
+    try std.testing.expect(there(directory, "h1-5.mem") and there(directory, "h2-7.mem"));
+    try lineage.release(arena, &disk, 4); // The last: 4, then 2, then 1.
+    for ([_][]const u8{ "h1-5.mem", "h1-5.hashes", "h2-7.mem", "h4-9.mem" }) |name| {
+        try std.testing.expect(!there(directory, name));
     }
 }

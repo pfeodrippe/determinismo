@@ -371,6 +371,7 @@ pub fn build(b: *std.Build) void {
         "examples/ignite/ignite_test.zig",
         "examples/surrealdb/surrealdb_test.zig",
         "examples/tetris/tetris_test.zig",
+        "examples/tigerbeetle/tigerbeetle_test.zig",
         "examples/scylla/cql.zig",
         "examples/scylla/scylla_test.zig",
         "examples/shop/pg.zig",
@@ -387,7 +388,21 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tcp", .module = tcp },
             },
         }) });
-        if (std.mem.eql(u8, root, "src/main.zig")) duckdb_link(b, unit_tests.root_module, duckdb);
+        if (std.mem.eql(u8, root, "src/main.zig")) {
+            duckdb_link(b, unit_tests.root_module, duckdb);
+            // Its tests compiled by `check` too, not linked (no DuckDB): a Mac checks them.
+            const check_tests = b.addTest(.{ .root_module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = target,
+                .optimize = .Debug,
+                .imports = &.{
+                    .{ .name = "determinismo", .module = sdk },
+                    .{ .name = "tcp", .module = tcp },
+                },
+            }) });
+            check_tests.root_module.link_libc = true;
+            check.dependOn(&check_tests.step);
+        }
         if (std.mem.eql(u8, root, "examples/sql/append.zig")) {
             unit_tests.root_module.addImport("pg", pg);
             unit_tests.root_module.addImport("mysql", mysql);
