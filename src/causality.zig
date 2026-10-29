@@ -1042,8 +1042,8 @@ fn decided_print(analysis: *Analysis, out: *std.Io.Writer, json: bool) !void {
 }
 
 /// The jumps of a curve (its moments' probabilities, in time order): each stretch where it goes
-/// one way only (flat steps included) and moves `jump_min` or more in all, as [first, last]
-/// moments. Refinement splits a jump into steps of a future or two each (12% with 8 futures):
+/// one way only (flat steps inside included) and moves `jump_min` or more in all, as [first,
+/// last] moments, its flat ends left out. Refinement splits a jump into steps of a future or two each (12% with 8 futures):
 /// none of them a jump between neighbors, the rise from 50% to 100% is one all the same.
 fn jumps_find(probabilities: []const f64, jump_min: f64, spans: [][2]usize) []const [2]usize {
     assert(spans.len >= probabilities.len);
@@ -1057,7 +1057,13 @@ fn jumps_find(probabilities: []const f64, jump_min: f64, spans: [][2]usize) []co
             if ((rising and step < 0) or (!rising and step > 0)) break;
         }
         if (@abs(probabilities[end] - probabilities[start]) >= jump_min) {
-            spans[count] = .{ start, end };
+            // Its flat ends left out: the jump is where the curve moves (run 179's 62.5% at
+            // 1008 ms to 100% at 1029 ms, then flat to 1690 ms).
+            var first = start;
+            while (probabilities[first + 1] == probabilities[first]) first += 1;
+            var last = end;
+            while (probabilities[last - 1] == probabilities[last]) last -= 1;
+            spans[count] = .{ first, last };
             count += 1;
         }
         start = end;
@@ -1069,10 +1075,13 @@ test jumps_find {
     var spans: [16][2]usize = undefined;
     // The e2e's refined curve (2026-10-29): 50% at 1801 ms rising a future at a time to 100%.
     const refined = [_]f64{ 0.5, 0.5, 0.625, 0.75, 0.875, 1, 0.875, 1, 1, 1, 1 };
-    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 5 }}, jumps_find(&refined, 0.2, &spans));
-    // A jump between neighbors, and a fall.
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 1, 5 }}, jumps_find(&refined, 0.2, &spans));
+    // A jump between neighbors (its flat ends left out), and a fall.
     const steep = [_]f64{ 0.1, 0.1, 0.9, 0.9, 0.2 };
-    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 3 }, .{ 3, 4 } }, jumps_find(&steep, 0.2, &spans));
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 1, 2 }, .{ 3, 4 } }, jumps_find(&steep, 0.2, &spans));
+    // Run 179's: flat after the rise.
+    const risen = [_]f64{ 0.625, 1, 1, 1, 1 };
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 1 }}, jumps_find(&risen, 0.2, &spans));
     // Noise under the threshold, and too few moments.
     const flat = [_]f64{ 0.5, 0.625, 0.5, 0.625 };
     try std.testing.expectEqual(@as(usize, 0), jumps_find(&flat, 0.2, &spans).len);

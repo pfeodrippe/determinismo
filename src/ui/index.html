@@ -948,7 +948,7 @@ async function causalityRefresh() {
 // The analysis's parameters (causality.zig), kept per browser: the planner (built in, a plugin's
 // command, tcp://host:port as the Clojure host's, or @name uploaded), the moments of its first
 // round, futures per moment, rounds after it, and the jump that is narrowed down.
-let causalityOptions = { planner: "", verdict: "", points: 8, futures: 16, refine: 6, jump_min: 0.2 };
+let causalityOptions = { planner: "", verdict: "", points: 8, futures: 16, refine: 6, jump_min: 0.2, explain_exec: "" };
 try { Object.assign(causalityOptions, JSON.parse(localStorage.getItem("causalityOptions") || "{}")); } catch { /* Defaults. */ }
 function causalityOptionsHtml() {
   const field = (name, label, width, tip, attributes = "") => `<label data-tip="${escape(tip)}">${label}
@@ -959,7 +959,8 @@ function causalityOptionsHtml() {
     ${field("points", "moments", "40px", "Moments in the first round, evenly to the failure (and one just after the setup snapshot)", 'type="number" min="1" max="64"')}
     ${field("futures", "futures", "40px", "Futures forked from each moment: more, a narrower interval", 'type="number" min="1" max="256"')}
     ${field("refine", "rounds", "36px", "Rounds after the first, at most: the planner narrows the jumps", 'type="number" min="0" max="20"')}
-    ${field("jump_min", "jump", "44px", "A change in probability this large between two moments is narrowed down", 'type="number" min="0.01" max="1" step="0.05"')}</div>`;
+    ${field("jump_min", "jump", "44px", "A change in probability this large between two moments is narrowed down", 'type="number" min="0.01" max="1" step="0.05"')}
+    ${field("explain_exec", "explain with", "200px", "Once the analysis is done, futures from inside its narrowest jump run this command at their moment, the timeline's randomness after it, their logs kept: a command that turns the system's logs up (e.g. det-nodes exec db <set the log level>)", 'placeholder="none"')}</div>`;
 }
 async function causalityRun(property, branch) {
   const run = state.runId;
@@ -970,6 +971,7 @@ async function causalityRun(property, branch) {
     refine: Number(options.refine), jump_min: Number(options.jump_min) };
   if (String(options.planner).trim()) body.planner = String(options.planner).trim();
   if (String(options.verdict || "").trim()) body.verdict = String(options.verdict).trim();
+  if (String(options.explain_exec || "").trim()) body.explain_exec = String(options.explain_exec).trim();
   try {
     await apiJson(`/runs/${run}/causality`, body);
   } catch (error) {
@@ -1032,6 +1034,10 @@ function causalityDraw(property) {
   }));
   const whole = box.querySelector("[data-zoom-reset]");
   if (whole) whole.addEventListener("click", () => zoom(null));
+  box.querySelectorAll("[data-explained]").forEach((row) => {
+    row.querySelector(".explained-logs").addEventListener("click", () => explainedLogs(analysis, row));
+    row.querySelector(".explained-grep").addEventListener("keydown", (event) => { if (event.key === "Enter") explainedLogs(analysis, row); });
+  });
   // Stacks at a jump's end: which node, then every thread's stack there (det-profile, in a
   // replay to the moment): the code the timeline was in as the bug became likely.
   box.querySelectorAll("[data-stacks-ms]").forEach((link) => link.addEventListener("click", (event) => {
@@ -1077,12 +1083,28 @@ function causalityDraw(property) {
   });
   svg.addEventListener("dblclick", () => zoom(null));
 }
-// Neighbors whose probabilities differ by a fifth or more (causality.zig refines those).
+// Stretches going one way only (flat steps inside included, flat ends left out) that move a
+// fifth or more in all, as causality.zig's jumps_find: refinement splits a jump into steps of a
+// future or two each.
 function causalityJumps(points) {
   const jumps = [];
-  for (let i = 1; i < points.length; i++) {
-    const a = points[i - 1], b = points[i];
-    if (Math.abs(b.probability - a.probability) >= 0.2) jumps.push({ a, b });
+  let start = 0;
+  while (start + 1 < points.length) {
+    let end = start + 1;
+    const rising = points[end].probability >= points[start].probability;
+    while (end + 1 < points.length) {
+      const step = points[end + 1].probability - points[end].probability;
+      if ((rising && step < 0) || (!rising && step > 0)) break;
+      end++;
+    }
+    if (Math.abs(points[end].probability - points[start].probability) >= 0.2) {
+      // Its flat ends left out: the jump is where the curve moves.
+      let first = start, last = end;
+      while (points[first + 1].probability === points[first].probability) first++;
+      while (points[last - 1].probability === points[last].probability) last--;
+      jumps.push({ a: points[first], b: points[last] });
+    }
+    start = end;
   }
   return jumps;
 }
@@ -1218,8 +1240,33 @@ function causalityChart(analysis) {
   const plotted = svg.replaceAll("data-clip", 'clip-path="url(#causality-clip)"');
   return title + `<svg class="causality-chart" viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;user-select:none"
     data-width="${W}" data-left="${L}" data-right="${W - R}" data-x0="${x0}" data-x1="${x1}">${clip}${plotted}</svg>` + legend + zoomed + list +
-    causalityEffects(analysis) +
+    causalityEffects(analysis) + causalityExplained(analysis) +
     `<div class="muted">Each point: its futures forked from a snapshot of the timeline saved there. A jump means the timeline made the bug likely inside it: click it for the logs up to there. Drag across the chart to zoom, double click to see it all.</div>`;
+}
+// The explanation's futures (explain_exec): from inside the narrowest jump, the command at their
+// moment; each one's logs (the nodes' output) filtered by a text, a failing one beside a passing.
+function causalityExplained(analysis) {
+  const explained = analysis.explained;
+  if (!explained) return "";
+  if (!explained.length) return `<div class="muted" style="margin:6px 0">Explained: no jump to failure to explain.</div>`;
+  return `<div class="group-title" style="margin-top:8px">Explained: futures from inside the jump, the command at their moment</div>
+    <div class="causality-explained">${explained.map((item, k) => `<div data-explained="${k}">
+      <span class="mono">${seconds(item.vtime_ms * 1e6)}</span>
+      <span class="${item.fails ? "fail-text" : "pass-text"}">${item.fails ? "fails" : "passes"}</span>
+      <input class="explained-grep" placeholder="text in the logs" style="width:180px">
+      <button class="explained-logs">logs</button>
+      <pre class="mono" hidden style="max-height:320px;overflow:auto;font-size:11px"></pre></div>`).join("")}</div>`;
+}
+async function explainedLogs(analysis, row) {
+  const output = row.querySelector("pre");
+  const grep = row.querySelector(".explained-grep").value;
+  output.hidden = false;
+  output.textContent = "Reading…";
+  try {
+    const answer = await apiJson(`/runs/${state.runId}/causality/${analysis.id}/explained/${row.dataset.explained}/logs?grep=${encodeURIComponent(grep)}`);
+    output.textContent = `${answer.matched} lines${answer.matched > answer.lines.length ? ` (the last ${answer.lines.length})` : ""}\n` +
+      answer.lines.map((line) => `${seconds(line.vtime_ns)} ${line.source} ${line.text}`).join("\n");
+  } catch (error) { output.textContent = error.message; }
 }
 // The faults the futures went through, by how much more often futures with one failed than those
 // without (causality.zig counts them): which faults make the bug more likely.
