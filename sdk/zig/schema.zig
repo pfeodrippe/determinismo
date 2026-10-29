@@ -210,6 +210,15 @@ pub const Faults = struct {
     runner_links: bool = true,
     /// Limit its CPU (a share of one CPU) for a while.
     throttle: bool = true,
+    /// Skew its realtime clock for a while, forward or back, 1 ms to 10 s (Jepsen's clock
+    /// bumps): its CLOCK_REALTIME apart from the other nodes', the monotonic clock untouched.
+    /// For systems ordering by wall clocks (hybrid logical clocks, leases, timestamps). Off by
+    /// default: some stop a node on purpose past their maximum offset.
+    clock_skew: bool = false,
+    /// The largest clock skew, in milliseconds (at least 10): below a system's documented
+    /// maximum offset when its safety assumes one (YugabyteDB's and CockroachDB's 500 ms), so
+    /// that what it then does wrong is a bug.
+    clock_skew_ms_max: u32 = 10_000,
     /// Stop one of its processes (SIGSTOP) for a while.
     process_pause: bool = true,
     /// Kill one of its processes other than its main one (SIGKILL), as a crash its supervisor

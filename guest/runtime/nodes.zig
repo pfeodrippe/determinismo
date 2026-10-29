@@ -152,6 +152,11 @@ pub fn start(
         if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
             die("unshare", error.Unshare);
         }
+        // Its own time namespace, entered at the exec: its realtime clock can be skewed apart
+        // from the other nodes' (clock_offset, the clock_skew fault).
+        if (linux.errno(linux.unshare(linux.CLONE.NEWTIME)) != .SUCCESS) {
+            die("unshare", error.Unshare);
+        }
         launch.exec(output_pipes.stdout[1], output_pipes.stderr[1]); // Never returns.
     }
     const pid: linux.pid_t = @intCast(result);
@@ -251,6 +256,7 @@ const namespaces = [_]Namespace{
     .{ .name = "net", .flag = linux.CLONE.NEWNET },
     .{ .name = "cgroup", .flag = linux.CLONE.NEWCGROUP },
     .{ .name = "pid", .flag = linux.CLONE.NEWPID },
+    .{ .name = "time", .flag = linux.CLONE.NEWTIME },
     .{ .name = "mnt", .flag = linux.CLONE.NEWNS },
 };
 
@@ -868,6 +874,22 @@ pub fn cpu_limit(name: []const u8, percent: ?u8) !void {
     try file_write(path, value);
 }
 
+/// Skews the node's realtime clock `offset_ns` from the guest's (0: none), in its time
+/// namespace: CLOCK_REALTIME, its coarse form and CLOCK_TAI, read through the vDSO or a syscall,
+/// and their absolute deadlines (the guest kernel's patch 0005: Linux offsets only the
+/// monotonic and boot clocks, before anything runs in the namespace). As a skewed host's clock:
+/// its monotonic clock and its timers' durations are untouched.
+pub fn clock_offset(name: []const u8, offset_ns: i64) !void {
+    const pid = pid_read(name) orelse return error.NotRunning;
+    var path_buffer: [64]u8 = undefined;
+    const path = try print_z(&path_buffer, "/proc/{d}/timens_offsets", .{pid});
+    const seconds = @divFloor(offset_ns, std.time.ns_per_s);
+    const nanoseconds = offset_ns - seconds * std.time.ns_per_s;
+    var value_buffer: [64]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "realtime {d} {d}\n", .{ seconds, nanoseconds });
+    try file_write(path, value);
+}
+
 /// The node's processes, in the order its cgroup lists them.
 pub fn processes(name: []const u8, pids: []linux.pid_t) !u32 {
     var paths: Paths = undefined;
@@ -961,6 +983,7 @@ pub fn leftover(name: []const u8) []const u8 {
     var paths: Paths = undefined;
     paths.init(name) catch return "";
     if (exists(paths.dropping)) return "its disk dropping writes";
+    if (clock_skewed(name)) return "its clock skewed";
     var pids: [1024]linux.pid_t = undefined;
     const count = processes(name, &pids) catch return "";
     for (pids[0..count]) |pid| {
@@ -970,6 +993,24 @@ pub fn leftover(name: []const u8) []const u8 {
         }
     }
     return "";
+}
+
+/// Whether the node's realtime clock is offset (its time namespace's "realtime" line).
+fn clock_skewed(name: []const u8) bool {
+    const pid = pid_read(name) orelse return false;
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/timens_offsets", .{pid}, 0) catch return false;
+    var buffer: [256]u8 = undefined;
+    const text = read_small(path, &buffer) orelse return false;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, fields.next() orelse continue, "realtime")) continue;
+        const seconds = fields.next() orelse return false;
+        const nanoseconds = fields.next() orelse return false;
+        return !std.mem.eql(u8, seconds, "0") or !std.mem.eql(u8, nanoseconds, "0");
+    }
+    return false;
 }
 
 /// Whether a thread is stopped by a signal ('T' in its stat, after the command's parenthesis).

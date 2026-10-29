@@ -1,0 +1,306 @@
+determinismo: time namespaces with a realtime offset, changeable while tasks are in them
+
+A node's clock skew (the clock_skew fault): CLOCK_REALTIME, CLOCK_REALTIME_COARSE and
+CLOCK_TAI offset per time namespace, read through the vDSO (its offsets, and time()) or the
+syscalls (clock_gettime, gettimeofday, time), absolute deadlines on them converted to the
+host's (clock_nanosleep, timers, timerfd, futex waits), set through
+/proc/<pid>/timens_offsets ("realtime <sec> <nsec>") at any time.
+
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -1663,6 +1663,9 @@
+ 		else if (strcmp(clock, "boottime") == 0 ||
+ 			 strcmp(clock, __stringify(CLOCK_BOOTTIME)) == 0)
+ 			off->clockid = CLOCK_BOOTTIME;
++		else if (strcmp(clock, "realtime") == 0 ||
++			 strcmp(clock, __stringify(CLOCK_REALTIME)) == 0)
++			off->clockid = CLOCK_REALTIME;
+ 		else
+ 			goto out;
+ 
+--- a/include/linux/time_namespace.h
++++ b/include/linux/time_namespace.h
+@@ -17,6 +17,11 @@
+ struct timens_offsets {
+ 	struct timespec64 monotonic;
+ 	struct timespec64 boottime;
++	/*
++	 * determinismo: CLOCK_REALTIME (and its coarse and TAI forms) in the namespace, a node's
++	 * clock skew. Unlike the others it may change while tasks are in the namespace.
++	 */
++	struct timespec64 realtime;
+ };
+ 
+ struct time_namespace {
+@@ -79,6 +84,13 @@
+ 	*ts = timespec64_add(*ts, ns_offsets->boottime);
+ }
+ 
++static inline void timens_add_realtime(struct timespec64 *ts)
++{
++	struct timens_offsets *ns_offsets = &current->nsproxy->time_ns->offsets;
++
++	*ts = timespec64_add(*ts, ns_offsets->realtime);
++}
++
+ static inline u64 timens_add_boottime_ns(u64 nsec)
+ {
+ 	struct timens_offsets *ns_offsets = &current->nsproxy->time_ns->offsets;
+@@ -151,6 +163,7 @@
+ 
+ static inline void timens_add_monotonic(struct timespec64 *ts) { }
+ static inline void timens_add_boottime(struct timespec64 *ts) { }
++static inline void timens_add_realtime(struct timespec64 *ts) { }
+ 
+ static inline u64 timens_add_boottime_ns(u64 nsec)
+ {
+--- a/kernel/futex/syscalls.c
++++ b/kernel/futex/syscalls.c
+@@ -182,6 +182,8 @@
+ 		*t = ktime_add_safe(ktime_get(), *t);
+ 	else if (cmd != FUTEX_LOCK_PI && !(op & FUTEX_CLOCK_REALTIME))
+ 		*t = timens_ktime_to_host(CLOCK_MONOTONIC, *t);
++	else
++		*t = timens_ktime_to_host(CLOCK_REALTIME, *t);
+ 	return 0;
+ }
+ 
+--- a/kernel/time/namespace.c
++++ b/kernel/time/namespace.c
+@@ -33,6 +33,11 @@
+ 	case CLOCK_BOOTTIME_ALARM:
+ 		offset = timespec64_to_ktime(ns_offsets->boottime);
+ 		break;
++	case CLOCK_REALTIME:
++	case CLOCK_REALTIME_ALARM:
++	case CLOCK_TAI:
++		offset = timespec64_to_ktime(ns_offsets->realtime);
++		break;
+ 	default:
+ 		return tim;
+ 	}
+@@ -182,7 +187,11 @@
+ 	struct timens_offset *offset = vdata->offset;
+ 	struct timens_offset monotonic = offset_from_ts(ns->offsets.monotonic);
+ 	struct timens_offset boottime = offset_from_ts(ns->offsets.boottime);
++	struct timens_offset realtime = offset_from_ts(ns->offsets.realtime);
+ 
++	offset[CLOCK_REALTIME]		= realtime;
++	offset[CLOCK_REALTIME_COARSE]	= realtime;
++	offset[CLOCK_TAI]		= realtime;
+ 	vdata->seq			= 1;
+ 	vdata->clock_mode		= VDSO_CLOCKMODE_TIMENS;
+ 	offset[CLOCK_MONOTONIC]		= monotonic;
+@@ -216,6 +225,23 @@
+  */
+ static DEFINE_MUTEX(offset_lock);
+ 
++/*
++ * determinismo: a namespace's realtime offset changed while tasks are in it: its vvar page
++ * changes too. Not preempted, on the guest's one CPU no task reads a half-written offset.
++ */
++static void timens_update_realtime(struct time_namespace *ns)
++{
++	struct timens_offset realtime = offset_from_ts(ns->offsets.realtime);
++	struct vdso_data *vdata = arch_get_vdso_data(page_address(ns->vvar_page));
++	unsigned int i;
++
++	for (i = 0; i < CS_BASES; i++) {
++		vdata[i].offset[CLOCK_REALTIME] = realtime;
++		vdata[i].offset[CLOCK_REALTIME_COARSE] = realtime;
++		vdata[i].offset[CLOCK_TAI] = realtime;
++	}
++}
++
+ static void timens_set_vvar_page(struct task_struct *task,
+ 				struct time_namespace *ns)
+ {
+@@ -355,6 +381,9 @@
+ 	case CLOCK_MONOTONIC:
+ 		clock = "monotonic";
+ 		break;
++	case CLOCK_REALTIME:
++		clock = "realtime";
++		break;
+ 	default:
+ 		clock = "unknown";
+ 		break;
+@@ -374,6 +403,7 @@
+ 
+ 	show_offset(m, CLOCK_MONOTONIC, &time_ns->offsets.monotonic);
+ 	show_offset(m, CLOCK_BOOTTIME, &time_ns->offsets.boottime);
++	show_offset(m, CLOCK_REALTIME, &time_ns->offsets.realtime);
+ 	put_time_ns(time_ns);
+ }
+ 
+@@ -405,6 +435,9 @@
+ 		case CLOCK_BOOTTIME:
+ 			ktime_get_boottime_ts64(&tp);
+ 			break;
++		case CLOCK_REALTIME:
++			ktime_get_real_ts64(&tp);
++			break;
+ 		default:
+ 			err = -EINVAL;
+ 			goto out;
+@@ -426,13 +459,17 @@
+ 	}
+ 
+ 	mutex_lock(&offset_lock);
+-	if (time_ns->frozen_offsets) {
+-		err = -EACCES;
+-		goto out_unlock;
++	/* determinismo: the realtime offset changes at any time (a node's clock skew). */
++	for (i = 0; i < noffsets; i++) {
++		if (time_ns->frozen_offsets && offsets[i].clockid != CLOCK_REALTIME) {
++			err = -EACCES;
++			goto out_unlock;
++		}
+ 	}
+ 
+ 	err = 0;
+ 	/* Don't report errors after this line */
++	preempt_disable();
+ 	for (i = 0; i < noffsets; i++) {
+ 		struct proc_timens_offset *off = &offsets[i];
+ 		struct timespec64 *offset = NULL;
+@@ -444,10 +481,16 @@
+ 		case CLOCK_BOOTTIME:
+ 			offset = &time_ns->offsets.boottime;
+ 			break;
++		case CLOCK_REALTIME:
++			offset = &time_ns->offsets.realtime;
++			break;
+ 		}
+ 
+ 		*offset = off->val;
+ 	}
++	if (time_ns->frozen_offsets)
++		timens_update_realtime(time_ns);
++	preempt_enable();
+ 
+ out_unlock:
+ 	mutex_unlock(&offset_lock);
+--- a/kernel/time/posix-timers.c
++++ b/kernel/time/posix-timers.c
+@@ -132,6 +132,7 @@
+ static int posix_get_realtime_timespec(clockid_t which_clock, struct timespec64 *tp)
+ {
+ 	ktime_get_real_ts64(tp);
++	timens_add_realtime(tp);
+ 	return 0;
+ }
+ 
+@@ -174,6 +175,7 @@
+ static int posix_get_realtime_coarse(clockid_t which_clock, struct timespec64 *tp)
+ {
+ 	ktime_get_coarse_real_ts64(tp);
++	timens_add_realtime(tp);
+ 	return 0;
+ }
+ 
+@@ -206,6 +208,7 @@
+ static int posix_get_tai_timespec(clockid_t which_clock, struct timespec64 *tp)
+ {
+ 	ktime_get_clocktai_ts64(tp);
++	timens_add_realtime(tp);
+ 	return 0;
+ }
+ 
+@@ -1363,22 +1366,10 @@
+ #endif
+ 
+ /*
+- * sys_clock_nanosleep() for CLOCK_REALTIME and CLOCK_TAI
+- */
+-static int common_nsleep(const clockid_t which_clock, int flags,
+-			 const struct timespec64 *rqtp)
+-{
+-	ktime_t texp = timespec64_to_ktime(*rqtp);
+-
+-	return hrtimer_nanosleep(texp, flags & TIMER_ABSTIME ?
+-				 HRTIMER_MODE_ABS : HRTIMER_MODE_REL,
+-				 which_clock);
+-}
+-
+-/*
+- * sys_clock_nanosleep() for CLOCK_MONOTONIC and CLOCK_BOOTTIME
++ * sys_clock_nanosleep() for every clock with nanosleep (determinismo: CLOCK_REALTIME and
++ * CLOCK_TAI too, whose namespaces may be skewed)
+  *
+- * Absolute nanosleeps for these clocks are time-namespace adjusted.
++ * Absolute nanosleeps are time-namespace adjusted.
+  */
+ static int common_nsleep_timens(const clockid_t which_clock, int flags,
+ 				const struct timespec64 *rqtp)
+@@ -1455,7 +1446,7 @@
+ 	.clock_get_ktime	= posix_get_realtime_ktime,
+ 	.clock_set		= posix_clock_realtime_set,
+ 	.clock_adj		= posix_clock_realtime_adj,
+-	.nsleep			= common_nsleep,
++	.nsleep			= common_nsleep_timens,
+ 	.timer_create		= common_timer_create,
+ 	.timer_set		= common_timer_set,
+ 	.timer_get		= common_timer_get,
+@@ -1504,7 +1495,7 @@
+ 	.clock_getres		= posix_get_hrtimer_res,
+ 	.clock_get_ktime	= posix_get_tai_ktime,
+ 	.clock_get_timespec	= posix_get_tai_timespec,
+-	.nsleep			= common_nsleep,
++	.nsleep			= common_nsleep_timens,
+ 	.timer_create		= common_timer_create,
+ 	.timer_set		= common_timer_set,
+ 	.timer_get		= common_timer_get,
+--- a/kernel/time/time.c
++++ b/kernel/time/time.c
+@@ -35,6 +35,7 @@
+ #include <linux/fs.h>
+ #include <linux/math64.h>
+ #include <linux/ptrace.h>
++#include <linux/time_namespace.h>
+ 
+ #include <linux/uaccess.h>
+ #include <linux/compat.h>
+@@ -61,7 +62,12 @@
+  */
+ SYSCALL_DEFINE1(time, __kernel_old_time_t __user *, tloc)
+ {
+-	__kernel_old_time_t i = (__kernel_old_time_t)ktime_get_real_seconds();
++	struct timespec64 ts;
++	__kernel_old_time_t i;
++
++	ktime_get_real_ts64(&ts);
++	timens_add_realtime(&ts);
++	i = (__kernel_old_time_t)ts.tv_sec;
+ 
+ 	if (tloc) {
+ 		if (put_user(i,tloc))
+@@ -144,6 +150,7 @@
+ 		struct timespec64 ts;
+ 
+ 		ktime_get_real_ts64(&ts);
++		timens_add_realtime(&ts);
+ 		if (put_user(ts.tv_sec, &tv->tv_sec) ||
+ 		    put_user(ts.tv_nsec / 1000, &tv->tv_usec))
+ 			return -EFAULT;
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@ -352,8 +352,17 @@
+ 	__kernel_old_time_t t;
+ 
+ 	if (IS_ENABLED(CONFIG_TIME_NS) &&
+-	    vd->clock_mode == VDSO_CLOCKMODE_TIMENS)
++	    vd->clock_mode == VDSO_CLOCKMODE_TIMENS) {
++		struct __kernel_timespec ts;
++
++		/* determinismo: the namespace's realtime offset. */
++		if (!do_hres(&vd[CS_HRES_COARSE], CLOCK_REALTIME, &ts)) {
++			if (time)
++				*time = ts.tv_sec;
++			return ts.tv_sec;
++		}
+ 		vd = __arch_get_timens_vdso_data(vd);
++	}
+ 
+ 	t = READ_ONCE(vd[CS_HRES_COARSE].basetime[CLOCK_REALTIME].sec);
+ 

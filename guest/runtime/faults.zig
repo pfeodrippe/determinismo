@@ -64,6 +64,10 @@ const duration_short_ns_max = 500 * std.time.ns_per_ms;
 const duration_ns_max = 10 * std.time.ns_per_s;
 const long_one_in = 4;
 const clock_skip_ns_max = 60 * std.time.ns_per_s;
+/// A clock skew's size, log-uniform from a millisecond (within a hybrid logical clock's maximum
+/// offset) up to the node's largest (Faults.clock_skew_ms_max; seconds: past leases, timeouts).
+const clock_skew_ns_min = std.time.ns_per_ms;
+const clock_skew_ns_max = 10 * std.time.ns_per_s;
 
 const Kind = enum {
     pause,
@@ -116,6 +120,9 @@ const Kind = enum {
     /// Every network fault under way ends (Antithesis's restore); skipped when none is.
     restore,
     clock_skip,
+    /// One node's realtime clock skewed, forward or back, for a while (Jepsen's clock bumps;
+    /// nodes.clock_offset): the other nodes' clocks as they were.
+    clock_skew,
 };
 /// How a disrupted link behaves (Antithesis's forms): packets dropped, delayed, or held for
 /// the whole fault and then delivered.
@@ -159,6 +166,8 @@ const Fault = struct {
     program: []const u8 = "",
     /// For outage: power losses (false: kills, the nodes allowing restarts).
     power: bool = true,
+    /// For clock_skew: the node's largest skew.
+    skew_ns_max: u64 = clock_skew_ns_max,
 };
 
 /// Set by the SIGTERM handler; checked between steps so a stop never leaves a fault applied.
@@ -420,6 +429,28 @@ const Applied = struct {
     peer_pod: []const u8 = "",
 };
 
+/// A clock skew's size up to `max_ns`: a decade from a millisecond (1 ms, 10 ms, 100 ms, 1 s)
+/// below it, then uniform within that decade (or up to the maximum).
+fn clock_skew_draw(max_ns: u64) u64 {
+    assert(max_ns >= clock_skew_ns_min * 10);
+    var decades: u64 = 0;
+    var top: u64 = clock_skew_ns_min * 10;
+    while (top < max_ns and decades < 3) : (decades += 1) top *= 10;
+    var low: u64 = clock_skew_ns_min;
+    for (0..sdk.random_below(decades + 1)) |_| low *= 10;
+    return low + sdk.random_below(@min(low * 10, max_ns) - low);
+}
+
+test clock_skew_draw {
+    // Every size within the maximum, from a millisecond.
+    for ([_]u64{ 10 * std.time.ns_per_ms, 400 * std.time.ns_per_ms, clock_skew_ns_max }) |max_ns| {
+        for (0..200) |_| {
+            const size = clock_skew_draw(max_ns);
+            try std.testing.expect(size >= clock_skew_ns_min and size < max_ns);
+        }
+    }
+}
+
 /// A fault's parameters, drawn from platform randomness.
 fn draw(fault: *const Fault) Applied {
     var applied = Applied{
@@ -462,6 +493,10 @@ fn draw(fault: *const Fault) Applied {
             applied.forward = sdk.random_below(2) == 0;
             applied.skip_ns = sdk.random_below(clock_skip_ns_max);
             applied.permanent = sdk.random_below(4) == 0;
+        },
+        .clock_skew => {
+            applied.forward = sdk.random_below(2) == 0;
+            applied.skip_ns = clock_skew_draw(fault.skew_ns_max);
         },
         .outage => {
             applied.outage = outage_draw(fault.endpoints);
@@ -611,6 +646,11 @@ fn faults_collect(
         if (allowed.stop) faults_add(faults, &count, .{ .kind = .stop, .node = node.name });
         if (allowed.disk) faults_add(faults, &count, .{ .kind = .disk, .node = node.name });
         if (allowed.throttle) faults_add(faults, &count, .{ .kind = .throttle, .node = node.name });
+        if (allowed.clock_skew) faults_add(faults, &count, .{
+            .kind = .clock_skew,
+            .node = node.name,
+            .skew_ns_max = @max(10, allowed.clock_skew_ms_max) * std.time.ns_per_ms,
+        });
         if (allowed.sync_stall) faults_add(faults, &count, .{ .kind = .sync_stall, .node = node.name });
         if (allowed.process_pause) {
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
@@ -714,6 +754,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .stop,
         .disk,
         .throttle,
+        .clock_skew,
         .process_pause,
         .thread_pause,
         .pod_pause,
@@ -789,6 +830,12 @@ fn node_slot(system: *const schema.System, name: []const u8) ?*?NodeFault {
     return &nodes_faulted[index - 1];
 }
 
+/// A clock skew's signed offset.
+fn skew_ns(applied: *const Applied) i64 {
+    const size: i64 = @intCast(applied.skip_ns);
+    return if (applied.forward) size else -size;
+}
+
 fn node_start(system: *const schema.System, applied: *const Applied) void {
     const slot = node_slot(system, applied.node) orelse return;
     if (slot.* != null) return;
@@ -804,6 +851,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .stop => stop_begin(applied.node, &fault),
         .disk => nodes.disk_fail(applied.node, applied.disk.?),
         .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
+        .clock_skew => nodes.clock_offset(applied.node, skew_ns(applied)),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
         else => unreachable,
@@ -860,6 +908,8 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
             if (again) node_start_again(system, name);
         },
         .throttle => nodes.cpu_limit(name, null) catch {},
+        // A node started again meanwhile has a fresh namespace: this sets what it has already.
+        .clock_skew => nodes.clock_offset(name, 0) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => thread_release(fault.pid, fault.stopped),
         // The pod may be gone (killed, rescheduled), its cgroup and namespace with it: said.
@@ -2089,7 +2139,7 @@ const Request = struct {
     direction: Direction = .both,
     flavor: Degradation = .delay_loss,
     cpu_percent: u8 = 20,
-    /// clock_skip (permanent: later skips stack on it).
+    /// clock_skip (permanent: later skips stack on it), clock_skew (the node's).
     skip_ms: u64 = 0,
     forward: bool = true,
     program: []const u8 = "",
@@ -2184,6 +2234,10 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
             applied.skip_ns = request.skip_ms * std.time.ns_per_ms;
             applied.forward = request.forward;
             applied.permanent = true;
+        },
+        .clock_skew => {
+            applied.skip_ns = request.skip_ms * std.time.ns_per_ms;
+            applied.forward = request.forward;
         },
         .custom => applied.program = request.program,
         .outage => {

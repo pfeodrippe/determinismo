@@ -2231,7 +2231,7 @@ fn check_inject(context: *Context) !void {
         .{ "no failing properties", clean },
         .{ "the injected faults came and went", came_and_went },
     }, "inject: a pause, a stop and a one-way partition asked for by the scenario take the node " ++
-        "away and give it back", .{});
+        "away and give it back; a clock skew moves its realtime clock alone, deadlines kept", .{});
     if (!clean or !came_and_went) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_inject_refused", "fault_failed",
     }) catch ""});

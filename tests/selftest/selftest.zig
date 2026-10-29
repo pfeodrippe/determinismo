@@ -17,7 +17,7 @@
 //!              but clock skips may start during it
 //!   inject     (profile "injectable") faults the scenario asks for (sdk.fault): a pause, a
 //!              graceful stop and a one-way partition, each taking the node away and giving it
-//!              back
+//!              back; a clock skew, the node's realtime clock 5 s behind while it lasts
 //!   hang       a driver that never ends: the timeline's ceiling of virtual time ends it, hung
 //!   readdress  (profile "movable") restarts the scenario asks for: the node answers at its
 //!              name each time, and sometimes came back at a new address
@@ -192,6 +192,7 @@ fn describe_faulted(d: *System.Describe) !void {
     var asked = quiet;
     asked.pause = true;
     asked.stop = true;
+    asked.clock_skew = true;
     injectable.node(.echo, .{
         .binary = "zig-out/bin/det-selftest-node",
         .ready = .{ .tcp = port },
@@ -684,8 +685,40 @@ fn faults_on_request(context: *System.Context) !void {
         .status = itself,
     });
     try sdk.retry(100, 100, answers, .{echo.address});
+    // A clock skew: the node's realtime clock 5 s behind the runner's while it lasts (a command
+    // in the node joins its time namespace), its absolute deadlines on that clock its own time.
+    sdk.fault(.{ .kind = "clock_skew", .node = echo.name, .skip_ms = 5000, .forward = false, .duration_ms = 2000 });
+    sdk.sleep_ms(100);
+    const skew_ms = realtime_skew_ms(&echo);
+    sdk.always(skew_ms != null and @abs(skew_ms.? + 5000) < 500, "an injected clock skew moves the node's realtime clock", .{
+        .skew_ms = skew_ms orelse 0,
+    });
+    const slept = echo.exec(&.{ "/bin/det-selftest-node", "abs-sleep", "300" }) catch 255;
+    sdk.always(slept == 0, "a skewed node's absolute realtime deadlines keep their time", .{ .status = slept });
+    sdk.sleep_ms(2000);
+    const after_ms = realtime_skew_ms(&echo);
+    sdk.always(after_ms != null and @abs(after_ms.?) < 500, "a clock skew ends with its fault", .{
+        .skew_ms = after_ms orelse 0,
+    });
     sdk.reachable("injected faults came and went", .{});
     sdk.stop_faults(0);
+}
+
+/// The node's CLOCK_REALTIME less the runner's (around the command), in milliseconds.
+fn realtime_skew_ms(node: *const sdk.Node) ?i64 {
+    var buffer: [64]u8 = undefined;
+    const before = realtime_ns();
+    const answer = node.exec_output(&.{ "/bin/det-selftest-node", "realtime" }, &buffer) catch return null;
+    const after = realtime_ns();
+    if (answer.status != 0) return null;
+    const theirs = std.fmt.parseInt(i128, std.mem.trim(u8, answer.output, " \n"), 10) catch return null;
+    return @intCast(@divTrunc(theirs - @divTrunc(before + after, 2), std.time.ns_per_ms));
+}
+
+fn realtime_ns() i128 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &now);
+    return @as(i128, now.sec) * std.time.ns_per_s + now.nsec;
 }
 
 fn hang(s: *System.Scenario) void {

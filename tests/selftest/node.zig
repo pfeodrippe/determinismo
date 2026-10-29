@@ -13,6 +13,10 @@
 //! `write2 <path> <path>` writes two at once, from
 //! two threads (two durability points together). `det-selftest-node ping <a.b.c.d>` exits 0 if
 //! the service at that address answers a line (a node reaching itself while isolated).
+//! `realtime` prints the node's CLOCK_REALTIME in nanoseconds; `abs-sleep <ms>` waits until
+//! that clock's now + ms twice, a nanosleep then a futex, both absolute (TIMER_ABSTIME,
+//! FUTEX_CLOCK_REALTIME), and exits 0 if each took about that long on the monotonic clock (a
+//! node's skewed clock: its deadlines are its own time).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -34,6 +38,23 @@ pub fn main(init: std.process.Init) !void {
         linux.exit_group(if (found) 0 else 1);
     }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "crash")) crash();
+    if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "realtime")) {
+        var line_buffer: [48]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buffer, "{d}\n", .{clock_ns(.REALTIME)}) catch unreachable;
+        _ = linux.write(1, line.ptr, line.len);
+        linux.exit_group(0);
+    }
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "abs-sleep")) {
+        const wanted_ns = (std.fmt.parseInt(u64, arguments[2], 10) catch linux.exit_group(2)) * std.time.ns_per_ms;
+        const slept_ns = [_]u64{ abs_nanosleep(wanted_ns), abs_futex_wait(wanted_ns) };
+        var line_buffer: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buffer, "slept {d} {d}\n", .{ slept_ns[0], slept_ns[1] }) catch unreachable;
+        _ = linux.write(1, line.ptr, line.len);
+        for (slept_ns) |slept| {
+            if (slept < wanted_ns * 8 / 10 or slept > wanted_ns + std.time.ns_per_s) linux.exit_group(1);
+        }
+        linux.exit_group(0);
+    }
     if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "ping")) {
         const address = std.Io.net.Ip4Address.parse(arguments[2], port) catch linux.exit_group(2);
         linux.exit_group(if (ping(address.bytes)) 0 else 1);
@@ -209,4 +230,41 @@ fn ping(address: [4]u8) bool {
     const size = linux.read(fd, &reply, reply.len);
     if (linux.errno(size) != .SUCCESS) return false;
     return std.mem.eql(u8, reply[0..size], "ping\n");
+}
+
+fn clock_ns(clock: linux.clockid_t) i128 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(clock, &now);
+    return @as(i128, now.sec) * std.time.ns_per_s + now.nsec;
+}
+
+fn timespec_of(ns: i128) linux.timespec {
+    return .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
+}
+
+/// Sleeps until CLOCK_REALTIME's now + `wanted_ns` (an absolute deadline); how long that took
+/// on the monotonic clock.
+fn abs_nanosleep(wanted_ns: u64) u64 {
+    const start = clock_ns(.MONOTONIC);
+    const deadline = timespec_of(clock_ns(.REALTIME) + wanted_ns);
+    while (true) {
+        const result = linux.clock_nanosleep(.REALTIME, .{ .ABSTIME = true }, &deadline, null);
+        if (linux.errno(result) != .INTR) break;
+    }
+    return @intCast(clock_ns(.MONOTONIC) - start);
+}
+
+/// A futex wait nothing wakes, until CLOCK_REALTIME's now + `wanted_ns` (FUTEX_WAIT_BITSET
+/// with FUTEX_CLOCK_REALTIME: pthread_cond_timedwait's); how long it took on the monotonic clock.
+fn abs_futex_wait(wanted_ns: u64) u64 {
+    var word: u32 = 0;
+    const start = clock_ns(.MONOTONIC);
+    const deadline = timespec_of(clock_ns(.REALTIME) + wanted_ns);
+    const wait_bitset = 9;
+    const clock_realtime = 256;
+    while (true) {
+        const result = linux.syscall6(.futex, @intFromPtr(&word), wait_bitset | clock_realtime, 0, @intFromPtr(&deadline), 0, 0xffff_ffff);
+        if (linux.errno(result) != .INTR and linux.errno(result) != .AGAIN) break;
+    }
+    return @intCast(clock_ns(.MONOTONIC) - start);
 }

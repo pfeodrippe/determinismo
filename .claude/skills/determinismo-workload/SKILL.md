@@ -70,6 +70,10 @@ fn transfers(s: *System.Scenario) void {
   leases, JVMs) need faults in bursts, `s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max =
   30_000 }`, or they never serve during a timeline; and their drivers need enough refused
   connections in a row to outlast a failover.
+- Systems that order by wall clocks (hybrid logical clocks, Paxos ballots from timestamps,
+  leases, TSOs): turn on `.faults.clock_skew` (one node's realtime clock skewed for a while),
+  with `clock_skew_ms_max` below their documented maximum offset when their safety assumes
+  one (YugabyteDB's, CockroachDB's 500 ms): past it they stop nodes or lose safety by design.
 - Give each profile an `explain` command when the system can turn its logs up at runtime
   (`profile.explain = "det-nodes exec <node> <set the log level>"`, ones restarts keep too):
   causality runs it in futures inside a failure's jump, and their logs show the mechanism
