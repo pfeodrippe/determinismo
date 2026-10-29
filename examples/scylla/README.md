@@ -59,7 +59,10 @@ the drivers may never read a key again). Faults: the default ones (pauses, parti
 throttling), process kills, restarts and graceful stops.
 
 Profiles: `default`, Jepsen's nemeses (process kills and restarts, graceful stops: Scylla's own
-supervision starts a killed Scylla again); `power-loss`, power losses too.
+supervision starts a killed Scylla again); `power-loss`, power losses too; `current` (2026-10-29),
+ScyllaDB 2026.3.4, the latest release (topology and schema through Raft, tablets), with power
+losses, Jepsen's configuration as for 4.2.rc3 (first smoke next). Every profile skews the
+nodes' clocks too (`clock_skew`): LWT ballots come from them.
 
 ## Making it run
 

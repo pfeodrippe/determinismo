@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# ScyllaDB 2026.3.4, the latest release (the `current` profile): topology and schema through
+# Raft, tablets; started by start.sh with Jepsen's configuration, as 4.2.rc3 is.
+FROM docker.io/scylladb/scylla:2026.3.4
+COPY examples/scylla/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+ENTRYPOINT ["/usr/local/bin/start.sh"]

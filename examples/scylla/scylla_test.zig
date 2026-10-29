@@ -59,10 +59,16 @@ pub fn main(init: std.process.Init) !void {
 /// `power-loss`: power losses too. Under them a node can stay down for good: after one in the
 /// middle of an sstable deletion, its pending_delete log read back as zeros and every start
 /// after failed replaying it (an open question: docs/PLAN.md).
+/// `current`: ScyllaDB 2026.3.4, the latest release (topology and schema through Raft, tablets),
+/// with power losses: whatever it does wrong is new.
 fn describe(d: *System.Describe) !void {
-    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/scylla/Dockerfile" };
-    inline for (.{ .{ "default", false }, .{ "power-loss", true } }) |entry| {
+    inline for (.{
+        .{ "default", false, "examples/scylla/Dockerfile" },
+        .{ "power-loss", true, "examples/scylla/Dockerfile" },
+        .{ "current", true, "examples/scylla/Dockerfile.2026.3" },
+    }) |entry| {
         const profile = try d.profile(entry[0]);
+        const build: sdk.schema.Build = .{ .context = ".", .dockerfile = entry[2] };
         inline for (node_names) |name| {
             profile.node(@field(System.Name, name), .{
                 .build = build,
