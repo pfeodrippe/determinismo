@@ -61,17 +61,17 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
-- jank's nREPL server (the user's ask, 2026-10-29): jank (Clojure on LLVM, 0.1 from its own
-  repository, as examples/tetris installs it) serves nREPL; drive it as examples/nrepl drives
-  nrepl/nrepl, the same bencode client (examples/nrepl/client.zig) and properties (an
-  evaluation returns its value; a session's `*1` is its own while others evaluate; every answered
-  request ends `done`; an interrupted evaluation ends interrupted or done; after faults a new
-  session evaluates), and jank's own: definitions seen across sessions, `load-file`, completions
-  and `describe`, an evaluation's error answered rather than crashing the server (jank 0.1
-  segfaulted on uncaught errors and on `sort` of an empty collection in the Tetris work), many
-  sessions and long evaluations at once. Concurrent clients, process kills and pauses, restarts;
-  a jank segfault is a crash the platform reports with its core dump. In progress: its server's
-  command and ops, then examples/jank-nrepl.
+- jank's nREPL server (the user's ask, 2026-10-29): examples/nrepl's profile and scenario
+  `jank` (Dockerfile.jank: jank 0.1 from its own repository, `jank repl --port` behind socat,
+  its pre-compiled header built in the image). The same client and drivers as nrepl/nrepl, and
+  new ones for both: errors answered and the session going on, definitions (values, and
+  functions JIT-compiled while other sessions call) read, completed and looked up in another
+  session, a session keeping its namespace, nothing after a request's `done`. Probing while
+  writing it found two evaluations that kill the whole server (integer `/` by zero, SIGFPE, the
+  known jank#629 regression's consequence; a stack overflow, SIGSEGV, even in `try`), wrong
+  out-of-range casts, sessions keeping no namespace, `completions`/`lookup` needing `ns`
+  (README.md). First smoke (run 217) passed but for the namespace, at 10 virtual seconds a
+  wall second; a 1 h hunt is queued after the Raft pair.
 
 - Smokes of the new systems (2026-10-29, late): ClickHouse Keeper and Ignite pass; rqlite's
   image failed to build (`chmod` as the image's own user: `COPY --chmod` now); SurrealDB never
@@ -122,7 +122,10 @@ event hashing, the guest module.
   transaction stays open and the last stable offset stuck. Causality's explanation futures (the
   profile's `explain` command, the `tx` logger at trace inside the jump) showed it; one of
   them is its own control (partitions with new transactions after the restart sweep, the one
-  without never does). Present in `dev`; recorded in examples/kafka's README.
+  without never does). Present in `dev`; recorded in examples/kafka's README. Next: the
+  intervention (a new transaction on the stuck partition after the restart arms the timer, and
+  the open transaction then expires) on a timeline of the queued Redpanda hunt, since run 177's
+  tapes are of the build before the timeline limit and no longer replay.
 
 - The Elle service ran every request on its HTTP server's one thread: a long check kept
   `/version` from answering within 2 s, and the next check replaced the service (`podman rm

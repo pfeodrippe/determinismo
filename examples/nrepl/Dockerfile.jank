@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# jank 0.1 (Clojure on LLVM, from jank's own repository) serving nREPL: `jank repl --port`, its
+# terminal client reading a pipe that never ends. It binds 127.0.0.1 only (no option for
+# another address), so socat serves the node's port 7888 on to it, once jank says it started
+# (the node is ready when 7888 answers).
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      ca-certificates curl gnupg socat \
+ && curl -fsS https://ppa.jank-lang.org/KEY.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/jank.gpg \
+ && echo "deb [signed-by=/etc/apt/trusted.gpg.d/jank.gpg] https://ppa.jank-lang.org noble main" \
+      > /etc/apt/sources.list.d/jank.list \
+ && apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q jank \
+ && rm -rf /var/lib/apt/lists/*
+ENV HOME=/root
+WORKDIR /tmp
+# jank's pre-compiled header (/root/.cache/jank), built on its first run: 10 s of every boot
+# otherwise.
+RUN echo '(println :ready)' > /tmp/warm.jank && jank run /tmp/warm.jank && rm /tmp/warm.jank
+ENTRYPOINT ["sh", "-c", "sleep infinity | jank repl --port 17888 2>&1 | tee /tmp/repl.log & until grep -q 'nREPL server started' /tmp/repl.log 2>/dev/null; do sleep 0.2; done; exec socat TCP-LISTEN:7888,fork,reuseaddr TCP:127.0.0.1:17888"]

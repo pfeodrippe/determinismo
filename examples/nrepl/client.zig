@@ -14,6 +14,9 @@ pub const Client = struct {
     next_id: u32 = 0,
     /// How long a read waits (virtual time) before the server counts as not answering.
     timeout_ms: u32 = 5000,
+    /// The last request whose "done" came: "done" means no more messages for it (nREPL's ops
+    /// reference), so one after is a property's violation.
+    done_id: []const u8 = "",
 
     pub fn init() Client {
         return .{ .arena_state = .init(std.heap.page_allocator) };
@@ -62,9 +65,12 @@ pub const Client = struct {
         var reply = Reply{};
         var out: std.ArrayList(u8) = .empty;
         var err: std.ArrayList(u8) = .empty;
+        // A message for the request done before this one (asserted once, at this one's end).
+        var late: ?bencode.Value = null;
         for (0..4096) |_| {
             const message = try bencode.read(arena, &client.connection);
             const for_id = message.string("id") orelse continue;
+            if (std.mem.eql(u8, for_id, client.done_id)) late = message;
             if (!std.mem.eql(u8, for_id, id)) continue;
             if (message.string("value")) |value| reply.value = value;
             if (message.string("new-session")) |session| reply.new_session = session;
@@ -75,6 +81,11 @@ pub const Client = struct {
             if (message.status_has("interrupted")) reply.interrupted = true;
             if (message.status_has("eval-error")) reply.eval_error = true;
             if (message.status_has("done")) {
+                sdk.always(late == null, "nothing answers a request after its done", .{
+                    .id = client.done_id,
+                    .fields = if (late) |message_late| message_late.dictionary.len else 0,
+                });
+                client.done_id = id;
                 reply.done = true;
                 reply.last = message;
                 reply.out = out.items;
