@@ -60,7 +60,6 @@ event hashing, the guest module.
   written but not run yet; long-term archive later (QUESTIONS.md).
 - e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
   (Playwright, tests/ui) and `-Donly=until` (causality's new output).
-- UI: a minimap for thousands of timelines.
 - Kafka (2026-10-28): the hunts hardly ran the workload. Run 56 committed in 9 of 508
   timelines and passed (a sometimes needs one): brokers killed every two seconds never came
   back. KAFKA-17754 had no way in either (it needs an EndTxn delayed on its way to the
@@ -75,8 +74,13 @@ event hashing, the guest module.
   shutdown leaves a zero-filled time index; retention deleted 30 committed transactions).
   Hunt run 67 (default, seed 17): commits in 50 of its first 87 timelines; Elle's failures
   were G0 alone (Jepsen's known Kafka behavior), now `allowed` in the check and reported apart.
-  The `coverage` profile (Java 25, the agent on the transaction path) hunts next on the same
-  seed and budget, for comparison. Rust SDK coverage lines: its coverage.c has the C SDK's
+  The `coverage` profile (Java 25, the agent on the transaction path) hunted next on the same
+  seed and budget (run 68): in its timeline 125 a transaction hung for good, KAFKA-18137 met
+  blind (fixed in 4.0.0; a coordinator elected and resigned at different epochs as it
+  restarted installed an empty load and gave the transactional id a new producer id). Next:
+  the `kafka-4.4-coverage` profile (Kafka 4.4.0, the latest release, transactions v2, the
+  coverage agent; `kafka-4.4` without), whose bugs would
+  be new. Rust SDK coverage lines: its coverage.c has the C SDK's
   lookup, copied (a packaged crate cannot include sdk/c); a Rust maze in
   tests/antithesis-compat/rust (release builds need `debug = true`, `strip = false`).
 - A false data loss, a platform bug (2026-10-28): a durable crash with two threads at
@@ -104,11 +108,25 @@ event hashing, the guest module.
   pool's `memory-priority` shared): held back always, it would have kept holders from being
   made (run 67 made none in 180 of its 207 timelines, at 15 GB available of the 16 they want,
   and replayed its returns' nodes instead, minutes each, while most workers waited); branch lines show `memory_wait=` when a VM waited for memory,
-  and the parallel check skips, saying so, when its VMs mostly waited.
+  and the parallel check skips, saying so, when its VMs mostly waited. The other way round
+  too (2026-10-28): the sessions had a CPU cap and no memory cap. They run with
+  `MemoryMax=24G` now, and determinismo admits VMs and makes holders by its cgroup's limit
+  (total and available the lesser of the host's and the limit's; the reserve an eighth of a
+  smaller limit), so a check never grows into the hunt's memory. Their e2e scratch is on disk
+  (`~/.cache/determinismo-e2e`), not in /tmp's tmpfs, where failed checks' files had held
+  16 GB of memory.
 - verify: a replay that could not start said "replayed nothing" (the 17:05 hyperthreads
   experiment: 64 refused, TapeInputsDiffer, its script missing serve's --cpu-modulation and
   pin). It prints how the replay ended now, and `verify --run <dir>` takes a run's options as
-  serve's replays do.
+  serve's replays do; `--timeline <n>` replays the ones named (MCP: `verify`).
+- A divergence under investigation (2026-10-28): Kafka run 68's timeline 98 ("the fault
+  injector never stalls": a 34 s stall) does not replay; two fresh replays part from its tape at
+  the same checkpoint (event 334,144), 10 s after its branch point (from timeline 30 at
+  1,375.86 s), while kafka-1 recovers its logs after a power loss. Its generation's nodes were
+  all made from in-memory holders; a replay makes its node by replaying from the start. Queued:
+  12 of run 68's timelines replayed (`verify`), and a 32-timeline Kafka run checking every
+  holder's node against a replay's (`--verify-holders`); then timeline 98 replayed again with
+  the divergence report (its last 64 events, to compare with the run's).
 - srv3 (2026-10-28, day), found and fixed:
   - Language properties (a Go panic, ...) failed timelines but no run's properties, stats, UI or
     queries showed them (Dgraph run 31: 159 timelines failing "no panics (Go)", every property
@@ -282,7 +300,53 @@ event hashing, the guest module.
 - Correlated power losses (2026-10-28): `outage`, several nodes losing power at once (all, or
   a group of two or more), beside one node's crash. Galera's run 58 could not lose a committed
   transaction without it: Jepsen's loss needs the nodes to crash together. Galera's hunt again
-  with it next.
+  with it next. Kill outages too (2026-10-28), for nodes that allow restarts but not power
+  losses: YugabyteDB's hunt (run 77) had no outage at all, and Jepsen's #2125 came from every
+  master killed together.
+- Known crashes (2026-10-28): a node may declare processes whose crashes the system is known to
+  have (`crashes_known`): such a crash is counted ("a process crash the system is known to
+  have: <name>", a sometimes), not failed. YugabyteDB 1.3.1's YSQL backends crash on their way
+  out in every timeline, so run 77's 31 timelines were all "failing" and the count said
+  nothing; another process's crash still fails (e2e `properties`). Known exits too
+  (2026-10-29, `exits_known`): an exit whose node's last output holds a declared text (ZooKeeper's
+  "No snapshot found, but there are log entries", ZOOKEEPER-3220) is counted, not failed.
+- New systems (2026-10-28), smokes queued on srv3, hunts after: ZooKeeper 3.9.6
+  (examples/zookeeper: list-append in multis through kazoo, Elle; `known` profile 3.9.1, before
+  ZOOKEEPER-4785's fix, for blind rediscovery), OpenSearch 3.9.0 (examples/opensearch:
+  list-append on documents with optimistic concurrency, Elle; never Jepsen-tested under its
+  name), Redpanda v26.2.6 (kafka-test's `redpanda` profile: Kafka's protocol, the same client and
+  checks), Kafka 4.4.0 (kafka-test's `kafka-4.4` and `kafka-4.4-coverage` profiles).
+- Writeback windows (2026-10-29, the user's choice): the guest writes nothing back unasked, so a
+  power loss drops every write never synced, however old (Antithesis keeps "durably synced
+  filesystem changes" too). Strict stays the default; a node may declare `writeback_s` (its disk
+  synced that often by `det-nodes writeback`, as a host's flusher), for systems that leave their
+  own metadata to writeback and were bricked at any age: RabbitMQ (feature flags, Mnesia's
+  tables), ZooKeeper (its snapshots, never synced: ZOOKEEPER-3220), OpenSearch (its keystore).
+  30 s each. e2e `disk`: a node with a window keeps across a crash what it wrote before it.
+- Checks beside a hunt (2026-10-29): the cgroup-aware memory (memory_total the unit's limit)
+  made claim_fits compare every run's VM claims on the host with a session's 24 GB: a check's VM
+  never fit while a hunt ran (the coverage check sat through YugabyteDB's hunt, the tapes check
+  through Galera's). Claims go against the host's memory again; the cgroup bounds what is
+  available. And a session waiting for memory says so (after 30 s, then every 5 minutes).
+- Scripts (2026-10-29): a scripted timeline dropped every fault on the runner's links (the
+  runner is no node of the system's: run_script took it for gone). Found by the e2e script
+  check's new condition, its own timeline following the script's commands and faults in order
+  (it had required the same failure: a coin flip, the seed deciding the drivers' draws).
+- Findings (2026-10-29): Kafka 4.4.0's KAFKA-20734 in its first smoke (a known blocker,
+  unreleased fix; counted apart since); Galera 26.4.24's abort on an uncaught std::out_of_range
+  in `gcomm::evs::Proto::populate_node_list` in three timelines of hunt run 97 (not in public
+  trackers, unchanged through 26.4.27; examples/galera); ZOOKEEPER-3220 (snapshots never
+  synced) in ZooKeeper's first smokes.
+- Output floods (2026-10-29): Redpanda's controller looped on an exception and wrote 4 GB of
+  events in one timeline (run 83; its page slow while serve took them in; the node's log file in
+  guest memory). The guest's output forwarder keeps 8 MB and then 200 MB an hour of virtual time
+  per node start or command (the logging property's rate), drops the rest and says so
+  (`output_dropped`, counted by the property). serve now shows the logging property as the
+  explorer judges it (it listed it passing: run-level, no failing timeline).
+- Node disks are memory (2026-10-28): YugabyteDB's WAL preallocates each tablet's next 64 MB
+  segment whole and keeps its segments 300 s; run 77 ended 7 of 64 timelines in OOM kills
+  (processes of ~100 MB killed). 4 MB segments since. A system's disk use is VM memory: size
+  segments, logs and retention for it.
 - RabbitMQ 4.1.4 (2026-10-28, examples/rabbitmq): a quorum queue under Jepsen's queue checks
   (confirmed messages dequeued, no phantoms, no refused ones), power losses at durability
   points among the faults. Its first two timelines found, blind, a node that never boots again
@@ -365,8 +429,8 @@ event hashing, the guest module.
 4. **The UI.** Done: stat cards, discovery and failing-property charts, the multiverse tree with
    shared prefixes, branch points and forks, zoom and pan, live updates, styled tooltips, logs
    with the parents' events, Clojure notebooks (babashka) with a per-run nREPL server, fork
-   from a moment, time budgets, strategy uploads. Left: a minimap for runs of thousands of
-   timelines.
+   from a moment, time budgets, strategy uploads, and a minimap for big runs (checked on etcd
+   run 64's 4,325 timelines, 2026-10-28: drawn whole, zoomed, moved from the minimap).
 5. **clojure-cli.repl**: examples/clojure-cli-repl, its server beside plain nREPL 1.7.0. Found
    (README): an editor evaluation hangs while a watching terminal does not read (over ~100 KB
    of output); closed sessions are kept; one inspector view for all terminals. Left: rerun the
@@ -579,7 +643,9 @@ places, and assertions carry no location.
   timelines to finish; cores 100% busy, 2026-10-27).
 - One host, many runs (cpus.zig): one CPU pool for every run, a core's first thread only
   (hyperthreads off again since 2026-10-28: a Kafka hunt with them replayed 7 of 9 checked
-  timelines; the experiment to find what a sibling perturbs is queued, `verify --run`); memory
+  timelines; the experiment, 2026-10-29: Kafka run 56's 64 sampled timelines replayed 32 at once with
+  hyperthreads on, 38 replayed, 26 parted from their tapes at various events with no clock
+  hazard counted; the control, the same with them off, is queued); memory
   admission by claims and by what is available now, the sessions' room held back while one of
   their VMs waits.
 - Busy guests: about 0.85-1x virtual per wall second now (0.3-0.6 before the exit work of
@@ -596,8 +662,8 @@ places, and assertions carry no location.
   from there as a holder would; a timeline's files go with its holders. `--holders-on-disk`
   puts every holder there (the e2e tree check verifies each such node against a replay's).
   Next: measure a Kafka hunt with them (timelines per hour, workers busy).
-- Setup is one core before branches fan out: start branch workers as soon as the snapshot exists,
-  and run independent e2e checks concurrently.
+- Setup is one core before branches fan out: measured, not worth it (YugabyteDB's run 77: boot
+  and setup 13.6 s of a 2 h hunt, 0.2%).
 
 ## Later
 
