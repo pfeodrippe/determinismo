@@ -54,12 +54,19 @@ n2 restored `9d42` at 397.8 s, formed `(d6e45c20-9d42, 26)` with n3, lost power 
 after its restore), restored `9d42` again, formed a view of its own with the same id, and aborted
 at 407.93 s on n3's join (its input map of one).
 
-Shown by changing the timeline: a replay of timeline 3 to 44.1 s (between n1's restore and its
-power loss) that runs `sync -f /var/lib/mysql` in n1 there and goes on with the timeline's
-randomness ends with no crash at all; the same replay running `true` there fails "no process
-crashes: mariadbd". (`determinismo runs exec`, or serve's `POST /runs/97/replay {"branch": 3,
-"at_vtime_ms": 44100, "exec": "det-nodes exec n1 sync -f /var/lib/mysql", "continue": true}`.)
-Two fixes, either enough here: fsync gvwstate.dat's directory after the rename (a restart's
+What the logs show, in both timelines: an incarnation restored twice, two different views with
+one id, and (timeline 3) n3's warning `Message from node that claims to come from same view but
+is not in current view` 27 ms before n2's abort. Changing the timeline was less conclusive. A
+replay of timeline 3 that runs `sync -f /var/lib/mysql` in n1 at 44.1 s (between its restore
+and its power loss) and goes on with the timeline's randomness ends with no crash; the same
+replay running `true` there instead takes another course (any command shifts the timing) and
+fails on another crash, a general protection fault in libc at 164.8 s, not the abort. Futures
+forked at 44.1 s with their own randomness (`explore --from-branch 3 --from-vtime-ms 44100
+--from-exec ...`, 32 each, to 100 s): 0 aborts after the sync, 2 after a sync of /proc (the same
+command, nothing made durable); in both, n1 or n3 restored an incarnation twice again after a
+later restart (21 of 28 and 30 of 32 futures), since every restart writes the file again
+unsynced. Consistent with the cause, not proof of it (p ≈ 0.25); a Galera built with the
+directory fsync would be. Two fixes, either enough here: fsync gvwstate.dat's directory after the rename (a restart's
 incarnation then never repeats), and have `populate_node_list` (like line 954) skip a node without
 an index rather than read the input map with -1. The function is unchanged on Galera's 4.x branch, through
 26.4.27, and neither fix is on Galera's 4.x heads (codership, mariadb-corporation). Not in MariaDB's
