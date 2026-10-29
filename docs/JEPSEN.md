@@ -100,6 +100,7 @@ Systems Jepsen never analyzed (or not in a decade), under the same workloads and
 | Apache Cassandra | 5.0.9: Jepsen's Scylla LWT list-append, final reads at SERIAL; 6.0-alpha2: Accord transactions (`accord` profile and scenario) | examples/cassandra: smokes |
 | ClickHouse Keeper | 26.9.27.3 as the ZooKeeper workload's servers (`keeper` profile) | examples/zookeeper: smoke |
 | Apache Ignite 3 | 3.1.0: list-append over read-write (serializable) and read-only transactions, through the Java client; `power-loss` profile (Raft logs synced) | examples/ignite: smoke |
+| SurrealDB | 3.3.5 on TiKV v8.5.8: list-append transactions over its HTTP API, snapshot isolation (its documented level) | examples/surrealdb: smoke |
 | rqlite | 10.6.6: list-append transactions through the unified endpoint, linearizable reads; `snapshots` profile | examples/rqlite: smoke |
 | MySQL Group Replication | 26.10.0, single primary: Jepsen's MySQL list-append | examples/mysql-gr: smokes passed, hunt queued |
 | Patroni | 4.1.0 with etcd, synchronous_mode | examples/patroni: run 189, 444 timelines, no loss |
