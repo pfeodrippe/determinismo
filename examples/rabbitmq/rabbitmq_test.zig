@@ -54,9 +54,10 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-/// `default`: each broker's feature_flags file synced as it changes (the finding in the README
-/// otherwise bricks the cluster in nearly every timeline); `flags-unsynced`: as RabbitMQ leaves
-/// it, that finding's profile.
+/// `default`: the brokers' disks with a host's 30 s writeback window (schema.Node.writeback_s):
+/// RabbitMQ leaves its feature flags file and Mnesia's tables to writeback, and the guest's
+/// strict model (nothing written back unasked) bricked nodes after power losses at any age
+/// (README). `flags-unsynced`: strict, the feature flags finding's profile.
 fn describe(d: *System.Describe) !void {
     inline for (.{ "default", "flags-unsynced" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
@@ -64,14 +65,15 @@ fn describe(d: *System.Describe) !void {
 }
 
 fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
-    const flags = if (comptime std.mem.eql(u8, profile_name, "flags-unsynced")) profile_name else "flags-synced";
+    const strict = comptime std.mem.eql(u8, profile_name, "flags-unsynced");
     const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/rabbitmq/Dockerfile" };
     inline for (.{ "rabbit-1", "rabbit-2", "rabbit-3" }, 1..) |name, id| {
         profile.node(@field(System.Name, name), .{
             .build = build,
-            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}), flags },
+            .command = &.{ "broker", std.fmt.comptimePrint("{d}", .{id}) },
             .ready = .{ .tcp = amqp_port },
             .faults = .{ .restart = true, .crash = true, .stop = true },
+            .writeback_s = if (strict) null else 30,
         });
     }
     profile.node(.rclient, .{

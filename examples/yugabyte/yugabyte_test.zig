@@ -70,6 +70,9 @@ fn describe(d: *System.Describe) !void {
                 .process_kill = true,
                 .process_kill_names = &.{ "yb-master", "yb-tserver" },
             },
+            // 1.3.1's YSQL backends segfault on their way out (README: Observed), in every
+            // timeline: counted, so a run's failing timelines say something again.
+            .crashes_known = &.{"postgres"},
         });
     }
 }

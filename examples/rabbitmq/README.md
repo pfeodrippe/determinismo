@@ -25,11 +25,13 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 
 ## Profiles
 
-- `default`: each broker's feature_flags file synced within a second of each change (start.sh
-  keeps a loop for it): the finding below would otherwise brick the cluster in nearly every
-  timeline (the guest writes nothing back unasked) and hide the rest. The second smoke (run
-  76, four timelines) lost all three brokers to it in two, by 30 s.
-- `flags-unsynced`: the file as RabbitMQ leaves it, the finding's profile.
+- `default`: the brokers' disks with a 30 s writeback window (`writeback_s = 30`: synced that
+  often, as a host's flusher writes dirty data back): RabbitMQ leaves its feature flags file and
+  Mnesia's tables to writeback, and the guest's strict model (nothing written back unasked, as
+  Antithesis keeps only "durably synced filesystem changes") bricked nodes after power losses at
+  any age, hiding the rest: the second smoke (run 76, four timelines) lost all three brokers in
+  two, by 30 s. A power loss within 30 s of a write still loses it, as on a real host.
+- `flags-unsynced`: strict (no window), the feature flags finding's profile.
 
 ## The workload and its properties
 
@@ -84,6 +86,24 @@ synced copy, renamed). The feature flags file has neither, in 4.1.4 and on main 
 2026-10-28). Not found in rabbitmq-server's issues (searched: the error, the file, empty,
 truncated, power). The same can follow any rewrite of the file (enabling a feature flag) on a
 file system without ext4's replace-by-truncate heuristic.
+
+### Observed: Mnesia unable to recover after a power loss soon after setup (not investigated)
+
+The default profile's smoke (run 79, srv3, 2026-10-29, feature flags synced) failed "no
+unexpected container exits" in 2 of 4 timelines. Timeline 0: rabbit-1 lost power at 13.26 s
+(setup ended at 12.61 s, the cluster formed a few seconds before), and restarted at 13.47 s;
+its dets files were repaired ("not properly closed"), Mnesia stopped and started again at
+21.6 s, and at 25.5 s `** FATAL ** mnesia_controller crashed: {{{aborted, {no_exists,
+rabbit_node_maintenance_states}}}` (in `mnesia_controller:node_has_tabs/3`, from
+`update_whereabouts`, loading by force): its peers told it of a table its own schema had lost
+(`schema.DAT` repaired, the table's creation never synced). Then `failed_waiting_for_tables ...
+{node_not_running,'rabbit@rabbit-1'}`: the node exited at 31.7 s and boots no more. The power loss came within a real host's writeback window of the
+cluster's formation, so this can happen outside determinismo too; the guest's writes never
+written back unasked made it possible at any age: the default profile has a 30 s writeback
+window since.
+Not in rabbitmq-server's issues (searched: the abort, `failed_waiting_for_tables` with
+`node_not_running`, the repair message); its Discussions not searched. Mnesia's, under RabbitMQ:
+Khepri, RabbitMQ's replacement for it, is the next thing to run here.
 
 ## Status
 

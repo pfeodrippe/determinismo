@@ -5,7 +5,6 @@
 # start one after another, so every node's one peer is rabbit-1, which forms the cluster: the
 # others join it. Discovery dials every peer listed, and peers not started yet held a node in
 # it past its readiness wait (60 s). Its data in /var/lib/rabbitmq (the node's disk).
-# start.sh broker <id> flags-unsynced: RabbitMQ's feature_flags file as RabbitMQ leaves it.
 # start.sh client: the client node on port 7000.
 set -e
 case "$1" in
@@ -25,19 +24,6 @@ CONF
   chmod 600 /var/lib/rabbitmq/.erlang.cookie
   chown -R rabbitmq:rabbitmq /var/lib/rabbitmq 2>/dev/null || true
   export RABBITMQ_NODENAME=rabbit@rabbit-$id HOME=/var/lib/rabbitmq
-  # RabbitMQ writes its feature_flags file without syncing it, and a power loss before the
-  # kernel writes it back leaves it empty: the node never boots again (README: Findings). The
-  # guest writes nothing back unasked, so in nearly every timeline the cluster bricked itself
-  # and hid the rest. Unless asked to keep RabbitMQ's behavior (`flags-unsynced`), the file is
-  # synced within a second of each change, as a host's writeback would within 30 s.
-  if [ "${3:-flags-synced}" != "flags-unsynced" ]; then
-    flags=/var/lib/rabbitmq/mnesia/rabbit@rabbit-$id-feature_flags
-    (last=; while :; do
-       now=$(stat -c %Y.%s "$flags" 2>/dev/null) || now=
-       if [ -n "$now" ] && [ "$now" != "$last" ] && sync "$flags"; then last=$now; fi
-       sleep 1
-     done) &
-  fi
   # As the image's own entrypoint runs it: the rabbitmq user.
   exec gosu rabbitmq rabbitmq-server
   ;;
