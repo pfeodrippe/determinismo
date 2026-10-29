@@ -69,7 +69,9 @@ event hashing, the guest module.
   passed alone, the others to run alone too.
 - Hunts queued after Galera's run 196: MySQL Group Replication, Galera jepsen-recovered, RabbitMQ
   Khepri ra-synced, hyperthreads, OpenSearch and Redpanda again, ZooKeeper known, YugabyteDB
-  outages; smokes: Cassandra 5.0.9, its Accord scenario (6.0-alpha2), ClickHouse Keeper.
+  outages; smokes, one after another: Cassandra 5.0.9 (ready on its storage port since its first
+  smoke), its Accord scenario (6.0-alpha2), ClickHouse Keeper, rqlite (`snapshots`), Apache
+  Ignite 3.1, SurrealDB 3.3 on TiKV: new systems Jepsen never analyzed (docs/JEPSEN.md).
 
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running

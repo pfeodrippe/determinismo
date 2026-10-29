@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# A SurrealDB node: PD, TiKV and SurrealDB together (SurrealDB's HTTP API on 8000, its data in
+# TiKV through the local PD), each started again when it exits, as examples/tidb runs PD, TiKV
+# and TiDB. $SURREAL_NODE: n1, n2 or n3.
+node="$SURREAL_NODE"
+data=/var/lib/tidb
+mkdir -p "$data"
+endpoints=n1:2379,n2:2379,n3:2379
+again() {
+  while true; do
+    "$@"
+    echo "surreal-start: $1 exited with $?; starting it again" >&2
+    sleep 1
+  done
+}
+again /pd-server --name="pd-$node" --data-dir="$data/pd" --config=/etc/tidb/pd.toml \
+  --client-urls=http://0.0.0.0:2379 --peer-urls=http://0.0.0.0:2380 \
+  --advertise-client-urls="http://$node:2379" --advertise-peer-urls="http://$node:2380" \
+  --initial-cluster=pd-n1=http://n1:2380,pd-n2=http://n2:2380,pd-n3=http://n3:2380 &
+again /tikv-server --pd="$endpoints" --addr=0.0.0.0:20160 --advertise-addr="$node:20160" \
+  --data-dir="$data/tikv" --config=/etc/tidb/tikv.toml &
+again /surreal start --no-banner --bind 0.0.0.0:8000 --unauthenticated tikv://127.0.0.1:2379 &
+wait
