@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Apache Cassandra 6.0-alpha2 (the official image), Accord enabled: a node of three, start.sh
+# configures it (CASSANDRA_ACCORD=1).
+FROM docker.io/library/cassandra:6.0-alpha2
+COPY examples/cassandra/start.sh /usr/local/bin/cassandra-start
+ENV CASSANDRA_ACCORD=1
+ENTRYPOINT ["/usr/local/bin/cassandra-start"]

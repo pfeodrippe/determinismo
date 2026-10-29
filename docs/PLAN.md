@@ -333,7 +333,14 @@ event hashing, the guest module.
   Patroni 4.1.0 (examples/patroni, 2026-10-29): PostgreSQL 18.6 with etcd beside it on each of
   three nodes, synchronous_mode, Jepsen's list-append through the primary; smokes fixed a start
   deadlock (Patroni waits for an etcd quorum: nodes ready on etcd's peer port) and its unsynced
-  bootstrap pg_hba.conf (clients refused after an early power loss); first hunt queued.
+  bootstrap pg_hba.conf (clients refused after an early power loss); first hunt (run 189, 444
+  timelines): no loss; its one failure Patroni's documented default after an interrupted
+  pg_rewind (README). MySQL Group Replication 26.10.0 (examples/mysql-gr): single primary,
+  BEFORE_ON_PRIMARY_FAILOVER, a start script that rejoins or re-forms the group after a
+  complete outage as MySQL Shell does; smoke 4 of 4, hunt queued. Apache Cassandra 5.0.9
+  (examples/cassandra): the Scylla LWT workload (the CQL client a shared module now) with final
+  reads at SERIAL; and Cassandra 6.0-alpha2's Accord transactions (`accord` profile and
+  scenario: Elle's list-append across partitions in BEGIN TRANSACTION blocks).
 - Writeback windows (2026-10-29, the user's choice): the guest writes nothing back unasked, so a
   power loss drops every write never synced, however old (Antithesis keeps "durably synced
   filesystem changes" too). Strict stays the default; a node may declare `writeback_s` (its disk
