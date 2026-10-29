@@ -102,6 +102,7 @@ Systems Jepsen never analyzed (or not in a decade), under the same workloads and
 | Apache Ignite 3 | 3.1.0: list-append over read-write (serializable) and read-only transactions, through the Java client; `power-loss` profile (Raft logs synced) | examples/ignite: smoke |
 | SurrealDB | 3.3.5 on TiKV v8.5.8: list-append transactions over its HTTP API, snapshot isolation (its documented level) | examples/surrealdb: smoke |
 | Kafka share groups | 4.4.0 (KIP-932, queues for Kafka, production-ready since 4.2): an accepted record never delivered again, none lost (scenario `share`) | examples/kafka: smoke |
+| NATS atomic batches | 2.15.2 (ADR-50, since 2.12.0): batches stored whole or not at all, contiguous (scenario `batch`) | examples/nats: smoke |
 | rqlite | 10.6.6: list-append transactions through the unified endpoint, linearizable reads; `snapshots` profile | examples/rqlite: smoke |
 | MySQL Group Replication | 26.10.0, single primary: Jepsen's MySQL list-append | examples/mysql-gr: smokes passed, hunt queued |
 | Patroni | 4.1.0 with etcd, synchronous_mode | examples/patroni: run 189, 444 timelines, no loss |
