@@ -346,6 +346,12 @@ pub const Multiverse = struct {
             vm.events.hash.final(),          failing,
         }) catch {};
         if (branch.memory_wait_ns > 0) line.print(" memory_wait={d:.3}s", .{seconds(branch.memory_wait_ns)}) catch {};
+        // Where exact stops went less than exactly in this timeline: beside a replay that parts
+        // from it, what to suspect first.
+        if (state.overshoots + state.throttles + state.late_steps > 0) line.print(
+            " hazards: overshoots={d} throttles={d} late_steps={d}",
+            .{ state.overshoots, state.throttles, state.late_steps },
+        ) catch {};
         var failing_names: [64][]const u8 = undefined;
         var failing_count: u32 = 0;
         for (vm.events.properties[0..vm.events.property_count]) |*property| {
@@ -372,6 +378,14 @@ pub const Multiverse = struct {
             // What judges logging volume (logging_judge), for serve's properties too.
             .output_bytes = vm.events.output_bytes,
             .output_span_ns = vm.events.output_span_ns(state.tsc / tsc_per_ns),
+            // Its exact stops' troubles, to set beside a replay that parts from it (run 164's
+            // timeline 159 had no record of them).
+            .hazards = .{
+                .skid_max = state.skid_max,
+                .overshoots = state.overshoots,
+                .throttles = state.throttles,
+                .late_steps = state.late_steps,
+            },
         };
         record(.{ .branch = timeline });
         if (timelines_fd) |fd| line_write(fd, timeline);
