@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! `determinismo verify <explore options> --record <run.jsonl> --tape-dir <dir> [--sample <n>]
-//! [--jobs <n>]`, or `determinismo verify --run <a run's directory> [--sample <n>] [--jobs <n>]`
-//! (the explore options, record and tapes of a run serve made, as its replays take them):
-//! replays a sample of a run's timelines from their tapes, each its own explore
+//! [--timeline <n>]... [--jobs <n>]`, or `determinismo verify --run <a run's directory>
+//! [--sample <n>] [--timeline <n>]... [--jobs <n>]` (the explore options, record and tapes of a
+//! run serve made, as its replays take them): replays a sample of a run's timelines (or the
+//! ones named: a timeline under suspicion) from their tapes, each its own explore
 //! (taking CPUs from the pool, beside whatever else runs on the host: a hunt, other runs), and
 //! compares each history with the record's (its events hash). A timeline that does not replay
 //! is a determinism bug of determinismo's, found under real load: its replay's first difference
@@ -28,6 +29,9 @@ const Timeline = struct {
     /// When nothing was replayed: how the replay ended (its last lines), so that a replay that
     /// could not start says why instead of passing for a divergence.
     ended: []const u8 = "",
+    /// A divergence's report: the replay's last events before the checkpoint it failed (vm.zig's
+    /// recent_print), to compare with the run's events there.
+    recent: []const u8 = "",
 };
 
 /// The end of a replay's output kept when it replayed nothing.
@@ -53,6 +57,7 @@ pub fn run(
     var run_directory: ?[]const u8 = null;
     var sample: usize = sample_default;
     var jobs: usize = jobs_default;
+    var named: std.ArrayList(u32) = .empty;
     var rest: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index < arguments.len) : (index += 1) {
@@ -73,6 +78,9 @@ pub fn run(
         } else if (std.mem.eql(u8, flag, "--jobs") and value != null) {
             jobs = std.fmt.parseInt(usize, value.?, 10) catch return usage();
             index += 1;
+        } else if (std.mem.eql(u8, flag, "--timeline") and value != null) {
+            try named.append(arena, std.fmt.parseInt(u32, value.?, 10) catch return usage());
+            index += 1;
         } else try rest.append(arena, flag);
     }
     if (run_directory) |directory| {
@@ -91,9 +99,25 @@ pub fn run(
         std.debug.print("[determinismo] verify: {s} has no timeline with a tape in {s}\n", .{ record, tapes });
         return 2;
     }
-    // The same sample each time for one record: a pseudo-random choice, seeded by its size.
+    // The timelines named, or the same sample each time for one record: a pseudo-random choice,
+    // seeded by its size.
     var chosen = all;
-    if (all.len > sample) {
+    if (named.items.len > 0) {
+        var kept: usize = 0;
+        for (all) |timeline| {
+            const wanted = std.mem.indexOfScalar(u32, named.items, timeline.index) != null;
+            if (!wanted) continue;
+            all[kept] = timeline;
+            kept += 1;
+        }
+        if (kept < named.items.len) {
+            std.debug.print("[determinismo] verify: {d} of the {d} timelines named have no tape in {s}\n", .{
+                named.items.len - kept, named.items.len, tapes,
+            });
+            return 2;
+        }
+        chosen = all[0..kept];
+    } else if (all.len > sample) {
         var random: std.Random.DefaultPrng = .init(all.len);
         random.random().shuffle(Timeline, all);
         chosen = all[0..sample];
@@ -135,6 +159,7 @@ pub fn run(
             timeline.hazards,
         });
         if (timeline.ended.len > 0) std.debug.print("    {s}\n", .{timeline.ended});
+        if (timeline.recent.len > 0) std.debug.print("{s}", .{timeline.recent});
     }
     std.debug.print("[determinismo] verify: {d} of {d} timelines replayed\n", .{ chosen.len - failed, chosen.len });
     return if (failed > 0) 3 else 0;
@@ -142,8 +167,9 @@ pub fn run(
 
 fn usage() u8 {
     std.debug.print("usage: determinismo verify <explore options> --record <run.jsonl> " ++
-        "--tape-dir <dir> [--sample <n>] [--jobs <n>]\n" ++
-        "       determinismo verify --run <run directory> [--sample <n>] [--jobs <n>]\n", .{});
+        "--tape-dir <dir> [--sample <n>] [--timeline <n>]... [--jobs <n>]\n" ++
+        "       determinismo verify --run <run directory> [--sample <n>] [--timeline <n>]... " ++
+        "[--jobs <n>]\n", .{});
     return 2;
 }
 
@@ -224,9 +250,23 @@ fn replay(work: *Work, timeline: *Timeline) !void {
         .exited => |code| code,
         else => 255,
     };
+    var recent: std.ArrayList(u8) = .empty;
+    var in_recent = false;
     for ([_][]const u8{ result.stdout, result.stderr }) |output| {
         var lines = std.mem.tokenizeScalar(u8, output, '\n');
         while (lines.next()) |line| {
+            // The divergence report: its header, then one "[determinismo]   <seq> ..." an event.
+            if (std.mem.startsWith(u8, line, "[determinismo] its last ")) in_recent = true;
+            if (in_recent) {
+                const event = std.mem.startsWith(u8, line, "[determinismo]   ");
+                if (event or std.mem.startsWith(u8, line, "[determinismo] its last ")) {
+                    try recent.appendSlice(arena, "    ");
+                    try recent.appendSlice(arena, line["[determinismo] ".len..]);
+                    try recent.append(arena, '\n');
+                    continue;
+                }
+                in_recent = false;
+            }
             if (std.mem.startsWith(u8, line, "[branch ")) {
                 const key = "events_hash=";
                 const at = std.mem.indexOf(u8, line, key) orelse continue;
@@ -240,6 +280,7 @@ fn replay(work: *Work, timeline: *Timeline) !void {
             }
         }
     }
+    timeline.recent = recent.items;
     if (timeline.replayed_hash.len == 0) {
         const output = std.mem.trimEnd(u8, result.stderr, "\n");
         const tail = output[output.len -| ended_size_max..];

@@ -143,6 +143,11 @@ itrace_at: u64,
 strategy: ?*Strategy,
 tape_fd: ?linux.fd_t,
 overrides: ?*tape.Overrides,
+/// The last events emitted (their number, moment and start): a replay that diverges from its
+/// tape prints them, to compare with its timeline's own (the run's events hold those) without
+/// replaying again to keep its events. Host-side: never in a snapshot, never hashed.
+recent: [recent_max]Recent,
+recent_count: u64,
 
 pub const Options = struct {
     memory_size: u64,
@@ -452,6 +457,8 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .strategy = null,
         .tape_fd = null,
         .overrides = null,
+        .recent = undefined,
+        .recent_count = 0,
     };
     vm.events.init(options.events_parse_buffer, .{
         .log_fd = options.events_fd,
@@ -1265,6 +1272,7 @@ fn handle_request(vm: *VM, address: u32) !void {
             while (lines.next()) |line| {
                 vm.decision_note(line, source);
                 try vm.events.emit(moment_now, line);
+                vm.recent_note(moment_now, line);
                 vm.exec_background = std.mem.startsWith(u8, line, "{\"event\":\"exec_") and
                     std.mem.indexOf(u8, line, "\"background\":true") != null;
                 if (vm.faults_record_fd) |fd| if (std.mem.startsWith(u8, line, "{\"event\":\"fault\",")) {
@@ -1318,6 +1326,7 @@ fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
     if (vm.overrides) |overrides| overrides.check(now) catch |err| {
         const message = "[determinismo] replay diverged from its tape at event {d}\n";
         std.debug.print(message, .{now.events});
+        vm.recent_print();
         // What could have perturbed the guest's clock on the way (the KVM patch's counts).
         if (vm.det_state()) |state| {
             std.debug.print("[determinismo] its clock's hazards: {d} counter throttles restarted, " ++
@@ -1402,7 +1411,37 @@ fn decision_event(
     }) catch return;
     if (label) |decision| writer.print(",\"decision\":{s}", .{decision}) catch return;
     writer.writeAll("}}") catch return;
-    try vm.events.emit(try vm.moment(), writer.buffered());
+    const moment_now = try vm.moment();
+    try vm.events.emit(moment_now, writer.buffered());
+    vm.recent_note(moment_now, writer.buffered());
+}
+
+const recent_max = tape.checkpoint_interval;
+const recent_text_max = 120;
+const Recent = struct { sequence: u64, moment: Events.Moment, size: u8, text: [recent_text_max]u8 };
+
+fn recent_note(vm: *VM, at: Events.Moment, data: []const u8) void {
+    const slot = &vm.recent[vm.recent_count % recent_max];
+    vm.recent_count += 1;
+    const size = @min(data.len, recent_text_max);
+    slot.sequence = vm.events.count;
+    slot.moment = at;
+    slot.size = @intCast(size);
+    @memcpy(slot.text[0..size], data[0..size]);
+}
+
+/// The events since the last checkpoint (the window a divergence lies in), oldest first, as the
+/// run's events file has them: its "seq", "vtime_ns" and "branches", and the event's start.
+fn recent_print(vm: *const VM) void {
+    const count = @min(vm.recent_count, recent_max);
+    std.debug.print("[determinismo] its last {d} events (seq vtime_ns branches event), to compare " ++
+        "with its timeline's:\n", .{count});
+    for (vm.recent_count - count..vm.recent_count) |index| {
+        const event = &vm.recent[index % recent_max];
+        std.debug.print("[determinismo]   {d} {d} {d} {s}\n", .{
+            event.sequence, event.moment.vtime_ns, event.moment.branches, event.text[0..event.size],
+        });
+    }
 }
 
 fn trace(vm: *VM, comptime kind: []const u8, value: u64) !void {

@@ -444,5 +444,32 @@
         "mutants"
       ]
     }
+  },
+  {
+    "name": "verify",
+    "description": "Determinism check of a run: replays a sample of its timelines (or the ones named) from their tapes, each beside whatever else runs on the host, and compares each history with the run's record (its events hash). A timeline that does not replay is a determinism bug of determinismo's: its output says where the replay parted from its tape (the checkpoint, and the replay's last events before it, to compare with the run's events there).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run": {
+          "type": "string",
+          "description": "The run's directory (its record.jsonl, tapes/ and machine.json: a run serve made, ~/.determinismo/runs/<id>)"
+        },
+        "timelines": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The timelines to replay (all of them must have a tape); none: a sample"
+        },
+        "sample": {
+          "type": "integer",
+          "description": "How many timelines to sample when none are named (the same ones each time for one record)"
+        }
+      },
+      "required": [
+        "run"
+      ]
+    }
   }
 ]

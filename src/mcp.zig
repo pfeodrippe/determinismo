@@ -174,6 +174,17 @@ fn tool_call(
         };
         return out.written();
     }
+    // A run's timelines replayed from their tapes against its record (determinism).
+    if (eql(u8, name, "verify")) {
+        const Verify = struct { run: []const u8, timelines: []const u32 = &.{}, sample: ?u32 = null };
+        const asked = try std.json.parseFromValueLeaky(Verify, arena, value, .{ .ignore_unknown_fields = true });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ options.self, "verify", "--run", asked.run });
+        for (asked.timelines) |index| try argv.appendSlice(arena, &.{ "--timeline", try number(arena, index) });
+        if (asked.sample) |count| try argv.appendSlice(arena, &.{ "--sample", try number(arena, count) });
+        const result = try std.process.run(arena, io, .{ .argv = argv.items });
+        return result.stderr;
+    }
     const arguments = try std.json.parseFromValueLeaky(Arguments, arena, value, .{
         .ignore_unknown_fields = true,
     });

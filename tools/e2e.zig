@@ -250,9 +250,10 @@ fn check_tapes(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "bank-test" });
     const strategy = try std.fs.path.join(context.arena, &.{ context.bin, "det-strategy-mutate" });
     const tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "tapes" });
+    const record = try std.fs.path.join(context.arena, &.{ context.scratch, "tapes-record.jsonl" });
     const report = try explore(context, &.{
-        "--program",  program,  "--scenario", "bank", "--seed", "11", "--branches", "4",
-        "--strategy", strategy, "--tape-dir", tapes,
+        "--program",  program,  "--scenario", "bank", "--seed",   "11",   "--branches", "4",
+        "--strategy", strategy, "--tape-dir", tapes,  "--record", record,
     });
     var branches: [branches_max]Branch = undefined;
     const count = parse_branches(report, &branches);
@@ -289,6 +290,60 @@ fn check_tapes(context: *Context) !void {
         .{ "the replay did not diverge", std.mem.indexOf(u8, inside, "diverged") == null },
         .{ "one timeline ran to its end", parse_branches(inside, &looked) == 1 },
     }, "tapes: a command at a moment of a replay runs, and the replay goes on to the end", .{});
+    // A replay that parts from its tape names where, and the events since the last checkpoint
+    // (to compare with the timeline's own): here a tape whose first checkpoint was altered.
+    const cwd = std.Io.Dir.cwd();
+    const recorded = try cwd.readFileAlloc(context.io, tape, context.arena, .limited(1 << 26));
+    const marker = "\"events_hash\":\"";
+    const at = std.mem.indexOf(u8, recorded, marker) orelse {
+        expect(context, false, "tapes: its tape has a checkpoint to alter", .{});
+        return;
+    };
+    const altered = try context.arena.dupe(u8, recorded);
+    @memcpy(altered[at + marker.len ..][0..16], "0123456789abcdef");
+    const altered_path = try std.fs.path.join(context.arena, &.{ tapes, "altered.jsonl" });
+    try cwd.writeFile(context.io, .{ .sub_path = altered_path, .data = altered });
+    const parted = try explore(context, &.{ "--program", program, "--scenario", "bank", "--tape", altered_path });
+    expect_all(context, &.{
+        .{ "it diverged at the first checkpoint (event 64)", std.mem.indexOf(u8, parted, "replay diverged from its tape at event 64\n") != null },
+        // Since the setup's snapshot, where a replay starts (event 25 here), up to the checkpoint.
+        .{ "it printed the events since the last checkpoint", std.mem.indexOf(u8, parted, "events (seq vtime_ns branches event)") != null },
+        .{ "the 64th among them", std.mem.indexOf(u8, parted, "[determinismo]   64 ") != null },
+    }, "tapes: a replay that parts from its tape names where, and its last events", .{});
+    // `determinismo verify`: the timeline named replays as recorded; from the altered tape it
+    // does not, and says where, with the replay's last events.
+    const index = try std.fmt.allocPrint(context.arena, "{d}", .{last.index});
+    const verified = try verify(context, &.{
+        "--program", program, "--scenario", "bank", "--record", record, "--tape-dir", tapes, "--timeline", index,
+    });
+    const altered_tapes = try std.fs.path.join(context.arena, &.{ context.scratch, "tapes-altered" });
+    try cwd.createDirPath(context.io, altered_tapes);
+    try cwd.writeFile(context.io, .{
+        .sub_path = try std.fs.path.join(context.arena, &.{ altered_tapes, tape_name }),
+        .data = altered,
+    });
+    const unverified = try verify(context, &.{
+        "--program", program, "--scenario", "bank", "--record", record, "--tape-dir", altered_tapes, "--timeline", index,
+    });
+    const passed = try std.fmt.allocPrint(context.arena, "PASS timeline {d} replays", .{last.index});
+    const failed = try std.fmt.allocPrint(context.arena, "FAIL timeline {d} does not replay", .{last.index});
+    expect_all(context, &.{
+        .{ "the timeline named replays", std.mem.indexOf(u8, verified, passed) != null },
+        .{ "and only it", std.mem.indexOf(u8, verified, "verify: 1 of 1 timelines replayed") != null },
+        .{ "from the altered tape it does not", std.mem.indexOf(u8, unverified, failed) != null },
+        .{ "saying where", std.mem.indexOf(u8, unverified, "replay diverged from its tape at event 64") != null },
+        .{ "with its last events", std.mem.indexOf(u8, unverified, "events (seq vtime_ns branches event)") != null },
+    }, "tapes: verify replays the timeline named ({d}), and reports one that parts from its tape", .{last.index});
+}
+
+/// `determinismo verify` with the machine options, its output kept as explore's.
+fn verify(context: *Context, extra: []const []const u8) ![]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(context.arena, &.{ context.determinismo, "verify" });
+    try argv.appendSlice(context.arena, context.machine);
+    try argv.appendSlice(context.arena, extra);
+    const result = try run_kept(context, argv.items);
+    return std.mem.concat(context.arena, u8, &.{ result.stdout, result.stderr });
 }
 
 /// Coverage-guided exploration solves the maze (1 in 10000 timelines by chance): with coverage
@@ -3100,7 +3155,8 @@ fn explore(context: *Context, extra: []const []const u8) ![]const u8 {
     // directory of another run's).
     const refusal = std.mem.indexOf(u8, result.stderr, "recorded with") != null or
         std.mem.indexOf(u8, result.stderr, "is not after the snapshot") != null or
-        std.mem.indexOf(u8, result.stderr, "holds run") != null;
+        std.mem.indexOf(u8, result.stderr, "holds run") != null or
+        std.mem.indexOf(u8, result.stderr, "replay diverged from its tape") != null;
     if (status != 0 and status != 3 and !refusal) {
         std.debug.print("e2e: determinismo exited with {d}:\n{s}\n", .{ status, result.stderr });
     }
