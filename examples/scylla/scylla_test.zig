@@ -20,7 +20,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sdk = @import("determinismo");
-const Cql = @import("cql.zig");
+const Cql = @import("cql");
 
 const Nodes = struct { n1: sdk.Node, n2: sdk.Node, n3: sdk.Node, n4: sdk.Node, n5: sdk.Node };
 const System = sdk.System(Nodes);

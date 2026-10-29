@@ -85,6 +85,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // A CQL client (ScyllaDB, Cassandra).
+    const cql = b.createModule(.{
+        .root_source_file = b.path("examples/scylla/cql.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "determinismo", .module = sdk }},
+    });
+
     // An nREPL client, shared by the nREPL and clojure-cli.repl examples.
     const nrepl = b.createModule(.{
         .root_source_file = b.path("examples/nrepl/client.zig"),
@@ -129,6 +137,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "opensearch-test", .path = "examples/opensearch/opensearch_test.zig" },
         .{ .name = "tetris-test", .path = "examples/tetris/tetris_test.zig" },
         .{ .name = "scylla-test", .path = "examples/scylla/scylla_test.zig" },
+        .{ .name = "cassandra-test", .path = "examples/cassandra/cassandra_test.zig" },
         .{ .name = "yugabyte-test", .path = "examples/yugabyte/yugabyte_test.zig" },
         .{ .name = "dgraph-test", .path = "examples/dgraph/dgraph_test.zig" },
         .{ .name = "flecs-test", .path = "examples/flecs/flecs_test.zig" },
@@ -158,6 +167,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "nrepl", .module = nrepl },
                     .{ .name = "pg", .module = pg },
                     .{ .name = "sql_append", .module = sql_append },
+                    .{ .name = "cql", .module = cql },
                 },
             }),
         });
@@ -375,6 +385,7 @@ pub fn build(b: *std.Build) void {
             unit_tests.root_module.addImport("pg", pg);
             unit_tests.root_module.addImport("mysql", mysql);
         }
+        if (std.mem.eql(u8, root, "examples/scylla/scylla_test.zig")) unit_tests.root_module.addImport("cql", cql);
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
     const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{
