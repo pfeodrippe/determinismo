@@ -78,3 +78,6 @@ says what else made a server exit.
 - 2026-10-29, first hunt (run 178, 3.9.6, seed 1, tree): 490 timelines until its discovery
   plateaued (2 h 10 min), nothing failing; 16 of 16 replays the same. Next: the `known` profile
   (3.9.1, before ZOOKEEPER-4785's fix) for its blind rediscovery.
+- 2026-10-29: profile `keeper`, ClickHouse Keeper 26.9.27.3 (ClickHouse's ZooKeeper-compatible
+  coordination service, C++ on NuRaft) as the three servers, under the same client and checks
+  (Dockerfile.keeper, `start.sh keeper <id>`; ready once Raft listens on 9234). First smoke next.

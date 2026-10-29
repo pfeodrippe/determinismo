@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# ClickHouse Keeper 26.9.27.3 (ClickHouse's ZooKeeper-compatible coordination service, NuRaft):
+# the servers of the `keeper` profile, under the same client and checks. start.sh keeper <id>.
+FROM docker.io/clickhouse/clickhouse-keeper:26.9.27.3
+COPY examples/zookeeper/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+ENTRYPOINT ["/usr/local/bin/start.sh"]

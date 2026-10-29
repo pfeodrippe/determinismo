@@ -30,9 +30,39 @@ CONF
   # As the image's own entrypoint runs it: the zookeeper user, in the foreground.
   exec gosu zookeeper zkServer.sh start-foreground
   ;;
+keeper)
+  # ClickHouse Keeper, server <id> of zk-1..3 (Raft between them on 9234, clients on 2181; its
+  # log synced before a write is acknowledged, force_sync, its default).
+  id=$2
+  mkdir -p /etc/clickhouse-keeper /var/lib/clickhouse/coordination/log /var/lib/clickhouse/coordination/snapshots
+  cat > /etc/clickhouse-keeper/keeper_config.xml <<CONF
+<clickhouse>
+  <logger><level>information</level><console>1</console></logger>
+  <listen_host>0.0.0.0</listen_host>
+  <keeper_server>
+    <tcp_port>2181</tcp_port>
+    <server_id>$id</server_id>
+    <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+    <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+    <four_letter_word_white_list>srvr,ruok,mntr</four_letter_word_white_list>
+    <coordination_settings>
+      <operation_timeout_ms>10000</operation_timeout_ms>
+      <session_timeout_ms>30000</session_timeout_ms>
+      <raft_logs_level>information</raft_logs_level>
+    </coordination_settings>
+    <raft_configuration>
+      <server><id>1</id><hostname>zk-1</hostname><port>9234</port></server>
+      <server><id>2</id><hostname>zk-2</hostname><port>9234</port></server>
+      <server><id>3</id><hostname>zk-3</hostname><port>9234</port></server>
+    </raft_configuration>
+  </keeper_server>
+</clickhouse>
+CONF
+  exec clickhouse-keeper --config-file=/etc/clickhouse-keeper/keeper_config.xml
+  ;;
 client)
   exec python3 /opt/zclient/zclient.py 7000
   ;;
 esac
-echo "usage: start.sh server <id> | client" >&2
+echo "usage: start.sh server <id> | keeper <id> | client" >&2
 exit 2

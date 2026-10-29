@@ -32,6 +32,7 @@ const System = sdk.System(Nodes);
 
 const client_port = 7000;
 const zk_port = 2181;
+const keeper_raft_port = 9234;
 const servers = 3;
 const transactions_per_driver = 20;
 const mops_max = 4;
@@ -55,16 +56,18 @@ pub fn main(init: std.process.Init) !void {
 
 fn describe(d: *System.Describe) !void {
     inline for (.{
-        .{ "default", "examples/zookeeper/Dockerfile" },
-        .{ "known", "examples/zookeeper/Dockerfile.3.9.1" },
+        .{ "default", "examples/zookeeper/Dockerfile", "server", zk_port },
+        .{ "known", "examples/zookeeper/Dockerfile.3.9.1", "server", zk_port },
+        // ClickHouse Keeper's servers, ready once Raft listens (alone, before any quorum).
+        .{ "keeper", "examples/zookeeper/Dockerfile.keeper", "keeper", keeper_raft_port },
     }) |entry| {
         const profile = try d.profile(entry[0]);
         const build: sdk.schema.Build = .{ .context = ".", .dockerfile = entry[1] };
         inline for (.{ "zk-1", "zk-2", "zk-3" }, 1..) |name, id| {
             profile.node(@field(System.Name, name), .{
                 .build = build,
-                .command = &.{ "server", std.fmt.comptimePrint("{d}", .{id}) },
-                .ready = .{ .tcp = zk_port },
+                .command = &.{ entry[2], std.fmt.comptimePrint("{d}", .{id}) },
+                .ready = .{ .tcp = entry[3] },
                 .faults = .{ .restart = true, .crash = true, .stop = true },
                 // ZooKeeper syncs its transaction log but not its snapshots (takeSnapshot(false),
                 // the startup one too: ZOOKEEPER-3220, open): with nothing written back unasked, a
@@ -76,7 +79,8 @@ fn describe(d: *System.Describe) !void {
             });
         }
         profile.node(.zclient, .{
-            .build = build,
+            // The ZooKeeper image's (kazoo), whatever the servers.
+            .build = .{ .context = ".", .dockerfile = if (std.mem.eql(u8, entry[2], "keeper")) "examples/zookeeper/Dockerfile" else entry[1] },
             .command = &.{"client"},
             .ready = .{ .tcp = client_port },
             // The client library's node, as Jepsen's clients: its links to the servers faulted,
