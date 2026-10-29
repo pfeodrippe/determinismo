@@ -778,6 +778,8 @@ pub const RunRequest = struct {
     /// A tree's returns run this long past their moment, then stop (explore's --horizon), and
     /// its generations in flight (--pipeline).
     horizon: ?[]const u8 = null,
+    /// A tree's branches from each moment it returns to (explore's --return-branches).
+    return_branches: ?u32 = null,
     pipeline: ?u32 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
@@ -880,6 +882,9 @@ fn explore_arguments(
         try argv.appendSlice(server.arena, &.{ "--branching", branching });
     }
     if (asked.horizon) |horizon| try argv.appendSlice(server.arena, &.{ "--horizon", horizon });
+    if (asked.return_branches) |count| {
+        try argv.appendSlice(server.arena, &.{ "--return-branches", try print(server, "{d}", .{count}) });
+    }
     if (asked.pipeline) |depth| {
         try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });
     }

@@ -108,7 +108,10 @@ use them in other repositories.
   generation of 16 timelines, the ones that first reached something (an assertion outcome, a
   fault kind, a closer guidance distance, a new kind of output line) are returned to just after
   it, and new timelines branch from there. Each timeline's `why` says why it starts where it
-  does. `--branching flat` starts every timeline at the setup snapshot; strategies plan flat
+  does. A generation of 16 is 4 fresh starts and 3 moments with 4 branches each:
+  `--return-branches 2` makes it 6 moments with 2 (serve's `return_branches`), and `--horizon
+  60s` stops each returned branch a minute past its moment unless it found something new
+  (short branches, the promising ones extended). `--branching flat` starts every timeline at the setup snapshot; strategies plan flat
   unless asked for a tree (`--branching tree --strategy ... --tape-dir ...`).
 - Disk faults: a node that allows `crash` gets an ext4 disk of its own; a crash is a power loss
   (what it synced survives, the rest is lost; the journal keeps the filesystem consistent), a

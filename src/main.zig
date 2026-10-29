@@ -62,6 +62,8 @@ const usage =
     \\                            then, --branches at most)
     \\                            [--timeline <duration>]   (each timeline's drivers run that long
     \\                            in virtual time; part of the inputs)
+    \\                            [--return-branches <n>]   (a tree's branches from each moment it
+    \\                            returns to: 4; fewer branches, more moments a generation)
     \\                            [--horizon <duration>]   (a tree's returns run that long past
     \\                            their moment, then stop: short branches, extended when they
     \\                            find something; default: to the timeline's end)
@@ -230,6 +232,9 @@ const Arguments = struct {
     /// host, about 10 timelines ran at once), with more moments returned to.
     generation_size: u32 = tree.generation_base,
     generation_given: bool = false,
+    /// Branches from each moment a tree returns to (`--return-branches`): fewer branches, more
+    /// moments per generation.
+    return_branches: u32 = tree.children,
     /// A tree's branches returned to a moment run this long past it, then stop (`--horizon`):
     /// short branches, many of them, around the moments that mattered (Antithesis returns to
     /// decision points often; a branch is extended only when it found something). Null: to the
@@ -1075,6 +1080,8 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
             pipeline: ?u32 = null,
             archive: ?bool = null,
             horizon_ns: ?u64 = null,
+            /// Before --return-branches, every record's: 4.
+            return_branches: u32 = tree.children,
             queue: bool = false,
         } = null,
         branch: ?struct {
@@ -1101,11 +1108,12 @@ fn resume_read(context: Context, arguments: *const Arguments, inputs: u64) !*con
                 std.mem.eql(u8, run.branching orelse "", @tagName(arguments.branching)) and
                 (!tree_run or (run.generation == arguments.generation_size and
                     run.pipeline == arguments.pipeline and run.archive == arguments.archive and
-                    run.horizon_ns == arguments.horizon_ns and run.queue));
+                    run.horizon_ns == arguments.horizon_ns and
+                    run.return_branches == arguments.return_branches and run.queue));
             if (!same) {
                 std.debug.print("[determinismo] {s} is the record of another run (inputs {s}, " ++
                     "seed {s}, {s} branching; these: {s}, {s}, {s}; a tree's generation, " ++
-                    "pipeline, archive, horizon and queue too): start a new run\n", .{
+                    "pipeline, archive, horizon, return branches and queue too): start a new run\n", .{
                     path,                          run.inputs orelse "?", run.seed orelse "?",
                     run.branching orelse "?",      &hex16(inputs),        &hex16(arguments.seed),
                     @tagName(arguments.branching),
@@ -1336,6 +1344,7 @@ fn command_explore(
                 .pipeline = arguments.pipeline,
                 .archive = arguments.archive,
                 .horizon_ns = arguments.horizon_ns,
+                .return_branches = arguments.return_branches,
                 .jobs = jobs_count(arguments),
                 .strategy = arguments.strategy_command,
                 .branching = @tagName(arguments.branching),
@@ -2156,7 +2165,7 @@ const tree = struct {
     /// Timelines per generation by default, and the unit of `--generation`.
     const generation_base = 16;
     const generation_max = 256;
-    /// Branches from each moment returned to.
+    /// Branches from each moment returned to, by default (`--return-branches`).
     const children = 4;
 
     /// From the setup snapshot, in every generation after the first: a quarter.
@@ -2164,13 +2173,19 @@ const tree = struct {
         return size / 4;
     }
 
-    /// Moments returned to per generation.
-    fn nodes(size: u32) u32 {
-        return (size - roots(size)) / children;
+    /// Moments returned to per generation, `branches` from each.
+    fn nodes(size: u32, branches: u32) u32 {
+        assert(branches > 0);
+        return (size - roots(size)) / branches;
+    }
+
+    /// Whether each moment's branches fill a generation's returns exactly.
+    fn fits(size: u32, branches: u32) bool {
+        return branches > 0 and (size - roots(size)) % branches == 0;
     }
 
     comptime {
-        assert(roots(generation_base) + nodes(generation_base) * children == generation_base);
+        assert(roots(generation_base) + nodes(generation_base, children) * children == generation_base);
     }
 };
 
@@ -2185,6 +2200,11 @@ fn explore_tree(
     own_cpu.give(); // Its timelines and node makers take their own.
     const exploration = branches.exploration;
     const size = branches.arguments.generation_size;
+    if (!tree.fits(size, branches.arguments.return_branches)) {
+        std.debug.print("error: --return-branches {d} does not divide a generation of {d}'s " ++
+            "{d} returned timelines\n", .{ branches.arguments.return_branches, size, size - tree.roots(size) });
+        return error.Usage;
+    }
     // In-run snapshots (holders.zig): not with a strategy that decides within timelines (its
     // decisions replay from its tape, as holders do not); one that only chooses where the tree
     // returns ("decides":false) keeps them.
@@ -2237,6 +2257,7 @@ fn explore_tree(
         .base = seed_base(exploration),
         .total = branches.arguments.branches,
         .size = size,
+        .children = branches.arguments.return_branches,
         .pipeline = branches.arguments.pipeline,
         .archive = branches.arguments.archive,
         .setup = branches.snapshot,
@@ -2758,6 +2779,8 @@ const TreeState = struct {
     base: u64,
     total: u32,
     size: u32,
+    /// Branches from each moment returned to (`--return-branches`).
+    children: u32,
     /// Generations in flight (`--pipeline`).
     pipeline: u32,
     jobs: u32,
@@ -2975,7 +2998,7 @@ fn tree_judge(
     std.sort.insertion(Candidate, chosen, {}, candidate_before);
     const counts = Counts{ .reached = &reached, .visits = &state.visits };
     const plugin = exploration.strategy;
-    var returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, state.size, &state.planned);
+    var returns = try tree_returns(arena, plugin, generation, chosen, counts, &random, state.size, state.children, &state.planned);
     if (state.archive and plugin == null) returns = try archive_returns(arena, state, returns, &random);
     for (done) |summary| for (summary.behaviors[0..summary.behavior_count]) |behavior| {
         const entry = try state.visits.getOrPut(arena, behavior.hash);
@@ -3007,7 +3030,7 @@ fn tree_judge(
                 .branch = back.branch,
                 .vtime_ns = back.vtime_ns,
             };
-            if ((resumed.children.get(key) orelse 0) >= tree.children) {
+            if ((resumed.children.get(key) orelse 0) >= state.children) {
                 makings[making_count] = .{ .back = back, .parent = parent, .ready = true, .snapshot = state.setup };
                 making_count += 1;
                 continue;
@@ -3112,7 +3135,7 @@ fn tree_judge(
             .seed = parent.seed,
             .vtime_ns = at,
         };
-        for (0..tree.children) |_| {
+        for (0..state.children) |_| {
             if (state.next_index >= state.total) break;
             try queue_push(arena, state, .{
                 .index = state.next_index,
@@ -3213,7 +3236,7 @@ fn archive_returns(
     frontier: []const TreeReturn,
     random: *std.Random.DefaultPrng,
 ) ![]const TreeReturn {
-    const nodes = tree.nodes(state.size);
+    const nodes = tree.nodes(state.size, state.children);
     const novel = frontier.len > 0 and !std.mem.startsWith(u8, frontier[0].why, "A random moment");
     const keep: usize = if (novel) @min(frontier.len, (nodes + 1) / 2) else 0;
     var list: std.ArrayList(TreeReturn) = .empty;
@@ -3270,11 +3293,12 @@ fn tree_returns(
     counts: Counts,
     random: *std.Random.DefaultPrng,
     size: u32,
+    children: u32,
     /// Every branch planned before: a strategy may return to any of them (its own archive).
     planned: *const std.AutoHashMapUnmanaged(u32, Planned),
 ) ![]const TreeReturn {
     var list: std.ArrayList(TreeReturn) = .empty;
-    const nodes = tree.nodes(size);
+    const nodes = tree.nodes(size, children);
     if (strategy) |plugin| {
         const offered = try arena.alloc(Strategy.Candidate, chosen.len);
         for (chosen, offered) |candidate, *offer| offer.* = .{
@@ -4284,6 +4308,10 @@ fn parse_option(
         if (!multiple or size == 0 or size > tree.generation_max) return error.Usage;
         arguments.generation_size = size;
         arguments.generation_given = true;
+    } else if (eql(u8, flag, "--return-branches")) {
+        const count = try std.fmt.parseInt(u32, value, 10);
+        if (count == 0 or count > tree.generation_base) return error.Usage;
+        arguments.return_branches = count;
     } else if (eql(u8, flag, "--timeline")) {
         arguments.timeline_ms = try duration_parse(value) / std.time.ns_per_ms;
         arguments.timeline_text = value;
