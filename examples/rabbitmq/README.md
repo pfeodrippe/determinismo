@@ -111,6 +111,20 @@ Not in rabbitmq-server's issues (searched: the abort, `failed_waiting_for_tables
 `node_not_running`, the repair message); its Discussions not searched. Mnesia's, under RabbitMQ:
 Khepri, RabbitMQ's replacement for it, is the next thing to run here.
 
+### Observed: after a power loss, Mnesia replays its log into the wrong directory (being read)
+
+Hunt run 118 (srv3, 2026-10-29, `flags-synced`): with the feature flags finding out of the way,
+26 of its first 203 timelines lose a broker for good the same way. Timeline 26: rabbit-2 lost
+power at 16.43 s (a crash fault; restarted twice in the two seconds before), started again at
+16.98 s, and at 27.1 s Mnesia, replaying its log, failed `** FATAL ** Schema update error`:
+`{"Cannot create Mnesia dir", "/Mnesia.rabbit@rabbit-2", eacces}` in `mnesia_dumper`
+(`insert_op`, `perform_update`) for the table `rabbit_node_maintenance_states`. That directory is
+Mnesia's default (its working directory, here /), not the node's
+`/var/lib/rabbitmq/mnesia/rabbit@rabbit-2`, which the same boot's Ra systems use. The boot then
+fails (`BOOT FAILED ... {case_clause,{error,{node_not_running,'rabbit@rabbit-2'}}}`) and every
+boot after. Not in rabbitmq-server's issues (searched: the error, the table, `mnesia_dumper`
+with `eacces`). Next: a replay to the moment, to read Mnesia's `dir` and the log it replays.
+
 ## Status
 
 - 2026-10-28: first timelines (srv3): the finding above, in both. Run 76 (enqueues noted
