@@ -290,6 +290,24 @@ fn check_tapes(context: *Context) !void {
         .{ "the replay did not diverge", std.mem.indexOf(u8, inside, "diverged") == null },
         .{ "one timeline ran to its end", parse_branches(inside, &looked) == 1 },
     }, "tapes: a command at a moment of a replay runs, and the replay goes on to the end", .{});
+    // Steps after a command (a wait, a wait-until) run the new timeline on: its tape no longer
+    // applies (a sync, then an until a crash, once parted from Galera's tape at its first
+    // checkpoint).
+    const script = try std.fs.path.join(context.arena, &.{ context.scratch, "tape-steps.txt" });
+    try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = script, .data = "echo changed\n" ++
+        "det:wait 300\ndet:background sleep 0.2; echo waited\n" ++
+        "det:until 3000 event=exec_output details.text~waited\n" });
+    const stepped = try explore(context, &.{
+        "--program",     program, "--scenario",    "bank", "--tape",     tape,
+        "--at-vtime-ms", "1500",  "--exec-script", script, "--continue",
+    });
+    var stepped_branch: [1]Branch = undefined;
+    expect_all(context, &.{
+        .{ "the steps ran (\"changed\", \"waited\")", std.mem.indexOf(u8, stepped, "changed") != null and std.mem.indexOf(u8, stepped, "waited") != null },
+        .{ "the until held", std.mem.indexOf(u8, stepped, "until: timed out") == null },
+        .{ "the replay did not diverge", std.mem.indexOf(u8, stepped, "diverged") == null },
+        .{ "one timeline ran to its end", parse_branches(stepped, &stepped_branch) == 1 },
+    }, "tapes: steps after a command at a moment of a replay run on, the tape no longer applying", .{});
     // A replay that parts from its tape names where, and the events since the last checkpoint
     // (to compare with the timeline's own): here a tape whose first checkpoint was altered.
     const cwd = std.Io.Dir.cwd();

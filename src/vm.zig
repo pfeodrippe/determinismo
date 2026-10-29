@@ -53,6 +53,9 @@ moment_command: ?[]const u8,
 moment_reached: bool,
 /// Keep running after the command at the moment finished (instead of ending the run there).
 moment_continue: bool,
+/// The moment's commands began: a new timeline from there, which its tape does not describe
+/// (steps after a command, `det:wait` and `det:until`, run it on).
+moment_changed: bool = false,
 fresh_seed: ?u64,
 /// The moment can also be the first event matching a condition (`--until`, as Antithesis's
 /// wait_until), the instant the guest emits it.
@@ -889,6 +892,7 @@ fn moment_arrive(vm: *VM) !?Outcome {
         return vm.steps_next();
     }
     const given = vm.moment_command orelse return .moment_reached;
+    vm.moment_changed = true;
     // A fresh future: the timeline's randomness and tape end here, the guest's kernel generator
     // reseeded from the new seed, and the fault injector told, as at a tree's branch point.
     const commands = if (vm.fresh_seed) |seed| blk: {
@@ -1321,8 +1325,10 @@ fn checkpoint(vm: *VM, moment_now: Events.Moment) !void {
     };
     if (vm.tape_fd) |fd| tape.write_checkpoint(fd, now);
     // A command run at the moment makes a new timeline from there: the tape describes the one
-    // without it (a replay to look inside a timeline, --exec, must not stop at its own change).
-    if (vm.moment_reached and vm.moment_command != null) return;
+    // without it (a replay to look inside a timeline, --exec, must not stop at its own change,
+    // nor its steps after it: an until after an exec parted from the tape at its first
+    // checkpoint).
+    if (vm.moment_changed) return;
     if (vm.overrides) |overrides| overrides.check(now) catch |err| {
         const message = "[determinismo] replay diverged from its tape at event {d}\n";
         std.debug.print(message, .{now.events});
