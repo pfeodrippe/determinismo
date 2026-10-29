@@ -1151,13 +1151,21 @@ fn check_runs(context: *Context) !void {
     try command.print(arena, "exec '{s}' explore", .{context.determinismo});
     for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
     for (system) |part| try command.print(arena, " '{s}'", .{part});
-    try command.print(arena, " --seed 4 --branches 100000 --time-budget 30m > /dev/null 2>&1", .{});
+    try command.print(arena, " --seed 4 --branches 100000 --time-budget 30m --holders-on-disk > /dev/null 2>&1", .{});
     var child = try std.process.spawn(context.io, .{ .argv = &.{ "sh", "-c", command.items }, .stdout = .ignore, .stderr = .ignore });
     var running = false;
     for (0..600) |_| {
         const run = curl(context, &.{url ++ "/runs/2"}) catch "";
         running = std.mem.indexOf(u8, run, "\"state\":\"running\"") != null;
         if (running) break;
+        sleep_ms(100);
+    }
+    // Stopped once it holds moments on disk: they go with it (run 173's 209 GB stayed).
+    const holders_directory = try std.fs.path.join(arena, &.{ data, "runs", "2", "holders" });
+    var held: usize = 0;
+    for (0..1200) |_| {
+        held = files_count(context, holders_directory);
+        if (held > 0) break;
         sleep_ms(100);
     }
     _ = curl(context, &.{ "-X", "POST", url ++ "/runs/2/stop" }) catch "";
@@ -1170,10 +1178,19 @@ fn check_runs(context: *Context) !void {
         sleep_ms(200);
     }
     _ = term;
+    var left = held;
+    for (0..200) |_| {
+        left = files_count(context, holders_directory);
+        if (left == 0) break;
+        sleep_ms(100);
+    }
     expect_all(context, &.{
         .{ "serve shows it running", running },
+        .{ "it held moments on disk", held > 0 },
         .{ "serve stopped it", stopped },
-    }, "runs: another, running at a terminal, shows running in serve, and serve stops it", .{});
+        .{ "its moments on disk went with it", left == 0 },
+    }, "runs: another, running at a terminal, shows running in serve, and serve stops it; its " ++
+        "{d} moments held on disk go", .{held});
     // Run 1's events directory deleted, the path is free: another run takes it, and run 1's
     // link to it goes (it would show the new run's events). The smokes of 2026-10-29 were
     // refused their own deleted directories.
@@ -1187,6 +1204,16 @@ fn check_runs(context: *Context) !void {
         .{ "it ran", std.mem.indexOf(u8, taken, "[branch") != null },
         .{ "run 1 links it no more", std.os.linux.errno(run_1_link) == .NOENT },
     }, "runs: a deleted run's events directory is another's to take", .{});
+}
+
+/// The files in a directory (none when it is missing).
+fn files_count(context: *Context, path: []const u8) usize {
+    var directory = std.Io.Dir.cwd().openDir(context.io, path, .{ .iterate = true }) catch return 0;
+    defer directory.close(context.io);
+    var count: usize = 0;
+    var entries = directory.iterate();
+    while (entries.next(context.io) catch null) |_| count += 1;
+    return count;
 }
 
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
@@ -2318,7 +2345,22 @@ fn check_durability(context: *Context) !void {
     const common = [_][]const u8{
         "--program", program, "--profile", "durable", "--scenario", "durability", "--seed", "1",
     };
-    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2" }));
+    const events = try std.fmt.allocPrint(context.arena, "{s}/durability-events", .{context.scratch});
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2", "--events-dir", events }));
+    // The kernel's console lines are events (source kernel: boot in the setup's, a power loss's
+    // ext4 lines in a timeline's), and a timeline's events carry a checkpoint each second.
+    var kernel_lines: u32 = 0;
+    var checkpoints: u32 = 0;
+    for ([_][]const u8{ "setup.jsonl", "branch-0.jsonl" }) |name| {
+        const path = try std.fs.path.join(context.arena, &.{ events, name });
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, path, context.arena, .limited(1 << 28)) catch continue;
+        kernel_lines += @intCast(std.mem.count(u8, text, "\"source\":\"kernel\""));
+        if (std.mem.eql(u8, name, "branch-0.jsonl")) checkpoints += @intCast(std.mem.count(u8, text, "{\"checkpoint\":"));
+    }
+    expect_all(context, &.{
+        .{ "the kernel's console lines are events", kernel_lines > 0 },
+        .{ "a timeline's events carry checkpoints", checkpoints > 0 },
+    }, "events: {d} kernel lines, {d} checkpoints in timeline 0", .{ kernel_lines, checkpoints });
     const properties = [_][]const u8{
         "a sync stall holds a node's syncs, and they complete",
         "a crash just before a sync loses the write",
