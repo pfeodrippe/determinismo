@@ -111,7 +111,7 @@ Not in rabbitmq-server's issues (searched: the abort, `failed_waiting_for_tables
 `node_not_running`, the repair message); its Discussions not searched. Mnesia's, under RabbitMQ:
 Khepri, RabbitMQ's replacement for it, is the next thing to run here.
 
-### Observed: after a power loss, Mnesia replays its log into the wrong directory (being read)
+### Found blind: after a power loss, a boot's throwaway Mnesia takes a schema update and dies (being read)
 
 Hunt run 118 (srv3, 2026-10-29, `flags-synced`): with the feature flags finding out of the way,
 26 of its first 203 timelines lose a broker for good the same way. Timeline 26: rabbit-2 lost
@@ -123,7 +123,19 @@ Mnesia's default (its working directory, here /), not the node's
 `/var/lib/rabbitmq/mnesia/rabbit@rabbit-2`, which the same boot's Ra systems use. The boot then
 fails (`BOOT FAILED ... {case_clause,{error,{node_not_running,'rabbit@rabbit-2'}}}`) and every
 boot after. Not in rabbitmq-server's issues (searched: the error, the table, `mnesia_dumper`
-with `eacces`). Next: a replay to the moment, to read Mnesia's `dir` and the log it replays.
+with `eacces`).
+
+Read by replay (serve's replay of timeline 26 with `rabbitmqctl eval` at moments): at 26.5 s and
+26.85 s Mnesia's `dir` is unset, its `schema_location` `ram`, and the boot process (`<0.209.0>`)
+is in `rabbit_mnesia:check_cluster_consistency/2` → `with_running_or_clean_mnesia/1` →
+`mnesia:start()`. That function (4.1.4, rabbit_mnesia.erl:1016) checks a peer's protocol with a
+throwaway Mnesia: dir unset, RAM schema, "to prevent joining cluster and/or corrupting data",
+then restores both. At 27.1 s that throwaway Mnesia applies a schema update for a disc table
+(`rabbit_node_maintenance_states`), which it can only put in its default directory, and dies;
+the boot fails on it. Where the update comes from is still open: the peers, which count
+rabbit-2 a cluster member, are the likely source (a disc table's copy pushed to a member).
+Also: `with_running_or_clean_mnesia` restores `dir` with no `try ... after`, so any exit from
+its fun leaves the node's Mnesia settings at the throwaway ones.
 
 ## Status
 
