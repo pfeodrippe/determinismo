@@ -60,7 +60,7 @@ event hashing, the guest module.
   (srv3, 2026-10-29: two snapshots along a branch, the futures loaded from each the ones a replay
   forks there); long-term archive later.
 - e2e: `saved` and `until` (causality's output, extract, inject, rewind) passed on srv3
-  (2026-10-29); `ui` (Playwright, tests/ui) still to run there.
+  (2026-10-29); `ui` (Playwright, tests/ui, 8 of 8) too.
 - Kafka (2026-10-28): the hunts hardly ran the workload. Run 56 committed in 9 of 508
   timelines and passed (a sometimes needs one): brokers killed every two seconds never came
   back. KAFKA-17754 had no way in either (it needs an EndTxn delayed on its way to the
