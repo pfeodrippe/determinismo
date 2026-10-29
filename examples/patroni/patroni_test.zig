@@ -38,6 +38,8 @@ const options: sql_append.Options = .{
     .user = "postgres",
     .isolation = "SERIALIZABLE",
     .primary_only = true,
+    // Faults aimed at the primary the drivers find (addresses' order).
+    .node_names = &.{ "pg1", "pg2", "pg3" },
     // A commit waits for a synchronous standby, which may be failing over.
     .timeout_ms = 20_000,
     // A failover takes tens of seconds (ttl 15 s, after a power loss of two nodes more): ~66 s

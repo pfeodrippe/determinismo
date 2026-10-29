@@ -6,7 +6,7 @@
 // Java client's documentation says: on a KafkaException, abort the transaction, even after a
 // commit timed out (which, with a commit still in flight, is KAFKA-17754's opening).
 //
-//   hello <transactional id>                     -> ok | error <reason>
+//   hello <transactional id>                     -> ok [<coordinator's broker id>] | error <reason>
 //   txn commit|abort <topic> <partition>:<value>... -> ok | aborted | fail <reason> | unknown <reason>
 //   create <topic> <partitions> <replicas>       -> ok | exists | error <reason>
 //   read <topic> <partition>                     -> values <value>,... | error <reason>
@@ -107,7 +107,8 @@ public final class KClient {
                 case "hello":
                     transactionalId = words[1];
                     producerOpen();
-                    return "ok";
+                    Integer coordinator = coordinator();
+                    return coordinator == null ? "ok" : "ok " + coordinator;
                 case "txn":
                     return transaction(words);
                 case "create":
@@ -138,6 +139,21 @@ public final class KClient {
             properties.put("transaction.timeout.ms", "10000");
             producer = new KafkaProducer<>(properties, new ByteArraySerializer(), new LongSerializer());
             producer.initTransactions();
+        }
+
+        // The broker coordinating this producer's transactions (KIP-664's describeTransactions),
+        // or null when no broker says (the drivers then aim no faults at it).
+        private Integer coordinator() {
+            Properties properties = new Properties();
+            properties.put("bootstrap.servers", bootstrap);
+            properties.put("request.timeout.ms", "3000");
+            properties.put("default.api.timeout.ms", "5000");
+            try (AdminClient admin = AdminClient.create(properties)) {
+                return admin.describeTransactions(List.of(transactionalId)).description(transactionalId).get()
+                        .coordinatorId();
+            } catch (Exception e) {
+                return null;
+            }
         }
 
         private void producerDrop() {

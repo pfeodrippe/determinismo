@@ -157,7 +157,8 @@ fn collection_create(all: *const [3]Member) !void {
 }
 
 /// Connects to `address`, then to the primary it names if it is not one (as drivers follow the
-/// replica set). Whether the connection is to the primary.
+/// replica set). Whether the connection is to the primary; the injector's faults are aimed at it
+/// (sdk.fault_aim), as Jepsen's nemeses target the primary.
 fn primary_connect(connection: *Mongo, all: *const [3]Member, address: [4]u8) !bool {
     try connection.open(address, port, .{ .timeout_ms = timeout_ms });
     var buffer: [command_size_max]u8 = undefined;
@@ -170,7 +171,12 @@ fn primary_connect(connection: *Mongo, all: *const [3]Member, address: [4]u8) !b
     };
     const master = bson.get(reply, "ismaster") catch null;
     if (master) |element| {
-        if (element.truth() orelse false) return true;
+        if (element.truth() orelse false) {
+            for (all) |member| {
+                if (std.mem.eql(u8, &member.address, &address)) sdk.fault_aim(member.name);
+            }
+            return true;
+        }
     }
     const named = (bson.get(reply, "primary") catch null) orelse {
         connection.close();
@@ -182,6 +188,7 @@ fn primary_connect(connection: *Mongo, all: *const [3]Member, address: [4]u8) !b
     for (all) |member| {
         if (!std.mem.eql(u8, member.name, name)) continue;
         try connection.open(member.address, port, .{ .timeout_ms = timeout_ms });
+        sdk.fault_aim(member.name);
         return true;
     }
     return false;

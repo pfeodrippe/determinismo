@@ -29,7 +29,8 @@ Jepsen's list-append in SQL: every key a row of `lists (id INTEGER PRIMARY KEY, 
 its list the text `v1,v2,...`. A transaction is one request to the unified endpoint
 (`/db/request?transaction`): reads and appends (an upsert concatenating `,v`) in one SQLite
 transaction; with an append it goes through the Raft log, read-only at `level=linearizable`.
-Each through a node drawn at random (followers forward to their leader). Outcomes: committed;
+Each through a node drawn at random (followers forward to their leader); each driver aims the
+injector at the leader a node names as it starts (`/leader`, `sdk.fault_aim`). Outcomes: committed;
 not committed (no connection, a statement's error rolling it back, `leader not found`);
 unknown otherwise (a leadership lost while committing, a timeout).
 

@@ -4,6 +4,7 @@
 #
 #   txn <node> <mop>...  -> ok <read>... | fail <reason> | unknown <reason>
 #   keys <node>          -> keys <key>... | unknown <reason>
+#   leader               -> leader <node> | leader      (the server whose `srvr` says leader)
 #
 # <node> is 1, 2 or 3: zk-<node>:2181 only (no failover to another server), connected on first
 # use and again after an error. A mop is `a:<key>:<value>` (append) or `r:<key>` (read); a read
@@ -176,7 +177,28 @@ class Session:
             except Exception as error:
                 self.drop(node)
                 return "unknown " + reason(error)
+        if command == "leader" and len(words) == 1:
+            for node in ("1", "2", "3"):
+                if "Mode: leader" in four_letter_word("zk-" + node, b"srvr"):
+                    return "leader " + node
+            return "leader"
         return "fail unknown command"
+
+
+def four_letter_word(host, word):
+    """A server's answer to a four-letter word ("" when it gives none within the timeout)."""
+    try:
+        with socket.create_connection((host, 2181), timeout=TIMEOUT_S) as connection:
+            connection.sendall(word)
+            chunks = []
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 def serve(connection):

@@ -137,6 +137,7 @@ fn stream_create(all: *const [servers_count][4]u8) !void {
 /// the sequence JetStream gave it.
 fn publish_many(context: *System.Context) !void {
     const all = addresses(context);
+    leader_aim(&all, stream);
     var id: [4]u8 = undefined;
     sdk.random_bytes(&id);
     var client: Client = undefined;
@@ -177,6 +178,24 @@ fn publish(client: *Client, message: []const u8) !u64 {
     }) catch return error.BadReply;
     if (ack.@"error" != null or ack.seq == 0) return error.JetStreamError;
     return ack.seq;
+}
+
+/// The injector's faults aimed at the stream's leader (sdk.fault_aim), as Jepsen's nemeses target
+/// one: the server its info names (`cluster.leader`); nothing when no server answers.
+fn leader_aim(all: *const [servers_count][4]u8, comptime name: []const u8) void {
+    var client: Client = undefined;
+    client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms }) catch return;
+    defer client.close();
+    var buffer: [reply_size_max]u8 = undefined;
+    const reply = client.request("$JS.API.STREAM.INFO." ++ name, "", &buffer) catch return;
+    if (reply.status != 0) return;
+    const Info = struct { cluster: struct { leader: []const u8 = "" } = .{} };
+    var parse_buffer: [reply_size_max]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&parse_buffer);
+    const info = std.json.parseFromSliceLeaky(Info, fixed.allocator(), reply.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return;
+    if (info.cluster.leader.len > 0) sdk.fault_aim(info.cluster.leader);
 }
 
 /// "<message> <sequence>", appended in one write.
@@ -346,6 +365,7 @@ fn batch_stream_create(all: *const [servers_count][4]u8) !void {
 
 fn batches_publish(context: *System.Context) !void {
     const all = addresses(context);
+    leader_aim(&all, batch_stream);
     var id: [4]u8 = undefined;
     sdk.random_bytes(&id);
     var client: Client = undefined;

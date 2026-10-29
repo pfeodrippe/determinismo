@@ -174,6 +174,19 @@ fn call(
     }) catch error.BadAnswer;
 }
 
+/// The injector's faults aimed at the leader (sdk.fault_aim), as Jepsen's nemeses target one:
+/// the member whose own id is the leader its status names; nothing when none answers so.
+fn leader_aim(all: *const [members_count][4]u8) void {
+    const LeaderStatus = struct { header: Header = .{}, leader: []const u8 = "" };
+    for (all, member_names) |address, name| {
+        var buffer: [4096]u8 = undefined;
+        const status = call(LeaderStatus, address, "/v3/maintenance/status", "{}", &buffer) catch continue;
+        if (status.leader.len == 0 or !std.mem.eql(u8, status.leader, status.header.member_id)) continue;
+        sdk.fault_aim(name);
+        return;
+    }
+}
+
 /// Errors that say only that no answer came: under faults, expected.
 fn no_answer(err: anyerror) bool {
     return err == error.NoAnswer or sdk.tcp.unavailable(err);
@@ -468,6 +481,7 @@ const Held = struct { key: u64, list: std.ArrayList(u8), mod_revision: u64 };
 fn append_many(context: *System.Context) !void {
     const all = addresses(context);
     const arena = context.init.arena.allocator();
+    leader_aim(&all);
     var id: u64 = undefined;
     sdk.random_bytes(std.mem.asBytes(&id));
     id &= 0xffff_ffff;

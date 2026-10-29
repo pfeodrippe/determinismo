@@ -154,6 +154,13 @@ fn appends(context: *System.Context) !void {
     var client: Client = undefined;
     try client.open(context);
     defer client.connection.close();
+    // Half the faults aimed at the leader (sdk.fault_aim), as Jepsen's nemeses target one.
+    if (client.request("leader", .{})) |reply| {
+        if (std.mem.startsWith(u8, reply, "leader ")) {
+            var name_buffer: [8]u8 = undefined;
+            sdk.fault_aim(std.fmt.bufPrint(&name_buffer, "zk-{s}", .{reply["leader ".len..]}) catch "");
+        }
+    } else |_| {}
     const history: sdk.elle.History = .{};
     var id: u64 = undefined;
     sdk.random_bytes(std.mem.asBytes(&id));

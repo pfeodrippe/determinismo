@@ -130,6 +130,7 @@ fn appends(context: *System.Context) !void {
     id &= 0xffff_ffff;
     var process = sdk.elle.process_new();
     const buffer = try arena.alloc(u8, response_size_max);
+    pd_leader_aim(arena, all[sdk.random_below(nodes_count)]);
     for (0..transactions_per_driver) |sequence| {
         var mops: [mops_max]Mop = undefined;
         const count = draw(&mops, id, sequence);
@@ -152,6 +153,20 @@ fn appends(context: *System.Context) !void {
             },
         }
     }
+}
+
+/// The injector's faults aimed at PD's leader (sdk.fault_aim), whose clock every transaction's
+/// timestamps come from: the member PD's API names ("pd-n2": node n2); nothing when none answers.
+fn pd_leader_aim(arena: std.mem.Allocator, address: [4]u8) void {
+    var buffer: [16 * 1024]u8 = undefined;
+    const response = sdk.tcp.http_with(address, pd_port, "GET", "/pd/api/v1/leader", "", &buffer, .{ .timeout_ms = 5_000 }) catch return;
+    if (response.status != 200) return;
+    const Leader = struct { name: []const u8 = "" };
+    const leader = std.json.parseFromSliceLeaky(Leader, arena, response.body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    if (std.mem.startsWith(u8, leader.name, "pd-")) sdk.fault_aim(leader.name["pd-".len..]);
 }
 
 fn draw(mops: *[mops_max]Mop, id: u64, sequence: u64) u32 {

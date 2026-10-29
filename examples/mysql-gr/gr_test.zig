@@ -69,6 +69,8 @@ fn Isolation(comptime level: []const u8) type {
             .database = "jepsen",
             .isolation = level,
             .primary_only = true,
+            // Faults aimed at the primary the drivers find (addresses' order).
+            .node_names = &.{ "n1", "n2", "n3" },
             // A commit waits for the group's certification, which may be electing a primary.
             .timeout_ms = 20_000,
             // A primary elected after a member's expulsion takes seconds (its failure detection);

@@ -15,7 +15,9 @@ throttling, clock skips), restarts, graceful stops and power losses (each member
 own ext4 disk: what was synced survives), and at the members' syncs, stalls and power losses
 (`sync_stall`, `durable_crash`). A wipe is left out: a member that lost its data cannot rejoin as
 itself, by design. Members snapshot every 100 entries, so followers catch up from snapshots and
-restarts load them.
+restarts load them. Since 2026-10-29 also per-member clock skews (`clock_skew`), and half the
+faults aimed at the leader the append drivers find as they start (`sdk.fault_aim`: the member
+whose own id its status names as leader).
 
 What is checked:
 

@@ -21,6 +21,8 @@ Profiles:
 
 Faults: Antithesis's set, restarts, graceful stops and power losses (each server's data on its
 own disk), and at the servers' syncs, stalls and power losses (`sync_stall`, `durable_crash`).
+Half of them aimed at the stream's leader, which each producer looks up as it starts
+(`$JS.API.STREAM.INFO`'s `cluster.leader`, `sdk.fault_aim`), as Jepsen's nemeses target one.
 
 | Property | How |
 |---|---|

@@ -91,7 +91,22 @@ fn schema(context: *System.Context) !void {
 fn append(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const all: [3][4]u8 = .{ context.nodes.n1.address, context.nodes.n2.address, context.nodes.n3.address };
+    pd_leader_aim(arena, all[sdk.random_below(all.len)]);
     try sql_append.transactions(arena, &all, options);
+}
+
+/// The injector's faults aimed at PD's leader (sdk.fault_aim), whose clock every transaction's
+/// timestamps come from: the member PD's API names ("pd-n2": node n2); nothing when none answers.
+fn pd_leader_aim(arena: std.mem.Allocator, address: [4]u8) void {
+    var buffer: [16 * 1024]u8 = undefined;
+    const response = sdk.tcp.http_with(address, pd_port, "GET", "/pd/api/v1/leader", "", &buffer, .{ .timeout_ms = 5_000 }) catch return;
+    if (response.status != 200) return;
+    const Leader = struct { name: []const u8 = "" };
+    const leader = std.json.parseFromSliceLeaky(Leader, arena, response.body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    if (std.mem.startsWith(u8, leader.name, "pd-")) sdk.fault_aim(leader.name["pd-".len..]);
 }
 
 /// Every committed append still there once faults stop (examples/sql/append.zig).

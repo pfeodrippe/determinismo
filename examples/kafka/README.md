@@ -103,7 +103,10 @@ Setup creates the topic and starts one producer before faults begin: Kafka creat
 transaction coordinators' topic at the first producer's start, and under faults that can take
 the whole timeline (the coverage profile's slower brokers never got one).
 
-Since 2026-10-29 the brokers' clocks are skewed too (`clock_skew`, one broker's realtime clock
+Since 2026-10-29 each driver aims the injector at its producer's transaction coordinator
+(KClient's `hello` answers its broker id, from `describeTransactions`; `sdk.fault_aim`): half
+the faults then involve the broker where transaction bugs live (Redpanda's run 177 began with
+the coordinator's crash). The brokers' clocks are skewed too (`clock_skew`, one broker's realtime clock
 ahead or behind by up to 10 s for a while, sometimes strobing): transaction coordinators expire
 transactions by their wall clocks, and the logs' safety must not depend on clocks agreeing.
 
@@ -274,6 +277,21 @@ by design: counted in an event (`kafka_share_redelivered`).
   WRITE_TXN_MARKERS"; writes behind a hang the judge cannot clear are unjudged since), and
   timelines 157 and 172 were G0 (allowed, as for Kafka) beside Elle's cycle search timing out
   (no anomaly since, an `elle_cycle_search_timeout` event).
+- Under investigation, a second Redpanda hang (run 177's timeline 56, 2026-10-29): a coordinator
+  that abandons an abort. Causality (analysis 1) puts the decision between 757.7 s (futures
+  pass) and 774.9 s (all fail); faults stopped at 763.8 s. In that window kafka-1 was stopped
+  (757.0 s for 7.5 s) and an outage took kafka-2 and kafka-3 down at 763.6 s: no broker up for a
+  moment. After the restart kafka-1, coordinator of transaction t7771015 (producer 16001, status
+  `preparing_abort`, term 43), sent its abort to `jepsen/3` every 0.32 s from 769.3 s, each
+  failing `tx::errc::leader_not_found` (the partition's replicas came back at terms 31, 32 and
+  33, and pre-votes failed on the larger terms), 16 times, the last at 774.13 s; `jepsen/3`
+  elected kafka-3 at 774.24 s, 0.1 s later, and nothing ever sent the abort again: the
+  coordinator expired other transactions at 780 and 784 s, never this one, and the partition
+  kept producer 16001's transaction open to the timeline's end. Not run 177's first hang (the
+  coordinator knew this transaction and its partitions), nor TSB-2026-37 (26.1.1 to 26.1.5), nor
+  #30003 (fixed before 26.2.6: producers dropped from local snapshots), nor #14624 (endless
+  retries of a group abort). Next: the analysis's explanation futures (the `tx` logger at trace
+  from inside the jump) for what the partition does with the transaction once it has a leader.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the

@@ -66,6 +66,9 @@ pub const Options = struct {
     /// `pg_is_in_recovery()`, Patroni's; MySQL's `super_read_only`, Group Replication's
     /// secondaries and members not in the group). A standby's reads lag, its writes are refused.
     primary_only: bool = false,
+    /// The nodes' names, in `addresses`' order: with `primary_only`, a driver that reaches the
+    /// primary aims the injector's faults at it (sdk.fault_aim), as Jepsen's nemeses target one.
+    node_names: []const []const u8 = &.{},
     /// Connections refused in a row (or standbys reached) before a driver gives up, a pause up
     /// to a second between them: ~11 s at 20. A cluster that fails over in tens of seconds
     /// (Patroni's ttl) needs more, or every driver gives up during it (the first Patroni smoke's
@@ -136,7 +139,8 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
     var sequence: u64 = 0;
     while (sequence < options.transactions) {
         if (!connected) {
-            const address = addresses[sdk.random_below(addresses.len)];
+            const index = sdk.random_below(addresses.len);
+            const address = addresses[index];
             connection.open(address, options) catch |err| {
                 if (!sdk.tcp.unavailable(err) and err != error.ServerError) return err;
                 // Down, cut off or starting: a while later, without spending a transaction.
@@ -160,6 +164,9 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
             }
             connected = true;
             refused = 0; // A streak ends.
+            if (options.primary_only and options.node_names.len == addresses.len) {
+                sdk.fault_aim(options.node_names[index]);
+            }
             // Transactions of one micro-operation run alone, at this level too.
             if (options.isolation) |level| {
                 var statement: [128]u8 = undefined;

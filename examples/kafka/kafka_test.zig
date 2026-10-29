@@ -226,7 +226,7 @@ fn producer_start(context: *System.Context) !void {
     try client.open(context);
     defer client.connection.close();
     const reply = try client.request("hello setup", .{});
-    if (std.mem.eql(u8, reply, "ok")) return;
+    if (std.mem.startsWith(u8, reply, "ok")) return;
     sdk.event("kafka_error", .{ .command = "hello", .reply = reply });
     return error.NotStarted;
 }
@@ -265,10 +265,17 @@ fn transactions(context: *System.Context) !void {
         if (tcp.unavailable(err)) return;
         return err;
     };
-    if (!std.mem.eql(u8, hello, "ok")) {
+    if (!std.mem.startsWith(u8, hello, "ok")) {
         // No producer yet (the coordinator unavailable): nothing was sent.
         sdk.sometimes(true, "a producer could not start", .{ .reply = hello });
         return;
+    }
+    // Faults aimed at its transactions' coordinator, where Kafka's transaction bugs live (a
+    // coordinator crashing between beginning a transaction and recording it: Redpanda's run 177).
+    if (std.mem.startsWith(u8, hello, "ok ")) {
+        var name_buffer: [16]u8 = undefined;
+        const coordinator = std.fmt.bufPrint(&name_buffer, "kafka-{s}", .{hello["ok ".len..]}) catch "";
+        if (coordinator.len > 0) sdk.fault_aim(coordinator);
     }
     const started_ns = monotonic_ns();
     for (0..transactions_per_driver) |sequence| {

@@ -138,6 +138,7 @@ fn appends(context: *System.Context) !void {
     id &= 0xffff_ffff;
     var process = sdk.elle.process_new();
     const buffer = try arena.alloc(u8, response_size_max);
+    leader_aim(arena, all[sdk.random_below(nodes_count)], buffer);
     for (0..transactions_per_driver) |sequence| {
         var mops: [mops_max]Mop = undefined;
         const count = draw(&mops, id, sequence);
@@ -160,6 +161,21 @@ fn appends(context: *System.Context) !void {
             },
         }
     }
+}
+
+/// The injector's faults aimed at the leader a node names (its /leader: the leader's node id,
+/// ours 1 to 3), as Jepsen's nemeses target one; nothing when it names none.
+fn leader_aim(arena: std.mem.Allocator, address: [4]u8, buffer: []u8) void {
+    const response = sdk.tcp.http_with(address, http_port, "GET", "/leader", "", buffer, .{ .timeout_ms = 5_000 }) catch return;
+    if (response.status != 200) return;
+    const Leader = struct { id: []const u8 = "" };
+    const leader = std.json.parseFromSliceLeaky(Leader, arena, response.body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    if (leader.id.len == 0) return;
+    var name_buffer: [16]u8 = undefined;
+    sdk.fault_aim(std.fmt.bufPrint(&name_buffer, "rq-{s}", .{leader.id}) catch return);
 }
 
 fn draw(mops: *[mops_max]Mop, id: u64, sequence: u64) u32 {

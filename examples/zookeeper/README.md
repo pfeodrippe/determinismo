@@ -81,3 +81,5 @@ says what else made a server exit.
 - 2026-10-29: profile `keeper`, ClickHouse Keeper 26.9.27.3 (ClickHouse's ZooKeeper-compatible
   coordination service, C++ on NuRaft) as the three servers, under the same client and checks
   (Dockerfile.keeper, `start.sh keeper <id>`; ready once Raft listens on 9234). First smoke next.
+  The drivers aim half the faults at the leader they find as they start (zclient's `leader`: the
+  server whose `srvr` says "Mode: leader"; `sdk.fault_aim`), ZooKeeper's and Keeper's alike.
