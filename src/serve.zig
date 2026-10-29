@@ -24,7 +24,7 @@
 //!   GET  /runs/<id>/output   its output, as text
 //!   POST /runs/<id>/replay   {branch, at_vtime_ms? | until? rewind_ms?, exec?} -> its output
 //!   POST /runs/<id>/causality {branch, property, points?, futures?, refine?, moments_max?,
-//!                            jump_min?, gap_min_ms?, planner?, verdict?} -> {id} (in the background:
+//!                            jump_min?, gap_min_ms?, planner?, verdict?, explain_exec?} -> {id} (in the background:
 //!                            causality.zig; its snapshots kept in the run's snapshots/)
 //!   GET  /runs/<id>/causality  every analysis: [{id, done, of: {branch, property, failure_ms,
 //!                            snapshot_ms, futures, planner}, points: [...]}]
@@ -1190,6 +1190,10 @@ const CausalityRequest = struct {
     /// A planner plugin: a command, `tcp://host:port`, or `@<name>` (an uploaded strategy
     /// executable, PUT /strategies/<name>). Null: the built-in one.
     planner: ?[]const u8 = null,
+    /// A command that turns the system's logs up, for futures inside the narrowest jump once
+    /// the analysis is done (causality's --explain-exec): their events in the run's
+    /// snapshots/explain.
+    explain_exec: ?[]const u8 = null,
 };
 
 /// Removes the snapshots of runs where none was saved for `snapshots_keep_ns` (the newest
@@ -1356,6 +1360,7 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
+    if (asked.explain_exec) |command| try argv.appendSlice(server.arena, &.{ "--explain-exec", command });
     if (asked.verdict) |verdict| {
         try argv.appendSlice(server.arena, &.{ "--verdict", verdict });
     } else if (try failure_moments(server, run.id, asked.branch, asked.property)) |moments| {
@@ -1556,6 +1561,13 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
         if (std.mem.startsWith(u8, line, "{\"faults\":")) effects = line;
     }
     if (effects) |line| try out.print(",\"fault_effects\":{s}", .{line});
+    // Its explanation's futures (explain_exec): each moment, whether it failed, its events.
+    lines.reset();
+    const explained_key = "{\"explained\":";
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, explained_key) or line.len < explained_key.len + 1) continue;
+        try out.print(",\"explained\":{s}", .{line[explained_key.len .. line.len - 1]});
+    }
     try out.writeAll("}");
 }
 

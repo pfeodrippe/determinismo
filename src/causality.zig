@@ -85,6 +85,13 @@ const Request = struct {
     /// Branch n's tape: the timeline replayed and branched from (a tree's branch).
     tape: ?[]const u8 = null,
     snapshots: ?[]const u8 = null,
+    /// A command that turns the system's logs up (`--explain-exec`): once the analysis is done,
+    /// futures from inside its narrowest jump with it run at their moment, the timeline's own
+    /// randomness after it, each one's events kept (`--explain-dir`, by default beside the
+    /// snapshots): a failing one shows the mechanism, with the logs a passing one lacks
+    /// (Redpanda's run 177, by hand: its tx logger at trace from inside the jump).
+    explain_exec: ?[]const u8 = null,
+    explain_dir: ?[]const u8 = null,
     /// Everything else: machine and system options, the seed; passed to every explore.
     rest: []const []const u8,
 };
@@ -292,7 +299,107 @@ pub fn run(
     }
     try decided_print(&analysis, out, request.json);
     try out.flush();
+    if (request.explain_exec) |command| {
+        try explain(&analysis, out, command);
+        try out.flush();
+    }
     return 0;
+}
+
+/// Moments inside the narrowest jump to failure: a quarter, half and three quarters across.
+const explain_moments = 3;
+
+/// The futures of `explain_exec`: each replays the branch to a moment inside the narrowest jump
+/// to failure (jumps_find), runs the command there and goes on to its end, its events kept; one
+/// failing shows the mechanism with the logs turned up. Before the jump the command's own
+/// perturbation makes futures pass, past it the cause is in the past: inside, some fail.
+fn explain(analysis: *Analysis, out: *std.Io.Writer, command: []const u8) !void {
+    const arena = analysis.arena;
+    const request = analysis.request;
+    const points = analysis.points.items;
+    std.mem.sort(Point, points, {}, point_earlier);
+    const probabilities = try arena.alloc(f64, points.len);
+    for (points, probabilities) |point, *probability| probability.* = wilson(point.failing, point.futures).probability;
+    const spans = try arena.alloc([2]usize, points.len);
+    var narrowest: ?[2]usize = null;
+    for (jumps_find(probabilities, request.jump_min, spans)) |span| {
+        if (probabilities[span[1]] <= probabilities[span[0]]) continue; // Toward failure only.
+        const width = points[span[1]].vtime_ms - points[span[0]].vtime_ms;
+        if (narrowest) |best| if (points[best[1]].vtime_ms - points[best[0]].vtime_ms <= width) continue;
+        narrowest = span;
+    }
+    const span = narrowest orelse {
+        if (request.json) try out.writeAll("{\"explained\":[]}\n") else try out.writeAll("explained: no jump to failure\n");
+        return;
+    };
+    const from_ms = points[span[0]].vtime_ms;
+    const to_ms = points[span[1]].vtime_ms;
+    // Not in the analysis's own directory: a temporary one goes when it ends.
+    const directory = request.explain_dir orelse if (request.snapshots) |kept|
+        try std.fs.path.join(arena, &.{ kept, "explain" })
+    else
+        "determinismo-explain";
+    try std.Io.Dir.cwd().createDirPath(analysis.io, directory);
+    const Explained = struct { vtime_ms: u64, fails: bool, events: []const u8 };
+    var explained: [explain_moments]Explained = undefined;
+    var count: usize = 0;
+    for (1..explain_moments + 1) |quarter| {
+        const vtime_ms = from_ms + (to_ms - from_ms) * quarter / (explain_moments + 1);
+        if (count > 0 and explained[count - 1].vtime_ms == vtime_ms) continue;
+        const events = try std.fmt.allocPrint(arena, "{s}/at-{d}ms", .{ directory, vtime_ms });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ analysis.self, "explore" });
+        try argv.appendSlice(arena, request.rest);
+        if (request.tape) |tape| {
+            try argv.appendSlice(arena, &.{ "--tape", tape });
+        } else try argv.appendSlice(arena, &.{ "--branch", try std.fmt.allocPrint(arena, "{d}", .{request.branch}) });
+        try argv.appendSlice(arena, &.{
+            "--at-vtime-ms", try std.fmt.allocPrint(arena, "{d}", .{vtime_ms}),
+            "--exec",        command,
+            "--continue",    "--events-dir",
+            events,
+        });
+        const result = try std.process.run(arena, analysis.io, .{
+            .argv = argv.items,
+            .stdout_limit = .limited(64 << 20),
+            .stderr_limit = .limited(64 << 20),
+        });
+        explained[count] = .{
+            .vtime_ms = vtime_ms,
+            .fails = branch_fails(result.stderr, request),
+            .events = events,
+        };
+        count += 1;
+    }
+    if (request.json) {
+        try out.print("{f}\n", .{std.json.fmt(.{ .explained = explained[0..count] }, .{})});
+        return;
+    }
+    try out.print("explained, {d}ms -> {d}ms with `{s}`:\n", .{ from_ms, to_ms, command });
+    for (explained[0..count]) |item| {
+        try out.print("  {d}ms  {s}  events in {s}\n", .{ item.vtime_ms, if (item.fails) "fails " else "passes", item.events });
+    }
+}
+
+/// Whether the explore's branch line says the bug happened: the property failing, or (a
+/// verdict) any property failing.
+fn branch_fails(output: []const u8, request: *const Request) bool {
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "[branch")) continue;
+        if (request.verdict != null) return std.mem.indexOf(u8, line, " failing=0") == null;
+        var buffer: [512]u8 = undefined;
+        const quoted = std.fmt.bufPrint(&buffer, "FAIL \"{s}\"", .{request.property}) catch return false;
+        return std.mem.indexOf(u8, line, quoted) != null;
+    }
+    return false;
+}
+
+test branch_fails {
+    const request: Request = .{ .branch = 23, .property = "no transaction stays open", .rest = &.{} };
+    try std.testing.expect(branch_fails("x\n[branch   23] seed=1 hung vtime=3600.009s failing=2  FAIL \"no transaction stays open\"\n", &request));
+    try std.testing.expect(!branch_fails("[branch   23] seed=1 shutdown vtime=199.4s failing=0\n", &request));
+    try std.testing.expect(!branch_fails("no branch line\n", &request));
 }
 
 fn point_earlier(_: void, a: Point, b: Point) bool {
@@ -760,7 +867,8 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             eql(u8, flag, "--planner") or eql(u8, flag, "--run-url") or
             eql(u8, flag, "--jump-min") or eql(u8, flag, "--gap-min-ms") or
             eql(u8, flag, "--moments-max") or eql(u8, flag, "--verdict") or
-            eql(u8, flag, "--failure-ms") or eql(u8, flag, "--snapshot-ms") or eql(u8, flag, "--jobs");
+            eql(u8, flag, "--failure-ms") or eql(u8, flag, "--snapshot-ms") or eql(u8, flag, "--jobs") or
+            eql(u8, flag, "--explain-exec") or eql(u8, flag, "--explain-dir");
         if (!ours) {
             try rest.append(arena, flag);
             continue;
@@ -798,6 +906,10 @@ fn arguments_parse(arena: std.mem.Allocator, arguments: []const [:0]const u8) !R
             request.snapshot_ms = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, flag, "--jobs")) {
             request.jobs = try std.fmt.parseInt(u32, value, 10);
+        } else if (eql(u8, flag, "--explain-exec")) {
+            request.explain_exec = value;
+        } else if (eql(u8, flag, "--explain-dir")) {
+            request.explain_dir = value;
         } else {
             request.futures = try std.fmt.parseInt(u32, value, 10);
         }

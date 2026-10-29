@@ -142,6 +142,8 @@ const usage =
     \\                            [--planner <cmd> | tcp://host:port] [--run-url <url>]
     \\                            [--verdict '<condition>']   (the bug, instead of the property)
     \\                            [--snapshots <dir>] [--json]   (see causality.zig)
+    \\                            [--explain-exec '<command>' [--explain-dir <dir>]]   (futures
+    \\                            inside the jump with the command at their moment: logs up)
     \\       determinismo extract <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')
     \\                            --file <node>:<path> --to <local file>
     \\       determinismo inject  <options> --branch <n> (--at-vtime-ms <ms> | --until '<cond>')

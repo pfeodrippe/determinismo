@@ -81,7 +81,11 @@ use them in other repositories.
    <node> --stacks"; the UI's "stacks" on a jump). `replay` with `until` stops at the first event
    matching a condition (its first violation, say) to look there, and with `rewind_ms` that long
    before it. `fork` from any moment
-   explores its futures.
+   explores its futures. When the system's logs are too quiet to show the mechanism,
+   `--explain-exec '<command that turns them up>'` (serve: `explain_exec`) ends the analysis
+   with futures from inside the narrowest jump to failure, the command run at their moment and
+   the timeline's own randomness after it, each one's events kept: a failing one shows the
+   mechanism step by step (Redpanda's open transaction, run 177).
    **Try a change**: `replay` with `exec` and `continue` makes a change at a moment (data, a
    setting, a function redefined through a REPL) and lets the branch play out; `fork` with
    `exec` explores many futures of the changed system. `determinismo extract` takes a node's

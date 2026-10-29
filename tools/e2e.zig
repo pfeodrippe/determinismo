@@ -1216,6 +1216,24 @@ fn files_count(context: *Context, path: []const u8) usize {
     return count;
 }
 
+/// Whether causality's explanation ran futures inside the jump, each one's events kept.
+fn explained_ok(context: *Context, stdout: []const u8) bool {
+    const key = "{\"explained\":";
+    var lines = std.mem.tokenizeScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const Line = struct { explained: []const struct { vtime_ms: u64, fails: bool, events: []const u8 } };
+        const parsed = std.json.parseFromSliceLeaky(Line, context.arena, line, .{}) catch return false;
+        if (parsed.explained.len == 0) return false;
+        for (parsed.explained) |item| {
+            const timelines = std.fs.path.join(context.arena, &.{ item.events, "timelines.jsonl" }) catch return false;
+            std.Io.Dir.cwd().access(context.io, timelines, .{}) catch return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn curl(context: *Context, arguments: []const []const u8) ![]const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     const json = "Content-Type: application/json";
@@ -1263,6 +1281,10 @@ fn check_until_and_causality(context: *Context) !void {
         "--branch",  branch, "--property", "total balance is conserved", "--points", "4",
         "--futures", "8",    "--json",
     });
+    // Its explanation too: futures inside the jump with a command at their moment (a system's
+    // logs turned up there; here, any command), each one's events kept.
+    const explain_dir = try std.fmt.allocPrint(arena, "{s}/explain", .{context.scratch});
+    try argv.appendSlice(arena, &.{ "--explain-exec", "true", "--explain-dir", explain_dir });
     const result = try run_kept(context, argv.items);
     // Refinement adds moments inside jumps.
     const curve = try causality_curve(arena, result.stdout);
@@ -1274,6 +1296,7 @@ fn check_until_and_causality(context: *Context) !void {
         .{ "each within its 90% interval", curve.bounded },
         .{ "the futures' faults counted (a faults line each round)", effects },
         .{ "where it was decided: each jump with its faults and code first run (a decided line)", std.mem.indexOf(u8, result.stdout, "{\"decided\":[{") != null },
+        .{ "explained: futures inside the jump, each with its events", explained_ok(context, result.stdout) },
     }, "causality: {d} moments (4, and refinements inside jumps), certain at the failure " ++
         "({d:.2}), each within its 90% interval, where it was decided", .{ curve.moments, curve.latest.probability });
     // The bug as an event condition (a verdict) instead of a property: the same analysis.
