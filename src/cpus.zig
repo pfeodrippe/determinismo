@@ -172,6 +172,7 @@ pub const Pool = struct {
     /// process to it.
     pub fn take(pool: *Pool) Held {
         assert(pool.count > 0);
+        const asked_ns = monotonic_ns();
         // Waiting with priority: the others see it, and leave the CPUs it may run on to it.
         if (pool.priority) for (pool.priority_fds[0..pool.count]) |fd| {
             _ = linux.flock(fd, std.posix.LOCK.SH);
@@ -260,7 +261,11 @@ pub const Pool = struct {
                 const claim = std.mem.toBytes(claim_bytes);
                 _ = linux.pwrite(pool.fds[slot], &claim, claim.len, 0);
                 pin(pool.cpus[slot]);
-                return .{ .slot = slot, .memory_wait_ns = memory_wait_ns };
+                return .{
+                    .slot = slot,
+                    .memory_wait_ns = memory_wait_ns,
+                    .cpu_wait_ns = (monotonic_ns() - asked_ns) -| memory_wait_ns,
+                };
             }
             if (pool.priority) {
                 const pause: linux.timespec = .{ .sec = 0, .nsec = wait_ns_min };
@@ -318,6 +323,9 @@ pub const Held = struct {
     /// How long the take waited for the host's memory (other runs' VMs and holders claim it):
     /// a run whose VMs mostly wait for memory runs fewer timelines at once than it has CPUs.
     memory_wait_ns: u64 = 0,
+    /// And for a CPU, the rest of the take: its CPUs held by other runs' VMs (or a priority
+    /// process's), each attempt a pause of 10 to 30 ms.
+    cpu_wait_ns: u64 = 0,
 };
 
 /// The pool directory's `<kind>-<cpu>` file, opened (made if new).

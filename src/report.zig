@@ -258,8 +258,10 @@ pub const Multiverse = struct {
     /// Output the timelines printed, and the virtual time they printed it over: Antithesis's
     /// "Logging output was limited" is a ratio over the whole simulation, not per timeline.
     output_bytes: u64 = 0,
-    /// How long its timelines waited for the host's memory before they started (Branch).
+    /// How long its timelines waited for the host's memory before they started (Branch), and
+    /// for a CPU.
     memory_wait_ns: u64 = 0,
+    cpu_wait_ns: u64 = 0,
     /// A tree's workers, and how many timelines ran at once on average (main.zig's Busy).
     workers: u32 = 0,
     at_once: f64 = 0,
@@ -277,8 +279,10 @@ pub const Multiverse = struct {
         path: []const tape.Segment = &.{},
         generation: u32 = 0,
         why: []const u8 = "",
-        /// How long its CPU waited for the host's memory before it started (cpus.Held).
+        /// How long its CPU waited for the host's memory before it started, and for the CPU
+        /// (cpus.Held).
         memory_wait_ns: u64 = 0,
+        cpu_wait_ns: u64 = 0,
     };
 
     const Aggregate = struct {
@@ -344,6 +348,7 @@ pub const Multiverse = struct {
         multiverse.idle_ns += (vm.stats.idle_tsc -| branch.start_idle_tsc) / tsc_per_ns;
         multiverse.wall_ns += branch.wall_ns;
         multiverse.memory_wait_ns += branch.memory_wait_ns;
+        multiverse.cpu_wait_ns += branch.cpu_wait_ns;
         multiverse.output_bytes += vm.events.output_bytes;
         multiverse.output_span_ns += vm.events.output_span_ns(state.tsc / tsc_per_ns);
         try multiverse.logging_judge();
@@ -357,6 +362,8 @@ pub const Multiverse = struct {
             vm.events.hash.final(),          failing,
         }) catch {};
         if (branch.memory_wait_ns > 0) line.print(" memory_wait={d:.3}s", .{seconds(branch.memory_wait_ns)}) catch {};
+        // A take's pauses alone are tens of milliseconds: from a tenth of a second, other runs.
+        if (branch.cpu_wait_ns >= cpu_wait_said_ns) line.print(" cpu_wait={d:.3}s", .{seconds(branch.cpu_wait_ns)}) catch {};
         // Where exact stops went less than exactly in this timeline: beside a replay that parts
         // from it, what to suspect first.
         if (state.overshoots + state.throttles + state.late_steps > 0) line.print(
@@ -658,10 +665,13 @@ pub const Multiverse = struct {
             .workers = multiverse.workers,
             .at_once = multiverse.at_once,
             .memory_wait_ns = multiverse.memory_wait_ns,
+            .cpu_wait_ns = multiverse.cpu_wait_ns,
             .properties = lines[0..multiverse.aggregate_count],
         } });
     }
 };
+
+const cpu_wait_said_ns = 100 * std.time.ns_per_ms;
 
 test "Multiverse.efficiency" {
     const multiverse = try std.testing.allocator.create(Multiverse);

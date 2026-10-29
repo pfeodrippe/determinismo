@@ -2926,15 +2926,15 @@ fn check_parallel(context: *Context) !void {
             continue;
         }
         const at_once = concurrency(output);
-        // A host whose memory other runs claim (a hunt beside the checks) admits fewer VMs at
-        // once than it has CPUs: that is the pool's back-pressure, not this bug (srv3,
-        // 2026-10-28: a Kafka hunt's 50 GB and its holders left one VM at a time).
-        const waited = memory_waited(output);
-        if (waited.memory_s > 0.25 * waited.run_s) {
-            std.debug.print("SKIP parallel: a {s} run's VMs waited {d:.0}s for memory in {d:.0}s " ++
-                "(other runs' claims): {d:.1} timelines at once says nothing of its cores\n", .{
-                branching, waited.memory_s, waited.run_s, at_once,
-            });
+        // A host whose memory or CPUs other runs claim (a hunt, or smokes on the reserved cores,
+        // beside the checks) admits fewer VMs at once than the run has CPUs: that is the pool's
+        // back-pressure, not this bug (srv3, 2026-10-28: a Kafka hunt's 50 GB and its holders
+        // left one VM at a time; 2026-10-29: smokes on the reserved cores).
+        const run = waits_of(output);
+        if (run.memory_s + run.cpu_s > 0.25 * run.run_s) {
+            std.debug.print("SKIP parallel: a {s} run's VMs waited {d:.0}s for memory and {d:.0}s " ++
+                "for CPUs in {d:.0}s (other runs' claims): {d:.1} timelines at once says nothing of " ++
+                "its cores\n", .{ branching, run.memory_s, run.cpu_s, run.run_s, at_once });
             continue;
         }
         const least = @min(1.8, 0.65 * @as(f64, @floatFromInt(cores)));
@@ -2957,34 +2957,40 @@ fn workers_said(output: []const u8) u32 {
 }
 
 /// The timelines' wall times over the run's (its multiverse line's).
-/// How long a report's timelines waited for the host's memory (their `memory_wait=`), and the
-/// run's wall time.
-fn memory_waited(output: []const u8) struct { memory_s: f64, run_s: f64 } {
+/// How long a report's timelines waited for the host's memory and for CPUs other runs held
+/// (their `memory_wait=` and `cpu_wait=`), and the run's wall time.
+fn waits_of(output: []const u8) struct { memory_s: f64, cpu_s: f64, run_s: f64 } {
     var memory_s: f64 = 0;
+    var cpu_s: f64 = 0;
     var run_s: f64 = 0;
     var lines = std.mem.tokenizeScalar(u8, output, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "[branch ")) {
-            const wait = field(line, "memory_wait=") orelse continue;
-            memory_s += std.fmt.parseFloat(f64, std.mem.trimEnd(u8, wait, "s")) catch 0;
+            if (field(line, "memory_wait=")) |wait| {
+                memory_s += std.fmt.parseFloat(f64, std.mem.trimEnd(u8, wait, "s")) catch 0;
+            }
+            if (field(line, "cpu_wait=")) |wait| {
+                cpu_s += std.fmt.parseFloat(f64, std.mem.trimEnd(u8, wait, "s")) catch 0;
+            }
         } else if (std.mem.indexOf(u8, line, "] multiverse: ")) |_| {
             const end = std.mem.lastIndexOf(u8, line, "s wall") orelse continue;
             const start = (std.mem.lastIndexOfScalar(u8, line[0..end], ' ') orelse continue) + 1;
             run_s = std.fmt.parseFloat(f64, line[start..end]) catch 0;
         }
     }
-    return .{ .memory_s = memory_s, .run_s = run_s };
+    return .{ .memory_s = memory_s, .cpu_s = cpu_s, .run_s = run_s };
 }
 
-test memory_waited {
+test waits_of {
     const report = "[branch    0] seed=ab shutdown vtime=2.9s wall=0.4s events=488 " ++
-        "events_hash=5167 failing=0 memory_wait=1.500s\n" ++
+        "events_hash=5167 failing=0 memory_wait=1.500s cpu_wait=0.250s\n" ++
         "[branch    1] seed=cd shutdown vtime=2.1s wall=0.1s events=99 events_hash=c66e failing=1 " ++
         "memory_wait=0.500s  FAIL \"total\"\n" ++
         "[determinismo] multiverse: 2 branches, 1 with failing properties, 3.000s wall\n";
-    const waited = memory_waited(report);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), waited.memory_s, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), waited.run_s, 0.001);
+    const run = waits_of(report);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), run.memory_s, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), run.cpu_s, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), run.run_s, 0.001);
 }
 
 fn concurrency(output: []const u8) f64 {

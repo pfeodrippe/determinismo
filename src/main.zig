@@ -2084,6 +2084,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .generation = place.generation,
             .why = place.why,
             .memory_wait_ns = if (held) |cpu| cpu.memory_wait_ns else 0,
+            .cpu_wait_ns = if (held) |cpu| cpu.cpu_wait_ns else 0,
         });
         if (exploration.strategy) |strategy| {
             const end = BranchResult{ .index = index, .outcome = outcome };
@@ -2621,11 +2622,12 @@ const Busy = struct {
         multiverse.workers = busy.jobs;
         multiverse.at_once = busy.at_once();
         std.debug.print("[determinismo] workers: {d:.1} timelines at once of {d} on average " ++
-            "({d:.0}%); their VMs waited {d:.0}s for memory\n", .{
+            "({d:.0}%); their VMs waited {d:.0}s for memory, {d:.0}s for CPUs other runs held\n", .{
             busy.at_once(),
             busy.jobs,
             100 * busy.at_once() / @as(f64, @floatFromInt(@max(busy.jobs, 1))),
             @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s,
+            @as(f64, @floatFromInt(multiverse.cpu_wait_ns)) / std.time.ns_per_s,
         });
     }
 };
@@ -2644,10 +2646,11 @@ fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *c
     }
     const efficiency = multiverse.efficiency();
     text.print("],\"done\":{d},\"failing\":{d},\"generation\":{d},\"at_s\":{d}," ++
-        "\"workers\":{d},\"at_once\":{d:.2},\"memory_wait_s\":{d:.1},\"idle_share\":{d:.3}," ++
+        "\"workers\":{d},\"at_once\":{d:.2},\"memory_wait_s\":{d:.1},\"cpu_wait_s\":{d:.1},\"idle_share\":{d:.3}," ++
         "\"clock_reads_per_s\":{d:.0},\"per_node\":{d:.2}}}\n", .{
         multiverse.branches,          multiverse.failing_branches, generation,                                                             wall.sec,
-        busy.jobs,                    busy.at_once(),              @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s, efficiency.idle_share,
+        busy.jobs,                    busy.at_once(),              @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s,
+        @as(f64, @floatFromInt(multiverse.cpu_wait_ns)) / std.time.ns_per_s, efficiency.idle_share,
         efficiency.clock_reads_per_s, efficiency.per_node,
     }) catch return;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;

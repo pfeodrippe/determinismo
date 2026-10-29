@@ -654,16 +654,18 @@ function environmentBody() {
 }
 
 // How busy a tree's workers were: timelines running at once on average, of how many, and how
-// long their VMs waited for the host's memory (the explorer's status while it runs, its summary
-// after). A hunt whose CPUs sit idle says so here.
+// long their VMs waited for the host's memory and for CPUs other runs held (the explorer's
+// status while it runs, its summary after). A hunt whose CPUs sit idle says so here.
 function atOnce(run) {
   const live = run.state === "running" ? run.progress : null;
-  const known = live && live.workers ? { workers: live.workers, at_once: live.at_once, memory_s: live.memory_wait_s }
-    : run.summary && run.summary.workers ? { workers: run.summary.workers, at_once: run.summary.at_once, memory_s: (run.summary.memory_wait_ns || 0) / 1e9 }
+  const known = live && live.workers ? { workers: live.workers, at_once: live.at_once, memory_s: live.memory_wait_s, cpu_s: live.cpu_wait_s || 0 }
+    : run.summary && run.summary.workers ? { workers: run.summary.workers, at_once: run.summary.at_once, memory_s: (run.summary.memory_wait_ns || 0) / 1e9, cpu_s: (run.summary.cpu_wait_ns || 0) / 1e9 }
     : null;
   if (!known) return "–";
   const share = Math.round(100 * known.at_once / known.workers);
-  return `${known.at_once.toFixed(1)} of ${known.workers} workers (${share}%)` + (known.memory_s >= 1 ? ` · VMs waited ${Math.round(known.memory_s)} s for memory` : "");
+  return `${known.at_once.toFixed(1)} of ${known.workers} workers (${share}%)`
+    + (known.memory_s >= 1 ? ` · VMs waited ${Math.round(known.memory_s)} s for memory` : "")
+    + (known.cpu_s >= 1 ? ` · ${Math.round(known.cpu_s)} s for CPUs other runs held` : "");
 }
 function utilizationSummary() {
   const vtime = state.run.branches.reduce((sum, branch) => sum + branch.vtime_ns, 0);
