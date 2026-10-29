@@ -34,7 +34,10 @@ index of -1 into a vector of two. Symbolized from the image's libgalera_smm.so (
 `Proto::create_join()` (:1854) and `send_join()`, in the gcomm thread (an `AsioTcpSocket` read
 handler, then `Protostack::leave()`). `populate_node_list` asks the input map for each known
 node's `safe_seq(node.index())` and `range(node.index())`, both `node_index_->at(index)`: a node
-the current view counts as a member (or the node itself) had no index, -1. Just before, n2 went
+the current view counts as a member (or the node itself) had no index, -1. n2's last view, at
+47.39 s, 20 ms before (non-primary, two members): n1's new incarnation `d309ba44-...-b089` joined
+and its incarnation from before its crash at 35.8 s, `d309ba44-...-b088` (the same UUID but one
+digit: a restart within moments), left, n3 partitioned. Just before, n2 went
 through non-primary views of two members, one of them `unspecified`, after: an outage of n1 and
 n3 (30.8 s), a crash of n1 (35.8 s), pauses of n2's process (6.6 s), n3 (8.6 s) and n1 (6.4 s),
 partitions into groups (6.7 s), clogs. The function is unchanged on Galera's 4.x branch, through
