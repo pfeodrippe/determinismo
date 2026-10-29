@@ -40,6 +40,11 @@ const partitions = 4;
 const replicas = 3;
 const txns_path = "/tmp/kafka-txns.log";
 const transactions_per_driver = 20;
+/// No transaction begins past this much of a command's time (the guest's clock): Redpanda's
+/// under faults sat in the client's 10 s timeouts, a command took 80 s, and a timeline's 41 to
+/// 63 commands ran past its hour (run 177: "the guest finishes its scenario" failed with the
+/// drivers still running, faults with them). Apache Kafka's 20 take a few seconds.
+const driver_budget_ns = 20 * std.time.ns_per_s;
 const sends_max = 4;
 /// One transaction in a few aborted on purpose (its writes must never be read).
 const abort_one_in = 5;
@@ -228,7 +233,13 @@ fn transactions(context: *System.Context) !void {
         sdk.sometimes(true, "a producer could not start", .{ .reply = hello });
         return;
     }
+    const started_ns = monotonic_ns();
     for (0..transactions_per_driver) |sequence| {
+        if (monotonic_ns() - started_ns >= driver_budget_ns) {
+            // An event, no target: Apache Kafka's commands never run out.
+            sdk.event("kafka_command_budget", .{ .done = sequence });
+            break;
+        }
         const count = 1 + sdk.random_below(sends_max);
         const commit = sdk.random_below(abort_one_in) != 0;
         var values: [sends_max]u64 = undefined;
@@ -506,4 +517,10 @@ test transactions_parse {
     try std.testing.expectEqual(Outcome.aborted, noted[1].outcome);
     try std.testing.expectEqual(Outcome.unknown, noted[2].outcome);
     try std.testing.expectEqual(Outcome.failed, noted[3].outcome);
+}
+
+fn monotonic_ns() u64 {
+    var now: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &now);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
