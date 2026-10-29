@@ -1,0 +1,72 @@
+#!/bin/bash
+# gr-start <id>: member n<id> of three. mysqld (the image's entrypoint) and, beside it, what an
+# operator does: join the group when one runs; when none runs anywhere (the first start, or after
+# every member went down), form it again on the most up-to-date member, once all three answer,
+# as MySQL Shell's rebootClusterFromCompleteOutage() does. No member forms a group while another
+# could hold a newer one: all three must answer, each one's GTIDs a subset of the chosen one's.
+set -e
+id=$1
+me=n$id
+sed -e "s/NODE_ID/$id/" -e "s/NODE_NAME/$me/" /etc/mysql/conf.d/gr.cnf.in > /etc/mysql/conf.d/gr.cnf
+# Read only until the group makes the member its primary: a member restarted and not yet back in
+# the group takes no writes (they would be errant transactions). Not at the first start: the
+# image's initialization runs statements of its own, refused read only; nothing writes then
+# before the group formed, and the group makes its secondaries read only itself.
+if [ -d /var/lib/mysql/mysql ]; then
+  printf '[mysqld]\nsuper_read_only = ON\n' > /etc/mysql/conf.d/read-only.cnf
+else
+  rm -f /etc/mysql/conf.d/read-only.cnf
+fi
+# Over TCP: the image's initialization runs a server of its own on the socket alone
+# (--skip-networking), still holding initialization's GTIDs; one that answered it formed a group
+# there (the third smoke: n3, its initialization then refused read only).
+local_sql() { mysql -uroot -h 127.0.0.1 -P 3306 -N -s --connect-timeout=2 -e "$1" 2> /dev/null; }
+peer_sql() { mysql -uroot -h "$1" -N -s --connect-timeout=2 -e "$2" 2> /dev/null; }
+state() { local_sql "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid"; }
+online_somewhere() {
+  for peer in n1 n2 n3; do
+    [ "$peer" = "$me" ] && continue
+    count=$(peer_sql "$peer" "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE'") || continue
+    [ "${count:-0}" -gt 0 ] && return 0
+  done
+  return 1
+}
+# Whether this member is the one to form the group: every member answers, and this one's GTIDs hold
+# every other's (ties to the lowest name).
+chosen() {
+  mine=$(local_sql "SELECT @@GLOBAL.gtid_executed") || return 1
+  for peer in n1 n2 n3; do
+    [ "$peer" = "$me" ] && continue
+    theirs=$(peer_sql "$peer" "SELECT @@GLOBAL.gtid_executed") || return 1
+    covered=$(local_sql "SELECT GTID_SUBSET('$theirs', '$mine')") || return 1
+    [ "$covered" = 1 ] || return 1
+    # Equal sets: the lower name forms it.
+    same=$(local_sql "SELECT GTID_SUBSET('$mine', '$theirs')") || return 1
+    if [ "$same" = 1 ] && [[ "$peer" < "$me" ]]; then return 1; fi
+  done
+  return 0
+}
+helper() {
+  set +e # A query that fails is answered by the next round, never the helper's end.
+  until local_sql "SELECT 1" > /dev/null; do sleep 1; done
+  while true; do
+    case "$(state)" in
+      ONLINE|RECOVERING) sleep 2; continue ;;
+    esac
+    if online_somewhere; then
+      local_sql "START GROUP_REPLICATION" > /dev/null || true
+      sleep 5
+      continue
+    fi
+    if chosen; then
+      echo "gr-start: no group runs and $me holds every member's transactions: forming it" >&2
+      local_sql "SET GLOBAL group_replication_bootstrap_group = ON; START GROUP_REPLICATION; SET GLOBAL group_replication_bootstrap_group = OFF" > /dev/null || \
+        local_sql "SET GLOBAL group_replication_bootstrap_group = OFF" > /dev/null || true
+      sleep 5
+      continue
+    fi
+    sleep 2
+  done
+}
+helper &
+exec docker-entrypoint.sh mysqld

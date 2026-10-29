@@ -61,9 +61,10 @@ pub const Options = struct {
     /// A statement the final reads' connections run first, so that a read sees every commit the
     /// cluster made (Galera: `SET SESSION wsrep_sync_wait = 1`); null: none.
     final_session: ?[]const u8 = null,
-    /// Only through the primary of a PostgreSQL cluster of standbys (Patroni's): a connection to
-    /// a standby (`pg_is_in_recovery()`) is dropped for another node, as a client following the
-    /// leader does. A standby's reads lag by design, and its writes are refused.
+    /// Only through the primary of a cluster with standbys: a connection to a standby is
+    /// dropped for another node, as a client following the leader does (PostgreSQL's
+    /// `pg_is_in_recovery()`, Patroni's; MySQL's `super_read_only`, Group Replication's
+    /// secondaries and members not in the group). A standby's reads lag, its writes are refused.
     primary_only: bool = false,
     /// Connections refused in a row (or standbys reached) before a driver gives up, a pause up
     /// to a second between them: ~11 s at 20. A cluster that fails over in tens of seconds
@@ -72,11 +73,15 @@ pub const Options = struct {
     refused_max: u32 = 20,
 };
 
-/// Whether the connection is to a standby, not the primary (PostgreSQL).
+/// Whether the connection is to a standby, not the primary.
 fn standby(connection: *Client) bool {
     var cell: [8]u8 = undefined;
-    const text = connection.query_text("SELECT pg_is_in_recovery()", &cell) catch return true;
-    return !std.mem.eql(u8, text orelse "", "f");
+    const query, const primary = switch (connection.*) {
+        .postgres => .{ "SELECT pg_is_in_recovery()", "f" },
+        .mysql => .{ "SELECT @@global.super_read_only", "0" },
+    };
+    const text = connection.query_text(query, &cell) catch return true;
+    return !std.mem.eql(u8, text orelse "", primary);
 }
 
 pub const Dialect = enum { postgres, mysql };

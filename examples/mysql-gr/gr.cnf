@@ -1,0 +1,21 @@
+# Group Replication, single-primary (InnoDB Cluster's settings); NODE_ID and NODE_NAME filled in by
+# the start script. The plugin's options `loose-`: the data directory's initialization loads no
+# plugin, and an option it does not know otherwise aborts it.
+[mysqld]
+server_id = NODE_ID
+report_host = NODE_NAME
+gtid_mode = ON
+enforce_gtid_consistency = ON
+plugin_load_add = group_replication.so
+loose-group_replication_group_name = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+# The MySQL communication stack (the default since 8.0.27): the group's messages over the server's
+# own port, as the recovery user (GROUP_REPLICATION_STREAM).
+loose-group_replication_communication_stack = MYSQL
+loose-group_replication_local_address = "NODE_NAME:3306"
+loose-group_replication_group_seeds = "n1:3306,n2:3306,n3:3306"
+loose-group_replication_single_primary_mode = ON
+# A new primary applies its backlog before it serves (no stale reads after a failover).
+loose-group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
+loose-group_replication_start_on_boot = OFF
+loose-group_replication_bootstrap_group = OFF
+loose-group_replication_recovery_get_public_key = ON
