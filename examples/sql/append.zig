@@ -61,16 +61,30 @@ pub const Options = struct {
     /// A statement the final reads' connections run first, so that a read sees every commit the
     /// cluster made (Galera: `SET SESSION wsrep_sync_wait = 1`); null: none.
     final_session: ?[]const u8 = null,
+    /// Only through the primary of a PostgreSQL cluster of standbys (Patroni's): a connection to
+    /// a standby (`pg_is_in_recovery()`) is dropped for another node, as a client following the
+    /// leader does. A standby's reads lag by design, and its writes are refused.
+    primary_only: bool = false,
+    /// Connections refused in a row (or standbys reached) before a driver gives up, a pause up
+    /// to a second between them: ~11 s at 20. A cluster that fails over in tens of seconds
+    /// (Patroni's ttl) needs more, or every driver gives up during it (the first Patroni smoke's
+    /// timeline 0: two nodes lost power, no transaction ran).
+    refused_max: u32 = 20,
 };
+
+/// Whether the connection is to a standby, not the primary (PostgreSQL).
+fn standby(connection: *Client) bool {
+    var cell: [8]u8 = undefined;
+    const text = connection.query_text("SELECT pg_is_in_recovery()", &cell) catch return true;
+    return !std.mem.eql(u8, text orelse "", "f");
+}
 
 pub const Dialect = enum { postgres, mysql };
 pub const Upsert = enum { update_insert_update, on_conflict };
 pub const Key = enum { primary, secondary };
 
 const tables_max = 16;
-/// Connections refused before a driver gives up (the next one tries again), and the pause
-/// between them.
-const refused_max = 20;
+/// The pause between connections refused (Options.refused_max of them in a row at most).
 const refused_pause_ms_min = 100;
 const refused_pause_ms_max = 1000;
 const mops_max = 4;
@@ -127,11 +141,20 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
                     .sqlstate = connection.sqlstate(),
                 });
                 refused += 1;
-                if (refused == refused_max) return;
+                if (refused == options.refused_max) return;
                 pause_ms(refused_pause_ms_min + sdk.random_below(refused_pause_ms_max - refused_pause_ms_min));
                 continue;
             };
+            if (options.primary_only and standby(&connection)) {
+                // A standby, or one that cannot say: another node, without spending a transaction.
+                connection.close();
+                refused += 1;
+                if (refused == options.refused_max) return;
+                pause_ms(refused_pause_ms_min + sdk.random_below(refused_pause_ms_max - refused_pause_ms_min));
+                continue;
+            }
             connected = true;
+            refused = 0; // A streak ends.
             // Transactions of one micro-operation run alone, at this level too.
             if (options.isolation) |level| {
                 var statement: [128]u8 = undefined;
@@ -149,7 +172,7 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
                     connection.close();
                     connected = false;
                     refused += 1;
-                    if (refused == refused_max) return;
+                    if (refused == options.refused_max) return;
                     continue;
                 };
             }
@@ -220,6 +243,10 @@ const FinalReader = struct {
     fn connect(reader: *FinalReader) bool {
         const address = reader.addresses[sdk.random_below(reader.addresses.len)];
         reader.connection.open(address, reader.options) catch return false;
+        if (reader.options.primary_only and standby(&reader.connection)) {
+            reader.connection.close();
+            return false;
+        }
         if (reader.options.final_session) |statement| reader.connection.exec(statement) catch {
             reader.connection.close();
             return false;
