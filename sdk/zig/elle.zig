@@ -59,6 +59,11 @@ pub const CheckOptions = struct {
     /// is not known.
     allowed: []const []const u8 = &.{},
     message: []const u8 = "Elle finds no anomaly in the history",
+    /// Judged directly beside Elle: every list read lists each append acknowledged before the
+    /// read began. For a system whose reads may see a write before it is acknowledged, one copy
+    /// before another (OpenSearch's realtime GET: Elle at strict serializability takes that for
+    /// G-single-item-realtime), checked at `serializable` with this: what it does promise.
+    realtime_reads: bool = false,
 };
 
 /// The check to put in the program's `.checks`: Elle on every timeline's history (the records of
@@ -90,8 +95,119 @@ pub fn check(comptime options: CheckOptions) fn (*sdk.Check, []const u8) anyerro
             sdk.sometimes(verdict.valid == true, "Elle checked a history and found it valid", .{
                 .ops = verdict.ops,
             });
+            if (options.realtime_reads) {
+                const stale = try reads_stale(context.arena, history);
+                for (stale.first[0..@min(stale.count, stale.first.len)]) |read| {
+                    sdk.always(false, realtime_message, read);
+                }
+                if (stale.count > stale.first.len) sdk.event("reads_stale", .{ .count = stale.count });
+                if (stale.count == 0) sdk.always(true, realtime_message, .{ .reads = stale.reads });
+            }
         }
     }.run;
+}
+
+const realtime_message = "every append acknowledged before a read began is in it";
+
+/// A read that missed an append acknowledged before it began.
+pub const Stale = struct {
+    key: u64,
+    value: u64,
+    /// When the append was acknowledged, and when the read began and ended (the guest's clock).
+    acknowledged_ns: u64,
+    read_ns: [2]u64,
+    listed: usize,
+};
+
+pub const StaleReads = struct {
+    count: u32 = 0,
+    reads: u32 = 0,
+    first: [8]Stale = undefined,
+};
+
+/// The history's (JSON lines) list reads that miss an append acknowledged before they began:
+/// a process does one operation at a time, so an `ok` began at that process's last `invoke`.
+pub fn reads_stale(gpa: std.mem.Allocator, text: []const u8) !StaleReads {
+    const Append = struct { key: u64, value: u64, acknowledged_ns: u64 };
+    const Read = struct { key: u64, list: []const u64, began_ns: u64, ended_ns: u64 };
+    var invoked: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+    var appends: std.ArrayList(Append) = .empty;
+    var reads: std.ArrayList(Read) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, line, .{}) catch
+            return error.BadHistory;
+        if (parsed != .object) return error.BadHistory;
+        const kind = parsed.object.get("type") orelse return error.BadHistory;
+        const process = parsed.object.get("process") orelse return error.BadHistory;
+        const time = parsed.object.get("time") orelse return error.BadHistory;
+        if (kind != .string or process != .integer or time != .integer) return error.BadHistory;
+        const now: u64 = @intCast(time.integer);
+        if (std.mem.eql(u8, kind.string, "invoke")) {
+            try invoked.put(gpa, @intCast(process.integer), now);
+            continue;
+        }
+        if (!std.mem.eql(u8, kind.string, "ok")) continue;
+        const began = invoked.get(@intCast(process.integer)) orelse continue;
+        const mops = parsed.object.get("value") orelse return error.BadHistory;
+        if (mops != .array) return error.BadHistory;
+        for (mops.array.items) |mop| {
+            if (mop != .array or mop.array.items.len != 3) continue;
+            const f = mop.array.items[0];
+            const key = mop.array.items[1];
+            const value = mop.array.items[2];
+            if (f != .string or key != .integer) continue;
+            if (std.mem.eql(u8, f.string, "append") and value == .integer) {
+                try appends.append(gpa, .{ .key = @intCast(key.integer), .value = @intCast(value.integer), .acknowledged_ns = now });
+            } else if (std.mem.eql(u8, f.string, "r") and value == .array) {
+                const list = try gpa.alloc(u64, value.array.items.len);
+                for (value.array.items, list) |item, *slot| {
+                    if (item != .integer) return error.BadHistory;
+                    slot.* = @intCast(item.integer);
+                }
+                try reads.append(gpa, .{ .key = @intCast(key.integer), .list = list, .began_ns = began, .ended_ns = now });
+            }
+        }
+    }
+    var stale: StaleReads = .{ .reads = @intCast(reads.items.len) };
+    for (reads.items) |read| {
+        for (appends.items) |append| {
+            if (append.key != read.key or append.acknowledged_ns >= read.began_ns) continue;
+            if (std.mem.indexOfScalar(u64, read.list, append.value) != null) continue;
+            if (stale.count < stale.first.len) stale.first[stale.count] = .{
+                .key = read.key,
+                .value = append.value,
+                .acknowledged_ns = append.acknowledged_ns,
+                .read_ns = .{ read.began_ns, read.ended_ns },
+                .listed = read.list.len,
+            };
+            stale.count += 1;
+        }
+    }
+    return stale;
+}
+
+test reads_stale {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // Process 2 reads 40 before its append is acknowledged (a dirty read, allowed), process 3
+    // misses it after (stale), process 4's read began before the acknowledgment (allowed).
+    const history =
+        \\{"process":1,"type":"invoke","f":"txn","time":10,"value":[["append",7,40]]}
+        \\{"process":2,"type":"invoke","f":"txn","time":11,"value":[["r",7,null]]}
+        \\{"process":2,"type":"ok","f":"txn","time":12,"value":[["r",7,[40]]]}
+        \\{"process":4,"type":"invoke","f":"txn","time":13,"value":[["r",7,null]]}
+        \\{"process":1,"type":"ok","f":"txn","time":14,"value":[["append",7,40]]}
+        \\{"process":4,"type":"ok","f":"txn","time":15,"value":[["r",7,[]]]}
+        \\{"process":3,"type":"invoke","f":"txn","time":16,"value":[["r",7,null]]}
+        \\{"process":3,"type":"ok","f":"txn","time":17,"value":[["r",7,[]]]}
+        \\
+    ;
+    const stale = try reads_stale(arena.allocator(), history);
+    try std.testing.expectEqual(@as(u32, 3), stale.reads);
+    try std.testing.expectEqual(@as(u32, 1), stale.count);
+    try std.testing.expectEqual(@as(u64, 40), stale.first[0].value);
+    try std.testing.expectEqual([2]u64{ 16, 17 }, stale.first[0].read_ns);
 }
 
 /// Whether every anomaly type found is one of `allowed`.
