@@ -28,6 +28,8 @@
 //!                            causality.zig; its snapshots kept in the run's snapshots/)
 //!   GET  /runs/<id>/causality  every analysis: [{id, done, of: {branch, property, failure_ms,
 //!                            snapshot_ms, futures, planner}, points: [...]}]
+//!   GET  /runs/<id>/causality/<n>/explained/<k>/logs?grep=<text>  the node output of its
+//!                            explanation's future k: {lines: [{vtime_ns, source, text}], matched}
 //!   GET  /runs/<id>/causality/<n>  one: {id, done, of, points: [{vtime_ms, futures, failing,
 //!                            probability, low, high}], fault_effects?: {faults: [{fault, with,
 //!                            with_failing}], futures, failing}}
@@ -663,6 +665,14 @@ fn run_route(
         const index = std.fmt.parseInt(u32, index_text, 10) catch return error.NotFound;
         if (parts.next()) |verb| {
             if (eql(u8, verb, "stop") and eql(u8, request.method, "POST")) return causality_stop(server, run, index, out);
+            // GET /runs/<id>/causality/<n>/explained/<k>/logs?grep=<text>: the node output of
+            // its explanation's future k (lines holding the text), as its events have it.
+            if (eql(u8, verb, "explained")) {
+                const future = std.fmt.parseInt(usize, parts.next() orelse return error.NotFound, 10) catch return error.NotFound;
+                const what = parts.next() orelse return error.NotFound;
+                if (!eql(u8, what, "logs")) return error.NotFound;
+                return explained_logs(server, run, index, future, out);
+            }
             return error.NotFound;
         }
         return causality_show(server, run, index, out);
@@ -1569,6 +1579,58 @@ fn causality_write(server: *Server, run: *const Run, index: u32, out: *std.Io.Wr
         try out.print(",\"explained\":{s}", .{line[explained_key.len .. line.len - 1]});
     }
     try out.writeAll("}");
+}
+
+/// Output lines of an explanation's future, at most this many (the latest kept past it).
+const explained_lines_max = 2000;
+
+/// The node output an analysis's explanation future wrote (causality.zig's explain: its events
+/// directory, named in the analysis's own output, never by the request), `grep` filtering:
+/// `{"lines": [{"vtime_ns", "source", "text"}], "matched": n}`.
+fn explained_logs(server: *Server, run: *const Run, index: u32, future: usize, out: *std.Io.Writer) !u16 {
+    const name = try print(server, "causality-{d}.jsonl", .{index});
+    const output = run_file(server, run.id, name) catch return error.NotFound;
+    const Explained = struct { explained: []const struct { vtime_ms: u64, fails: bool, events: []const u8 } };
+    var events: ?[]const u8 = null;
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"explained\":")) continue;
+        const parsed = std.json.parseFromSliceLeaky(Explained, server.arena, line, .{}) catch continue;
+        if (future < parsed.explained.len) events = parsed.explained[future].events;
+    }
+    const directory_path = events orelse return error.NotFound;
+    const grep = if (query_value(server.query_string, "grep")) |encoded| grep: {
+        const copy = try server.arena.dupe(u8, encoded);
+        std.mem.replaceScalar(u8, copy, '+', ' ');
+        break :grep std.Uri.percentDecodeInPlace(copy);
+    } else "";
+    var directory = std.Io.Dir.cwd().openDir(server.io, directory_path, .{ .iterate = true }) catch return error.NotFound;
+    defer directory.close(server.io);
+    const Line = struct { vtime_ns: u64 = 0, event: struct { output: ?struct { source: []const u8 = "", text: []const u8 = "" } = null } = .{} };
+    var kept: std.ArrayList(Line) = .empty;
+    var matched: u64 = 0;
+    var entries = directory.iterate();
+    while (try entries.next(server.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "branch-") and !std.mem.eql(u8, entry.name, "fork.jsonl")) continue;
+        const text = directory.readFileAlloc(server.io, entry.name, server.arena, .limited(1 << 30)) catch continue;
+        var event_lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (event_lines.next()) |event_line| {
+            if (std.mem.indexOf(u8, event_line, "\"output\"") == null) continue;
+            if (grep.len > 0 and std.mem.indexOf(u8, event_line, grep) == null) continue;
+            const parsed = std.json.parseFromSliceLeaky(Line, server.arena, event_line, .{ .ignore_unknown_fields = true }) catch continue;
+            if (parsed.event.output == null) continue;
+            matched += 1;
+            if (kept.items.len == explained_lines_max) _ = kept.orderedRemove(0);
+            try kept.append(server.arena, parsed);
+        }
+    }
+    try out.writeAll("{\"lines\":[");
+    for (kept.items, 0..) |line, at| {
+        if (at > 0) try out.writeAll(",");
+        try out.print("{f}", .{std.json.fmt(.{ .vtime_ns = line.vtime_ns, .source = line.event.output.?.source, .text = line.event.output.?.text }, .{})});
+    }
+    try out.print("],\"matched\":{d}}}\n", .{matched});
+    return 200;
 }
 
 /// Stops an analysis, and its futures: it runs in a session of its own (spawn), its futures in its
