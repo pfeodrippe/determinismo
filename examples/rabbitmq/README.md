@@ -111,6 +111,25 @@ Not in rabbitmq-server's issues (searched: the abort, `failed_waiting_for_tables
 `node_not_running`, the repair message); its Discussions not searched. Mnesia's, under RabbitMQ:
 Khepri, RabbitMQ's replacement for it, is the next thing to run here.
 
+### Found blind: confirmed messages lost when two quorum queue members forget themselves
+
+Hunt run 118 (srv3, 2026-10-29, `flags-synced`, seed 1), timeline 1005: 23 of 34 confirmed
+messages gone after a drain that completed (`every confirmed message is dequeued`: lost 23).
+No power loss was needed:
+- 12.72 s: queue `jepsen` declared, its leader rabbit-1 (term 1);
+- 12.89 s: rabbit-1 stopped gracefully (its dets synced as it stopped: it keeps its member);
+- 13.19 s: rabbit-3 leader in term 2; rabbit-2 and rabbit-3 confirm the messages that follow;
+- 13.34 s, 13.36 s: rabbit-2 and rabbit-3 killed (SIGKILL, files intact), 0.6 s after the
+  declaration: Ra had not yet written their registrations to `names.dets` (below);
+- 25.3 s: both come back "configured member ... was not found on this node. Starting member as
+  a new one" (`name_not_registered`): new, empty members, their term 2 logs orphaned;
+- 25.7 s: rabbit-1, with term 1's log alone, elected leader over the two empty members: what
+  rabbit-2 and rabbit-3 had confirmed is gone.
+Ra's `ra_directory` registers a server with `dets:insert` into a table opened `{auto_save,
+500}`, with no `dets:sync`: unchanged in ra 2.16.13 (RabbitMQ 4.1.4), 2.17.0, 3.2.0 (its latest
+release) and main (checked 2026-10-29). Not in rabbitmq-server's or ra's issues (searched:
+`names.dets`, `name_not_registered`, the warning, lost messages with new members).
+
 ### Found blind: a quorum queue whose members all forget themselves stops serving for good
 
 A broker that goes down soon after a quorum queue is declared comes back without knowing its
@@ -119,11 +138,11 @@ not found on this node. Starting member as a new one. Context: name_not_register
 which servers a node runs in `names.dets` (ra 2.16.13's `ra_directory`), opened with
 `{auto_save, 500}` and written by `dets:insert` with no `dets:sync`: a registration reaches the
 file up to half a second later, and the disk only at writeback. Hunt run 118 (srv3, 828
-timelines): 502 of ~640 such warnings follow a broker going down within a second of the
+timelines at first, 1,498 in the end): 502 of ~640 such warnings follow a broker going down within a second of the
 queue's declaration (56 of them plain kills, no power loss), the rest power losses within the
-writeback window. When all three members start as new ones (15 timelines), the queue never
-serves again in all 15: every `basic.get` fails (`internal_error`, "Cannot get a message from
-queue"), in 14 of them with every broker up and healthy; the confirmed messages in it
+writeback window. When all three members start as new ones (21 of 1,498 timelines), the queue
+never serves again in all 21: every `basic.get` fails (`internal_error`, "Cannot get a message from
+queue"), in 20 of them with every broker up and healthy; the confirmed messages in it
 (15 in the Khepri smoke's timeline 0) are out of reach. With one or two members forgotten (360
 timelines) the queue goes on. The same on Mnesia and Khepri (`queue_khepri`'s smoke). Nearest
 in rabbitmq-server's issues: #10007 (2023, closed), the same warning when a node was down
