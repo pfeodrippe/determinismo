@@ -159,6 +159,28 @@ scratch"); Galera's own tracker (codership/galera-bugs) is not public. A fix: ne
 primary view to gvwstate.dat while the node's state is incomplete (a joiner), or have
 `pc.recovery` bootstrap only a node with a complete state.
 
+## Found blind: stateless nodes restore their component under a nil history, and a node that saves it never starts again
+
+Hunt run 123 (`jepsen-dirsync`), timeline 459. At 98.4 s n2 and n3, both without a state (seqno -1
+after crashes), restore their saved component (`pc.recovery`); GCS: `Quorum: No node with complete
+state`, `Bootstrapped primary 00000000-… found: 2`, `group UUID =
+00000000-0000-0000-0000-000000000000`, and both shift to SYNCED. The group runs under the nil
+history: it orders actions (`Shifting JOINED -> SYNCED (TO: 1)` at 132.65 s, `(TO: 2)` at 141.31 s,
+three members by then), and n3 serves as a donor in it. n3 saves `00000000-…:2`, and from 154.64 s
+every start aborts (`Non-negative state seqno requires non-nil history UUID:
+00000000-0000-0000-0000-000000000000:2`, `gcs init failed: Invalid argument`, `Aborting`): the node
+never starts again without an operator editing grastate.dat. Run 123 has a node that will not
+start for this in 59 of its 632 timelines; run 58 (`jepsen`) in 27 of 532; run 97 in 1 of 299.
+
+In the code (Galera's 4.x head): a first component of a single bootstrapping node with no
+history gets a new history UUID (`gcs_group.cpp`, "Starting new group from scratch"); a
+component of several takes the bootstrap quorum's as it is (`group_post_state_exchange`:
+`group->group_uuid = quorum->group_uuid`, `act_id_ = quorum->act_id`), nil and -1 when no member
+has a state, and the group goes on in it. Not found in MariaDB's Jira (the error's text: no issue)
+or Galera's public issues. With the systemd unit's position recovery crashed nodes report their
+positions, so fewer components form with no state at all: the `jepsen-recovered` hunt queued
+will say whether it still happens.
+
 ## Status
 
 - Hunt run 58 (srv3, 2026-10-28, `jepsen` profile, 12.1.2, seed 2, 2 h): 532 timelines, Elle
