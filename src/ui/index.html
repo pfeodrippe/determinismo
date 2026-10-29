@@ -951,6 +951,8 @@ async function causalityRefresh() {
 let causalityOptions = { planner: "", verdict: "", points: 8, futures: 16, refine: 6, jump_min: 0.2, explain_exec: "" };
 try { Object.assign(causalityOptions, JSON.parse(localStorage.getItem("causalityOptions") || "{}")); } catch { /* Defaults. */ }
 function causalityOptionsHtml() {
+  // Empty: the run's profile's command (its test program's `explain`), shown as the placeholder.
+  const explain = state.run && state.run.explain;
   const field = (name, label, width, tip, attributes = "") => `<label data-tip="${escape(tip)}">${label}
     <input data-option="${name}" value="${escape(String(causalityOptions[name]))}" style="width:${width}" ${attributes}></label>`;
   return `<div class="causality-options muted">Causality:
@@ -960,7 +962,7 @@ function causalityOptionsHtml() {
     ${field("futures", "futures", "40px", "Futures forked from each moment: more, a narrower interval", 'type="number" min="1" max="256"')}
     ${field("refine", "rounds", "36px", "Rounds after the first, at most: the planner narrows the jumps", 'type="number" min="0" max="20"')}
     ${field("jump_min", "jump", "44px", "A change in probability this large between two moments is narrowed down", 'type="number" min="0.01" max="1" step="0.05"')}
-    ${field("explain_exec", "explain with", "200px", "Once the analysis is done, futures from inside its narrowest jump run this command at their moment, the timeline's randomness after it, their logs kept: a command that turns the system's logs up (e.g. det-nodes exec db <set the log level>)", 'placeholder="none"')}</div>`;
+    ${field("explain_exec", "explain with", "200px", "Once the analysis is done, futures from inside its narrowest jump run this command at their moment, the timeline's randomness after it, their logs kept: a command that turns the system's logs up (e.g. det-nodes exec db <set the log level>); empty: the profile's own, if it declares one", `placeholder="${escape(explain || "none")}"`)}</div>`;
 }
 async function causalityRun(property, branch) {
   const run = state.runId;

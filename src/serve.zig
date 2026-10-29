@@ -991,6 +991,12 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const trimmed = std.mem.trim(u8, request, " \n");
         if (trimmed.len > 0 and trimmed[0] == '{') try out.print(",\"request\":{s}", .{trimmed});
     } else |_| {}
+    // Its profile's command that turns the system's logs up: its analyses' explanation unless
+    // one asks for another.
+    if (system_explain(server, run.id)) |command| {
+        try out.writeAll(",\"explain\":");
+        try std.json.Stringify.value(command, .{}, out);
+    }
     var lines = std.mem.tokenizeScalar(u8, record, '\n');
     while (lines.next()) |line| {
         for ([_][]const u8{ "run", "summary", "snapshot", "changed" }) |key| {
