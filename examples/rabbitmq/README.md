@@ -231,4 +231,16 @@ its fun leaves the node's Mnesia settings at the throwaway ones.
 - 2026-10-29: scenario `queue_khepri` (with `flags-synced`): the cluster switched to Khepri,
   RabbitMQ's Raft-based metadata store, during setup (`rabbitmqctl enable_feature_flag --opt-in
   khepri_db`). Smoke (srv3, 8 timelines): no broker lost (on Mnesia, about one timeline in three
-  loses one), 7 clean, one drain not finishing. Hunted next.
+  loses one), 7 clean, one drain not finishing. Hunt run 164 (srv3, 2026-10-29, seed 1, 1,928
+  timelines): brokers boot (30 timelines with an unexpected exit, against 583 of run 160's on
+  Mnesia), and with them the forgotten quorum queue members do their damage: **confirmed
+  messages lost in 45 timelines (180 messages), every one with a member that forgot itself**
+  (`name_not_registered`). One forgotten member is enough: in timeline 1053 only rabbit-1 forgot
+  itself, and 4 of 76 confirmed messages were lost; it rejoins under its old identity with an
+  empty log, and with another member down it and a member missing entries are a majority. On
+  Mnesia the brokers mostly did not boot, the queue stopped instead (run 118: one timeline lost
+  messages so). This run predates the drain's settle step, so a timeline's loss may be the
+  drain's alone, but all 45 lossy timelines having a forgotten member is not the drain's doing.
+  Hunt queued: Khepri with Ra's directory synced (`ra-synced`), whose forgetting should take the
+  losses with it. 182 timelines could not drain, one replay of 16 parted from its timeline (docs/
+  PLAN.md, determinism).
