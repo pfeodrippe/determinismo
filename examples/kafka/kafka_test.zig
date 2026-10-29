@@ -436,9 +436,9 @@ fn everything_read(context: *System.Context) !void {
     };
     sdk.always(aborted_read == 0, "no write of an aborted transaction is ever read", details);
     sdk.always(lost == 0, "every write of a committed transaction is read", details);
-    sdk.sometimes(known_lost > 0, "a committed transaction's writes are lost to a known hang (KAFKA-20734)", .{
-        .transactions = known_lost,
-    });
+    // An event, as the hang itself (kafka_known_hang): a sometimes would be a target, failing
+    // every run where the bug never struck (Redpanda's run 177).
+    if (known_lost > 0) sdk.event("kafka_known_loss", .{ .transactions = known_lost, .issue = "KAFKA-20734" });
     sdk.always(torn == 0, "a transaction's writes are read all or none", details);
     sdk.always(duplicated == 0, "no write is read twice", details);
 }

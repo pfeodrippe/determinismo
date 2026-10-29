@@ -196,8 +196,8 @@ the whole timeline (the coverage profile's slower brokers never got one).
   gone once the judge aborted the hang to read past it (the commit marker the coordinator
   skipped), each with its known hang aborted. Since, the
   log notes each write's partition, and a committed transaction whose unread writes all sit on
-  partitions whose known hang was aborted is that bug's (a sometimes, "a committed
-  transaction's writes are lost to a known hang (KAFKA-20734)"), not a lost or torn one.
+  partitions whose known hang was aborted is that bug's (a `kafka_known_loss` event), not a
+  lost or torn one.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
