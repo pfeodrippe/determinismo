@@ -111,6 +111,24 @@ Not in rabbitmq-server's issues (searched: the abort, `failed_waiting_for_tables
 `node_not_running`, the repair message); its Discussions not searched. Mnesia's, under RabbitMQ:
 Khepri, RabbitMQ's replacement for it, is the next thing to run here.
 
+### Found blind: a quorum queue whose members all forget themselves stops serving for good
+
+A broker that goes down soon after a quorum queue is declared comes back without knowing its
+member of the queue: `Quorum queue recovery: configured member of queue 'jepsen' in vhost '/' was
+not found on this node. Starting member as a new one. Context: name_not_registered`. Ra keeps
+which servers a node runs in `names.dets` (ra 2.16.13's `ra_directory`), opened with
+`{auto_save, 500}` and written by `dets:insert` with no `dets:sync`: a registration reaches the
+file up to half a second later, and the disk only at writeback. Hunt run 118 (srv3, 828
+timelines): 502 of ~640 such warnings follow a broker going down within a second of the
+queue's declaration (56 of them plain kills, no power loss), the rest power losses within the
+writeback window. When all three members start as new ones (15 timelines), the queue never
+serves again in all 15: every `basic.get` fails (`internal_error`, "Cannot get a message from
+queue"), in 14 of them with every broker up and healthy; the confirmed messages in it
+(15 in the Khepri smoke's timeline 0) are out of reach. With one or two members forgotten (360
+timelines) the queue goes on. The same on Mnesia and Khepri (`queue_khepri`'s smoke). Nearest
+in rabbitmq-server's issues: #10007 (2023, closed), the same warning when a node was down
+while the queue was declared; here every node was up.
+
 ### Found blind: after a power loss, a boot's throwaway Mnesia takes a schema update and dies (being read)
 
 Hunt run 118 (srv3, 2026-10-29, `flags-synced`): with the feature flags finding out of the way,
