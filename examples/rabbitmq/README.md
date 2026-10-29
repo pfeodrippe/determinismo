@@ -161,3 +161,9 @@ its fun leaves the node's Mnesia settings at the throwaway ones.
   answering, and the judge counts those; and a confirmed message is lost only after a complete
   drain (with no node serving, its fate is unknown, and the drain's property fails instead).
   Smokes (4 timelines each): confirmed messages accounted for in every drained timeline.
+- 2026-10-29: hunt run 118 (`flags-synced`), first 508 timelines: no message lost, none
+  dequeued that was never enqueued or refused. 160 lose a broker for good, by their whole
+  histories (ancestors included): 82 the throwaway Mnesia's schema update above, 37 the
+  `mnesia_controller` crash on `rabbit_node_maintenance_states` (observed above), 36 other
+  boots ending `mnesia_not_running` (a table load from a peer killed midway, for one), 5 other.
+  Mnesia not coming back after power losses, in its several ways, is what is left.
