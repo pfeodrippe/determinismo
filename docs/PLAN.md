@@ -78,9 +78,12 @@ event hashing, the guest module.
 - e2e under load: coverage (synced workers), parallel, script, ending and ui's causality analysis
   fail when other units share the reserved cores (2026-10-29's suite beside smokes); coverage
   passed alone, the others to run alone too.
-- Hunts queued after Galera's run 196: MySQL Group Replication, Galera jepsen-recovered, RabbitMQ
-  Khepri ra-synced, hyperthreads, OpenSearch and Redpanda again, ZooKeeper known, YugabyteDB
-  outages; smokes, one after another: Cassandra 5.0.9 (ready on its storage port since its first
+- Hunts: Galera's run 196 done (README); MySQL Group Replication (run 200) running, then Galera
+  jepsen-recovered, RabbitMQ Khepri ra-synced, the hyperthreads run, then srv3's
+  ~/hunts/next-list.txt (read when its turn comes): Cassandra 6's Accord, Ignite, ScyllaDB's
+  current release, SurrealDB, Kafka share groups, YugabyteDB's current release, Cassandra 5,
+  NATS batches, rqlite, ClickHouse Keeper, Redpanda and Patroni again (with clock skews),
+  ZooKeeper known, YugabyteDB outages, OpenSearch; smokes, one after another: Cassandra 5.0.9 (ready on its storage port since its first
   smoke), its Accord scenario (6.0-alpha2), ClickHouse Keeper, rqlite (`snapshots`), Apache
   Ignite 3.1, SurrealDB 3.3 on TiKV, Kafka 4.4's share groups: new systems and features Jepsen
   never analyzed (docs/JEPSEN.md).
