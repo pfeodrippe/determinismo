@@ -128,7 +128,10 @@ No power loss was needed:
 Ra's `ra_directory` registers a server with `dets:insert` into a table opened `{auto_save,
 500}`, with no `dets:sync`: unchanged in ra 2.16.13 (RabbitMQ 4.1.4), 2.17.0, 3.2.0 (its latest
 release) and main (checked 2026-10-29). Not in rabbitmq-server's or ra's issues (searched:
-`names.dets`, `name_not_registered`, the warning, lost messages with new members).
+`names.dets`, `name_not_registered`, the warning, lost messages with new members). Serve's
+replay of timeline 1005 is exact (events hash 4235bd4f817ed2ec, 2,138 events, the same 23
+lost): `POST /runs/118/replay {"branch": 1005}`. The `ra-synced` hunt (Ra syncing each
+registration) is queued against run 118.
 
 ### Found blind: a quorum queue whose members all forget themselves stops serving for good
 
