@@ -20,6 +20,9 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   each started again when it exits.
 - Faults: the default ones, process kills, power losses, graceful stops, in bursts with quiet
   stretches.
+- TiKV keeps no disk reserve (examples/tidb/tikv.toml): with its 5 GB default on a node's disk
+  every write was refused as disk full, and SurrealDB answered "still starting up" for the whole
+  setup (first smoke, run 206).
 
 ## The workload and its properties
 

@@ -19,7 +19,9 @@ automatic retries of conflicting transactions, on by default, broke snapshot iso
 updates and read skew). The three nodes share the machine: each is limited to 3 GiB (TiKV
 8.5 holds about 2.2 GB from its start, whatever its settings) or, for 2.1.7, 1 GiB (its TiKV
 holds about 0.5 GB), so the guest needs `--memory-mib 10240`, or 4096 with `--profile jepsen`;
-the block caches are small (`tikv.toml`, `tikv-2.1.7.toml`).
+the block caches are small (`tikv.toml`, `tikv-2.1.7.toml`), and TiKV 8.5 keeps no disk reserve
+(`reserve-space`, `reserve-raft-space`: 5 GB and 1 GB by default, more than a node's disk, which
+made it refuse every write as disk full in SurrealDB's first smoke).
 TiKV's gRPC resolves the nodes' names with the system resolver (`GRPC_DNS_RESOLVER=native`):
 its default, c-ares, asks DNS and skips /etc/hosts.
 
