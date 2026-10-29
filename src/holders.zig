@@ -282,6 +282,8 @@ pub const Owner = struct {
     made: u32 = 0,
     /// Whether it said that memory stopped its holders (once a timeline).
     short_said: bool = false,
+    /// Whether it said its disk keeps its reserve (no holder on disk, Owner.disk_hold).
+    disk_full_said: bool = false,
     /// The last hold point (the holder forked there keeps it): inside an idle skip or not.
     point: VM.Hold.Point = .{ .idle = false },
     kept: [per_timeline_max + 1]Held = undefined,
@@ -404,6 +406,13 @@ pub const Owner = struct {
     /// the previous write still under way, none this time: never a stall.
     fn disk_hold(owner: *Owner, vm: *VM, moment: u64, point: VM.Hold.Point) !void {
         const disk = owner.disk.?;
+        if (!disk_room(disk.directory)) {
+            // Its nodes are then made by replays, as with no memory: slower, never a full disk.
+            if (!owner.disk_full_said) std.debug.print("[determinismo] holders: none on disk " ++
+                "either, the disk keeps its reserve\n", .{});
+            owner.disk_full_said = true;
+            return;
+        }
         if (!owner.disk_writer_done(false)) return;
         const hashes = owner.disk_hashes orelse hashes: {
             const pages = vm.memory.len / std.heap.page_size_min;
@@ -566,6 +575,11 @@ pub const Owner = struct {
         const name = ladder_name(&name_buffer, owner.branch, moment_ns);
         const base = request.base[0..request.base_len];
         const memory: []align(std.heap.page_size_min) const u8 = vm.memory;
+        // A full disk takes every run's writes with it: no ladder past the reserve.
+        if (!disk_room(ladder.directory)) {
+            _ = write_all(socket, &.{1});
+            linux.exit_group(1);
+        }
         Snapshot.disk_save(owner.snapshot, memory, vm.memory_fd, ladder.hashes, ladder.directory, name, base, owner.point.idle) catch {
             _ = write_all(socket, &.{1});
             linux.exit_group(1);
@@ -656,6 +670,47 @@ fn machine_forget(vm: *VM) void {
     _ = linux.close(vm.kvm_fd);
     if (vm.events.log_fd) |fd| _ = linux.close(fd);
     if (vm.strategy) |strategy| strategy.forget();
+}
+
+/// Snapshots on disk (holders, ladders) leave their filesystem at least the larger of these
+/// free: a Kafka hunt's holders took 355 GB in an hour and filled srv3's disk (run 173, every
+/// run's writes failing with NoSpaceLeft).
+const disk_reserve_min = 100 << 30;
+const disk_reserve_percent = 20;
+
+/// Whether the filesystem holding `directory` has more free than its reserve.
+fn disk_room(directory: []const u8) bool {
+    var path_buffer: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{directory}, 0) catch return false;
+    var buffer: Statfs = undefined;
+    const result = linux.syscall2(.statfs, @intFromPtr(path.ptr), @intFromPtr(&buffer));
+    if (linux.errno(result) != .SUCCESS) return false;
+    const block: u64 = @intCast(buffer.bsize);
+    const free = buffer.bavail * block;
+    const total = buffer.blocks * block;
+    return free >= @max(disk_reserve_min, total / 100 * disk_reserve_percent);
+}
+
+/// Linux's `struct statfs` (x86_64).
+const Statfs = extern struct {
+    type: i64,
+    bsize: i64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    namelen: i64,
+    frsize: i64,
+    flags: i64,
+    spare: [4]i64,
+};
+
+test disk_room {
+    try std.testing.expect(@sizeOf(Statfs) == 120);
+    // The scratch filesystem of a test host has room or not; a missing directory has none.
+    try std.testing.expect(!disk_room("/nonexistent/determinismo"));
 }
 
 fn oom_first() void {
