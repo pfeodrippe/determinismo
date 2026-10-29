@@ -89,6 +89,8 @@ pub fn main(init: std.process.Init) !void {
             .ending = ending_scenario,
             .sinks = sinks_scenario,
             .aim = aim_scenario,
+            .slow = slow_scenario,
+            .sought = sought_scenario,
         },
         .checks = .{ .squares = squares_check },
     });
@@ -762,6 +764,33 @@ fn aim_at_witness(context: *System.Context) !void {
     sdk.fault_aim(context.nodes.witness.?.name);
     sdk.sleep_ms(40 * std.time.ms_per_s);
     sdk.reachable("the driver aimed the faults for a while", .{});
+}
+
+/// Drivers of 3 s each, as many starts as the composer draws: past half the timeline limit no
+/// more start, and the timeline finishes (the e2e check gives it 30 s).
+fn slow_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.parallel_driver("slow", slow_driver);
+}
+
+fn slow_driver(_: *System.Context) !void {
+    sdk.sleep_ms(3 * std.time.ms_per_s);
+    sdk.reachable("a slow driver finished", .{});
+}
+
+/// Half the timelines reach a marked state (a `sometimes` made true), among the selftest's other
+/// new behaviors: the tree returns just after the marked state first (the e2e check reads why).
+fn sought_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("wander", wander);
+}
+
+fn wander(_: *System.Context) !void {
+    sdk.sleep_ms(500);
+    if (sdk.random_below(2) == 0) sdk.sometimes(true, "a marked state was reached", .{});
+    sdk.sleep_ms(200);
+    _ = sdk.random_below(2); // A draw after it: its moment leads elsewhere.
+    sdk.sleep_ms(3000);
 }
 
 fn hang(s: *System.Scenario) void {

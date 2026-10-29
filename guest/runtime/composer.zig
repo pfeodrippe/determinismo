@@ -440,7 +440,18 @@ fn run_drivers(composer: *Composer) void {
         const end_ns = now_ns() + length_ns;
         while (now_ns() < end_ns) driver_start(composer, kinds, parallelism);
     } else {
-        for (0..starts) |_| driver_start(composer, kinds, parallelism);
+        // No driver starts past half the timeline's limit: those running finish, then the
+        // ending and the checks run. Many starts one at a time of a slow system's drivers ran
+        // past the limit and failed as hangs while every command progressed (Redpanda run 177:
+        // its median timeline 20 minutes, a tenth at the hour; Group Replication's timeline 222).
+        const stop_ns = if (timeline_limit_ns()) |limit_ns| now_ns() + limit_ns / 2 else null;
+        for (0..starts) |started| {
+            if (stop_ns) |stop| if (now_ns() >= stop) {
+                sdk.event("drivers_stopped", .{ .started = started, .starts = starts });
+                break;
+            };
+            driver_start(composer, kinds, parallelism);
+        }
     }
 }
 
@@ -464,20 +475,42 @@ fn driver_start(composer: *Composer, kinds: []const Kind, parallelism: u64) void
 
 /// det.timeline_ms= from the kernel command line (explore's --timeline), in nanoseconds.
 fn timeline_length_ns() ?u64 {
+    return cmdline_ms("det.timeline_ms=");
+}
+
+/// det.timeline_limit_ms= (explore's --timeline-limit: where a timeline not finished is a hang),
+/// in nanoseconds.
+fn timeline_limit_ns() ?u64 {
+    return cmdline_ms("det.timeline_limit_ms=");
+}
+
+fn cmdline_ms(comptime key: []const u8) ?u64 {
     const fd = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return null;
     defer _ = linux.close(@intCast(fd));
     var buffer: [4096]u8 = undefined;
     const size = linux.read(@intCast(fd), &buffer, buffer.len);
     if (linux.errno(size) != .SUCCESS) return null;
-    const key = "det.timeline_ms=";
-    var words = std.mem.tokenizeAny(u8, buffer[0..size], " \n");
+    return words_ms(buffer[0..size], key);
+}
+
+/// `key<ms>` among a command line's words, in nanoseconds.
+fn words_ms(text: []const u8, key: []const u8) ?u64 {
+    var words = std.mem.tokenizeAny(u8, text, " \n");
     while (words.next()) |word| {
         if (!std.mem.startsWith(u8, word, key)) continue;
         const ms = std.fmt.parseInt(u64, word[key.len..], 10) catch return null;
         return ms * std.time.ns_per_ms;
     }
     return null;
+}
+
+test words_ms {
+    const line = "quiet det.scenario=bank det.timeline_limit_ms=3600000 det.timeline_ms=30000\n";
+    try std.testing.expectEqual(@as(?u64, 3600 * std.time.ns_per_s), words_ms(line, "det.timeline_limit_ms="));
+    try std.testing.expectEqual(@as(?u64, 30 * std.time.ns_per_s), words_ms(line, "det.timeline_ms="));
+    try std.testing.expectEqual(@as(?u64, null), words_ms("quiet det.scenario=bank", "det.timeline_ms="));
+    try std.testing.expectEqual(@as(?u64, null), words_ms("det.timeline_ms=soon", "det.timeline_ms="));
 }
 
 /// At most one eventually command (which stops everything else) or one finally command.

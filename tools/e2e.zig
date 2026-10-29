@@ -198,6 +198,8 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "voidstar", check_voidstar },             .{ "changed", check_changed },
         .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
         .{ "hang", check_hang },                     .{ "pinned", check_pinned },
+        .{ "slow", check_slow },                     .{ "sought", check_sought },
+        .{ "budget", check_budget },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -2483,6 +2485,88 @@ fn check_durability(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});
+}
+
+/// A tree past its time budget, with more timelines finishing then than its generation has room
+/// for: every one's results read, the run ends (runs 177 and 200 hung so for hours: a worker
+/// blocked writing its unread summary while the explorer waited for it). Under `timeout`, a
+/// hang is this check's failure, named.
+fn check_budget(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(context.arena, &.{ "timeout", "300", context.determinismo, "explore" });
+    try argv.appendSlice(context.arena, context.machine);
+    try argv.appendSlice(context.arena, &.{
+        "--program",    program, "--scenario", "slow", "--seed",           "1",
+        "--time-budget", "20s",  "--generation", "4",  "--jobs",           "4",
+        "--timeline-limit", "60s",
+    });
+    const result = try run_kept(context, argv.items);
+    const output = try std.mem.concat(context.arena, u8, &.{ result.stdout, result.stderr });
+    var branches: [branches_max]Branch = undefined;
+    const count = parse_branches(output, &branches);
+    const ended = switch (result.term) {
+        .exited => |code| code == 0 or code == 3,
+        else => false,
+    };
+    expect_all(context, &.{
+        .{ "the run ends past its budget (within timeout's 300 s)", ended },
+        .{ "more timelines than one generation", count > 4 },
+    }, "budget: a tree past its budget reads every timeline's results and ends ({d} timelines)", .{count});
+}
+
+/// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just
+/// after it, and says so; with --no-prefer-sometimes it does not.
+fn check_sought(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    var whys: [2]bool = undefined;
+    for ([_]bool{ true, false }, &whys) |prefer, *said| {
+        const record = try std.fmt.allocPrint(context.arena, "{s}/sought-{}.jsonl", .{ context.scratch, prefer });
+        std.Io.Dir.cwd().deleteFile(context.io, record) catch {};
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(context.arena, &.{
+            "--program", program, "--scenario", "sought", "--seed", "1", "--branches", "64",
+            "--record",  record,
+        });
+        if (!prefer) try argv.append(context.arena, "--no-prefer-sometimes");
+        _ = try explore(context, argv.items);
+        const text = std.Io.Dir.cwd().readFileAlloc(context.io, record, context.arena, .limited(1 << 26)) catch "";
+        said.* = std.mem.indexOf(u8, text, "a state the program marks worth reaching") != null and
+            std.mem.indexOf(u8, text, "a marked state was reached") != null;
+    }
+    expect_all(context, &.{
+        .{ "returns go just after the sometimes first, saying so", whys[0] },
+        .{ "without --prefer-sometimes, none says so", !whys[1] },
+    }, "sought: the tree returns just after a sometimes made true first, saying why", .{});
+}
+
+/// Drivers slower than their timeline's limit allows: no driver starts past half the limit, and
+/// every timeline finishes (drivers ran on to the limit and failed as hangs before).
+fn check_slow(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fs.path.join(context.arena, &.{ context.scratch, "slow-events" });
+    const report = try explore(context, &.{
+        "--program",        program, "--scenario", "slow", "--seed",       "1", "--branches", "8",
+        "--timeline-limit", "30s",   "--branching", "flat", "--events-dir", events,
+    });
+    var branches: [8]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    const stopped = try query_count(context, &.{ events, "event=drivers_stopped" });
+    var unfinished = false;
+    var hung = false;
+    var lines = std.mem.tokenizeScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "FAIL") != null and
+            std.mem.indexOf(u8, line, "the guest finishes its scenario") != null) unfinished = true;
+        // A timeline's own line (a property's text may say "hung" too).
+        if (std.mem.startsWith(u8, line, "[branch") and std.mem.indexOf(u8, line, " hung ") != null) hung = true;
+    }
+    expect_all(context, &.{
+        .{ "8 timelines", count == 8 },
+        .{ "none hung", !hung },
+        .{ "\"the guest finishes its scenario\" holds", !unfinished },
+        .{ "drivers stopped starting in some", stopped > 0 },
+    }, "slow: no driver starts past half the timeline limit; {d} of 8 timelines stopped starting them, none hung", .{stopped});
 }
 
 /// A timeline that never finishes ends at its ceiling of virtual time, as hung (the finish

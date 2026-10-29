@@ -138,6 +138,10 @@ use them in other repositories.
   a timeline's end; serve's run page, "CPU by node"). A slow system: lower its background work
   to test sizes (compaction, splits, heartbeats, failure detectors), find the busy node, then
   `determinismo profile` at a moment.
+- A timeline not finished by `--timeline-limit` (1 h of virtual time by default) ends as hung
+  ("the guest finishes its scenario" fails). The composer starts no driver past half of it
+  (a `drivers_stopped` event): those running finish, then the ending and the checks, so only a
+  command that never finishes is a hang, not a slow system's many drivers.
 - Verbose systems: `explore --retroactive 'Applied block'` leaves such output lines out of the
   events (queries stay fast); replay a timeline (`--branch`, its tape) to see them.
 - Targeted runs: `explore --changed <diff file | git range>` aims the tree at a change's lines

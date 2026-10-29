@@ -938,7 +938,7 @@ fn cmdline_build(
     arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [4][]const u8 = undefined;
+    var parts: [5][]const u8 = undefined;
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
@@ -952,6 +952,10 @@ fn cmdline_build(
     }
     if (arguments.timeline_ms) |ms| { // det-composer's.
         parts[count] = try std.fmt.allocPrint(arena, "det.timeline_ms={d}", .{ms});
+        count += 1;
+    }
+    if (arguments.timeline_limit_ns) |ns| { // det-composer's: no driver starts past its half.
+        parts[count] = try std.fmt.allocPrint(arena, "det.timeline_limit_ms={d}", .{ns / std.time.ns_per_ms});
         count += 1;
     }
     return std.mem.join(arena, " ", parts[0..count]);
@@ -3104,6 +3108,7 @@ fn tree_judge(
             .score = score,
             .moment = moment,
             .label = label,
+            .sought = moment_sought,
             .changed_moment = changed_moment,
             .changed_label = changed_label,
         };
@@ -3309,6 +3314,8 @@ const Candidate = struct {
     score: f64 = 0,
     moment: ?u64,
     label: []const u8,
+    /// Its moment follows a `sometimes` or `reachable` made true (they come first).
+    sought: bool = false,
     /// A targeted run: when it first ran changed code (with room to go on), and which line.
     changed_moment: ?u64 = null,
     changed_label: []const u8 = "",
@@ -3507,6 +3514,13 @@ fn tree_returns(
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first ran changed " ++
                 "code ({s}): a targeted run explores what follows it.", .{
                 summary.index, candidate.changed_label,
+            })
+        else if (candidate.moment != null and candidate.sought)
+            try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
+                "{s}, a state the program marks worth reaching (a sometimes or reachable made " ++
+                "true comes first), of the {d} behaviors no timeline before it had: its " ++
+                "frontier.", .{
+                summary.index, candidate.label, candidate.novel,
             })
         else if (candidate.moment != null)
             try std.fmt.allocPrint(arena, "Returned to #{d} just after it first reached " ++
@@ -4675,4 +4689,38 @@ test {
     _ = @import("yaml.zig");
     _ = @import("report.zig");
     _ = @import("snapshot.zig");
+}
+
+test "a finished timeline's summary is read whole even when its generation has no slot left" {
+    var pipe: [2]linux.fd_t = undefined;
+    try std.testing.expect(linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) == .SUCCESS);
+    const pid = linux.fork();
+    if (pid == 0) {
+        // A worker: its results, one summary (larger than a pipe holds), then it exits.
+        _ = linux.close(pipe[0]);
+        const results = std.heap.page_allocator.create(report.Multiverse) catch linux.exit_group(1);
+        results.* = .{};
+        write_all(pipe[1], std.mem.asBytes(results));
+        const count: u32 = 1;
+        write_all(pipe[1], std.mem.asBytes(&count));
+        const summary = std.heap.page_allocator.create(Summary) catch linux.exit_group(1);
+        @memset(std.mem.asBytes(summary), 0);
+        write_all(pipe[1], std.mem.asBytes(summary));
+        linux.exit_group(0);
+    }
+    _ = linux.close(pipe[1]);
+    // The pipe's read end held elsewhere too, as the explorer's other forks hold it: its close
+    // alone never ends the worker's write.
+    const held: linux.fd_t = @intCast(linux.dup(pipe[0]));
+    defer _ = linux.close(held);
+    const multiverse = try std.testing.allocator.create(report.Multiverse);
+    defer std.testing.allocator.destroy(multiverse);
+    multiverse.* = .{};
+    const items = try std.testing.allocator.alloc(Summary, 1);
+    defer std.testing.allocator.free(items);
+    var summaries: Summaries = .{ .items = items, .count = 1 }; // Full: past the budget.
+    const running = [_]Running{.{ .pid = @intCast(pid), .results = pipe[0], .place = undefined, .index = 0, .start_ns = 0 }};
+    const finished = (try timeline_wait(&running, multiverse, &summaries, -1)).?;
+    try std.testing.expectEqual(@as(usize, 0), finished.at);
+    try std.testing.expectEqual(@as(u32, 1), summaries.count);
 }
