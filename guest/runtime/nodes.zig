@@ -82,9 +82,30 @@ pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
     }
     try hosts_write("/etc/hosts", system);
     host_settings();
-    for (system.nodes) |*node| {
+    for (system.nodes, 0..) |*node, index| {
         try start(arena, system, node);
-        try ready_wait(node);
+        ready_wait(node) catch |err| {
+            // Said, with the nodes it waited before: a readiness that needs them never comes
+            // (Patroni's REST API waits for an etcd quorum; the first smoke said only that setup
+            // never completed).
+            var later: std.ArrayList(u8) = .empty;
+            for (system.nodes[index + 1 ..], 0..) |other, at| {
+                if (at > 0) later.appendSlice(arena, ", ") catch {};
+                later.appendSlice(arena, other.name) catch {};
+            }
+            sdk.event("node_not_ready", .{
+                .node = node.name,
+                .tcp = if (node.ready) |ready| ready.tcp else 0,
+                .err = @errorName(err),
+                .not_started = later.items,
+            });
+            if (err == error.NodeNotReady) std.debug.print("[guest] node {s} never became ready " ++
+                "(nothing accepted on tcp {d}); not started meanwhile: {s}. Does its readiness wait " ++
+                "for them (a quorum, a peer)? A port it opens alone is ready earlier.\n", .{
+                node.name, if (node.ready) |ready| ready.tcp else 0, if (later.items.len > 0) later.items else "none",
+            });
+            return err;
+        };
     }
     sdk.event("nodes_up", .{ .nodes = system.nodes.len });
 }
