@@ -64,6 +64,12 @@ fn transfers(s: *System.Scenario) void {
   may end the driver phase and kill drivers mid-call, and an operation that applied but was
   noted only after its answer is neither acknowledged nor unknown (an etcd counter came out one
   over in 83 timelines). Invoked without an outcome counts as unknown.
+- Nodes start one after another, each once it is ready: make readiness something that comes up
+  alone (Patroni waits for an etcd quorum before its REST API listens: ready on etcd's peer port,
+  or pg1 waits forever for pg2). Systems that take tens of seconds to recover (elections,
+  leases, JVMs) need faults in bursts, `s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max =
+  30_000 }`, or they never serve during a timeline; and their drivers need enough refused
+  connections in a row to outlast a failover.
 - A node's disk is the VM's memory (snapshots hold it): size what the system writes and keeps
   for long timelines (preallocated segments, retention, log files), or OOM kills end them
   (YugabyteDB's 64 MB WAL segments, preallocated per tablet: `--log_segment_size_mb 4`).
