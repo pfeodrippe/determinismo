@@ -130,7 +130,12 @@ pub const Build = struct {
 };
 
 /// The node is ready once this succeeds (from the runner).
-pub const Ready = struct { tcp: u16 };
+pub const Ready = struct {
+    tcp: u16,
+    /// How long it may take, in seconds of virtual time: a node that joins its cluster before
+    /// it listens (Cassandra's CQL port, after its ring delay alone) needs more than a minute.
+    timeout_s: u32 = 60,
+};
 
 /// A process limit, by Docker's name ("nofile", "memlock", "nproc", ...: ulimit_resource), set
 /// before a node's command runs. `unlimited` (RLIM_INFINITY) for no limit.

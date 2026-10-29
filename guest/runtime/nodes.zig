@@ -51,7 +51,7 @@ pub fn sink_path(buffer: []u8, name: []const u8, filtered: bool) ![]const u8 {
     return std.fmt.bufPrint(buffer, state_root ++ "/{s}/root{s}", .{ name, directory });
 }
 const poll_interval_ns = 10 * std.time.ns_per_ms;
-const ready_attempts_max = 6000; // 60 s of virtual time.
+
 const stop_attempts_max = 3000;
 const freeze_attempts_max = 100; // 1 s of virtual time.
 const link_attempts_max = 500;
@@ -883,11 +883,26 @@ pub fn clock_offset(name: []const u8, offset_ns: i64) !void {
     const pid = pid_read(name) orelse return error.NotRunning;
     var path_buffer: [64]u8 = undefined;
     const path = try print_z(&path_buffer, "/proc/{d}/timens_offsets", .{pid});
-    const seconds = @divFloor(offset_ns, std.time.ns_per_s);
-    const nanoseconds = offset_ns - seconds * std.time.ns_per_s;
     var value_buffer: [64]u8 = undefined;
-    const value = try std.fmt.bufPrint(&value_buffer, "realtime {d} {d}\n", .{ seconds, nanoseconds });
-    try file_write(path, value);
+    try file_write(path, realtime_offset_line(&value_buffer, offset_ns));
+}
+
+/// "realtime <seconds> <nanoseconds>": the seconds rounded down, the nanoseconds within
+/// [0, 10^9), as the kernel reads an offset (a second and a half back: -2 500000000).
+fn realtime_offset_line(buffer: *[64]u8, offset_ns: i64) []const u8 {
+    const seconds = @divFloor(offset_ns, std.time.ns_per_s);
+    const nanoseconds = @mod(offset_ns, std.time.ns_per_s);
+    return std.fmt.bufPrint(buffer, "realtime {d} {d}\n", .{ seconds, nanoseconds }) catch unreachable;
+}
+
+test realtime_offset_line {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("realtime 0 0\n", realtime_offset_line(&buffer, 0));
+    try std.testing.expectEqualStrings("realtime 5 0\n", realtime_offset_line(&buffer, 5 * std.time.ns_per_s));
+    try std.testing.expectEqualStrings("realtime -2 500000000\n", realtime_offset_line(&buffer, -1_500_000_000));
+    try std.testing.expectEqualStrings("realtime -1 999999999\n", realtime_offset_line(&buffer, -1));
+    // The largest skews fit.
+    _ = realtime_offset_line(&buffer, std.math.minInt(i64));
 }
 
 /// The node's processes, in the order its cgroup lists them.
@@ -1475,7 +1490,8 @@ pub fn address_parse(text: []const u8) !netlink.Address {
 fn ready_wait(node: *const schema.Resolved) !void {
     const ready = node.ready orelse return;
     const address = try address_now(node);
-    for (0..ready_attempts_max) |_| {
+    const attempts = @as(u64, ready.timeout_s) * std.time.ns_per_s / poll_interval_ns;
+    for (0..attempts) |_| {
         if (tcp_accepts(address, ready.tcp)) {
             sdk.event("node_ready", .{ .node = node.name });
             return;

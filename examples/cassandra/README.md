@@ -46,3 +46,12 @@ the write did not happen; a timeout, a write failure, a lost connection may have
   rewrote cassandra.yaml in place (`cat` over it): truncated, "Missing required directive
   CommitLogSync" at every start. The container's scaffolding, not Cassandra: start.sh restores
   the shipped configuration first since.
+- 2026-10-29, first Accord smoke (6.0-alpha2; ran without faults, det-faults then crashed at
+  start): setup failed. Ready on the storage port, n2 and n3 joined at once and chose the same
+  tokens (the replication-aware allocator is deterministic, both from a ring of n1 alone); the
+  cluster metadata service committed n2's join and refused n3's ("Rejecting this plan as some
+  tokens are already assigned"), and n3 failed its startup for good. Cassandra asks for nodes
+  added one at a time (CASSANDRA-16364 is the same race before TCM): ready on CQL's port since,
+  which a node opens once it joined (up to 240 s: alone, the first waits 30 s for gossip). A
+  transaction refused for a keyspace a node does not know yet (its metadata catching up) counts
+  as refused, not malformed.

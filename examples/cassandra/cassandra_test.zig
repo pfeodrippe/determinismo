@@ -23,7 +23,6 @@ const System = sdk.System(Nodes);
 
 const node_names = [_][]const u8{ "n1", "n2", "n3" };
 const port = 9042;
-const storage_port = 7000;
 const table = "jepsen_keyspace.lists";
 /// Drivers number themselves here (in the runner, under a lock): values must be unique per key
 /// and fit CQL's int.
@@ -75,9 +74,12 @@ fn describe(d: *System.Describe) !void {
                 .build = build,
                 .command = &.{name},
                 .env = &.{"CASSANDRA_COMMITLOG_SYNC=" ++ entry[2]},
-                // The storage port, which a node opens alone: CQL's opens only after gossip
-                // with a peer, or 30 s without one (the first node waited on the others).
-                .ready = .{ .tcp = storage_port },
+                // CQL's port, which a node opens once it joined the ring (alone, after 30 s of
+                // trying to gossip): nodes then join one after another, as Cassandra asks. Ready
+                // on the storage port, two joined at once, chose the same tokens (the allocator
+                // is deterministic), and Cassandra 6 refused the second's join, which never
+                // started again (the first Accord smoke; CASSANDRA-16364 the same race).
+                .ready = .{ .tcp = port, .timeout_s = 240 },
                 .faults = .{
                     .restart = true,
                     .crash = entry[1],
@@ -540,7 +542,10 @@ fn accord_run(arena: std.mem.Allocator, connection: *Cql, mops: []const Mop, lis
             // Refused before it ran: a syntax or invalid request, unavailable replicas.
             const definite = failure.code == Cql.code.unavailable or failure.code == Cql.code.syntax or
                 failure.code == Cql.code.invalid;
-            if (failure.code == Cql.code.syntax or failure.code == Cql.code.invalid) {
+            // A node whose cluster metadata has not caught up yet (just restarted) knows no
+            // keyspace or table: refused, not malformed.
+            const unknown_schema = std.mem.indexOf(u8, failure.message, "does not exist") != null;
+            if (failure.code == Cql.code.syntax or (failure.code == Cql.code.invalid and !unknown_schema)) {
                 // The workload's own bug: never.
                 sdk.assert_unreachable("a transaction is refused as malformed", .{ .message = failure.message });
             }
