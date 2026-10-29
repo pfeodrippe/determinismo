@@ -29,10 +29,13 @@ To make pluggable (none changes what a timeline does, only what is looked at or 
    fault inside a jump: which fault decided it), dense. Every parameter from the page too.
 2. **Causality's verdict**: what counts as "the bug happened" in a future (the property failing
    by default; any query condition, or a plugin judging a future's events).
-   Next: causality's explanation, once a jump is narrow: futures from inside it with a command
-   that turns the system's logs up (`--explain-exec '<command>'`), the timeline's own
-   randomness after it, the first failing one's events kept beside a passing one's. By hand it
-   explained Redpanda's open transaction (run 177: `tx` at trace from 116 s).
+   Causality's explanation, done (2026-10-29): `--explain-exec '<command>'` (serve:
+   `explain_exec`) ends the analysis with futures from a quarter, half and three quarters into
+   the narrowest jump to failure, the command (one that turns the system's logs up) run at
+   their moment and the timeline's own randomness after it, each one's events kept and whether
+   it failed (`{"explained": [...]}`; e2e `until`). By hand it explained Redpanda's open
+   transaction (run 177: `tx` at trace from 116 s). Next: the UI's analysis view lists them,
+   each future's logs a click away.
 3. **Behaviors and cells**: what counts as a new behavior (events.zig's keys) and the
    Go-Explore archive's cell and score: today fixed in Zig; a plugin mapping a timeline's
    summary to cells and weights, offline (between generations), so timelines pay nothing.
