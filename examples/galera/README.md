@@ -102,3 +102,16 @@ n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
   durable. Smoke (4 timelines): no node restored an incarnation twice (n2 restarted 19 times, 19
   incarnations), where without it most timelines repeat one. A hunt of it, against run 97, tells
   whether the rename causes the EVS abort.
+- Hunt run 123 (srv3, 2026-10-29, `jepsen-dirsync`, seed 3 as run 97): **no EVS abort in 545
+  timelines** (run 97: 8 of 299) and no "claims to come from same view" warning (run 97: 6):
+  with gvwstate.dat's rename durable, the abort is gone, as the cause predicts. Its 34
+  "no process crashes: mariadbd" failures are storage engines that will not start after a
+  power loss (each then aborts, the signal 11 in `abort()`): InnoDB in 25 (17 of them
+  `Page [page id: space=3, page number=0] log sequence number 78921 is in the future! Current
+  system log sequence number 77734` on `undo003`, "Data structure corruption"), Aria in 9
+  ("Aria recovery failed"). Observed, not yet understood: a page on disk ahead of the redo
+  log that should cover it breaks write-ahead logging, either in InnoDB (Jepsen's
+  configuration flushes the log about once a second, `innodb_flush_log_at_trx_commit = 0`,
+  which may lose recent commits but should never corrupt) or in determinismo's disk model
+  (whether it can make a page durable before an earlier, unsynced log write). Next: replay
+  one to the power loss and compare what each file had synced.
