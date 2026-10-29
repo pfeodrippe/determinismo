@@ -58,6 +58,7 @@ const event_sets = @import("event_sets.zig");
 const extract = @import("extract.zig");
 const duckdb = @import("duckdb.zig");
 const store = @import("store.zig");
+const holders = @import("holders.zig");
 const host_runs = @import("runs.zig");
 
 pub const Options = struct {
@@ -2145,6 +2146,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
             if (host_runs.running_pid(server.arena, directory) != null) continue;
             const record = run_file(&server, run.id, "record.jsonl") catch "";
             run.status = recorded_status(record);
+            holders_drop(&server, run);
             if (run_ended_itself(run) and ended_count < ended.len) {
                 ended[ended_count] = run.id;
                 ended_count += 1;
@@ -2160,6 +2162,7 @@ fn runs_reap(shared: *Shared, ended: []u32) usize {
         // What the explorer left in its process group (it leads its session): holders of
         // timelines it stopped waiting for, workers of a killed explorer.
         _ = linux.kill(-run.pid, .KILL);
+        holders_drop(&server, run);
         archive(&server, run) catch |err| {
             std.debug.print("[determinismo] archiving run {d} failed: {s}\n", .{
                 run.id, @errorName(err),
@@ -2194,6 +2197,15 @@ fn run_repeat(server: *Server, id: u32) !void {
 }
 
 /// Hands a finished run's directory to the archive command (in the background).
+/// A run's holders on disk serve only its explorer: one stopped (SIGTERM, no defers run) left
+/// them, 209 GB of run 173's until srv3's disk was full. A resume starts without them anyway.
+fn holders_drop(server: *Server, run: *const Run) void {
+    const directory = run_directory(server, run.id) catch return;
+    const path = std.fs.path.join(server.arena, &.{ directory, "holders" }) catch return;
+    const disk: holders.Disk = .{ .directory = path };
+    disk.delete(null);
+}
+
 fn archive(server: *Server, run: *const Run) !void {
     const template = server.options.archive orelse return;
     const directory = try run_directory(server, run.id);

@@ -1151,7 +1151,7 @@ fn check_runs(context: *Context) !void {
     try command.print(arena, "exec '{s}' explore", .{context.determinismo});
     for (context.machine) |part| try command.print(arena, " '{s}'", .{part});
     for (system) |part| try command.print(arena, " '{s}'", .{part});
-    try command.print(arena, " --seed 4 --branches 100000 --time-budget 30m --holders-on-disk > /dev/null 2>&1", .{});
+    try command.print(arena, " --seed 4 --branches 100000 --time-budget 30m --branching tree --holders-on-disk > /dev/null 2>&1", .{});
     var child = try std.process.spawn(context.io, .{ .argv = &.{ "sh", "-c", command.items }, .stdout = .ignore, .stderr = .ignore });
     var running = false;
     for (0..600) |_| {
