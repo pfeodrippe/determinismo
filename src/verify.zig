@@ -25,6 +25,8 @@ const Timeline = struct {
     replayed_hash: []const u8 = "",
     diverged: []const u8 = "",
     hazards: []const u8 = "",
+    /// Its tape was recorded by another build of determinismo: parting may be the build's doing.
+    other_build: bool = false,
     status: u8 = 0,
     /// When nothing was replayed: how the replay ended (its last lines), so that a replay that
     /// could not start says why instead of passing for a divergence.
@@ -149,7 +151,7 @@ pub fn run(
             continue;
         }
         failed += 1;
-        std.debug.print("  FAIL timeline {d} does not replay: recorded {s}, replayed {s}{s}{s}{s}{s}\n", .{
+        std.debug.print("  FAIL timeline {d} does not replay: recorded {s}, replayed {s}{s}{s}{s}{s}{s}\n", .{
             timeline.index,
             timeline.events_hash,
             if (timeline.replayed_hash.len > 0) timeline.replayed_hash else "nothing",
@@ -157,6 +159,7 @@ pub fn run(
             timeline.diverged,
             if (timeline.hazards.len > 0) "; " else "",
             timeline.hazards,
+            if (timeline.other_build) "; recorded by another build of determinismo" else "",
         });
         if (timeline.ended.len > 0) std.debug.print("    {s}\n", .{timeline.ended});
         if (timeline.recent.len > 0) std.debug.print("{s}", .{timeline.recent});
@@ -277,6 +280,8 @@ fn replay(work: *Work, timeline: *Timeline) !void {
                 timeline.diverged = line[at..];
             } else if (std.mem.indexOf(u8, line, "its clock's hazards: ")) |at| {
                 timeline.hazards = line[at + "its clock's hazards: ".len ..];
+            } else if (std.mem.indexOf(u8, line, "recorded by another build of determinismo") != null) {
+                timeline.other_build = true;
             }
         }
     }

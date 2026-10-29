@@ -373,10 +373,19 @@ event hashing, the guest module.
   (f4f42fedaf402bf6). Same 1,695 events; the first difference at seq 1666 (rabbit-2's output at
   94.85 s: 0.7 µs later and 34,262 branches fewer in the replay), after a stretch of 30 s with no
   event at all (from 64.14 s), so it cannot be placed closer after the fact: the original keeps
-  no trace. Recent hunts: 1 diverged of 96 sampled (runs 97, 118, 123, 148, 160, 164). Next: the
-  hyperthreads control (queued: run 56 replayed with SMT off), and a checkpoint every second of
-  virtual time (vtime, branches) in the events, so that the next divergence is placed within a
-  second.
+  no trace. Recent hunts: 1 diverged of 96 sampled (runs 97, 118, 123, 148, 160, 164). Done
+  since: a checkpoint at the first timer past each second of virtual time (vtime, branches) in
+  every timeline's events, neither counted nor hashed, and a replay that parts from the run says
+  where (the last checkpoint both passed, the first differing line on each side), its events kept
+  beside the tapes. The hyperthreads control (2026-10-29 08:55): run 56's 64 sampled timelines
+  replayed one VM per core, as with hyperthread siblings shared: 38 of 64 both times, the same
+  26 failing at the same events (timeline 49 at event 6080 in both). Not hyperthreads: a
+  difference between the build that recorded run 56 (2026-10-28) and today's, the same every
+  time. Old runs replayed by a newer host part from their tapes; new runs replay (1 of 96
+  sampled parted, above). Done since: tapes and the run's record carry the build that made them
+  (`host`, a hash of the explorer's executable), and a replay by another build says so. Kafka's
+  holders against replays (next.sh's check, 32 timelines): no holder node was compared, memory
+  short (12 to 13 GB available, 16 wanted), so holders went to disk; still open.
 - `eventually` endings kill the drivers as soon as the composer reaches them (after its 4 to 63
   starts, pauses under 20 ms): RabbitMQ's run 118 drove a median 26.6 s, under 10 s in 274 of
   1,494 timelines. Antithesis's composer may start one any time after a driver started, killing
@@ -490,7 +499,11 @@ event hashing, the guest module.
      timelines on average, 2 (6 moments) in 165.2, 115.2 and 73.0 (per seed: ahead in 6, 5 and
      5 of 8, about +4 each, paired t 2.1-2.5), 1 (12 moments) in 136.9, 91.6 and 55.5 (behind on
      every seed). Two is a small, consistent gain on a toy; the default stays 4 until a known
-     bug in a real system agrees (Raft's deadlock, etcd's #22498 timelines to first find).
+     bug in a real system agrees (Raft's deadlock, etcd's #22498 timelines to first find). The
+     Raft POC's deadlock (bench/explore.py, 20 minutes a seed, 4 CPUs on srv3): seed 1 found in
+     52 s (39th timeline) by 4, 77 s (31st) by 2; seed 2 not found in 369 timelines by 4, found in
+     547 s (230th) by 2. One each way, and throughput itself varied threefold (369 to 1,080
+     timelines): no verdict, the default stays.
    - Measured 2026-10-29, `--horizon 60s` on Galera (run 148 against run 97: `jepsen`, seed 3,
      an hour each, stopped by the plateau rule): 954 timelines against 299, but 52 behaviors
      against 53 and behind at every point of the hour (46 against 51 at 5%), and Galera's EVS
@@ -556,6 +569,10 @@ in ANTITHESIS.md yet.
    no property noticed (a gap in the properties). `determinismo mutate` (patches to a node's
    build, caught / never ran / unnoticed), its e2e check, the MCP tool and the
    determinismo-mutants skill are done.
+8. **The kernel's log as events** (Antithesis's `environment.journal.events`): done, the
+   kernel's console lines as output events from source `kernel` at their moments (the console's
+   writes are the guest's own exits). Events hashes changed with it: replays of runs recorded
+   before differ by those events alone.
 
 ## Strategy guidance (next)
 

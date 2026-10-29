@@ -20,6 +20,9 @@ pub const Header = struct {
     /// The tree explorer's path to where this branch starts, from the setup snapshot: each
     /// ancestor (its index and seed) and the moment the next one left it. Empty: the snapshot.
     chain: []const Segment = &.{},
+    /// The build of determinismo that recorded it (a hash of its executable): a replay by another
+    /// may part from it for that alone (null: tapes from before 2026-10-29).
+    host: ?u64 = null,
 };
 
 /// One step of a path: branch `branch` (seed `seed`) ran from the previous step's moment to
@@ -114,6 +117,7 @@ pub fn write_header(fd: linux.fd_t, header: Header) void {
         }
         writer.writeAll("]") catch unreachable;
     }
+    if (header.host) |host| writer.print(",\"host\":\"{x:0>16}\"", .{host}) catch unreachable;
     if (header.fork) |fork| {
         writer.print(",\"from_branch\":{d},\"from_vtime_ns\":{d}", .{
             fork.branch, fork.vtime_ns,
@@ -171,6 +175,7 @@ pub fn parse(source: []const u8, scratch: []u8, overrides: *Overrides) !Header {
                 return error.BadTape).integer),
             .exec = if (header.object.get("from_exec")) |command| command.string else null,
         } else null,
+        .host = if (header.object.get("host") != null) try hex_field(header.object, "host") else null,
     };
     if (header.object.get("chain")) |chain| {
         if (chain != .array or chain.array.items.len > chain_length_max) return error.BadTape;
@@ -300,6 +305,7 @@ test "a path round-trips through the header" {
         .branch = 42,
         .branch_seed = 3,
         .chain = &chain,
+        .host = 0xfeed,
     });
     _ = linux.close(pipe[1]);
     var source: [4096]u8 = undefined;
@@ -308,4 +314,5 @@ test "a path round-trips through the header" {
     try std.testing.expectEqual(@as(u32, 42), header.branch);
     try std.testing.expectEqual(@as(usize, 2), header.chain.len);
     try std.testing.expectEqual(chain[1], header.chain[1]);
+    try std.testing.expectEqual(@as(?u64, 0xfeed), header.host);
 }

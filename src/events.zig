@@ -643,6 +643,18 @@ const LogLine = struct { sequence: u64, moment: Moment, data: []const u8, json: 
 
 /// One JSON line (the events database ingests them, store.zig): data that is not JSON is
 /// written as text, `{"raw": "..."}`.
+/// Where the execution is (`{"checkpoint":{"vtime_ns":..,"branches":..}}`): logged beside the
+/// events, not one of them (no seq, so ingestion skips it; neither counted nor hashed), so that a
+/// replay that parts from the run is placed between two checkpoints.
+pub fn checkpoint(events: *const Events, moment: Moment) void {
+    const fd = events.log_fd orelse return;
+    var buffer: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{{\"checkpoint\":{{\"vtime_ns\":{d},\"branches\":{d}}}}}\n", .{
+        moment.vtime_ns, moment.branches,
+    }) catch unreachable; // 128 bytes fit two u64s and the keys.
+    write_all(fd, line);
+}
+
 fn write_log_line(fd: linux.fd_t, line: LogLine) void {
     assert(fd >= 0);
     assert(line.sequence > 0);

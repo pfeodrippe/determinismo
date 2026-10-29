@@ -141,7 +141,15 @@ use them in other repositories.
   "timelines replay to their recorded history" (`explore --verify-replays <n>`, HTTP
   `verify_replays`; 1 replays them all). `priority: true` (HTTP) gives a run's VMs the CPUs
   before other runs': a check beside a hunt, which goes on with the CPUs left. A timeline that
-  did not replay keeps its output beside the tapes (`replay-<n>.log`). After the fact,
+  did not replay keeps its output beside the tapes (`replay-<n>.log`), its events
+  (`replay-<n>-events`), and its line in the results says where it parted from the run's events:
+  the last checkpoint both passed and the first line that differs on each side (the events carry
+  a `{"checkpoint":{"vtime_ns","branches"}}` line at the first timer past each second of virtual
+  time, neither counted nor hashed, so a divergence is placed within a second even where no
+  event comes for long). Tapes and the run's record carry the build that made them (`host`, a
+  hash of the explorer's executable): a replay by another build says so, as parting from a tape
+  can then be the build's doing (run 56, recorded the day before: the same 26 of 64 parted at the
+  same events every time) rather than nondeterminism. After the fact,
   `determinismo verify --run <run directory> [--sample <n>] [--timeline <n>]...` replays a
   sample of a run's timelines, or the ones named; a replay that parts from its tape prints the
   last events before the checkpoint it failed, to compare with the run's. To find where it
@@ -170,4 +178,6 @@ use them in other repositories.
   crashes, the kernel kills no process for lack of memory and reports no warnings, BUGs or hung
   tasks, peak memory stays under 95%, logging stays under 200 MB per hour of virtual time, the
   fault injector started, and no panics or uncaught exceptions in output (Go, Rust, Java). A kernel property's failure carries the log line and the
-  kernel's timestamp (`kernel_us`, virtual time) in its details.
+  kernel's timestamp (`kernel_us`, virtual time) in its details. The kernel's console lines are
+  events too, output from source `kernel` at their moments (ext4 aborting a journal at a power
+  loss, the OOM killer, a hung task): query them as any node's output (`output.source=kernel`).

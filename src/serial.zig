@@ -26,6 +26,15 @@ output_fd: linux.fd_t = 1,
 /// Every byte the guest has written, to compare runs.
 output_hash: std.hash.Wyhash = .init(0),
 output_bytes: u64 = 0,
+/// The line being written (cut at `line_size_max`), done at its newline: the VM turns the
+/// kernel's into events.
+line: [line_size_max]u8 = undefined,
+line_count: u16 = 0,
+line_done: bool = false,
+
+/// A console line kept for an event: escaped as JSON (6 bytes a byte at most) it stays within
+/// an event's 4 KB.
+pub const line_size_max = 512;
 
 const Serial = @This();
 
@@ -98,6 +107,12 @@ fn emit(serial: *Serial, byte: u8) void {
     serial.output_bytes += 1;
     serial.output[serial.output_count] = byte;
     serial.output_count += 1;
+    if (byte == '\n') {
+        serial.line_done = true;
+    } else if (serial.line_count < serial.line.len) {
+        serial.line[serial.line_count] = byte;
+        serial.line_count += 1;
+    }
     if (byte == '\n' or serial.output_count == serial.output.len) serial.flush();
     assert(serial.output_count < serial.output.len);
 }
@@ -120,4 +135,17 @@ test "transmit-empty interrupt is raised once and acknowledged by IIR" {
     try std.testing.expect(serial.write(port_base + 1, ier_transmit_empty));
     try std.testing.expectEqual(@as(u8, 0x02), serial.read(port_base + 2));
     try std.testing.expectEqual(@as(u8, 0x01), serial.read(port_base + 2));
+}
+
+test "a line is kept until its newline, a long one cut" {
+    var serial = Serial{ .output_fd = -1 };
+    for ("[    1.000000] ok") |byte| _ = serial.write(port_base, byte);
+    try std.testing.expect(!serial.line_done);
+    _ = serial.write(port_base, '\n');
+    try std.testing.expect(serial.line_done);
+    try std.testing.expectEqualStrings("[    1.000000] ok", serial.line[0..serial.line_count]);
+    serial.line_count = 0;
+    serial.line_done = false;
+    for (0..line_size_max + 10) |_| _ = serial.write(port_base, 'x');
+    try std.testing.expectEqual(line_size_max, serial.line_count);
 }

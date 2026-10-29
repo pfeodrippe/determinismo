@@ -39,7 +39,11 @@ pub const Verifier = struct {
         assert(every > 0);
         const results_path = try std.fmt.allocPrint(arena, "{s}.replays", .{record});
         std.Io.Dir.cwd().deleteFile(io, results_path) catch {};
-        const base = try program_kept(arena, io, try replay_argv(arena, argv), tapes);
+        const replayer: Replayer = .{
+            .base = try program_kept(arena, io, try replay_argv(arena, argv), tapes),
+            .tapes = tapes,
+            .events = flag_value(argv, "--events-dir"),
+        };
         const explorer = linux.getpid();
         const pid = linux.fork();
         if (linux.errno(pid) != .SUCCESS) return error.Fork;
@@ -56,7 +60,7 @@ pub const Verifier = struct {
                 .flags = 0,
             };
             _ = linux.sigaction(linux.SIG.USR1, &action, null);
-            verify_loop(io, base, record, tapes, every, jobs, results_path);
+            verify_loop(io, replayer, record, every, jobs, results_path);
             linux.exit_group(0);
         }
         return .{ .pid = @intCast(pid), .results_path = results_path };
@@ -167,11 +171,18 @@ fn finish_requested(_: linux.SIG) callconv(.c) void {
     finishing.store(true, .release);
 }
 
+/// What a replay needs: the explorer's arguments for it, the run's tapes, and the run's events
+/// (`--events-dir`), to place where a replay parts from them.
+const Replayer = struct {
+    base: []const []const u8,
+    tapes: []const u8,
+    events: ?[]const u8,
+};
+
 fn verify_loop(
     io: std.Io,
-    base: []const []const u8,
+    replayer: Replayer,
     record: []const u8,
-    tapes: []const u8,
     every: u32,
     jobs: u32,
     results_path: []const u8,
@@ -185,7 +196,7 @@ fn verify_loop(
         if (!finishing.load(.acquire)) sleep_ns(scan_interval_ns); // A signal ends the sleep.
         if (finishing.load(.acquire)) {
             const text = std.Io.Dir.cwd().readFileAlloc(io, record, arena, .unlimited) catch "";
-            return finish_pending(arena, io, base, tapes, every, jobs, results_path, text, &verified, replays);
+            return finish_pending(arena, io, replayer, every, jobs, results_path, text, &verified, replays);
         }
         const text = std.Io.Dir.cwd().readFileAlloc(io, record, arena, .unlimited) catch continue;
         // Timelines recorded at the read before: their tapes are closed.
@@ -212,7 +223,7 @@ fn verify_loop(
             if (replays == replays_max) break;
             verified.put(arena, timeline.index, {}) catch return;
             replays += 1;
-            const line = replay_one(arena, io, base, tapes, timeline.index, timeline.hash) catch |err|
+            const line = replay_one(arena, io, replayer, timeline.index, timeline.hash) catch |err|
                 std.fmt.allocPrint(arena, "{d} different {s} none {s}\n", .{ timeline.index, timeline.hash, @errorName(err) }) catch return;
             append(results_path, line);
         }
@@ -224,8 +235,7 @@ fn verify_loop(
 fn finish_pending(
     arena: std.mem.Allocator,
     io: std.Io,
-    base: []const []const u8,
-    tapes: []const u8,
+    replayer: Replayer,
     every: u32,
     jobs: u32,
     results_path: []const u8,
@@ -248,8 +258,7 @@ fn finish_pending(
     const Worker = struct {
         fn run(
             worker_io: std.Io,
-            worker_base: []const []const u8,
-            worker_tapes: []const u8,
+            worker_replayer: Replayer,
             worker_results: []const u8,
             all: []const Pending,
             next: *std.atomic.Value(u32),
@@ -261,7 +270,7 @@ fn finish_pending(
                 // Each its own arena: the workers run at once.
                 var own: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
                 defer own.deinit();
-                const line = replay_one(own.allocator(), worker_io, worker_base, worker_tapes, timeline.index, timeline.hash) catch |err|
+                const line = replay_one(own.allocator(), worker_io, worker_replayer, timeline.index, timeline.hash) catch |err|
                     std.fmt.allocPrint(own.allocator(), "{d} different {s} none {s}\n", .{ timeline.index, timeline.hash, @errorName(err) }) catch return;
                 append(worker_results, line);
             }
@@ -272,25 +281,32 @@ fn finish_pending(
     var threads: [replays_max]std.Thread = undefined;
     var started: usize = 0;
     for (0..workers) |_| {
-        threads[started] = std.Thread.spawn(.{}, Worker.run, .{ io, base, tapes, results_path, pending.items, &next }) catch break;
+        threads[started] = std.Thread.spawn(.{}, Worker.run, .{ io, replayer, results_path, pending.items, &next }) catch break;
         started += 1;
     }
     // None started (no threads to be had): this one does them all.
-    if (started == 0) Worker.run(io, base, tapes, results_path, pending.items, &next);
+    if (started == 0) Worker.run(io, replayer, results_path, pending.items, &next);
     for (threads[0..started]) |thread| thread.join();
 }
 
 fn replay_one(
     arena: std.mem.Allocator,
     io: std.Io,
-    base: []const []const u8,
-    tapes: []const u8,
+    replayer: Replayer,
     index: u32,
     recorded: []const u8,
 ) ![]const u8 {
+    const tapes = replayer.tapes;
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, base);
+    try argv.appendSlice(arena, replayer.base);
     try argv.appendSlice(arena, &.{ "--tape", try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ tapes, index }) });
+    // Its events beside the tapes, while the run has its own to compare them with: kept when it
+    // parts from the run, as the evidence.
+    const replay_events: ?[]const u8 = if (replayer.events != null)
+        try std.fmt.allocPrint(arena, "{s}/replay-{d}-events", .{ tapes, index })
+    else
+        null;
+    if (replay_events) |directory| try argv.appendSlice(arena, &.{ "--events-dir", directory });
     const result = try std.process.run(arena, io, .{
         .argv = argv.items,
         .stdout_limit = .limited(64 << 20),
@@ -299,6 +315,7 @@ fn replay_one(
     var replayed: []const u8 = "none";
     var why: []const u8 = "";
     var hazards: []const u8 = "";
+    var other_build = false;
     for ([_][]const u8{ result.stdout, result.stderr }) |output| {
         var lines = std.mem.tokenizeScalar(u8, output, '\n');
         while (lines.next()) |line| {
@@ -311,10 +328,13 @@ fn replay_one(
                 why = line[at..];
             } else if (std.mem.indexOf(u8, line, "its clock's hazards: ")) |at| {
                 hazards = line[at..];
+            } else if (std.mem.indexOf(u8, line, "recorded by another build of determinismo") != null) {
+                other_build = true;
             }
         }
     }
     if (std.mem.eql(u8, replayed, recorded) and why.len == 0) {
+        if (replay_events) |directory| std.Io.Dir.cwd().deleteTree(io, directory) catch {};
         return std.fmt.allocPrint(arena, "{d} same {s}\n", .{ index, recorded });
     }
     // Killed (SIGKILL: the host's OOM killer) before it ended: not replayed, which says nothing
@@ -337,9 +357,111 @@ fn replay_one(
     // clock's hazards, without replaying it again.
     const log = try std.fmt.allocPrint(arena, "{s}/replay-{d}.log", .{ tapes, index });
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log, .data = tail(result.stderr, 256 << 10) }) catch {};
-    return std.fmt.allocPrint(arena, "{d} different {s} {s} {s}{s}{s}\n", .{
-        index, recorded, replayed, why, if (hazards.len > 0) "; " else "", hazards,
+    const parted = if (replay_events) |directory| parting(
+        arena,
+        io,
+        try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ replayer.events.?, index }),
+        try std.fmt.allocPrint(arena, "{s}/branch-{d}.jsonl", .{ directory, index }),
+    ) else "";
+    return std.fmt.allocPrint(arena, "{d} different {s} {s} {s}{s}{s}{s}{s}\n", .{
+        index,                                                                  recorded, replayed, why, if (hazards.len > 0) "; " else "", hazards, parted,
+        if (other_build) "; recorded by another build of determinismo" else "",
     });
+}
+
+/// Where a replay's events part from the run's: the last checkpoint both passed (one per second
+/// of virtual time, Events.checkpoint) and the first line that differs on each side; "" when
+/// either file cannot be read or they do not differ.
+fn parting(arena: std.mem.Allocator, io: std.Io, recorded_path: []const u8, replayed_path: []const u8) []const u8 {
+    const limit: std.Io.Limit = .limited(1 << 30);
+    const recorded = std.Io.Dir.cwd().readFileAlloc(io, recorded_path, arena, limit) catch return "";
+    const replayed = std.Io.Dir.cwd().readFileAlloc(io, replayed_path, arena, limit) catch return "";
+    return parting_text(arena, recorded, replayed);
+}
+
+fn parting_text(arena: std.mem.Allocator, recorded: []const u8, replayed: []const u8) []const u8 {
+    var recorded_lines = std.mem.tokenizeScalar(u8, recorded, '\n');
+    var replayed_lines = std.mem.tokenizeScalar(u8, replayed, '\n');
+    var passed: ?u64 = null; // The last checkpoint both passed, its virtual time.
+    while (true) {
+        const a = recorded_lines.next();
+        const b = replayed_lines.next();
+        if (a == null and b == null) return "";
+        if (a != null and b != null and std.mem.eql(u8, a.?, b.?)) {
+            if (std.mem.startsWith(u8, a.?, "{\"checkpoint\":")) passed = number_after(a.?, "\"vtime_ns\":");
+            continue;
+        }
+        const after = if (passed) |ns|
+            std.fmt.allocPrint(arena, "the checkpoint at {f}", .{seconds(ns)}) catch return ""
+        else
+            "no checkpoint";
+        return std.fmt.allocPrint(arena, "; parted after {s}: recorded {s}, replayed {s}", .{
+            after, place(arena, a), place(arena, b),
+        }) catch "";
+    }
+}
+
+/// A line's place: "seq <n> at <t> s", "a checkpoint at <t> s", or "nothing" (its file ended).
+fn place(arena: std.mem.Allocator, line: ?[]const u8) []const u8 {
+    const text = line orelse return "nothing";
+    const vtime_ns = number_after(text, "\"vtime_ns\":") orelse return "an unreadable line";
+    if (std.mem.startsWith(u8, text, "{\"checkpoint\":")) {
+        return std.fmt.allocPrint(arena, "a checkpoint at {f}", .{seconds(vtime_ns)}) catch "";
+    }
+    const seq = number_after(text, "\"seq\":") orelse 0;
+    return std.fmt.allocPrint(arena, "seq {d} at {f}", .{ seq, seconds(vtime_ns) }) catch "";
+}
+
+fn number_after(text: []const u8, key: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, text, key) orelse return null;
+    const start = at + key.len;
+    var end = start;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    return std.fmt.parseInt(u64, text[start..end], 10) catch null;
+}
+
+/// Virtual time to the microsecond, for a person: "94.852498 s".
+const Seconds = struct {
+    ns: u64,
+    pub fn format(value: Seconds, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{d}.{d:0>6} s", .{ value.ns / std.time.ns_per_s, value.ns % std.time.ns_per_s / std.time.ns_per_us });
+    }
+};
+
+fn seconds(ns: u64) Seconds {
+    return .{ .ns = ns };
+}
+
+/// The value after `flag` in an argument list, if it is there.
+fn flag_value(argv: []const [:0]const u8, flag: []const u8) ?[]const u8 {
+    for (argv, 0..) |argument, index| {
+        if (std.mem.eql(u8, argument, flag) and index + 1 < argv.len) return argv[index + 1];
+    }
+    return null;
+}
+
+test parting_text {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const recorded =
+        \\{"seq":1,"vtime_ns":500,"branches":7,"event":{"event":"a"}}
+        \\{"checkpoint":{"vtime_ns":1000000123,"branches":9}}
+        \\{"seq":2,"vtime_ns":94852498828,"branches":13274724501,"event":{"event":"b"}}
+    ;
+    const replayed =
+        \\{"seq":1,"vtime_ns":500,"branches":7,"event":{"event":"a"}}
+        \\{"checkpoint":{"vtime_ns":1000000123,"branches":9}}
+        \\{"seq":2,"vtime_ns":94852499537,"branches":13274690239,"event":{"event":"b"}}
+    ;
+    try std.testing.expectEqualStrings(
+        "; parted after the checkpoint at 1.000000 s: recorded seq 2 at 94.852498 s, replayed seq 2 at 94.852499 s",
+        parting_text(arena.allocator(), recorded, replayed),
+    );
+    try std.testing.expectEqualStrings("", parting_text(arena.allocator(), recorded, recorded));
+    try std.testing.expectEqualStrings(
+        "; parted after no checkpoint: recorded seq 1 at 0.000000 s, replayed nothing",
+        parting_text(arena.allocator(), recorded, ""),
+    );
 }
 
 /// The last `size_max` bytes of `bytes` (all of them when shorter).

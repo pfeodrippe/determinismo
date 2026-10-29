@@ -951,6 +951,9 @@ const Exploration = struct {
     fork: ?tape.Fork = null,
     /// Identifies what the machine boots; recorded in tapes.
     inputs: u64 = 0,
+    /// This build of determinismo (a hash of its executable): recorded in tapes and the run's
+    /// record, so that a replay by another build says so.
+    host: u64 = 0,
     exploration_seed: u64,
     strategy: ?*Strategy = null,
     tape_directory: ?[]const u8 = null,
@@ -1312,6 +1315,7 @@ fn command_explore(
         try std.Io.Dir.cwd().createDirPath(context.io, directory);
     }
     exploration.inputs = inputs_hash(options, arguments);
+    exploration.host = host_build();
     const signature = host_cpu_signature()[3];
     std.debug.print("[determinismo] inputs {x:0>16} (determinism ABI {d}, CPU signature " ++
         "{x:0>8})\n", .{ exploration.inputs, VM.determinism_abi, signature });
@@ -1348,6 +1352,7 @@ fn command_explore(
                 .jobs = jobs_count(arguments),
                 .strategy = arguments.strategy_command,
                 .branching = @tagName(arguments.branching),
+                .host = &hex16(exploration.host),
                 // A tree's generations are the timelines that finished together, recorded as
                 // judged (explore_tree): a record without them is not one to resume.
                 .queue = true,
@@ -1368,6 +1373,14 @@ fn command_explore(
             });
             return error.TapeInputsDiffer;
         }
+        // Recorded by another build: allowed (most changes leave timelines as they were), but a
+        // replay that parts from the tape may then be the build's doing (run 56, recorded the day
+        // before: the same 26 of 64 parted, at the same events, with or without hyperthreads).
+        if (header.host) |host| if (host != exploration.host) {
+            std.debug.print("[determinismo] the tape was recorded by another build of determinismo " ++
+                "({x:0>16}; this is {x:0>16}): a replay that parts from it may be the build's " ++
+                "doing\n", .{ host, exploration.host });
+        };
         exploration.exploration_seed = header.exploration_seed;
         exploration.replay = .{ .header = header, .overrides = overrides };
         exploration.fork = header.fork;
@@ -2051,6 +2064,7 @@ fn branch_announce(
             .branch_seed = place.seed,
             .fork = exploration.fork,
             .chain = place.path,
+            .host = exploration.host,
         });
     }
 }
@@ -4427,6 +4441,24 @@ fn open_for_appending(arena: std.mem.Allocator, path: []const u8, mode: enum { f
     return fd;
 }
 
+/// This build of determinismo: a hash of its own executable, read through a small buffer (0
+/// when it cannot be read).
+fn host_build() u64 {
+    const fd = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0;
+    defer _ = linux.close(@intCast(fd));
+    var hasher = std.hash.Wyhash.init(0);
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = linux.read(@intCast(fd), &buffer, buffer.len);
+        if (linux.errno(count) == .INTR) continue;
+        if (linux.errno(count) != .SUCCESS) return 0;
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+    }
+    return hasher.final();
+}
+
 fn hex16(value: u64) [16]u8 {
     var text: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&text, "{x:0>16}", .{value}) catch unreachable;
@@ -4483,6 +4515,7 @@ test {
     _ = @import("rtc.zig");
     _ = @import("pit.zig");
     _ = @import("serial.zig");
+    _ = @import("vm.zig");
     _ = @import("cpuid.zig");
     _ = @import("decisions.zig");
     _ = @import("events.zig");

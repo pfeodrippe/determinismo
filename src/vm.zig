@@ -99,6 +99,10 @@ hold: ?*const Hold,
 hold_behaviors: u32,
 /// Restored from a hold point inside an idle skip (Options.from_hold): the skip goes on first.
 idle_pending: bool,
+/// The virtual time of the next checkpoint in the events (Events.checkpoint): where an execution
+/// is at each second, so that a replay that parts from it is placed within a second even where
+/// no event comes for long (run 164, timeline 159: 30 s without one).
+checkpoint_next_ns: u64,
 deterministic: bool,
 builtin_properties: bool,
 checks: []const schema.Check,
@@ -357,6 +361,9 @@ pub fn init_from_snapshot(vm: *VM, options: *const Options, snapshot: *const Sna
     vm.decisions = .{ .seed = options.seed, .pulls = snapshot.decisions.pulls };
     vm.last_pull_ns = 0;
     vm.idle_pending = if (options.from_hold) |point| point.idle else false;
+    // A timeline's checkpoints from its own start, the first at its first timer: the same in its
+    // replay, whatever this VM ran before (a holder goes on with its own timeline's).
+    if (options.from_hold == null) vm.checkpoint_next_ns = 0;
     assert(vm.branches_offset == snapshot.branches);
     if (options.branch_signal) {
         assert(options.from_hold == null); // A holder continues its own timeline.
@@ -432,6 +439,7 @@ fn init_machine(vm: *VM, options: *const Options) !void {
         .hold = null,
         .hold_behaviors = 0,
         .idle_pending = false,
+        .checkpoint_next_ns = checkpoint_interval_ns,
         .deterministic = options.deterministic,
         .builtin_properties = options.builtin_properties,
         .checks = options.checks,
@@ -1002,11 +1010,59 @@ fn timer_fire(vm: *VM) !void {
     if (vm.vtime_limit_tsc) |limit| if (vm.pit.deadline_tsc()) |tsc| {
         if (tsc >= limit) vm.over_limit = true;
     };
+    // The timer fires at a point of the execution's own (its deadline), idle or not: the first
+    // past each second is a checkpoint.
+    if (vm.events.log_fd != null) if (vm.pit.deadline_tsc()) |tsc| {
+        if (tsc / tsc_per_ns >= vm.checkpoint_next_ns) {
+            const now = try vm.moment();
+            vm.events.checkpoint(now);
+            vm.checkpoint_next_ns = (now.vtime_ns / checkpoint_interval_ns + 1) * checkpoint_interval_ns;
+        }
+    };
     try vm.trace("timer", vm.pit.fired);
     vm.pit.fire();
     vm.stats.timer_fires += 1;
     try vm.irq_pulse(PIT.irq);
 }
+
+/// A line the guest wrote to its console, done: the kernel's (printk's, "[   13.006075] ...") an
+/// event at its moment, from source "kernel" (Antithesis's journal: ext4 aborting its journal,
+/// the OOM killer, a task hung), beside the nodes' output. The console's writes are the guest's
+/// own exits: the same moments in every replay.
+fn console_line(vm: *VM) !void {
+    defer {
+        vm.serial.line_count = 0;
+        vm.serial.line_done = false;
+    }
+    if (!vm.deterministic) return;
+    const line = std.mem.trimEnd(u8, vm.serial.line[0..vm.serial.line_count], "\r");
+    if (!kernel_line(line)) return;
+    var buffer: [Serial.line_size_max * 6 + 128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("{{\"output\":{{\"source\":\"kernel\",\"stream\":\"console\",\"text\":{f}}}}}", .{
+        std.json.fmt(line, .{}),
+    }) catch return;
+    try vm.events.emit(try vm.moment(), writer.buffered());
+}
+
+/// printk's own: "[" then the seconds since boot, right-aligned, then "] ".
+fn kernel_line(line: []const u8) bool {
+    if (line.len < 3 or line[0] != '[') return false;
+    const close = std.mem.indexOfScalar(u8, line[0..@min(line.len, 20)], ']') orelse return false;
+    for (line[1..close]) |byte| if (!std.ascii.isDigit(byte) and byte != ' ' and byte != '.') return false;
+    return close > 1;
+}
+
+test kernel_line {
+    try std.testing.expect(kernel_line("[   13.006075] Aborting journal on device dm-0-8."));
+    try std.testing.expect(kernel_line("[12345.000001] Out of memory: Killed process 42"));
+    try std.testing.expect(!kernel_line("[guest] done, status 0"));
+    try std.testing.expect(!kernel_line("[] nothing"));
+    try std.testing.expect(!kernel_line("Booting the kernel"));
+}
+
+/// Virtual time between checkpoints in the events.
+const checkpoint_interval_ns = std.time.ns_per_s;
 
 const Idle = enum { timer, moment, none };
 
@@ -1158,6 +1214,7 @@ fn io_out(vm: *VM, port: u16, bytes: []const u8) !?Outcome {
     assert(bytes.len >= 1 and bytes.len <= 4);
     if (Serial.contains(port)) {
         if (vm.serial.write(port, bytes[0])) try vm.irq_pulse(Serial.irq);
+        if (vm.serial.line_done) try vm.console_line();
         return null;
     }
     switch (port) {
