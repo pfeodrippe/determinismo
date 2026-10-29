@@ -217,6 +217,9 @@ pub fn System(comptime Nodes: type) type {
         pub const Profile = struct {
             name: []const u8,
             specs: [field_names.len]?Spec = @splat(null),
+            /// A command that turns the system's logs up, in the guest at a moment (`det-nodes
+            /// exec <node> ...`): what causality's explanation runs inside a jump.
+            explain: ?[]const u8 = null,
 
             pub fn node(p: *Profile, comptime name: Name, spec: Spec) void {
                 assert(p.specs[@backingInt(name)] == null); // Each node once per profile.
@@ -428,7 +431,7 @@ pub fn System(comptime Nodes: type) type {
                     return error.NodeMissing;
                 }
             }
-            return .{ .name = profile.name, .nodes = nodes.items };
+            return .{ .name = profile.name, .nodes = nodes.items, .explain = profile.explain };
         }
     };
 }

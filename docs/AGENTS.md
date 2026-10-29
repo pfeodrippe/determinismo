@@ -85,7 +85,8 @@ use them in other repositories.
    `--explain-exec '<command that turns them up>'` (serve: `explain_exec`) ends the analysis
    with futures from inside the narrowest jump to failure, the command run at their moment and
    the timeline's own randomness after it, each one's events kept: a failing one shows the
-   mechanism step by step (Redpanda's open transaction, run 177).
+   mechanism step by step (Redpanda's open transaction, run 177). A test program's profile may
+   declare that command (`profile.explain`): serve then runs it in every analysis of the run.
    **Try a change**: `replay` with `exec` and `continue` makes a change at a moment (data, a
    setting, a function redefined through a REPL) and lets the branch play out; `fork` with
    `exec` explores many futures of the changed system. `determinismo extract` takes a node's

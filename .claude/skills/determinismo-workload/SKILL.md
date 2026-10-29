@@ -70,6 +70,10 @@ fn transfers(s: *System.Scenario) void {
   leases, JVMs) need faults in bursts, `s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max =
   30_000 }`, or they never serve during a timeline; and their drivers need enough refused
   connections in a row to outlast a failover.
+- Give each profile an `explain` command when the system can turn its logs up at runtime
+  (`profile.explain = "det-nodes exec <node> <set the log level>"`, ones restarts keep too):
+  causality runs it in futures inside a failure's jump, and their logs show the mechanism
+  (Redpanda's `rpk ... log-level set tx`, examples/kafka).
 - A node's disk is the VM's memory (snapshots hold it): size what the system writes and keeps
   for long timelines (preallocated segments, retention, log files), or OOM kills end them
   (YugabyteDB's 64 MB WAL segments, preallocated per tablet: `--log_segment_size_mb 4`).

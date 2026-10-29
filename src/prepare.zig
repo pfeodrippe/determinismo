@@ -112,6 +112,7 @@ pub fn prepare(arena: std.mem.Allocator, io: std.Io, options: Options) !Prepared
         // is its setup command's (kapp's readiness, as Antithesis's).
         .sdk_setup = options.compose != null,
         .checks = description.checks,
+        .explain = profile.explain,
     };
     var writer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(system, .{ .emit_null_optional_fields = false }, &writer.writer);

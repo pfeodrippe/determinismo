@@ -49,6 +49,10 @@ pub fn record_path(comptime name: []const u8) [:0]const u8 {
 pub const Profile = struct {
     name: []const u8,
     nodes: []const Node,
+    /// A command that turns the system's logs up, run in the guest at a moment (`det-nodes exec
+    /// <node> ...`): causality's explanation runs it in futures inside a jump (its
+    /// `explain_exec`, serve's default for the run's analyses).
+    explain: ?[]const u8 = null,
 };
 
 pub const Node = struct {
@@ -280,6 +284,8 @@ pub const System = struct {
     /// composer waits for it before the drivers, as Antithesis does.
     sdk_setup: bool = false,
     checks: []const Check = &.{},
+    /// The profile's command that turns the system's logs up (Profile.explain).
+    explain: ?[]const u8 = null,
 
     pub fn scenario(system: *const System, name: []const u8) ?*const Scenario {
         for (system.scenarios) |*entry| {

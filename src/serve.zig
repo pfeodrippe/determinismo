@@ -1370,7 +1370,10 @@ fn causality_argv(server: *Server, run: *const Run, asked: *const CausalityReque
     if (asked.planner) |planner| {
         try argv.appendSlice(server.arena, &.{ "--planner", try strategy_resolve(server, planner) });
     }
-    if (asked.explain_exec) |command| try argv.appendSlice(server.arena, &.{ "--explain-exec", command });
+    // Asked for, or the profile's own (its test program's `explain`, in the run's pin).
+    if (asked.explain_exec orelse system_explain(server, run.id)) |command| {
+        try argv.appendSlice(server.arena, &.{ "--explain-exec", command });
+    }
     if (asked.verdict) |verdict| {
         try argv.appendSlice(server.arena, &.{ "--verdict", verdict });
     } else if (try failure_moments(server, run.id, asked.branch, asked.property)) |moments| {
@@ -2384,6 +2387,17 @@ fn notebook_evaluate(
 
 /// The system a run booted (its pin, in its events): its replays boot the same node disks,
 /// whatever the images and Dockerfiles have become since.
+/// The run's profile's command that turns its logs up (schema.Profile.explain), from its pin.
+fn system_explain(server: *Server, id: u32) ?[]const u8 {
+    const pin_path = std.fs.path.join(server.arena, &.{ run_directory(server, id) catch return null, "events", "system.pin.json" }) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(server.io, pin_path, server.arena, .limited(16 << 20)) catch return null;
+    const Pin = struct { system_json: []const u8 = "" };
+    const pin = std.json.parseFromSliceLeaky(Pin, server.arena, text, .{ .ignore_unknown_fields = true }) catch return null;
+    const System = struct { explain: ?[]const u8 = null };
+    const system = std.json.parseFromSliceLeaky(System, server.arena, pin.system_json, .{ .ignore_unknown_fields = true }) catch return null;
+    return system.explain;
+}
+
 fn pin_arguments(server: *Server, argv: *std.ArrayList([]const u8), id: u32) !void {
     const pin = try std.fs.path.join(server.arena, &.{ try run_directory(server, id), "events", "system.pin.json" });
     std.Io.Dir.cwd().access(server.io, pin, .{}) catch return; // A run from before pins.
