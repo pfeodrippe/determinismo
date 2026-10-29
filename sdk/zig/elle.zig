@@ -258,6 +258,106 @@ pub const History = struct {
     }
 };
 
+/// Each key's committed appends, from a history's `ok` lines, in the order keys first appear.
+pub const Committed = std.AutoArrayHashMapUnmanaged(u64, std.ArrayList(u64));
+
+/// The appends `history` says committed (none when nothing was recorded).
+pub fn appends_committed(gpa: std.mem.Allocator, history: *const History) !Committed {
+    return appends_parse(gpa, try file_read(gpa, history.path));
+}
+
+pub fn appends_parse(gpa: std.mem.Allocator, text: []const u8) !Committed {
+    var committed: Committed = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, line, .{}) catch
+            return error.BadHistory;
+        if (parsed != .object) return error.BadHistory;
+        const kind = parsed.object.get("type") orelse return error.BadHistory;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "ok")) continue;
+        const mops = parsed.object.get("value") orelse return error.BadHistory;
+        if (mops != .array) return error.BadHistory;
+        for (mops.array.items) |mop| {
+            if (mop != .array or mop.array.items.len != 3) continue;
+            const f = mop.array.items[0];
+            if (f != .string or !std.mem.eql(u8, f.string, "append")) continue;
+            const key = mop.array.items[1];
+            const value = mop.array.items[2];
+            if (key != .integer or value != .integer) return error.BadHistory;
+            const entry = try committed.getOrPut(gpa, @intCast(key.integer));
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(gpa, @intCast(value.integer));
+        }
+    }
+    return committed;
+}
+
+/// A whole file ("" when there is none).
+fn file_read(gpa: std.mem.Allocator, path: [:0]const u8) ![]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) == .NOENT) return "";
+    if (linux.errno(fd) != .SUCCESS) return error.HistoryOpen;
+    defer _ = linux.close(@intCast(fd));
+    var bytes: std.ArrayList(u8) = .empty;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = linux.read(@intCast(fd), &buffer, buffer.len);
+        if (linux.errno(count) == .INTR) continue;
+        if (linux.errno(count) != .SUCCESS) return error.HistoryRead;
+        if (count == 0) break;
+        try bytes.appendSlice(gpa, buffer[0..count]);
+    }
+    return bytes.items;
+}
+
+/// Lost appends asserted one by one; past these, counted in an event.
+const lost_reported_max = 8;
+
+/// Once faults stop (a `finally` command, the drivers done): every append the history says
+/// committed must be in its key's list as `reader` reads it, `reader.read_list(gpa, key)`: the
+/// list, or null once it can read no more (a cluster may wait for an operator, as Galera does
+/// after losing every node), the rest of the keys then unjudged. A lost append fails "every
+/// committed append is in the final read"; each read goes into the history, for Elle. Elle below
+/// strict serializability takes a read missing a committed append for an older snapshot, and a
+/// workload's own reads may never read a key again (Galera run 123: a committed row lost, Elle's
+/// 58 operations none the wiser).
+pub fn final_reads(gpa: std.mem.Allocator, history: *const History, reader: anytype) !void {
+    const committed = try appends_committed(gpa, history);
+    if (committed.count() == 0) return;
+    var judged: u32 = 0;
+    var lost: u32 = 0;
+    for (committed.keys(), committed.values()) |key, values| {
+        const asked = [_]Mop{.{ .read = .{ .key = key, .list = null } }};
+        const process = process_new();
+        try history.invoke(gpa, process, &asked);
+        const seen = reader.read_list(gpa, key) orelse {
+            try history.fail(gpa, process, &asked);
+            break; // Out of attempts: the rest unjudged.
+        };
+        try history.ok(gpa, process, &.{.{ .read = .{ .key = key, .list = seen } }});
+        judged += 1;
+        for (values.items) |value| {
+            if (std.mem.indexOfScalar(u64, seen, value) != null) continue;
+            lost += 1;
+            if (lost > lost_reported_max) continue;
+            sdk.always(false, "every committed append is in the final read", .{
+                .key = key,
+                .value = value,
+                .read = seen.len,
+                .committed = values.items.len,
+            });
+        }
+    }
+    sdk.sometimes(judged > 0, "the final reads reach a node once faults stop", .{
+        .keys = committed.count(),
+        .judged = judged,
+    });
+    if (judged > 0 and lost == 0) {
+        sdk.always(true, "every committed append is in the final read", .{ .keys = judged });
+    }
+    if (lost > lost_reported_max) sdk.event("final_reads_lost", .{ .lost = lost, .keys = judged });
+}
+
 /// The guest's clock (virtual, the same in every replay): when an operation was recorded, which
 /// Elle reports with the operations of an anomaly (the window the anomaly formed in).
 fn time_ns() u64 {
@@ -296,6 +396,24 @@ pub fn line_write(writer: *std.Io.Writer, process: u64, kind: Kind, mops: []cons
         }
     }
     try writer.writeAll("]}\n");
+}
+
+test appends_parse {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const history =
+        \\{"process":1,"type":"invoke","f":"txn","time":1,"value":[["append",7,70],["r",8,null]]}
+        \\{"process":1,"type":"ok","f":"txn","time":2,"value":[["append",7,70],["r",8,[1]]]}
+        \\{"process":2,"type":"info","f":"txn","time":3,"value":[["append",7,71]]}
+        \\{"process":3,"type":"fail","f":"txn","time":4,"value":[["append",9,90]]}
+        \\{"process":4,"type":"ok","f":"txn","time":5,"value":[["append",9,91],["append",7,72]]}
+        \\
+    ;
+    const committed = try appends_parse(arena.allocator(), history);
+    try std.testing.expectEqualSlices(u64, &.{ 7, 9 }, committed.keys());
+    try std.testing.expectEqualSlices(u64, &.{ 70, 72 }, committed.get(7).?.items);
+    try std.testing.expectEqualSlices(u64, &.{91}, committed.get(9).?.items);
+    try std.testing.expectError(error.BadHistory, appends_parse(arena.allocator(), "{\"type\":\"ok\"}\n"));
 }
 
 test line_write {

@@ -82,8 +82,6 @@ const keys_window = 4;
 /// drivers as soon as the composer reaches the ending.
 const final_attempts_max = 60;
 const final_pause_ms = 1000;
-/// Lost appends reported one by one; past these, counted.
-const lost_reported_max = 8;
 const value_size_max = 64 * 1024;
 
 /// The tables, once (any node).
@@ -179,130 +177,61 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
     }
 }
 
-/// Once faults stop: every append the history says committed is in its key's list, read through
-/// a node that answers. A lost one fails "every committed append is in the final read"; a cluster
-/// that answers no final read is not judged, only noted. The reads go into the history, for Elle.
+/// Once faults stop: every append the history says committed is in its key's list
+/// (sdk.elle.final_reads), read through any node that answers.
 pub fn final_reads(arena: std.mem.Allocator, addresses: []const [4]u8, options: Options) !void {
+    var reader: FinalReader = .{ .addresses = addresses, .options = options };
+    defer reader.close();
     const history: sdk.elle.History = .{};
-    const committed = try appends_committed(arena, history.path);
-    if (committed.count() == 0) return;
-    var connection: Client = undefined;
-    var connected = false;
-    defer if (connected) connection.close();
-    var attempts: u32 = 0;
-    var judged: u32 = 0;
-    var lost: u32 = 0;
-    next_key: for (committed.keys(), committed.values()) |key, values| {
-        while (attempts < final_attempts_max) {
-            if (!connected) {
-                connected = final_connect(&connection, addresses, options);
-                if (!connected) {
-                    attempts += 1;
+    try sdk.elle.final_reads(arena, &history, &reader);
+}
+
+/// The final reads' connection: to a node drawn at random, with the final session statement,
+/// reopened elsewhere after a read fails, until `final_attempts_max` attempts failed.
+const FinalReader = struct {
+    addresses: []const [4]u8,
+    options: Options,
+    connection: Client = undefined,
+    connected: bool = false,
+    attempts: u32 = 0,
+
+    pub fn read_list(reader: *FinalReader, arena: std.mem.Allocator, key: u64) ?[]const u64 {
+        while (reader.attempts < final_attempts_max) {
+            if (!reader.connected) {
+                reader.connected = reader.connect();
+                if (!reader.connected) {
+                    reader.attempts += 1;
                     pause_ms(final_pause_ms);
                     continue;
                 }
             }
-            const asked = [_]sdk.elle.Mop{.{ .read = .{ .key = key, .list = null } }};
-            const process = sdk.elle.process_new();
-            try history.invoke(arena, process, &asked);
             var list: ?[]const u64 = null;
-            read(arena, &connection, .{ .append = false, .key = key, .value = 0 }, &list, options) catch {
-                try history.fail(arena, process, &asked);
-                connection.close();
-                connected = false;
-                attempts += 1;
+            read(arena, &reader.connection, .{ .append = false, .key = key, .value = 0 }, &list, reader.options) catch {
+                reader.close();
+                reader.attempts += 1;
                 pause_ms(final_pause_ms);
                 continue;
             };
-            const seen = list orelse &.{};
-            try history.ok(arena, process, &.{.{ .read = .{ .key = key, .list = seen } }});
-            judged += 1;
-            for (values.items) |value| {
-                if (std.mem.indexOfScalar(u64, seen, value) != null) continue;
-                lost += 1;
-                if (lost > lost_reported_max) continue;
-                sdk.always(false, "every committed append is in the final read", .{
-                    .key = key,
-                    .value = value,
-                    .read = seen.len,
-                    .committed = values.items.len,
-                });
-            }
-            continue :next_key;
+            return list orelse &.{};
         }
-        break; // Out of attempts: the rest unjudged.
+        return null;
     }
-    sdk.sometimes(judged > 0, "the final reads reach a node once faults stop", .{
-        .keys = committed.count(),
-        .judged = judged,
-    });
-    if (judged > 0 and lost == 0) {
-        sdk.always(true, "every committed append is in the final read", .{ .keys = judged });
+
+    fn connect(reader: *FinalReader) bool {
+        const address = reader.addresses[sdk.random_below(reader.addresses.len)];
+        reader.connection.open(address, reader.options) catch return false;
+        if (reader.options.final_session) |statement| reader.connection.exec(statement) catch {
+            reader.connection.close();
+            return false;
+        };
+        return true;
     }
-    if (lost > lost_reported_max) sdk.event("final_reads_lost", .{ .lost = lost, .keys = judged });
-}
 
-/// A connection for the final reads, to a node drawn at random, with the final session statement.
-fn final_connect(connection: *Client, addresses: []const [4]u8, options: Options) bool {
-    const address = addresses[sdk.random_below(addresses.len)];
-    connection.open(address, options) catch return false;
-    if (options.final_session) |statement| connection.exec(statement) catch {
-        connection.close();
-        return false;
-    };
-    return true;
-}
-
-const Committed = std.AutoArrayHashMapUnmanaged(u64, std.ArrayList(u64));
-
-fn appends_committed(arena: std.mem.Allocator, path: [:0]const u8) !Committed {
-    return appends_parse(arena, try file_read(arena, path));
-}
-
-/// Each key's committed appends, from a history's `ok` lines, in the order keys first appear.
-fn appends_parse(arena: std.mem.Allocator, text: []const u8) !Committed {
-    var committed: Committed = .empty;
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch
-            return error.BadHistory;
-        if (parsed != .object) return error.BadHistory;
-        const kind = parsed.object.get("type") orelse return error.BadHistory;
-        if (kind != .string or !std.mem.eql(u8, kind.string, "ok")) continue;
-        const mops = parsed.object.get("value") orelse return error.BadHistory;
-        if (mops != .array) return error.BadHistory;
-        for (mops.array.items) |mop| {
-            if (mop != .array or mop.array.items.len != 3) continue;
-            const f = mop.array.items[0];
-            if (f != .string or !std.mem.eql(u8, f.string, "append")) continue;
-            const key = mop.array.items[1];
-            const value = mop.array.items[2];
-            if (key != .integer or value != .integer) return error.BadHistory;
-            const entry = try committed.getOrPut(arena, @intCast(key.integer));
-            if (!entry.found_existing) entry.value_ptr.* = .empty;
-            try entry.value_ptr.append(arena, @intCast(value.integer));
-        }
+    fn close(reader: *FinalReader) void {
+        if (reader.connected) reader.connection.close();
+        reader.connected = false;
     }
-    return committed;
-}
-
-/// A whole file ("" when there is none).
-fn file_read(arena: std.mem.Allocator, path: [:0]const u8) ![]const u8 {
-    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd) == .NOENT) return "";
-    if (linux.errno(fd) != .SUCCESS) return error.HistoryOpen;
-    defer _ = linux.close(@intCast(fd));
-    var bytes: std.ArrayList(u8) = .empty;
-    var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const count = linux.read(@intCast(fd), &buffer, buffer.len);
-        if (linux.errno(count) == .INTR) continue;
-        if (linux.errno(count) != .SUCCESS) return error.HistoryRead;
-        if (count == 0) break;
-        try bytes.appendSlice(arena, buffer[0..count]);
-    }
-    return bytes.items;
-}
+};
 
 fn draw(mops: *[mops_max]Mop, id: u64, sequence: u64) u32 {
     const count: u32 = @intCast(1 + sdk.random_below(mops_max));
@@ -588,24 +517,6 @@ test sqlstate_definite {
     try std.testing.expect(!sqlstate_definite("08006"));
     try std.testing.expect(!sqlstate_definite("57P01"));
     try std.testing.expect(mysql_definite(1205) and !mysql_definite(2013));
-}
-
-test appends_parse {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const history =
-        \\{"process":1,"type":"invoke","f":"txn","time":1,"value":[["append",7,70],["r",8,null]]}
-        \\{"process":1,"type":"ok","f":"txn","time":2,"value":[["append",7,70],["r",8,[1]]]}
-        \\{"process":2,"type":"info","f":"txn","time":3,"value":[["append",7,71]]}
-        \\{"process":3,"type":"fail","f":"txn","time":4,"value":[["append",9,90]]}
-        \\{"process":4,"type":"ok","f":"txn","time":5,"value":[["append",9,91],["append",7,72]]}
-        \\
-    ;
-    const committed = try appends_parse(arena.allocator(), history);
-    try std.testing.expectEqualSlices(u64, &.{ 7, 9 }, committed.keys());
-    try std.testing.expectEqualSlices(u64, &.{ 70, 72 }, committed.get(7).?.items);
-    try std.testing.expectEqualSlices(u64, &.{91}, committed.get(9).?.items);
-    try std.testing.expectError(error.BadHistory, appends_parse(arena.allocator(), "{\"type\":\"ok\"}\n"));
 }
 
 test list_parse {

@@ -78,6 +78,7 @@ fn describe(d: *System.Describe) !void {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("replica_set", replica_set_setup);
     s.parallel_driver("append", append);
+    s.finally("final reads", final_reads);
 }
 
 const Member = struct { name: []const u8, address: [4]u8 };
@@ -240,6 +241,58 @@ fn append(context: *System.Context) !void {
         sequence += 1;
     }
 }
+
+/// Once faults stop: every committed append in its key's document (sdk.elle.final_reads), read
+/// from the primary at majority read concern.
+fn final_reads(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    var reader: FinalReader = .{ .all = members(context) };
+    defer reader.close();
+    const history: sdk.elle.History = .{};
+    try sdk.elle.final_reads(arena, &history, &reader);
+}
+
+/// Connections the final reads try (a pause after each that fails) before leaving the rest of
+/// the keys unjudged.
+const final_attempts_max = 60;
+const final_pause_ms = 1000;
+
+/// The final reads' connection: to the primary, found through a member drawn at random, reopened
+/// after a read fails, until `final_attempts_max` attempts failed.
+const FinalReader = struct {
+    all: [3]Member,
+    connection: Mongo = undefined,
+    connected: bool = false,
+    attempts: u32 = 0,
+
+    pub fn read_list(reader: *FinalReader, arena: std.mem.Allocator, key: u64) ?[]const u64 {
+        while (reader.attempts < final_attempts_max) {
+            if (!reader.connected) {
+                const address = reader.all[sdk.random_below(reader.all.len)].address;
+                reader.connected = primary_connect(&reader.connection, &reader.all, address) catch false;
+                if (!reader.connected) {
+                    reader.attempts += 1;
+                    pause_ms(final_pause_ms);
+                    continue;
+                }
+            }
+            var list: ?[]const u64 = null;
+            find(arena, &reader.connection, .{ .append = false, .key = key, .value = 0 }, null, &list) catch {
+                reader.close();
+                reader.attempts += 1;
+                pause_ms(final_pause_ms);
+                continue;
+            };
+            return list orelse &.{};
+        }
+        return null;
+    }
+
+    fn close(reader: *FinalReader) void {
+        if (reader.connected) reader.connection.close();
+        reader.connected = false;
+    }
+};
 
 fn draw(mops: *[mops_max]Mop, id: u64, sequence: u64) u32 {
     const count: u32 = @intCast(1 + sdk.random_below(mops_max));
