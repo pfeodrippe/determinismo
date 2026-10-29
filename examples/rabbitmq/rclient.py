@@ -11,6 +11,7 @@
 # unknown: no answer, it may be). Dequeues take one message (basic.get) and acknowledge it:
 # value once acknowledged; a message got but not acknowledged comes back, and is reported
 # unknown (it will be dequeued again).
+import os
 import socket
 import sys
 import threading
@@ -19,6 +20,18 @@ import pika
 from pika.exceptions import AMQPError, NackError, UnroutableError
 
 TIMEOUT_S = 5
+# Every dequeue this node made, as it made it: "d <value>" acknowledged, "d? <value>" got and its
+# acknowledgement unknown. A driver killed as its phase ends may never read the answer to a
+# dequeue this node completed (the message consumed, noted nowhere): the judge reads this log.
+DEQUEUED_PATH = "/var/lib/rclient/dequeued.log"
+dequeued_lock = threading.Lock()
+
+
+def dequeued(kind, value):
+    line = ("%s %s\n" % (kind, value)).encode()
+    with dequeued_lock:
+        with open(DEQUEUED_PATH, "ab") as log:
+            log.write(line)
 
 
 def reason(error):
@@ -92,9 +105,11 @@ class Session:
                 channel.basic_ack(method.delivery_tag)
                 # The ack is asynchronous: a round trip makes sure the broker had it.
                 channel.queue_declare(queue=queue, passive=True)
+                dequeued("d", body.decode())
                 return "value " + body.decode()
             except Exception as error:
                 self.drop(node)
+                dequeued("d?", body.decode())
                 return "unknown " + body.decode() + " " + reason(error)
         return "error unknown command"
 
@@ -121,6 +136,7 @@ def serve(connection):
 
 
 def main():
+    os.makedirs(os.path.dirname(DEQUEUED_PATH), exist_ok=True)
     port = int(sys.argv[1])
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

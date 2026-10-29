@@ -111,3 +111,12 @@ Khepri, RabbitMQ's replacement for it, is the next thing to run here.
   before they are sent, the drain leaving out a node failing for a minute): no phantom
   dequeue in 4 timelines; every other failure the feature_flags finding's (all three brokers
   down, nothing left to drain). Hence the `default` profile's sync.
+- 2026-10-29: hunt run 100 (srv3, `default` with its 30 s writeback window, ~700 timelines):
+  the feature flags finding in 476 timelines (it follows every boot, not only the first: a power
+  loss within 30 s of any restart), and "every confirmed message is dequeued" failing in 351, 61
+  of them after a complete drain. Not RabbitMQ's: a dequeue driver killed as its phase ended
+  could miss the answer to a dequeue the client node completed (the message got and
+  acknowledged, noted nowhere). The client node now logs every dequeue it makes before
+  answering, and the judge counts those; and a confirmed message is lost only after a complete
+  drain (with no node serving, its fate is unknown, and the drain's property fails instead).
+  Smokes (4 timelines each): confirmed messages accounted for in every drained timeline.

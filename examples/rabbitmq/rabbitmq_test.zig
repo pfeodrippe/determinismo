@@ -33,6 +33,9 @@ const amqp_port = 5672;
 const queue = "jepsen";
 const brokers = 3;
 const ops_path = "/tmp/rabbitmq-ops.log";
+/// The client node's dequeues (rclient.py's DEQUEUED_PATH), and how much of it the judge reads.
+const dequeued_path = "/var/lib/rclient/dequeued.log";
+const dequeued_log_max = 16 * 1024 * 1024;
 const operations_per_driver = 20;
 const setup_attempts_max = 300;
 /// Draining once faults stop: the queue read until every node answered empty this many times
@@ -291,7 +294,7 @@ fn drained(context: *System.Context) !void {
         .dequeued = dequeued,
         .nodes_left_out = left_out,
     });
-    try judge(context);
+    try judge(context, done);
 }
 
 fn client_opened(context: *System.Context, client: *Client) !void {
@@ -299,14 +302,26 @@ fn client_opened(context: *System.Context, client: *Client) !void {
 }
 
 /// What the log says: each value's enqueue outcome and how often it was dequeued.
-fn judge(context: *System.Context) !void {
+/// `complete`: the drain finished (every node serving said empty). Without it a confirmed
+/// message still in the queue is not lost, its fate unknown: the drain's own property fails.
+fn judge(context: *System.Context, complete: bool) !void {
     const arena = context.init.arena.allocator();
     const log = std.Io.Dir.cwd().readFileAlloc(context.init.io, ops_path, arena, .limited(1 << 26)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    const counts = try tally(arena, log);
-    sdk.always(counts.lost == 0, "every confirmed message is dequeued", counts);
+    // Dequeues as the client node made them (rclient.py's log): a driver killed as its phase
+    // ends may not have noted one the client node completed (run 100: 61 timelines "lost" a
+    // confirmed message the drain never saw, as a killed dequeue had taken it).
+    const buffer = try arena.alloc(u8, dequeued_log_max);
+    const dequeued = try context.nodes.rclient.exec_output(&.{ "cat", dequeued_path }, buffer);
+    if (dequeued.output.len == buffer.len) return error.DequeuedLogTooLarge;
+    const counts = try tally(arena, log, dequeued.output);
+    if (complete) {
+        sdk.always(counts.lost == 0, "every confirmed message is dequeued", counts);
+    } else {
+        sdk.sometimes(true, "confirmed messages were left undrained", counts);
+    }
     sdk.always(counts.unexpected == 0, "nothing is dequeued that was never enqueued", counts);
     sdk.always(counts.refused_dequeued == 0, "no refused message is dequeued", counts);
     sdk.sometimes(counts.redelivered > 0, "a message is dequeued twice (redelivered)", counts);
@@ -325,22 +340,29 @@ const Tally = struct {
     example_lost: u64 = 0,
 };
 
-fn tally(arena: std.mem.Allocator, log: []const u8) !Tally {
+/// The enqueues from the runner's log, the dequeues from the client node's (`dequeued`): the
+/// drivers' own dequeue notes are left out (one killed after the client node acknowledged a
+/// message never noted it).
+fn tally(arena: std.mem.Allocator, log: []const u8, dequeued: []const u8) !Tally {
     const Seen = struct { invoked: bool = false, enqueued: u8 = 0, dequeued: u32 = 0, maybe_dequeued: u32 = 0 };
     var values: std.AutoHashMapUnmanaged(u64, Seen) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, log, '\n');
-    while (lines.next()) |line| {
-        var words = std.mem.tokenizeScalar(u8, line, ' ');
-        const kind = words.next() orelse continue;
-        const value = std.fmt.parseInt(u64, words.next() orelse continue, 10) catch continue;
-        const entry = try values.getOrPut(arena, value);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        if (std.mem.eql(u8, kind, "e")) entry.value_ptr.invoked = true;
-        if (std.mem.eql(u8, kind, "e+")) entry.value_ptr.enqueued = '+';
-        if (std.mem.eql(u8, kind, "e-")) entry.value_ptr.enqueued = '-';
-        if (std.mem.eql(u8, kind, "e?")) entry.value_ptr.enqueued = '?';
-        if (std.mem.eql(u8, kind, "d")) entry.value_ptr.dequeued += 1;
-        if (std.mem.eql(u8, kind, "d?")) entry.value_ptr.maybe_dequeued += 1;
+    for ([_][]const u8{ log, dequeued }, [_]bool{ false, true }) |text, client| {
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            var words = std.mem.tokenizeScalar(u8, line, ' ');
+            const kind = words.next() orelse continue;
+            const value = std.fmt.parseInt(u64, words.next() orelse continue, 10) catch continue;
+            const dequeue = kind[0] == 'd';
+            if (dequeue != client) continue;
+            const entry = try values.getOrPut(arena, value);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            if (std.mem.eql(u8, kind, "e")) entry.value_ptr.invoked = true;
+            if (std.mem.eql(u8, kind, "e+")) entry.value_ptr.enqueued = '+';
+            if (std.mem.eql(u8, kind, "e-")) entry.value_ptr.enqueued = '-';
+            if (std.mem.eql(u8, kind, "e?")) entry.value_ptr.enqueued = '?';
+            if (std.mem.eql(u8, kind, "d")) entry.value_ptr.dequeued += 1;
+            if (std.mem.eql(u8, kind, "d?")) entry.value_ptr.maybe_dequeued += 1;
+        }
     }
     var counts: Tally = .{};
     var example_lost: ?u64 = null;
@@ -363,6 +385,8 @@ fn tally(arena: std.mem.Allocator, log: []const u8) !Tally {
 test tally {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    // The runner's log: enqueues, and the dequeues drivers noted (left out: the client node's
+    // log has every dequeue, 7's too, whose driver was killed before noting it).
     const log =
         \\e 1
         \\e+ 1
@@ -375,16 +399,24 @@ test tally {
         \\e 5
         \\e+ 5
         \\e 6
+        \\e 7
+        \\e+ 7
+        \\d 6
+        \\d 1
+        \\
+    ;
+    const dequeued =
         \\d 6
         \\d 1
         \\d 1
         \\d 3
         \\d 9
         \\d? 5
+        \\d 7
         \\
     ;
-    const counts = try tally(arena.allocator(), log);
-    try std.testing.expectEqual(3, counts.confirmed);
+    const counts = try tally(arena.allocator(), log, dequeued);
+    try std.testing.expectEqual(4, counts.confirmed);
     try std.testing.expectEqual(1, counts.lost); // 2: confirmed, never dequeued.
     try std.testing.expectEqual(2, counts.example_lost);
     try std.testing.expectEqual(1, counts.unexpected); // 9.
