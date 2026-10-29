@@ -37,6 +37,11 @@ partition are not isolated at equal timestamps).
 - Keyspace `jepsen_keyspace`, SimpleStrategy, replication factor 3. Table `lists (part int, id
   int, lwt_trivial int, value list<int>, PRIMARY KEY (part, id))`, size-tiered compaction: every
   key a row of partition 0.
+- The `current` profile's keyspace is on tablets (NetworkTopologyStrategy; SimpleStrategy's
+  stay on vnodes, so before 2026-10-29 its tablets never ran), of a test size:
+  `target_tablet_size_in_bytes: 65536` (5 GB by default) and memtables flushed every minute, so
+  tablets split within a timeline. LWT on tablets came in 2025.4, its Paxos state in a side
+  table per table instead of `system.paxos`: newer code than the vnodes path Jepsen tested.
 
 ## The workload
 

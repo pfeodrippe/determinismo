@@ -53,13 +53,23 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// `default`: 1.3.1, Jepsen's. `current`: 2026.1.2.0, the latest release, a master of 1 GB and a
-/// tablet server of 2 GB (--memory-mib 12288).
+/// tablet server of 2 GB (--memory-mib 12288), with automatic tablet splitting test-sized: its
+/// thresholds are 512 MB and up, which a test's data never reaches, so tablets split (and
+/// leaders move after) within a timeline: memtables flushed at 128 KiB (a split counts SST files
+/// alone), tablets split from 128 KiB, forced at 2 MiB.
 fn describe(d: *System.Describe) !void {
     inline for (.{
         .{ "default", "examples/yugabyte/Dockerfile", &[_][]const u8{}, true },
         .{ "current", "examples/yugabyte/Dockerfile.2026.1", &[_][]const u8{
             "YB_MASTER_MEMORY=1073741824",
             "YB_TSERVER_MEMORY=2147483648",
+            "YB_MASTER_FLAGS=--enable_automatic_tablet_splitting=true " ++
+                "--tablet_split_low_phase_size_threshold_bytes=131072 " ++
+                "--tablet_split_high_phase_size_threshold_bytes=524288 " ++
+                "--tablet_force_split_threshold_bytes=2097152 " ++
+                "--tablet_split_low_phase_shard_count_per_node=16 " ++
+                "--tablet_split_high_phase_shard_count_per_node=32",
+            "YB_TSERVER_FLAGS=--db_write_buffer_size=131072",
         }, false },
     }) |entry| try describe_profile(try d.profile(entry[0]), entry[1], entry[2], entry[3]);
 }

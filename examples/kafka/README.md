@@ -277,21 +277,37 @@ by design: counted in an event (`kafka_share_redelivered`).
   WRITE_TXN_MARKERS"; writes behind a hang the judge cannot clear are unjudged since), and
   timelines 157 and 172 were G0 (allowed, as for Kafka) beside Elle's cycle search timing out
   (no anomaly since, an `elle_cycle_search_timeout` event).
-- Under investigation, a second Redpanda hang (run 177's timeline 56, 2026-10-29): a coordinator
-  that abandons an abort. Causality (analysis 1) puts the decision between 757.7 s (futures
-  pass) and 774.9 s (all fail); faults stopped at 763.8 s. In that window kafka-1 was stopped
-  (757.0 s for 7.5 s) and an outage took kafka-2 and kafka-3 down at 763.6 s: no broker up for a
-  moment. After the restart kafka-1, coordinator of transaction t7771015 (producer 16001, status
-  `preparing_abort`, term 43), sent its abort to `jepsen/3` every 0.32 s from 769.3 s, each
-  failing `tx::errc::leader_not_found` (the partition's replicas came back at terms 31, 32 and
-  33, and pre-votes failed on the larger terms), 16 times, the last at 774.13 s; `jepsen/3`
-  elected kafka-3 at 774.24 s, 0.1 s later, and nothing ever sent the abort again: the
-  coordinator expired other transactions at 780 and 784 s, never this one, and the partition
-  kept producer 16001's transaction open to the timeline's end. Not run 177's first hang (the
-  coordinator knew this transaction and its partitions), nor TSB-2026-37 (26.1.1 to 26.1.5), nor
-  #30003 (fixed before 26.2.6: producers dropped from local snapshots), nor #14624 (endless
-  retries of a group abort). Next: the analysis's explanation futures (the `tx` logger at trace
-  from inside the jump) for what the partition does with the transaction once it has a leader.
+- Found, a second Redpanda hang (run 177's timeline 56, 2026-10-29): **a partition leader that
+  restarted from a local snapshot never expires the open transactions it holds**. In
+  `rm_stm`, the auto-abort timer is armed only when a fence batch is applied (`apply_fence`, a
+  transaction's begin) and after each sweep; `apply_local_snapshot` puts the snapshot's open
+  transactions on `_active_tx_producers` and arms nothing. So after a restart the partition
+  sweeps (and asks the coordinator to abort what expired) only once another transaction begins
+  on it. If the coordinator's own abort gave up meanwhile (`abort_data`'s retries, spent while
+  the partition had no leader), nothing ever closes the transaction: the partition's last
+  stable offset stays where it began, and read_committed consumers stop there. How it was
+  found:
+  - Causality (analysis 1) put the decision between 749.0 s (0 of 4 futures fail) and 774.9 s
+    (4 of 4), around kafka-1's stop at 757.0 s and an outage of kafka-2 and kafka-3 at 763.6 s;
+    faults stopped at 763.8 s.
+  - Its explanation futures (the `tx` logger at trace from inside the jump) show the mechanism.
+    From 753.3 s: all three brokers restart (766-767 s); kafka-2 loads `jepsen/2`'s snapshot
+    (offset 619) with producer 13001's transaction open at epoch 21 (begun at offset 586),
+    leads from 770.8 s, and never sweeps again: to the end (920 s) it is open, "open 586 596".
+    From 751.2 s: kafka-2 does not restart, its timer from before goes on (sweeps 754.8, 764.9,
+    774.9 s), the 774.9 s sweep asks coordinator 11 to abort, and the transaction closes. From
+    755.5 s, the control inside one timeline: every broker restarts from snapshots; partitions
+    0, 1 and 3 see new transactions (their fences arm the timer: sweeps every 10 s from 780 s),
+    partition 2 sees none and never sweeps, stuck at "open 586 596".
+  - The original timeline (`jepsen/3`, producer 16001) fits it: the coordinator's abort failed
+    `leader_not_found` 16 times while the partition had no leader, gave up at 774.13 s, and
+    kafka-3, back from the outage, led `jepsen/3` from 774.24 s without ever expiring it.
+  Present in v26.2.6 (the `v26.2.x` branch's `rm_stm.cc` is v26.2.2's) and in `dev`. Not #30003
+  (open producers dropped from local snapshots, fixed in 26.1.x and later: it keeps them, with
+  their timeout, and its test turns auto-abort off), nor #14624, nor TSB-2026-37. A fix: arm the
+  timer when a snapshot with open transactions is applied (or on becoming leader). To see it:
+  run 177's causality analysis 1, its explanation futures in
+  `snapshots/explain/at-753344ms` and `at-755504ms`.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the

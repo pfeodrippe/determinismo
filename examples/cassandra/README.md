@@ -22,6 +22,10 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   (`commitlog_sync: batch`), and power losses too, at syncs as well.
 - Faults in bursts with quiet stretches (JVMs restart in tens of seconds); process kills only of
   Cassandra's JVM.
+- Background work at test timescales: the failure detector at `phi_convict_threshold: 5` (the
+  least Cassandra takes; 8 by default), so a paused or cut off node is convicted within a fault,
+  and memtables flushed every minute (`memtable_flush_period_in_ms`), so sstables, their
+  compactions and reads merging them happen within a timeline.
 
 ## The workload and its properties
 

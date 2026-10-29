@@ -60,12 +60,13 @@ pub fn main(init: std.process.Init) !void {
 /// middle of an sstable deletion, its pending_delete log read back as zeros and every start
 /// after failed replaying it (an open question: docs/PLAN.md).
 /// `current`: ScyllaDB 2026.3.4, the latest release (topology and schema through Raft, tablets),
-/// with power losses: whatever it does wrong is new.
+/// with power losses: whatever it does wrong is new. Its keyspace is on tablets of a test size
+/// (64 KiB, not 5 GB: they split, and move, within a timeline).
 fn describe(d: *System.Describe) !void {
     inline for (.{
-        .{ "default", false, "examples/scylla/Dockerfile" },
-        .{ "power-loss", true, "examples/scylla/Dockerfile" },
-        .{ "current", true, "examples/scylla/Dockerfile.2026.3" },
+        .{ "default", false, "examples/scylla/Dockerfile", &[_][]const u8{} },
+        .{ "power-loss", true, "examples/scylla/Dockerfile", &[_][]const u8{} },
+        .{ "current", true, "examples/scylla/Dockerfile.2026.3", &[_][]const u8{"SCYLLA_YAML=target_tablet_size_in_bytes: 65536"} },
     }) |entry| {
         const profile = try d.profile(entry[0]);
         const build: sdk.schema.Build = .{ .context = ".", .dockerfile = entry[2] };
@@ -73,6 +74,7 @@ fn describe(d: *System.Describe) !void {
             profile.node(@field(System.Name, name), .{
                 .build = build,
                 .command = &.{name},
+                .env = entry[3],
                 .ready = .{ .tcp = port },
                 // Kills of Scylla only: a kill of start.sh's helpers (an address looked up,
                 // under set -e) as a node started ended its start.sh, the node down for good.
@@ -109,7 +111,8 @@ fn addresses(context: *System.Context) [node_names.len][4]u8 {
 fn schema_setup(context: *System.Context) !void {
     const all = addresses(context);
     _ = try sdk.retry(setup_attempts_max, 500, ring_formed, .{&all});
-    _ = try sdk.retry(setup_attempts_max, 500, schema_create, .{all[0]});
+    const tablets = std.mem.eql(u8, context.profile, "current");
+    _ = try sdk.retry(setup_attempts_max, 500, schema_create, .{ all[0], tablets });
     for (all) |address| _ = try sdk.retry(setup_attempts_max, 500, table_known, .{address});
 }
 
@@ -129,18 +132,30 @@ fn ring_formed(all: *const [node_names.len][4]u8) !void {
     }
 }
 
-fn schema_create(address: [4]u8) !void {
+/// Jepsen's keyspace and table. With `tablets` (the current release), the keyspace is on tablets
+/// (NetworkTopologyStrategy's alone; SimpleStrategy's stay on vnodes), its memtables flushed
+/// every minute so tablets have the sstables a split measures (start.sh's target tablet size
+/// is test-sized).
+fn schema_create(address: [4]u8, tablets: bool) !void {
     var connection: Cql = undefined;
     try connection.open(address, port, .{ .timeout_ms = timeout_ms });
     defer connection.close();
-    const statements = [_][]const u8{
+    // Jepsen's: lwt_trivial stays null, for a condition always true.
+    const table_create = "CREATE TABLE IF NOT EXISTS " ++ table ++ " (part int, id int, " ++
+        "lwt_trivial int, value list<int>, PRIMARY KEY (part, id)) " ++
+        "WITH compaction = {'class': 'SizeTieredCompactionStrategy'}";
+    const vnodes = [_][]const u8{
         "CREATE KEYSPACE IF NOT EXISTS jepsen_keyspace WITH replication = " ++
             "{'class': 'SimpleStrategy', 'replication_factor': 3}",
-        // Jepsen's: lwt_trivial stays null, for a condition always true.
-        "CREATE TABLE IF NOT EXISTS " ++ table ++ " (part int, id int, lwt_trivial int, " ++
-            "value list<int>, PRIMARY KEY (part, id)) " ++
-            "WITH compaction = {'class': 'SizeTieredCompactionStrategy'}",
+        table_create,
     };
+    const on_tablets = [_][]const u8{
+        "CREATE KEYSPACE IF NOT EXISTS jepsen_keyspace WITH replication = " ++
+            "{'class': 'NetworkTopologyStrategy', 'replication_factor': 3} " ++
+            "AND tablets = {'enabled': true}",
+        table_create ++ " AND memtable_flush_period_in_ms = 60000",
+    };
+    const statements: []const []const u8 = if (tablets) &on_tablets else &vnodes;
     for (statements) |statement| {
         switch (try connection.query(statement, .{})) {
             .done, .rows => {},

@@ -22,6 +22,10 @@ cp /etc/cassandra/cassandra.yaml.shipped "$config"
 if [ "${CASSANDRA_COMMITLOG_SYNC:-periodic}" = batch ]; then
   sed -i -e 's/^commitlog_sync: periodic/commitlog_sync: batch/' -e 's/^commitlog_sync_period:/# commitlog_sync_period:/' "$config"
 fi
+# Failure detection at its quickest (phi 5, the least Cassandra takes; 8 by default): a paused or
+# cut off node is convicted within a timeline's fault, as Scylla's Jepsen configuration does (2).
+sed -i 's/^# *phi_convict_threshold:.*/phi_convict_threshold: 5/' "$config"
+grep -q '^phi_convict_threshold:' "$config" || printf 'phi_convict_threshold: 5\n' >>"$config"
 # Accord (Cassandra 6): enabled where the configuration has it, else added.
 if [ "${CASSANDRA_ACCORD:-0}" = 1 ]; then
   if grep -q '^accord:' "$config"; then

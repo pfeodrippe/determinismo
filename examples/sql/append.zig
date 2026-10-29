@@ -163,6 +163,9 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
                 continue;
             }
             connected = true;
+            // A rare state the tree returns to first (what follows a recovery is where such
+            // systems break; a failover, the aim's move, det-faults marks).
+            if (refused > 0) sdk.sometimes(true, "a driver connected again after refusals", .{ .refused = refused });
             refused = 0; // A streak ends.
             if (options.primary_only and options.node_names.len == addresses.len) {
                 sdk.fault_aim(options.node_names[index]);

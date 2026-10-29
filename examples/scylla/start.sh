@@ -55,6 +55,8 @@ ring_delay_ms: 3000
 skip_wait_for_gossip_to_settle: 0
 shadow_round_ms: 1000
 YAML
+# SCYLLA_YAML: more settings (the current release's test-sized tablets).
+if [ -n "${SCYLLA_YAML:-}" ]; then printf '%s\n' "$SCYLLA_YAML" >>/etc/scylla/scylla.yaml; fi
 
 # Supervised as the image's supervisord does (autorestart=unexpected): an exit other than 0
 # starts it again. A node restarted while its seeds are down or cut off fails its shadow round

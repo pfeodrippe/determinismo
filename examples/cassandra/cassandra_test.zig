@@ -150,8 +150,10 @@ fn schema_create(address: [4]u8) !void {
         "CREATE KEYSPACE IF NOT EXISTS jepsen_keyspace WITH replication = " ++
             "{'class': 'SimpleStrategy', 'replication_factor': 3}",
         // Jepsen's: lwt_trivial stays null, for a condition always true.
+        // Memtables flushed every minute: sstables, their compactions and reads merging them
+        // happen within a timeline (a memtable of a 512 MB heap's quarter never fills).
         "CREATE TABLE IF NOT EXISTS " ++ table ++ " (part int, id int, lwt_trivial int, " ++
-            "value list<int>, PRIMARY KEY (part, id))",
+            "value list<int>, PRIMARY KEY (part, id)) WITH memtable_flush_period_in_ms = 60000",
     };
     for (statements) |statement| {
         switch (try connection.query(statement, .{})) {
@@ -422,7 +424,7 @@ fn accord_schema_create(address: [4]u8) !void {
         "CREATE KEYSPACE IF NOT EXISTS jepsen_keyspace WITH replication = " ++
             "{'class': 'SimpleStrategy', 'replication_factor': 3}",
         "CREATE TABLE IF NOT EXISTS " ++ accord_table ++ " (id int PRIMARY KEY, value list<int>) " ++
-            "WITH transactional_mode = 'full'",
+            "WITH transactional_mode = 'full' AND memtable_flush_period_in_ms = 60000",
     };
     for (statements) |statement| {
         switch (try connection.query(statement, .{})) {

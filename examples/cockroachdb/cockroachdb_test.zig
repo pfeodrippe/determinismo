@@ -6,7 +6,8 @@
 //! keys; across keys it allows causal reversal, so not strict serializability).
 //!
 //! Faults: the default ones, restarts, graceful stops and power losses (each node's store on its
-//! own disk), and stalls and power losses at the nodes' syncs.
+//! own disk), and stalls and power losses at the nodes' syncs. Ranges are test-sized (64 KiB),
+//! so they split, merge and move leases during a timeline.
 //!
 //!   determinismo explore ... --program zig-out/bin/cockroachdb-test --scenario append
 const std = @import("std");
@@ -78,16 +79,36 @@ fn append_scenario(s: *System.Scenario) void {
     s.finally("final reads", final_reads);
 }
 
-/// The cluster initialized (once: a second init says it already is), then the table.
+/// Ranges split at 64 KiB (CockroachDB's smallest; 512 MiB by default, which a test's data never
+/// reaches) and merge under 16 KiB: splits, merges and the lease and replica moves after them
+/// happen within a timeline, as Jepsen's split nemesis made them. No internal time series (a
+/// write every 10 s on every node that nothing reads here).
+const settings_sql = "ALTER RANGE default CONFIGURE ZONE USING range_min_bytes = 16384, " ++
+    "range_max_bytes = 65536; SET CLUSTER SETTING timeseries.storage.enabled = false";
+
+/// The cluster initialized (once: a second init says it already is), its ranges test-sized, then
+/// the table.
 fn cluster_ready(context: *System.Context) !void {
     var buffer: [4096]u8 = undefined;
     const init_output = try context.nodes.@"crdb-1".exec_output(&.{
         "/cockroach/cockroach", "init", "--insecure", "--host=crdb-1:26257",
     }, &buffer);
     sdk.event("cluster_init", .{ .status = init_output.status, .output = init_output.output });
+    _ = try sdk.retry(setup_attempts_max, 200, settings_apply, .{context});
     _ = try sdk.retry(setup_attempts_max, 200, sql_append.schema_create, .{
         context.nodes.@"crdb-1".address, options,
     });
+}
+
+fn settings_apply(context: *System.Context) !void {
+    var buffer: [4096]u8 = undefined;
+    const result = try context.nodes.@"crdb-1".exec_output(&.{
+        "/cockroach/cockroach", "sql", "--insecure", "--host=crdb-1:26257", "-e", settings_sql,
+    }, &buffer);
+    if (result.status != 0) {
+        sdk.event("cluster_settings_refused", .{ .status = result.status, .output = result.output });
+        return error.SettingsRefused;
+    }
 }
 
 fn append(context: *System.Context) !void {

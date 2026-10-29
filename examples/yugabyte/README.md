@@ -37,7 +37,11 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   started after.
 - Profile `current` (2026-10-29): YugabyteDB 2026.1.2.0-b137, the latest release
   (Dockerfile.2026.1), the same start script and flags, a 1 GB master and a 2 GB tablet server
-  (`--memory-mib 12288`); its YSQL backends' crashes are not known ones. First smoke next.
+  (`--memory-mib 12288`); its YSQL backends' crashes are not known ones. Its automatic tablet
+  splitting is test-sized (its thresholds start at 512 MB, which a test's data never reaches):
+  tablets split from 128 KiB, forced at 2 MiB, with memtables flushed at 128 KiB (a split
+  measures SST files alone), so splits and the leader moves after them happen within a
+  timeline. First smoke next.
 
 ## The workload
 

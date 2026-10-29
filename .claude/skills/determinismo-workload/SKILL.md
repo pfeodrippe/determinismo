@@ -79,6 +79,12 @@ fn transfers(s: *System.Scenario) void {
 - When the scenario learns which node matters most right now (a primary, a leader), aim the
   faults at it: `sdk.fault_aim(name)` (half the faults then involve it, decisions replays
   repeat; "" stops). examples/sql/append.zig's `node_names` does it for `primary_only` drivers.
+  The aim moving is itself marked (a `sometimes` det-faults asserts), so the tree returns to
+  just after leader changes.
+- Mark the rare states worth building on with a `sometimes` (a recovery, a retry path, an
+  outcome unknown): the tree returns to just after one first. Only states every run should
+  reach go in the catalog (a literal message); one a system may never have takes
+  `sdk.assert_computed(.sometimes, ...)`, or an unreached `sometimes` fails the run.
 - Give each profile an `explain` command when the system can turn its logs up at runtime
   (`profile.explain = "det-nodes exec <node> <set the log level>"`, ones restarts keep too):
   causality runs it in futures inside a failure's jump, and their logs show the mechanism
@@ -86,6 +92,15 @@ fn transfers(s: *System.Scenario) void {
 - A node's disk is the VM's memory (snapshots hold it): size what the system writes and keeps
   for long timelines (preallocated segments, retention, log files), or OOM kills end them
   (YugabyteDB's 64 MB WAL segments, preallocated per tablet: `--log_segment_size_mb 4`).
+- Size background work to the test (Antithesis's "Optimizing"): work that happens at production
+  sizes or periods never happens in a timeline of minutes and a few MB, and its bugs stay
+  hidden. Lower the thresholds of splits, merges and rebalancing (ranges, tablets, regions,
+  shards: TiKV regions of 5 keys, as Jepsen does), snapshots and log truncation (etcd every
+  100 entries, rqlite's `snapshots` profile), compaction and flushes, heartbeats, leases and
+  failure detectors (Patroni's ttl 15, Scylla's `phi_convict_threshold: 2`), and keep data
+  small and synthetic. The run's efficiency line says when a system is slow: little idle time
+  (something busy-waits or polls: a runtime's spin setting), clock reads per virtual second,
+  and the busy node (CPU by node).
 
 ## Assertions in the service
 

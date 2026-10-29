@@ -7,7 +7,8 @@
 # stop ends both. A tablet server gets 1 GB, a master 512 MB (Jepsen's 2 GB each: three nodes
 # share the machine; with 1 GB masters too, long timelines ended in the kernel's OOM kills of
 # postgres backends, 22 of run 18's 215 on srv3). YB_MASTER_MEMORY, YB_TSERVER_MEMORY: other
-# limits, in bytes (the current release's profile).
+# limits, in bytes (the current release's profile). YB_MASTER_FLAGS, YB_TSERVER_FLAGS: more flags,
+# separated by spaces.
 set -uo pipefail
 self=${1:?usage: start.sh <node>}
 nodes="yb1 yb2 yb3"
@@ -22,6 +23,8 @@ mkdir -p /data/master /data/tserver
 # WAL segments of 4 MB, not 64: a node's disk is guest memory, and each tablet preallocates its
 # next segment whole (fallocate), kept 300 s: long timelines ended in OOM kills (run 77).
 common=(--yb_num_shards_per_tserver 4 --logtostderr --minloglevel 1 --log_segment_size_mb 4)
+read -ra master_flags <<<"${YB_MASTER_FLAGS:-}"
+read -ra tserver_flags <<<"${YB_TSERVER_FLAGS:-}"
 
 # A stop, seen by the supervising subshells too.
 stopping=/tmp/start.stopping
@@ -41,8 +44,10 @@ trap 'touch "$stopping"; pkill -TERM -x yb-master; pkill -TERM -x yb-tserver; wa
 
 supervise master "$bin/yb-master" --master_addresses "$masters" --rpc_bind_addresses "$ip:7100" \
   --fs_data_dirs /data/master --replication_factor 3 --use_initial_sys_catalog_snapshot \
-  --load_balancer_max_concurrent_adds 10 --memory_limit_hard_bytes "${YB_MASTER_MEMORY:-536870912}" "${common[@]}" &
+  --load_balancer_max_concurrent_adds 10 --memory_limit_hard_bytes "${YB_MASTER_MEMORY:-536870912}" "${common[@]}" \
+  ${master_flags[@]+"${master_flags[@]}"} &
 supervise tserver "$bin/yb-tserver" --tserver_master_addrs "$masters" --rpc_bind_addresses "$ip:9100" \
   --fs_data_dirs /data/tserver --start_pgsql_proxy --pgsql_proxy_bind_address "$ip:5433" \
-  --rpc_slow_query_threshold_ms 1000 --memory_limit_hard_bytes "${YB_TSERVER_MEMORY:-1073741824}" "${common[@]}" &
+  --rpc_slow_query_threshold_ms 1000 --memory_limit_hard_bytes "${YB_TSERVER_MEMORY:-1073741824}" "${common[@]}" \
+  ${tserver_flags[@]+"${tserver_flags[@]}"} &
 wait

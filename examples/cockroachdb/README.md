@@ -15,6 +15,11 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
 Faults: Antithesis's set, restarts, graceful stops and power losses, and stalls and power losses
 at the nodes' syncs. A wipe is left out: a node that lost its store cannot rejoin as itself.
 
+Ranges are test-sized: they split at 64 KiB (CockroachDB's smallest; 512 MiB by default, which a
+test's data never reaches) and merge under 16 KiB, so splits, merges and the lease and replica
+moves after them happen within a timeline, as Jepsen's split nemesis made them happen. Internal
+time series are off (a write every 10 s per node that nothing here reads).
+
 ## Findings
 
 None yet: 4 of 4 timelines pass Elle on srv1 (seed 1, 6 GB guests: `--memory-mib 6144`).
