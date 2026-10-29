@@ -496,12 +496,12 @@ fn accord_draw(mops: *[mops_max]Mop, number: u32, sequence: u32) u32 {
     for (mops[0..count], 0..) |*mop, position| {
         var key = base + @as(u32, @intCast(sdk.random_below(keys_window)));
         // A key read once, and appended to once (one update of a row in a transaction).
-        const append = position >= reads;
+        const appending = position >= reads;
         for (mops[0..position]) |earlier| {
-            if (earlier.key == key and earlier.append == append) key = base + keys_window + @as(u32, @intCast(position));
+            if (earlier.key == key and earlier.append == appending) key = base + keys_window + @as(u32, @intCast(position));
         }
         mop.* = .{
-            .append = append,
+            .append = appending,
             .key = key,
             .value = (number << 8) | (sequence << 3) | @as(u32, @intCast(position)),
         };
