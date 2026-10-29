@@ -211,8 +211,20 @@ the whole timeline (the coverage profile's slower brokers never got one).
   added (its log behind the data partitions' after the power losses), or a produce delayed past
   the transaction's end opened a new one the coordinator never knew (Kafka's KIP-890 class: the
   client retries up to 1,000 times, under delay and duplication faults). Not TSB-2026-37 (an
-  rm_stm deadlock in 26.1.1 to 26.1.5). Next: causality on timeline 23 (where it was decided),
-  then the coordinator's and the partitions' logs at that moment.
+  rm_stm deadlock in 26.1.1 to 26.1.5), nor #8236 (group transactions refused begin_group_tx).
+  What keeps it open, in Redpanda's code (dev): a partition whose transaction timed out asks
+  its coordinator (`rm_stm::do_try_abort_old_tx`) and on any error keeps it, asking again on
+  the next pass; a coordinator holding the transaction as empty answers with an error each time
+  (the transition to expired is invalid). So a partition's transaction its coordinator does not
+  hold as ongoing pins the last stable offset until the producer itself expires. How one comes
+  about: adding partitions, the coordinator calls `begin_tx` on each before persisting the
+  addition (`do_add_partition_to_tx`), and when persisting fails it answers an error without
+  undoing them, counting on the client to retry. The client (`t10626586`) ran its 20
+  transactions, the last two (18: partitions 2, 3; 19: partitions 0, 3, 2) unknown, the commit
+  timed out, and the driver ended there. Causality (6 futures a moment): from 98.7 s none of the
+  futures fails, from 126.7 s every one (three outages between, one of the whole cluster).
+  Next: futures from inside that jump with the `tx` logger at trace (`rpk redpanda admin config
+  log-level set tx -l trace -e 0` on each broker), failing and passing ones compared.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
