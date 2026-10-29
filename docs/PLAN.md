@@ -56,10 +56,11 @@ event hashing, the guest module.
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
   analysis (built, not deployed); serve snapshotting a failure as soon as it is found.
-- Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check is
-  written but not run yet; long-term archive later (QUESTIONS.md).
-- e2e: the whole suite on srv2 (the only host since 2026-10-27), between hunts; then `-Donly=saved`, `-Donly=ui`
-  (Playwright, tests/ui) and `-Donly=until` (causality's new output).
+- Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check passed
+  (srv3, 2026-10-29: two snapshots along a branch, the futures loaded from each the ones a replay
+  forks there); long-term archive later.
+- e2e: `saved` and `until` (causality's output, extract, inject, rewind) passed on srv3
+  (2026-10-29); `ui` (Playwright, tests/ui) still to run there.
 - Kafka (2026-10-28): the hunts hardly ran the workload. Run 56 committed in 9 of 508
   timelines and passed (a sometimes needs one): brokers killed every two seconds never came
   back. KAFKA-17754 had no way in either (it needs an EndTxn delayed on its way to the
