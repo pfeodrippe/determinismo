@@ -86,3 +86,14 @@ quest kept, per depth bucket, the state with the best objective and went on from
 - Joining what `sort` returns for an empty collection (`(clojure.string/join ";" (sort ...))`
   inside a function) segfaults; an empty board is "" in the harness.
 - `jank compile -O 2` segfaulted compiling the game; the default optimization works.
+
+## The quest, run 119 (srv3, 2026-10-29, 512 timelines, the scoring player)
+
+Generation by generation the tree took the games further: lines per game 19 on average in the
+first generations, about 30 by the eighth, 48 by the twelfth, the best game 79 lines (level 5)
+in 239 pieces; later generations spread over other moments (the archive's least visited
+behaviors) and averaged less. Over the run: 30 lines cleared in 214 timelines, 40 in 145, 60
+in 67, level 5 in 17, a tetris (four lines at once) in 19; level 10 and 80 lines not reached.
+The rules: the level lags its lines in 484 timelines (every one that cleared 5 lines), and one
+hard drop placed two pieces in 25, the scoring player keeping its stacks low and so stuck at
+the spawn row far less often than random placement (138 of 728).
