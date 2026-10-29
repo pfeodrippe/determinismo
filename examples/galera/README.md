@@ -121,5 +121,11 @@ n2 at 407.93 s, the same frames, an index of -1 into a vector of one.
   unwritten extent), whose conversion is a journal update lost without a sync or ext4's 5 s
   commit, as on a real ext4. A hypothesis, not checked: the redo log's last O_DIRECT writes into
   such space lost before its once-a-second sync, while a page they cover (written after them)
-  was kept. Next: the redo log's extents (filefrag) and its last writes before the power loss,
-  by replay.
+  was kept. Checked since: the redo log is reserved so (a fresh `ib_logfile0`: blocks 12 on in
+  unwritten extents, `filefrag -v`), but both ways InnoDB 12.1.2 writes pages, directly and
+  through doublewrite (buf0flu.cc, buf0dblwr.cc), make the log durable first
+  (`log_write_up_to(lsn, true)`, a sync), and the startup rebuild of undo tablespaces only runs
+  when their number changes (it did not). So the page reached the disk another way, or the
+  disk model lost redo that had been synced: the lineage's node had two durable crashes (at a
+  sync: before it at 117.42 s, after it at 119.86 s) in the two minutes before, and a durable
+  crash once left a disk dropping writes (PLAN, 2026-10-28). Determinismo's first, then.

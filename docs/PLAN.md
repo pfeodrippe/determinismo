@@ -360,6 +360,12 @@ event hashing, the guest module.
   its dequeues, and losses are judged after a complete drain only. flags-synced (answered B)
   looks past the feature flags finding (476 of ~700 timelines): a good copy kept, as an atomic
   replace would; hunted next.
+- Disk model under suspicion (2026-10-29): Galera run 123's lineage of timeline 402 ends with
+  InnoDB's undo page ahead of its redo log ("LSN ... is in the future"), though InnoDB syncs
+  the redo before writing any page (both flush paths read). Either a third way of writing
+  pages or durable crashes (two at n2's syncs, 2.5 s apart) losing synced data. Next: replay
+  the lineage to just before each durable crash and compare the redo log's synced end with
+  the undo page's LSN; then the durable crash's handling of two syncs close together.
 - RabbitMQ findings (2026-10-29, hunt run 118, flags-synced, 1,498 timelines): confirmed
   messages lost when two quorum queue members restart as new ones (Ra's names.dets registration
   not synced, kills within half a second of the declaration; timeline 1005, 23 of 34, exact
