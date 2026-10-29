@@ -336,7 +336,42 @@ event hashing, the guest module.
   unreleased fix; counted apart since); Galera 26.4.24's abort on an uncaught std::out_of_range
   in `gcomm::evs::Proto::populate_node_list` in three timelines of hunt run 97 (not in public
   trackers, unchanged through 26.4.27; examples/galera); ZOOKEEPER-3220 (snapshots never
-  synced) in ZooKeeper's first smokes.
+  synced) in ZooKeeper's first smokes. Galera's root cause found by changing the timeline: two
+  views with one id, a restart reusing its UUID incarnation after a power loss undid gvwstate.dat's
+  unsynced rename (code and logs; futures forked with and without a sync: 0 and 2 aborts of 32,
+  consistent, not conclusive: every later restart recreates the hazard).
+- Steps over a tape (2026-10-29): a replay with a command at a moment, then a wait or an until,
+  went back to checking the tape after the command and parted from it at the next checkpoint
+  (Galera's sync-then-until replay). Checks stop once the moment's commands begin; e2e tapes
+  covers it.
+- Logging property for older runs (2026-10-29): the schema 4 migration left the timelines'
+  output empty, and every run ingested before it showed no logging property; ingest fills it
+  from timelines.jsonl.
+- Tetris (2026-10-29): djblue/tetris's jank build under a player's moves, as Antithesis's
+  Tetris quest (examples/tetris). Found: one hard drop places two pieces (a piece stuck at the
+  spawn row, player-drop's loop on y), djblue/tetris#7's symptom. Guidance per depth ("no holes
+  after N pieces") lifted games a little and plateaued: a better tactic or a keep-the-best
+  strategy is next for deep games. jank 0.1 met: no read-line or flush (thrown, segfaulting when
+  uncaught in -main), a segfault joining what sort returns for nothing, its compiler segfaulting
+  at -O 2.
+- RabbitMQ (2026-10-29): run 100's lost confirmed messages were the workload's (a dequeue
+  driver killed before noting what the client node had acknowledged): the client node now logs
+  its dequeues, and losses are judged after a complete drain only. flags-synced (answered B)
+  looks past the feature flags finding (476 of ~700 timelines): a good copy kept, as an atomic
+  replace would; hunted next.
+- Known crashes by output (2026-10-29): det-core matches a crashing process's node output
+  against its known exits; Galera declares its by-design abort (all 114 of run 97's crash
+  failures), so the crash property fails on other crashes alone.
+- Links left down (2026-10-29): run 100's timeline 360 ended its faults with a link down and no
+  word why; failed link changes are events now, and the property names the links.
+- Short branches (2026-10-29): Antithesis's multiverse map shows mostly short branches past the
+  branch point, a few extended; determinismo's `--horizon` does that, unused by hunts. Queued:
+  Galera's run 97 again with a 60 s horizon (timelines per hour, behaviors, the EVS abort's
+  rate), and with jepsen-dirsync (does the abort go with gvwstate.dat's rename made durable?).
+- Core isolation (2026-10-29, answered A, not applied): measured first, preemption of VM
+  threads was 1.1 per second in all, and the interrupts on the runs' cores (timer, IPIs from
+  our own memory changes, our PMU, NVMe completions on the submitting CPU) cost about 0.2% of
+  a VM's time; the live changes could move almost none of them.
 - Output floods (2026-10-29): Redpanda's controller looped on an exception and wrote 4 GB of
   events in one timeline (run 83; its page slow while serve took them in; the node's log file in
   guest memory). The guest's output forwarder keeps 8 MB and then 200 MB an hour of virtual time
