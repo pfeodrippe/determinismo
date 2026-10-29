@@ -23,6 +23,27 @@ error log goes to stderr, into the run's events.
 Faults: Antithesis's set, restarts, graceful stops and power losses (each node's data on its own
 disk), and stalls and power losses at the nodes' syncs.
 
+## Found blind: Galera 26.4.24 aborts on an uncaught std::out_of_range in EVS
+
+Hunt run 97 (srv3, 2026-10-29, `jepsen` profile: MariaDB 12.1.2, galera-4 26.4.24, seed 3,
+with correlated power losses), timeline 3 (and the 13 timelines branched from it): n2's mariadbd
+died at 47.41 s with `terminate called after throwing an instance of 'std::out_of_range' what():
+vector::_M_range_check: __n (which is 18446744073709551615) >= this->size() (which is 2)`: an
+index of -1 into a vector of two. Symbolized from the image's libgalera_smm.so (its frames with
+`addr2line`): `gcomm::evs::Proto::populate_node_list` (evs_proto.cpp), from
+`Proto::create_join()` (:1854) and `send_join()`, in the gcomm thread (an `AsioTcpSocket` read
+handler, then `Protostack::leave()`). `populate_node_list` asks the input map for each known
+node's `safe_seq(node.index())` and `range(node.index())`, both `node_index_->at(index)`: a node
+the current view counts as a member (or the node itself) had no index, -1. Just before, n2 went
+through non-primary views of two members, one of them `unspecified`, after: an outage of n1 and
+n3 (30.8 s), a crash of n1 (35.8 s), pauses of n2's process (6.6 s), n3 (8.6 s) and n1 (6.4 s),
+partitions into groups (6.7 s), clogs. The function is unchanged on Galera's 4.x branch, through
+26.4.27. Not in MariaDB's Jira (searched: `populate_node_list`, `create_join`,
+`_M_range_check` with Galera) nor in Galera's public issues (mariadb-corporation/galera); the
+nearest are older: MDEV-5088 (2013, Galera 3: `vector::_M_range_check` after a partition, fixed)
+and galera#100 (2014: `std::out_of_range` from EVS on a gap message, fixed). Galera's own bug
+tracker (codership/galera-bugs) is not public. Replay: run 97, timeline 3, at 47.4 s.
+
 ## Status
 
 - Hunt run 58 (srv3, 2026-10-28, `jepsen` profile, 12.1.2, seed 2, 2 h): 532 timelines, Elle
