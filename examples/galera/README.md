@@ -42,7 +42,8 @@ partitions into groups (6.7 s), clogs. The function is unchanged on Galera's 4.x
 `_M_range_check` with Galera) nor in Galera's public issues (mariadb-corporation/galera); the
 nearest are older: MDEV-5088 (2013, Galera 3: `vector::_M_range_check` after a partition, fixed)
 and galera#100 (2014: `std::out_of_range` from EVS on a gap message, fixed). Galera's own bug
-tracker (codership/galera-bugs) is not public. Replay: run 97, timeline 3, at 47.4 s.
+tracker (codership/galera-bugs) is not public. Replay: run 97, timeline 3, at 47.4 s; serve's
+replay of it is exact (events hash 060f1a0443c319fd, 9,444 events, the same abort).
 
 ## Status
 
