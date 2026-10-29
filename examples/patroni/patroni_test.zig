@@ -72,7 +72,9 @@ fn describe(d: *System.Describe) !void {
                 // etcd quorum, which needs the nodes after this one (the first smoke: pg1 alone,
                 // waiting on etcd, the others never started).
                 .ready = .{ .tcp = etcd_peer_port },
-                .faults = .{ .restart = true, .crash = true, .stop = true },
+                // Clock skews too: Patroni's HA loop runs on the node's wall clock, its leader key
+                // on etcd's leases; one primary at a time must not depend on clocks agreeing.
+                .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
                 // A host's writeback window: Patroni writes files of its own (its configuration,
                 // patroni.dynamic.json) without syncing them; PostgreSQL and etcd sync their own.
                 .writeback_s = 30,

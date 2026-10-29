@@ -73,3 +73,7 @@ etcd member on its own disk, outages of several at once), and stalls and power l
   `remove_data_directory_on_rewind_failure` off). PostgreSQL's documentation: a target whose
   pg_rewind failed partway is likely unrecoverable. Documented, not a finding: that PANIC is a
   known exit since (`exits_known`), so later hunts see the crashes it does not explain.
+- 2026-10-29: clock skews on (`clock_skew`: one node's realtime clock ahead or behind by up to
+  10 s for a while, sometimes strobing). Patroni's HA loop runs on the node's wall clock, its
+  leader key on etcd's leases: one primary at a time, and no acknowledged commit lost, must not
+  depend on the clocks agreeing. A second hunt, against run 189, is queued.
