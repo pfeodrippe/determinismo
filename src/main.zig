@@ -70,6 +70,10 @@ const usage =
     \\                            [--no-archive]   (Go-Explore's archive, on by default: half the
     \\                            returns to the newest frontier, the rest to the least visited
     \\                            behaviors of any generation; without it, the frontier only)
+    \\                            [--no-prefer-sometimes]   (on by default, as Antithesis does:
+    \\                            returns go first to just after a `sometimes` or `reachable`
+    \\                            assertion made true, the states the program marks worth
+    \\                            reaching; without it, every new behavior weighs the same)
     \\                            [--pipeline <n>]   (a tree's generations of timelines planned
     \\                            from the setup snapshot before its first returns, 1 to 4, and
     \\                            queued ahead after: default 2 up to 16 workers, else 3)
@@ -255,6 +259,10 @@ const Arguments = struct {
     /// forgotten once newer ones come, and a bug needing a second rare event after it is lost.
     archive: bool = true,
     archive_given: bool = false,
+    /// Returns go first to just after a `sometimes` or `reachable` made true (`--no-prefer-
+    /// sometimes`: every new behavior alike): Antithesis restarts tests from where one is hit.
+    prefer_sometimes: bool = true,
+    prefer_sometimes_given: bool = false,
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
@@ -879,6 +887,19 @@ fn system_prepare(
     return prepared;
 }
 
+/// How many nodes the system has (its JSON's `nodes`); 0 when unknown.
+fn system_nodes(system: ?std.json.Value) u32 {
+    const object = switch (system orelse return 0) {
+        .object => |object| object,
+        else => return 0,
+    };
+    const nodes = object.get("nodes") orelse return 0;
+    return switch (nodes) {
+        .array => |array| @intCast(array.items.len),
+        else => 0,
+    };
+}
+
 /// The scenarios to run, one at a time (null: the guest decides, as without --program).
 fn scenarios_selected(
     arena: std.mem.Allocator,
@@ -1066,12 +1087,14 @@ fn resume_settings_adopt(arena: std.mem.Allocator, io: std.Io, arguments: *Argum
     const path = arguments.record_path orelse return;
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return;
     const first = source[0 .. std.mem.indexOfScalar(u8, source, '\n') orelse source.len];
-    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null } = null };
+    const Line = struct { run: ?struct { pipeline: ?u32 = null, archive: ?bool = null, prefer_sometimes: ?bool = null } = null };
     const line = std.json.parseFromSliceLeaky(Line, arena, first, .{ .ignore_unknown_fields = true }) catch return;
     const run = line.run orelse return;
     if (!arguments.archive_given) if (run.archive) |archive| {
         arguments.archive = archive;
     };
+    // Recorded before it existed: it ran without.
+    if (!arguments.prefer_sometimes_given) arguments.prefer_sometimes = run.prefer_sometimes orelse false;
     if (!arguments.pipeline_given) if (run.pipeline) |pipeline| {
         arguments.pipeline = pipeline;
     };
@@ -1198,8 +1221,14 @@ const SummaryHeader = extern struct {
     trace_hash: u64,
     last_pull_ns: u64,
     cut: u8,
-    reserved: [7]u8 = @splat(0),
+    /// The behaviors' layout (summary_format): another build's are not read (their timelines
+    /// run again on resume).
+    format: u8 = summary_format,
+    reserved: [6]u8 = @splat(0),
 };
+
+/// Bumped whenever Events.Behavior changes. 1: `sought`.
+const summary_format = 1;
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
     const header: SummaryHeader = .{
@@ -1225,6 +1254,7 @@ fn summaries_index(arena: std.mem.Allocator, bytes: []const u8, out: *std.AutoHa
     var at: usize = 0;
     while (bytes.len - at >= @sizeOf(SummaryHeader)) {
         const header = std.mem.bytesToValue(SummaryHeader, bytes[at..][0..@sizeOf(SummaryHeader)]);
+        if (header.format != summary_format) break; // Another build's: run again.
         if (header.behavior_count > Events.behavior_count_max) return error.BadSummaries;
         const size = @sizeOf(SummaryHeader) + header.behavior_count * @sizeOf(Events.Behavior);
         if (bytes.len - at < size) break;
@@ -1361,6 +1391,7 @@ fn command_explore(
                 .generation = arguments.generation_size,
                 .pipeline = arguments.pipeline,
                 .archive = arguments.archive,
+                .prefer_sometimes = arguments.prefer_sometimes,
                 .horizon_ns = arguments.horizon_ns,
                 .return_branches = arguments.return_branches,
                 .jobs = jobs_count(arguments),
@@ -1477,7 +1508,7 @@ fn command_explore(
         options.events_fd = null; // Each branch writes its own file.
     }
     const multiverse = try context.arena.create(report.Multiverse);
-    multiverse.* = .{};
+    multiverse.* = .{ .nodes = system_nodes(arguments.system) };
     const branches = Branches{
         .snapshot = start,
         .setup = snapshot,
@@ -2006,6 +2037,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
                 .ladder = branches.ladder,
                 .disk = branches.holders_disk,
                 .disk_always = branches.arguments.holders_on_disk,
+                .disk_origin = place.disk_origin,
             };
             try owner.attach(vm);
         }
@@ -2027,6 +2059,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
         try branch_announce(context, vm, exploration, place);
         defer if (vm.tape_fd) |fd| close(fd);
         const time_start_ns = monotonic_ns();
+        const idle_start_tsc = vm.stats.idle_tsc;
         const outcome = try vm.run_until_exit();
         // Its last holder on disk complete before the explorer may load it.
         if (branches.holders != null) owner.disk_wait();
@@ -2043,6 +2076,7 @@ fn explore_branches(context: Context, vm: *VM, options: *VM.Options, branches: B
             .outcome = outcome,
             .wall_ns = monotonic_ns() - time_start_ns,
             .start_tsc = place.snapshot.tsc,
+            .start_idle_tsc = idle_start_tsc,
             .path = place.path,
             .generation = place.generation,
             .why = place.why,
@@ -2121,6 +2155,8 @@ const Planned = struct {
     why: []const u8 = "",
     /// Where it stops (virtual time), a returned branch's horizon: null for the timeline's end.
     horizon_ns: ?u64 = null,
+    /// The disk holder its node was made from: its own first disk holder saves against it.
+    disk_origin: ?holders.Origin = null,
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
@@ -2292,6 +2328,7 @@ fn explore_tree(
         .children = branches.arguments.return_branches,
         .pipeline = branches.arguments.pipeline,
         .archive = branches.arguments.archive,
+        .prefer_sometimes = branches.arguments.prefer_sometimes,
         .setup = branches.snapshot,
         .jobs = jobs,
         .holding = holding,
@@ -2602,10 +2639,13 @@ fn status_write(directory: ?[]const u8, running: []const Running, multiverse: *c
         const since_s = wall.sec - @as(i64, @intCast((now_ns - timeline.start_ns) / std.time.ns_per_s));
         text.print("{s}{{\"index\":{d},\"since_s\":{d}}}", .{ if (at == 0) "" else ",", timeline.index, since_s }) catch return;
     }
+    const efficiency = multiverse.efficiency();
     text.print("],\"done\":{d},\"failing\":{d},\"generation\":{d},\"at_s\":{d}," ++
-        "\"workers\":{d},\"at_once\":{d:.2},\"memory_wait_s\":{d:.1}}}\n", .{
-        multiverse.branches, multiverse.failing_branches, generation,                                                             wall.sec,
-        busy.jobs,           busy.at_once(),              @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s,
+        "\"workers\":{d},\"at_once\":{d:.2},\"memory_wait_s\":{d:.1},\"idle_share\":{d:.3}," ++
+        "\"clock_reads_per_s\":{d:.0},\"per_node\":{d:.2}}}\n", .{
+        multiverse.branches,          multiverse.failing_branches, generation,                                                             wall.sec,
+        busy.jobs,                    busy.at_once(),              @as(f64, @floatFromInt(multiverse.memory_wait_ns)) / std.time.ns_per_s, efficiency.idle_share,
+        efficiency.clock_reads_per_s, efficiency.per_node,
     }) catch return;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const staging = std.fmt.bufPrintSentinel(&path_buffer, "{s}/status.json.next", .{known}, 0) catch return;
@@ -2834,6 +2874,8 @@ const TreeState = struct {
     ladders: ?*Ladders = null,
     /// Where holders go while memory runs low (with a run directory).
     disk: ?*const holders.Disk = null,
+    /// Disk holders others' are saved against: kept while those timelines are.
+    lineage: holders.Lineage = .{},
     io: std.Io,
     /// Where the timelines that ran to their end ended (virtual time): their sum and count, for
     /// a timeline's expected end (holders' spacing).
@@ -2849,6 +2891,8 @@ const TreeState = struct {
     /// Go-Explore's archive (`--archive`): each behavior's cell, and every branch planned (its
     /// seed and path: one of an earlier generation is rebuilt from the setup snapshot).
     archive: bool,
+    /// Returns go first to sought behaviors (`--no-prefer-sometimes`: all alike).
+    prefer_sometimes: bool,
     cells: std.AutoHashMapUnmanaged(u64, Cell) = .empty,
     planned: std.AutoHashMapUnmanaged(u32, Planned) = .empty,
     setup: *const Snapshot,
@@ -2888,7 +2932,30 @@ const kills_max = 64;
 
 /// A cell of the archive: where a behavior was first reached (the moment just after it), and how
 /// often the tree returned there.
-const Cell = struct { branch: u32, vtime_ns: u64, label: []const u8, visits: u32 = 0 };
+/// An archive cell: a behavior, where timelines reached it (the first; for a sought one, up to
+/// `cell_places_max` timelines' moments, returns going to each in turn: the same rare state
+/// reached from different pasts), and how often the tree returned there.
+const Cell = struct {
+    places: [cell_places_max]Place,
+    place_count: u8 = 1,
+    label: []const u8,
+    visits: u32 = 0,
+    sought: bool = false,
+
+    const Place = struct { branch: u32, vtime_ns: u64 };
+
+    fn place(cell: *const Cell) Place {
+        assert(cell.place_count >= 1 and cell.place_count <= cell_places_max);
+        return cell.places[cell.visits % cell.place_count];
+    }
+};
+
+const cell_places_max = 4;
+
+/// How much more a sought behavior (a `sometimes` or `reachable` made true) weighs than another
+/// new one, in a timeline's novelty and as an archive cell (`--prefer-sometimes`): a few output
+/// lines new to the tree still outweigh one, as several rare things do.
+const sought_weight = 4;
 
 /// Generations planned ahead by default (`--pipeline`): the queue starts with that many from the
 /// setup snapshot, and each generation judged plans as many timelines as it had, so the queue,
@@ -2985,6 +3052,7 @@ fn tree_judge(
         // fifths); the branches return just after it.
         var score: f64 = 0;
         var moment_reached: u32 = std.math.maxInt(u32);
+        var moment_sought = false;
         const room_end = if (summary.cut)
             summary.end_ns -| std.time.ns_per_ms
         else
@@ -3004,13 +3072,18 @@ fn tree_judge(
             };
             const timelines = reached.get(behavior.hash) orelse continue; // Known before.
             novel += 1;
-            score += 1.0 / @as(f64, @floatFromInt(timelines));
+            const sought = state.prefer_sometimes and behavior.sought;
+            const weight: f64 = if (sought) sought_weight else 1;
+            score += weight / @as(f64, @floatFromInt(timelines));
             // A moment past its last randomness pull returns to the same timeline (a cut
-            // branch's future was never drawn: open to its end).
+            // branch's future was never drawn: open to its end). A sought behavior's moment
+            // first (the rarest of them), then the rarest of the rest.
             const open = summary.cut or behavior.vtime_ns < summary.last_pull_ns;
-            if (behavior.vtime_ns <= room_end and open and timelines <= moment_reached) {
+            const better = if (sought != moment_sought) sought else timelines <= moment_reached;
+            if (behavior.vtime_ns <= room_end and open and better) {
                 moment = behavior.vtime_ns;
                 moment_reached = timelines;
+                moment_sought = sought;
                 label = behavior.name();
             }
         }
@@ -3137,8 +3210,9 @@ fn tree_judge(
     if (state.ladders) |ladders| for (done) |summary| {
         if (summary.failing_count > 0) try ladders.consider(arena, state.registry, summary);
     };
-    // Their memory: this generation's (the ones in flight keep theirs).
-    if (state.holding) state.registry.release_listed(members, state.disk);
+    // Their memory: this generation's (the ones in flight keep theirs). Their files once their
+    // children are planned (Lineage: a child's holders save against the one its node came from).
+    if (state.holding) state.registry.release_listed(members, null);
     if (branches.arguments.verify_holders) for (makings[0..making_count]) |*making| {
         const held_node = making.snapshot orelse continue;
         if (!making.held and making.disk == null) continue;
@@ -3178,10 +3252,13 @@ fn tree_judge(
                 .generation = generation + 1,
                 .why = back.why,
                 .horizon_ns = if (back.horizon_ns orelse branches.arguments.horizon_ns) |horizon| at + horizon else null,
+                .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
             });
+            if (making.disk) |on_disk| try state.lineage.depend(arena, state.next_index, on_disk.branch);
             state.next_index += 1;
         }
     }
+    if (state.holding) if (state.disk) |disk| for (members) |branch| try state.lineage.release(arena, disk, branch);
     // These timelines served their start snapshots (a snapshot goes with its last timeline;
     // the setup snapshot is everyone's: never freed).
     for (plan.items) |entry| node_served(state, entry.snapshot);
@@ -3250,12 +3327,24 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
         const open = summary.cut or at < summary.last_pull_ns;
         if (!open or at + std.time.ns_per_ms >= summary.end_ns) continue;
         const entry = try state.cells.getOrPut(arena, behavior.hash);
-        if (entry.found_existing) continue;
+        if (entry.found_existing) {
+            // A sought behavior reached by another timeline: one more place to return to.
+            const cell = entry.value_ptr;
+            if (!state.prefer_sometimes or !cell.sought or cell.place_count == cell_places_max) continue;
+            const known = for (cell.places[0..cell.place_count]) |known| {
+                if (known.branch == summary.index) break true;
+            } else false;
+            if (known) continue;
+            cell.places[cell.place_count] = .{ .branch = summary.index, .vtime_ns = at };
+            cell.place_count += 1;
+            continue;
+        }
         entry.value_ptr.* = .{
-            .branch = summary.index,
-            .vtime_ns = at,
+            .places = undefined,
             .label = try arena.dupe(u8, behavior.name()),
+            .sought = behavior.sought,
         };
+        entry.value_ptr.places[0] = .{ .branch = summary.index, .vtime_ns = at };
     }
 }
 
@@ -3281,9 +3370,11 @@ fn archive_returns(
     var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1) {
         const timelines: u64 = state.visits.get(entry.key_ptr.*) orelse 0;
+        // A sought cell ranks as one a few times rarer (lower scores go first).
+        const weight: u64 = if (state.prefer_sometimes and !entry.value_ptr.sought) sought_weight else 1;
         ranked[index] = .{
             .hash = entry.key_ptr.*,
-            .score = (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)),
+            .score = (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)) * weight,
             .tie = random.random().int(u64),
         };
     }
@@ -3295,13 +3386,16 @@ fn archive_returns(
     for (ranked) |cell_ranked| {
         if (list.items.len == nodes) break;
         const cell = state.cells.getPtr(cell_ranked.hash).?;
+        const place = cell.place();
         cell.visits += 1;
         try list.append(arena, .{
-            .branch = cell.branch,
-            .vtime_ns = cell.vtime_ns,
+            .branch = place.branch,
+            .vtime_ns = place.vtime_ns,
             .why = try std.fmt.allocPrint(arena, "Go-Explore's archive: back to just after {s}, " ++
-                "first reached by #{d} ({d} timelines reached it); returned there {d} times.", .{
-                cell.label, cell.branch, state.visits.get(cell_ranked.hash) orelse 0, cell.visits,
+                "as #{d} reached it ({d} timelines reached it, from {d} places kept); returned " ++
+                "there {d} times.", .{
+                cell.label,  place.branch, state.visits.get(cell_ranked.hash) orelse 0, cell.place_count,
+                cell.visits,
             }),
         });
     }
@@ -4185,6 +4279,11 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
             arguments.archive_given = true;
             continue;
         }
+        if (std.mem.eql(u8, argv[index], "--prefer-sometimes") or std.mem.eql(u8, argv[index], "--no-prefer-sometimes")) {
+            arguments.prefer_sometimes = std.mem.eql(u8, argv[index], "--prefer-sometimes");
+            arguments.prefer_sometimes_given = true;
+            continue;
+        }
         if (std.mem.eql(u8, argv[index], "--resume")) {
             arguments.resume_run = true;
             continue;
@@ -4563,4 +4662,6 @@ test {
     _ = @import("compose.zig");
     _ = @import("kubernetes.zig");
     _ = @import("yaml.zig");
+    _ = @import("report.zig");
+    _ = @import("snapshot.zig");
 }

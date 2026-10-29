@@ -238,6 +238,20 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const escape = (text) => String(text).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const seconds = (ns) => (ns / 1e9).toFixed(3) + "s";
+// Each node's CPU time over the guest's uptime, the busiest first (det-init's node_cpu events).
+function cpuByNode(run) {
+  let shares = run.stats && run.stats.cpu_by_node;
+  if (typeof shares === "string") { try { shares = JSON.parse(shares); } catch { shares = null; } }
+  const entries = shares ? Object.entries(shares).sort((a, b) => b[1] - a[1]) : [];
+  return entries.length ? entries.map(([node, share]) => `${node} ${(share * 100).toFixed(0)}%`).join(", ") : "–";
+}
+// A run's efficiency figure: its summary's once it ended, else its explorer's live status; "–"
+// for runs from before they were measured.
+function efficiencyOf(run, key, format) {
+  const source = run.summary && run.summary[key] !== undefined ? run.summary
+    : run.progress && run.progress[key] !== undefined ? run.progress : null;
+  return source ? format(source[key]) : "–";
+}
 const quote = (text) => '"' + String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
 async function api(path, body) {
@@ -663,6 +677,12 @@ function utilizationBody() {
     ["Timelines at once", atOnce(run)],
     ["Virtual per wall (one core)", run.summary && run.summary.vtime_per_wall
       ? run.summary.vtime_per_wall.toFixed(2) + "×" : "–"],
+    // Antithesis's rule of thumb (virtual per wall x nodes above 1), and why a run is slow: an
+    // idle guest is skipped (little idle: something busy-waits), each clock read is an exit.
+    ["Virtual per wall x nodes", efficiencyOf(run, "per_node", (v) => v.toFixed(2) + (v < 1 ? " (below 1: heavy nodes)" : ""))],
+    ["Idle, skipped", efficiencyOf(run, "idle_share", (v) => (v * 100).toFixed(0) + "%" + (v < 0.05 ? " (something busy-waits)" : ""))],
+    ["Clock reads per virtual s", efficiencyOf(run, "clock_reads_per_s", (v) => Math.round(v).toLocaleString())],
+    ["CPU by node", cpuByNode(run)],
     ["Exact stops", run.summary ? `largest skid ${run.summary.skid_max} branches, ${run.summary.overshoots} overshoots` : "–"],
   ];
   return `<dl class="kv">${rows.map(([key, value]) => `<dt>${key}</dt><dd>${escape(value)}</dd>`).join("")}</dl>

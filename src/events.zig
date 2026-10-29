@@ -120,6 +120,9 @@ pub const Behavior = struct {
     /// where a branch from just after it aims its first fault (VM.Options.branch_signal).
     node_name: [behavior_node_size]u8 = undefined,
     node_size: u8 = 0,
+    /// A `sometimes` or `reachable` assertion made true: a state its programmer marked as worth
+    /// reaching, where the tree returns first (Antithesis restarts tests from where one is hit).
+    sought: bool = false,
 
     pub fn name(behavior: *const Behavior) []const u8 {
         return behavior.label[0..behavior.label_size];
@@ -239,15 +242,50 @@ fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
     const size = @min(node.len, behavior_node_size);
     @memcpy(behavior.node_name[0..size], node[0..size]);
     behavior.node_size = @intCast(size);
+    behavior.sought = behavior_sought(value);
     events.behavior_count += 1;
 }
 
-/// The node a behavior came from: a node's output's source, an event's `details.node`; "" when
-/// it does not say (an assertion's).
+/// Whether an assertion's evaluation is a `sometimes` or `reachable` made true (determinismo's
+/// or an Antithesis SDK's).
+fn behavior_sought(value: std.json.Value) bool {
+    const assertion = assertion_of(value) orelse return false;
+    const kind = assertion.kind;
+    if (!std.mem.eql(u8, kind, "sometimes") and !std.mem.eql(u8, kind, "reachable")) return false;
+    const condition = assertion.object.get("condition") orelse return true;
+    return condition == .bool and condition.bool;
+}
+
+/// An assertion's evaluation, with its kind's name: determinismo's `assert`, or an Antithesis
+/// SDK's `antithesis_assert` (its display_type mapped; a declaration, `hit` false, is none).
+const Assertion = struct { object: std.json.ObjectMap, kind: []const u8 };
+
+fn assertion_of(value: std.json.Value) ?Assertion {
+    if (value.object.get("assert")) |assertion| {
+        if (assertion != .object) return null;
+        return .{ .object = assertion.object, .kind = string_field(assertion.object, "type") orelse "assert" };
+    }
+    const assertion = value.object.get("antithesis_assert") orelse return null;
+    if (assertion != .object or declaration(assertion.object)) return null;
+    const display = string_field(assertion.object, "display_type") orelse return null;
+    for (antithesis_kinds) |entry| {
+        if (std.mem.eql(u8, display, entry[0])) return .{ .object = assertion.object, .kind = @tagName(entry[1]) };
+    }
+    return null;
+}
+
+/// The node a behavior came from: a node's output's source, an event's `details.node`, an
+/// assertion's when its details name one (det-faults' aim moved: the new leader); "" when it
+/// does not say.
 fn behavior_node(value: std.json.Value) []const u8 {
     if (value.object.get("output")) |output| if (output == .object) {
         return string_field(output.object, "source") orelse "";
     };
+    if (assertion_of(value)) |assertion| {
+        const details = assertion.object.get("details") orelse return "";
+        if (details != .object) return "";
+        return string_field(details.object, "node") orelse "";
+    }
     const details = value.object.get("details") orelse return "";
     if (details != .object) return "";
     return string_field(details.object, "node") orelse "";
@@ -255,14 +293,13 @@ fn behavior_node(value: std.json.Value) []const u8 {
 
 /// A behavior's label, cut where the label ends.
 fn behavior_label(writer: *std.Io.Writer, value: std.json.Value) void {
-    if (value.object.get("assert")) |assertion| if (assertion == .object) {
-        const kind = string_field(assertion.object, "type") orelse "assert";
+    if (assertion_of(value)) |assertion| {
         const message = string_field(assertion.object, "message") orelse "";
         const condition = assertion.object.get("condition") orelse std.json.Value{ .bool = true };
         const holds = condition != .bool or condition.bool;
-        writer.print("{s} \"{s}\": {}", .{ kind, message, holds }) catch {};
+        writer.print("{s} \"{s}\": {}", .{ assertion.kind, message, holds }) catch {};
         return;
-    };
+    }
     if (value.object.get("guidance")) |guidance| if (guidance == .object) {
         const message = string_field(guidance.object, "message") orelse "";
         writer.print("closer to \"{s}\"", .{message}) catch {};
@@ -362,6 +399,15 @@ fn behavior_hash(value: std.json.Value) ?u64 {
         for ([_][]const u8{ "type", "message", "condition" }) |key| {
             hash_field(&hasher, assertion.object, key);
         }
+        return hasher.final();
+    }
+    // An Antithesis SDK's evaluation: the same behavior as determinismo's of its kind (a Compose
+    // project's assertions guide the tree as a test program's do).
+    if (value.object.get("antithesis_assert") != null) {
+        const assertion = assertion_of(value) orelse return null;
+        hasher.update("type");
+        hasher.update(assertion.kind);
+        for ([_][]const u8{ "message", "condition" }) |key| hash_field(&hasher, assertion.object, key);
         return hasher.final();
     }
     const name = value.object.get("event") orelse return null;
@@ -468,20 +514,22 @@ fn declare(events: *Events, kind: Kind, assertion: std.json.ObjectMap) !void {
     location_note(property, assertion);
 }
 
+/// Antithesis SDKs' `display_type`s, as determinismo's kinds.
+const antithesis_kinds = [_]struct { []const u8, Kind }{
+    .{ "Always", .always },
+    .{ "AlwaysOrUnreachable", .always_or_unreachable },
+    .{ "Sometimes", .sometimes },
+    .{ "Reachable", .reachable },
+    .{ "Unreachable", .@"unreachable" },
+};
+
 /// An assertion from an Antithesis SDK (`{"antithesis_assert": {...}}`): its `display_type`
 /// names the property kind; entries with `hit: false` only declare the assertion.
 fn on_antithesis_assert(events: *Events, moment: Moment, assertion: std.json.Value) !void {
     if (assertion != .object) return error.BadAssertion;
     const display = string_field(assertion.object, "display_type") orelse
         return error.BadAssertion;
-    const kinds = [_]struct { []const u8, Kind }{
-        .{ "Always", .always },
-        .{ "AlwaysOrUnreachable", .always_or_unreachable },
-        .{ "Sometimes", .sometimes },
-        .{ "Reachable", .reachable },
-        .{ "Unreachable", .@"unreachable" },
-    };
-    for (kinds) |entry| {
+    for (antithesis_kinds) |entry| {
         if (!std.mem.eql(u8, display, entry[0])) continue;
         if (declaration(assertion.object)) return events.declare(entry[1], assertion.object);
         return events.assertion_record(moment, entry[1], assertion);
@@ -701,6 +749,29 @@ test "always fails on the first false condition and records its moment" {
     try std.testing.expectEqual(@as(u64, 20), events.properties[0].first_failure.?.branches);
 }
 
+test "sometimes and reachable made true are sought; an Antithesis SDK's evaluation is a behavior" {
+    const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
+    defer std.testing.allocator.free(parse_buffer);
+    var events: Events = undefined;
+    events.init(parse_buffer, .{ .log_fd = null });
+    const lines = [_][]const u8{
+        "{\"assert\":{\"type\":\"sometimes\",\"message\":\"failover\",\"condition\":true}}",
+        "{\"assert\":{\"type\":\"sometimes\",\"message\":\"failover\",\"condition\":false}}",
+        "{\"assert\":{\"type\":\"reachable\",\"message\":\"retry path\"}}",
+        "{\"assert\":{\"type\":\"always\",\"message\":\"conserved\",\"condition\":true}}",
+        // An Antithesis SDK's declaration (hit false) is none; its evaluation is one, as
+        // determinismo's of the same kind, message and outcome.
+        "{\"antithesis_assert\":{\"display_type\":\"Sometimes\",\"message\":\"leader moved\",\"hit\":false,\"condition\":false}}",
+        "{\"antithesis_assert\":{\"display_type\":\"Sometimes\",\"message\":\"leader moved\",\"hit\":true,\"condition\":true}}",
+        "{\"assert\":{\"type\":\"sometimes\",\"message\":\"leader moved\",\"condition\":true}}",
+    };
+    for (lines, 0..) |line, index| try events.emit(.{ .vtime_ns = index + 1, .branches = index + 1 }, line);
+    try std.testing.expectEqual(@as(u32, 5), events.behavior_count);
+    const sought = [_]bool{ true, false, true, false, true };
+    for (sought, 0..) |expected, index| try std.testing.expectEqual(expected, events.behaviors[index].sought);
+    try std.testing.expectEqualStrings("sometimes \"leader moved\": true", events.behaviors[4].name());
+}
+
 test "a behavior keeps the node it came from" {
     const parse_buffer = try std.testing.allocator.alloc(u8, parse_buffer_size);
     defer std.testing.allocator.free(parse_buffer);
@@ -715,8 +786,13 @@ test "a behavior keeps the node it came from" {
     // A branch point's own event names a node, but is the platform's, not the system's.
     const branch = "{\"event\":\"faults_branch\",\"details\":{\"quiet_ended\":true,\"node\":\"yb1\"}}";
     try events.emit(.{ .vtime_ns = 4, .branches = 40 }, branch);
-    try std.testing.expectEqual(@as(u32, 3), events.behavior_count);
+    // An assertion whose details name a node (det-faults' aim moved: the new leader).
+    const moved = "{\"assert\":{\"type\":\"sometimes\",\"message\":\"moved\",\"condition\":true," ++
+        "\"details\":{\"from\":\"yb2\",\"node\":\"yb1\"}}}";
+    try events.emit(.{ .vtime_ns = 5, .branches = 50 }, moved);
+    try std.testing.expectEqual(@as(u32, 4), events.behavior_count);
     try std.testing.expectEqualStrings("yb2", events.behaviors[0].node());
     try std.testing.expectEqualStrings("yb3", events.behaviors[1].node());
     try std.testing.expectEqualStrings("", events.behaviors[2].node());
+    try std.testing.expectEqualStrings("yb1", events.behaviors[3].node());
 }

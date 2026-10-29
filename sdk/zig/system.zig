@@ -139,6 +139,9 @@ pub fn System(comptime Nodes: type) type {
         pub const Context = struct {
             nodes: Nodes,
             scenario: []const u8,
+            /// The profile the system runs ("default" outside the guest): a scenario whose
+            /// profiles run different releases speaks to each as it is.
+            profile: []const u8 = "default",
             init: std.process.Init,
         };
 
@@ -298,9 +301,11 @@ pub fn System(comptime Nodes: type) type {
                 return error.UnknownScenario;
             }
             const handler = scenario.find(command_name) orelse return error.UnknownCommand;
+            const resolved = system_read(init.arena.allocator()) catch null;
             var context = Context{
                 .nodes = try Self.nodes_load(init.arena.allocator()),
                 .scenario = scenario_name,
+                .profile = if (resolved) |system| system.profile else "default",
                 .init = init,
             };
             return handler(&context);

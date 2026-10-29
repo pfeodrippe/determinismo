@@ -301,6 +301,11 @@ fn events_select(
         \\            WHEN kind = 'assert' THEN hash('assert',
         \\                categorical(assertion, '$.type'), categorical(assertion, '$.message'),
         \\                categorical(assertion, '$.condition'))
+        \\            -- An Antithesis SDK's evaluation (not a declaration), as events.zig counts it.
+        \\            WHEN kind = 'antithesis_assert'
+        \\                AND coalesce(TRY_CAST(assertion ->> '$.hit' AS BOOLEAN), true) THEN hash('antithesis_assert',
+        \\                categorical(assertion, '$.display_type'), categorical(assertion, '$.message'),
+        \\                categorical(assertion, '$.condition'))
         \\            WHEN kind = 'event' AND json_type(event, '$.event') = 'VARCHAR'
         \\                AND event ->> '$.event' NOT IN ('composer_start', 'composer_done',
         \\                    'command_start', 'command_exit', 'faults_phase', 'faults_start',
@@ -609,7 +614,16 @@ pub const stats_sql =
     \\    (SELECT coalesce(sum(vtime_ns), 0) FROM timelines) AS vtime_ns,
     \\    (SELECT coalesce(sum(wall_ns), 0) FROM timelines) AS wall_ns,
     \\    (SELECT count(DISTINCT behavior) FROM events) AS behaviors,
-    \\    (SELECT count(*) FROM events) AS events
+    \\    (SELECT count(*) FROM events) AS events,
+    \\    -- Each node's CPU time over the guest's uptime, averaged over the timelines (det-init's
+    \\    -- node_cpu events at a timeline's end): where a slow simulation spends its time.
+    \\    (SELECT coalesce(json_group_object(node, share), '{}') FROM (
+    \\        SELECT event->'details'->>'node' AS node,
+    \\            round(avg(CAST(event->'details'->>'usage_ms' AS DOUBLE)
+    \\                / nullif(CAST(event->'details'->>'uptime_ms' AS DOUBLE), 0)), 3) AS share
+    \\        FROM timeline_events
+    \\        WHERE kind = 'event' AND event->>'event' = 'node_cpu'
+    \\        GROUP BY 1 ORDER BY 2 DESC)) AS cpu_by_node
 ;
 
 const testing = std.testing;
@@ -789,13 +803,13 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
 
     // Behaviors: the setup's two assertions (the declaration and the evaluation) and node_start
     // is the runtime's; timeline 1 adds its sometimes and the partition; 2 its false always; 3
-    // shares 1's (antithesis assertions are not behaviors).
+    // its Antithesis SDK's unreachable.
     const Point = struct { timelines: u64, behaviors: i128 };
     const points = try connection.rows(Point, arena, discovery_sql, .{});
     try testing.expectEqual(3, points.len);
     try testing.expectEqual(Point{ .timelines = 1, .behaviors = 4 }, points[0]);
     try testing.expectEqual(Point{ .timelines = 2, .behaviors = 5 }, points[1]);
-    try testing.expectEqual(Point{ .timelines = 3, .behaviors = 5 }, points[2]);
+    try testing.expectEqual(Point{ .timelines = 3, .behaviors = 6 }, points[2]);
 
     // Logging volume, a run's property: the timelines' output over their output span. These
     // timelines had no such fields (older lines): no row. Timeline 4 logs 2 GB in an hour:
@@ -821,6 +835,28 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
     try testing.expectEqualStrings(logging, after[0].message);
     try testing.expectEqualStrings("failing", after[0].status);
     try testing.expectEqual(0, after[0].failing);
+
+    // CPU by node (det-init's node_cpu events at a timeline's end): each node's CPU time over
+    // the uptime, averaged over the timelines, the busiest first. None yet: an empty object.
+    const Cpu = struct { cpu_by_node: []const u8 };
+    const cpu_sql = "SELECT cpu_by_node::VARCHAR FROM (" ++ stats_sql ++ ")";
+    const none = (try connection.row(Cpu, arena, cpu_sql, .{})).?;
+    try testing.expectEqualStrings("{}", none.cpu_by_node);
+    const branch_5 = try std.fs.path.join(arena, &.{ directory, "branch-5.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = branch_5, .data = comptime line(7, 900,
+        \\{"event":"node_cpu","details":{"node":"db","usage_ms":600,"uptime_ms":1000}}
+    ) ++ line(8, 900,
+        \\{"event":"node_cpu","details":{"node":"app","usage_ms":100,"uptime_ms":1000}}
+    ) });
+    const branch_6 = try std.fs.path.join(arena, &.{ directory, "branch-6.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = branch_6, .data = comptime line(7, 2000,
+        \\{"event":"node_cpu","details":{"node":"db","usage_ms":400,"uptime_ms":2000}}
+    ) });
+    const with_cpu = comptime loud ++ timeline_line(5, 900, "[]") ++ timeline_line(6, 2000, "[]");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = timelines_path, .data = with_cpu });
+    try testing.expectEqual(2, try ingest(&connection, arena, io, directory));
+    const cpu = (try connection.row(Cpu, arena, cpu_sql, .{})).?;
+    try testing.expectEqualStrings("{\"db\":0.4,\"app\":0.1}", cpu.cpu_by_node);
 }
 
 test "a version 3 database gains the timelines' output in place, filled by the next ingest" {

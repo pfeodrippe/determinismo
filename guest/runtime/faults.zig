@@ -2341,9 +2341,24 @@ var aim_node: [branch_node_max]u8 = undefined;
 var aim_node_size: usize = 0;
 
 fn aim_set(node: []const u8) void {
+    var previous_buffer: [branch_node_max]u8 = undefined;
+    const previous_size = aim_node_size;
+    @memcpy(previous_buffer[0..previous_size], aim_node[0..previous_size]);
+    const previous = previous_buffer[0..previous_size];
     aim_node_size = @min(node.len, branch_node_max);
     @memcpy(aim_node[0..aim_node_size], node[0..aim_node_size]);
     sdk.event("faults_aim", .{ .node = aim_node[0..aim_node_size] });
+    // The scenario aims at the node that matters (a leader, a primary, a coordinator): another
+    // one now means it moved, a rare state the tree returns to first (what follows a failover is
+    // where systems break). Computed: a system that never moves it is not failed for it.
+    const current = aim_node[0..aim_node_size];
+    if (previous.len > 0 and current.len > 0 and !std.mem.eql(u8, previous, current)) {
+        // `node`: a branch from just after it aims its first fault at the new one.
+        sdk.assert_computed(.sometimes, true, "the aimed node moved (a leader or primary changed)", .{
+            .from = previous,
+            .node = current,
+        });
+    }
 }
 
 fn inject_request(json: []const u8) !void {

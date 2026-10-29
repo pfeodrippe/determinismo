@@ -112,7 +112,9 @@ use them in other repositories.
 - Exploration is a tree (Antithesis's "every event a potential branch point"): after each
   generation of 16 timelines, the ones that first reached something (an assertion outcome, a
   fault kind, a closer guidance distance, a new kind of output line) are returned to just after
-  it, and new timelines branch from there. Each timeline's `why` says why it starts where it
+  it, and new timelines branch from there. A `sometimes` or `reachable` made true comes first
+  (the frontier's moment, a heavier archive cell): put one on each rare state worth building on
+  (a failover, a retry path, a recovery), and the tree returns there. Each timeline's `why` says why it starts where it
   does. A generation of 16 is 4 fresh starts and 3 moments with 4 branches each:
   `--return-branches 2` makes it 6 moments with 2 (serve's `return_branches`), and `--horizon
   60s` stops each returned branch a minute past its moment unless it found something new
@@ -128,6 +130,14 @@ use them in other repositories.
   project's too),
   `--no-faults client,monitor` takes them all from some (an Antithesis launch's
   `exclude_faults`).
+- Efficiency (Antithesis's "virtual time per wall time"): every run reports how many virtual
+  seconds a wall second simulates (one core), that times the system's nodes (Antithesis's rule
+  of thumb: above 1), the share of virtual time the guest was idle and skipped (little: something
+  busy-waits or polls, so idle time is not fast-forwarded), clock reads per virtual second (each
+  an exit to the VMM), and each node's CPU time over the uptime (det-init's `node_cpu` events at
+  a timeline's end; serve's run page, "CPU by node"). A slow system: lower its background work
+  to test sizes (compaction, splits, heartbeats, failure detectors), find the busy node, then
+  `determinismo profile` at a moment.
 - Verbose systems: `explore --retroactive 'Applied block'` leaves such output lines out of the
   events (queries stay fast); replay a timeline (`--branch`, its tape) to see them.
 - Targeted runs: `explore --changed <diff file | git range>` aims the tree at a change's lines

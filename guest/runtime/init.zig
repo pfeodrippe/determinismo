@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
     }
     kernel_check();
     memory_check();
+    cpu_report();
     agent_wait();
     // The sinks' last look (what the nodes wrote last), then it ends.
     if (sinks_pid) |pid| {
@@ -579,6 +580,47 @@ fn memory_check() void {
     const total = meminfo_total(meminfo) orelse return;
     const details = .{ .peak_mib = peak >> 20, .total_mib = total >> 20 };
     sdk.assert_computed(.always, peak * 100 < total * 95, memory_property, details);
+}
+
+/// Each node's CPU time (its cgroup's cpu.stat), with the guest's uptime beside it, as an event:
+/// where a slow simulation spends its time (a node that busy-waits, a heavy runtime), which the
+/// run's efficiency figures (idle share, clock reads) do not say. All virtual time.
+fn cpu_report() void {
+    var uptime_buffer: [64]u8 = undefined;
+    const uptime_text = read_text("/proc/uptime", &uptime_buffer);
+    const uptime_s = std.fmt.parseFloat(f64, uptime_text[0 .. std.mem.indexOfScalar(u8, uptime_text, ' ') orelse uptime_text.len]) catch 0;
+    for (node_names) |name| {
+        var path_buffer: [128]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buffer, nodes.cgroup_root ++ "/{s}/cpu.stat", .{name}, 0) catch continue;
+        var buffer: [1024]u8 = undefined;
+        const text = read_text(path, &buffer);
+        const usage_usec = stat_field(text, "usage_usec") orelse continue;
+        sdk.event("node_cpu", .{
+            .node = name,
+            .usage_ms = usage_usec / 1000,
+            .user_ms = (stat_field(text, "user_usec") orelse 0) / 1000,
+            .system_ms = (stat_field(text, "system_usec") orelse 0) / 1000,
+            .uptime_ms = @as(u64, @intFromFloat(uptime_s * 1000)),
+        });
+    }
+}
+
+/// A `name value` line's value in a cgroup stat file.
+fn stat_field(text: []const u8, name: []const u8) ?u64 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, words.next() orelse continue, name)) continue;
+        return std.fmt.parseInt(u64, words.next() orelse return null, 10) catch null;
+    }
+    return null;
+}
+
+test stat_field {
+    const text = "usage_usec 1500000\nuser_usec 1200000\nsystem_usec 300000\n";
+    try std.testing.expectEqual(@as(?u64, 1500000), stat_field(text, "usage_usec"));
+    try std.testing.expectEqual(@as(?u64, 300000), stat_field(text, "system_usec"));
+    try std.testing.expectEqual(@as(?u64, null), stat_field(text, "nr_periods"));
 }
 
 /// MemTotal from /proc/meminfo's first line, in bytes.

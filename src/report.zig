@@ -171,11 +171,13 @@ test Catalog {
 /// where a timeline made it false or if no timeline hit it; `always_or_unreachable` and
 /// `unreachable` where a timeline violated them; `sometimes` if no timeline made it true;
 /// `reachable` if no timeline reached it.
-pub fn property_failing(kind: Events.Kind, counts: struct {
+pub const Counts = struct {
     branches_hit: u32,
     branches_true: u32,
     branches_failing: u32,
-}) bool {
+};
+
+pub fn property_failing(kind: Events.Kind, counts: Counts) bool {
     return switch (kind) {
         .always => counts.branches_failing > 0 or counts.branches_hit == 0,
         .always_or_unreachable, .@"unreachable" => counts.branches_failing > 0,
@@ -185,15 +187,15 @@ pub fn property_failing(kind: Events.Kind, counts: struct {
 }
 
 test property_failing {
-    const counts = .{ .branches_hit = 8, .branches_true = 0, .branches_failing = 0 };
+    const counts: Counts = .{ .branches_hit = 8, .branches_true = 0, .branches_failing = 0 };
     try std.testing.expect(property_failing(.sometimes, counts)); // Never true anywhere.
     try std.testing.expect(!property_failing(.reachable, counts));
     try std.testing.expect(!property_failing(.always, counts));
-    const never = .{ .branches_hit = 0, .branches_true = 0, .branches_failing = 0 };
+    const never: Counts = .{ .branches_hit = 0, .branches_true = 0, .branches_failing = 0 };
     try std.testing.expect(property_failing(.reachable, never)); // Declared, never reached.
     try std.testing.expect(property_failing(.always, never));
     try std.testing.expect(!property_failing(.always_or_unreachable, never));
-    const one_true = .{ .branches_hit = 8, .branches_true = 1, .branches_failing = 0 };
+    const one_true: Counts = .{ .branches_hit = 8, .branches_true = 1, .branches_failing = 0 };
     try std.testing.expect(!property_failing(.sometimes, one_true));
 }
 
@@ -246,6 +248,13 @@ pub const Multiverse = struct {
     /// took, each on one core: Antithesis's "virtual time per wall time".
     vtime_ns: u64 = 0,
     wall_ns: u64 = 0,
+    /// Of that virtual time, what the VMM skipped with the guest idle (nothing runnable until a
+    /// timer): little of it means something busy-waits (Antithesis: "avoid busy-waiting when
+    /// idle"), which keeps the simulation from fast-forwarding.
+    idle_ns: u64 = 0,
+    /// The system's nodes: virtual time per wall time times this should be above 1 (Antithesis's
+    /// rule of thumb for an efficient simulation).
+    nodes: u32 = 0,
     /// Output the timelines printed, and the virtual time they printed it over: Antithesis's
     /// "Logging output was limited" is a ratio over the whole simulation, not per timeline.
     output_bytes: u64 = 0,
@@ -261,8 +270,9 @@ pub const Multiverse = struct {
         seed: u64,
         outcome: VM.Outcome,
         wall_ns: u64,
-        /// Where the branch started: its snapshot's virtual TSC.
+        /// Where the branch started: its snapshot's virtual TSC, and the VM's idle count then.
         start_tsc: u64,
+        start_idle_tsc: u64 = 0,
         /// Its path from the setup snapshot (the tree explorer's; empty: it starts there).
         path: []const tape.Segment = &.{},
         generation: u32 = 0,
@@ -331,6 +341,7 @@ pub const Multiverse = struct {
         multiverse.xinuse_fixes += state.xinuse_fixes;
         multiverse.xinuse_unfixed += state.xinuse_unfixed;
         multiverse.vtime_ns += (state.tsc -| branch.start_tsc) / tsc_per_ns;
+        multiverse.idle_ns += (vm.stats.idle_tsc -| branch.start_idle_tsc) / tsc_per_ns;
         multiverse.wall_ns += branch.wall_ns;
         multiverse.memory_wait_ns += branch.memory_wait_ns;
         multiverse.output_bytes += vm.events.output_bytes;
@@ -437,6 +448,8 @@ pub const Multiverse = struct {
         multiverse.xinuse_fixes += other.xinuse_fixes;
         multiverse.xinuse_unfixed += other.xinuse_unfixed;
         multiverse.vtime_ns += other.vtime_ns;
+        multiverse.idle_ns += other.idle_ns;
+        multiverse.nodes = @max(multiverse.nodes, other.nodes);
         multiverse.wall_ns += other.wall_ns;
         multiverse.output_bytes += other.output_bytes;
         multiverse.output_span_ns += other.output_span_ns;
@@ -544,6 +557,7 @@ pub const Multiverse = struct {
             "in {d:.3}s)\n", .{
             multiverse.vtime_per_wall(), seconds(multiverse.vtime_ns), seconds(multiverse.wall_ns),
         });
+        multiverse.efficiency_print();
         overshoot_warn(multiverse.overshoots);
         multiverse.record_summary(wall_ns);
     }
@@ -562,6 +576,38 @@ pub const Multiverse = struct {
             );
             try catalog.note(aggregate.property.kind, aggregate.property.name(), reached);
         }
+    }
+
+    /// Antithesis's "Test Efficiency": how much of the virtual time was idle and skipped, clock
+    /// reads (each an exit to the VMM) per virtual second, and virtual time per wall time per
+    /// node; with what to look at when they are low.
+    fn efficiency_print(multiverse: *const Multiverse) void {
+        const measured = multiverse.efficiency();
+        if (multiverse.vtime_ns == 0) return;
+        print("[determinismo] efficiency: {d:.0}% of virtual time idle (skipped); {d:.0} clock " ++
+            "reads per virtual second; virtual per wall x {d} nodes = {d:.2}\n", .{
+            measured.idle_share * 100, measured.clock_reads_per_s, multiverse.nodes, measured.per_node,
+        });
+        if (measured.idle_share < idle_share_low) print("[determinismo] efficiency: the guest " ++
+            "was hardly ever idle: something busy-waits or polls (a runtime's spin, a poll loop), " ++
+            "and idle time is not skipped; `determinismo profile` at a moment shows what runs\n", .{});
+        if (multiverse.nodes > 0 and measured.per_node < 1) print("[determinismo] efficiency: " ++
+            "virtual per wall x nodes below 1: each node gets under a core's worth (heavy runtimes, " ++
+            "GC, the machine's memory short); fewer or lighter nodes, or test-sized settings\n", .{});
+    }
+
+    const idle_share_low = 0.05;
+
+    pub const Efficiency = struct { idle_share: f64, clock_reads_per_s: f64, per_node: f64 };
+
+    pub fn efficiency(multiverse: *const Multiverse) Efficiency {
+        if (multiverse.vtime_ns == 0) return .{ .idle_share = 0, .clock_reads_per_s = 0, .per_node = 0 };
+        const vtime: f64 = @floatFromInt(multiverse.vtime_ns);
+        return .{
+            .idle_share = @as(f64, @floatFromInt(multiverse.idle_ns)) / vtime,
+            .clock_reads_per_s = @as(f64, @floatFromInt(multiverse.rdtsc_exits)) / (vtime / std.time.ns_per_s),
+            .per_node = multiverse.vtime_per_wall() * @as(f64, @floatFromInt(multiverse.nodes)),
+        };
     }
 
     fn vtime_per_wall(multiverse: *const Multiverse) f64 {
@@ -606,6 +652,9 @@ pub const Multiverse = struct {
             .overshoots = multiverse.overshoots,
             .vtime_ns = multiverse.vtime_ns,
             .vtime_per_wall = multiverse.vtime_per_wall(),
+            .nodes = multiverse.nodes,
+            .idle_share = multiverse.efficiency().idle_share,
+            .clock_reads_per_s = multiverse.efficiency().clock_reads_per_s,
             .workers = multiverse.workers,
             .at_once = multiverse.at_once,
             .memory_wait_ns = multiverse.memory_wait_ns,
@@ -613,6 +662,23 @@ pub const Multiverse = struct {
         } });
     }
 };
+
+test "Multiverse.efficiency" {
+    const multiverse = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(multiverse);
+    multiverse.* = .{};
+    try std.testing.expectEqual(Multiverse.Efficiency{ .idle_share = 0, .clock_reads_per_s = 0, .per_node = 0 }, multiverse.efficiency());
+    // 10 virtual seconds in 20 of wall time, half of them idle, 1,000 clock reads, 3 nodes.
+    multiverse.vtime_ns = 10 * std.time.ns_per_s;
+    multiverse.wall_ns = 20 * std.time.ns_per_s;
+    multiverse.idle_ns = 5 * std.time.ns_per_s;
+    multiverse.rdtsc_exits = 1000;
+    multiverse.nodes = 3;
+    const measured = multiverse.efficiency();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), measured.idle_share, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), measured.clock_reads_per_s, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), measured.per_node, 1e-9);
+}
 
 /// An overshoot means a timer or moment landed later than its branch count: such a timeline
 /// may not replay. It only happens if the margin is below the PMU's interrupt skid.

@@ -791,6 +791,9 @@ pub const RunRequest = struct {
     horizon: ?[]const u8 = null,
     /// A tree's branches from each moment it returns to (explore's --return-branches).
     return_branches: ?u32 = null,
+    /// A tree's returns go first to a `sometimes` or `reachable` made true (explore's default);
+    /// false: every new behavior alike (--no-prefer-sometimes, for comparisons).
+    prefer_sometimes: bool = true,
     pipeline: ?u32 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
@@ -896,6 +899,7 @@ fn explore_arguments(
     if (asked.return_branches) |count| {
         try argv.appendSlice(server.arena, &.{ "--return-branches", try print(server, "{d}", .{count}) });
     }
+    if (!asked.prefer_sometimes) try argv.append(server.arena, "--no-prefer-sometimes");
     if (asked.pipeline) |depth| {
         try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });
     }
@@ -2076,6 +2080,9 @@ fn runs_discover(server: *Server) !void {
                 run.adopted = true;
             }
         }
+        // One that ended before a server saw it end (stopped meanwhile, or before servers
+        // dropped them: run 177's 107 GB, srv3 2026-10-29) leaves no holders behind either.
+        if (run.status != null) holders_drop(server, &run);
         runs_insert(shared, run);
     }
 }

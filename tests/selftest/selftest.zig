@@ -754,8 +754,11 @@ fn aim_scenario(s: *System.Scenario) void {
     s.singleton_driver("aim_at_witness", aim_at_witness);
 }
 
-/// Aims the injector at the witness for a while: the e2e check counts where the pauses went.
+/// Aims the injector at the echo node briefly, then at the witness for a while (the aim moves,
+/// as when a leader changes): the e2e check counts where the pauses went.
 fn aim_at_witness(context: *System.Context) !void {
+    sdk.fault_aim(context.nodes.echo.?.name);
+    sdk.sleep_ms(2 * std.time.ms_per_s);
     sdk.fault_aim(context.nodes.witness.?.name);
     sdk.sleep_ms(40 * std.time.ms_per_s);
     sdk.reachable("the driver aimed the faults for a while", .{});

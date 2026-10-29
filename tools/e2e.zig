@@ -2063,7 +2063,12 @@ fn check_tree(context: *Context) !void {
     const disk_left = try run_kept(context, &.{ "find", disk_data, "-path", "*/holders/*", "-type", "f" });
     expect_all(context, &.{
         .{ "64 timelines with holders on disk", disk_count == 64 },
+        // The host's own disk below the holders' reserve (100 GB free) makes none: said so,
+        // not taken for a holder bug (srv3 2026-10-29, 108 GB free beside a hunt's holders).
+        .{ "the disk above the holders' reserve", std.mem.indexOf(u8, on_disk, "the disk keeps its reserve") == null },
         .{ "nodes loaded from disk", disk_nodes > 0 },
+        // A timeline whose node came from a disk holder saves its own against it (a diff).
+        .{ "a timeline's first holder on disk saved against its origin", std.mem.indexOf(u8, on_disk, "saved against its origin") != null },
         .{ "each the one a replay makes (--verify-holders)", disk_verified },
         .{ "no holder file left once the run ended", disk_left.stdout.len == 0 },
     }, "tree: {d} nodes from holders on disk, each the one a replay makes; none left after", .{disk_nodes});
@@ -2282,8 +2287,15 @@ fn check_aim(context: *Context) !void {
     const aimed = try query_count(context, &.{ events, "decision.name=fault.aimed" });
     const witness = try query_count(context, &.{ events, "event=fault details.node=witness" });
     const echo = try query_count(context, &.{ events, "event=fault details.node=echo" });
+    const moved = try query_count(context, &.{
+        events, "assert.message=\"the aimed node moved (a leader or primary changed)\" assert.condition=true",
+    });
+    // det-init's CPU time of each node at a timeline's end (efficiency: CPU by node).
+    const cpu = try query_count(context, &.{ events, "event=node_cpu" });
     expect_all(context, &.{
         .{ "the aim reached the injector in all 4 timelines", aims == 4 },
+        .{ "its move (echo, then witness) marked in all 4", moved == 4 },
+        .{ "each node's CPU time reported at each timeline's end", cpu == 8 },
         .{ "draws decided whether to aim", decided >= 20 },
         .{ "about half aimed", aimed * 10 >= decided * 3 and aimed * 10 <= decided * 7 },
         .{ "the witness got more pauses", witness > echo },
@@ -3013,14 +3025,54 @@ fn check_script(context: *Context) !void {
     const followed = try run_kept(context, &.{ context.determinismo, "script", own_events });
     const original = try script_shape(context.arena, extracted.stdout);
     const own = try script_shape(context.arena, followed.stdout);
+    // Its faults are the script's, in order, each one due before its fault phase ended: the
+    // phase may end sooner than the original's (when its commands finish is the seed's: the
+    // full suite of 2026-10-29 stopped faults at 6.02 s, not 6.98, before the script's last 4).
+    const window_ns = faults_window_ns(context, own_events) orelse 0;
+    const due = script_due(context.arena, extracted.stdout, window_ns -| script_due_margin_ns);
     expect_all(context, &.{
         .{ "other seeds fail with the script", with > 0 },
         .{ "its own timeline, scripted, starts the script's commands, in order", std.mem.eql(u8, own.commands, original.commands) },
-        .{ "and applies the script's faults, in order", std.mem.eql(u8, own.faults, original.faults) },
+        .{ "and applies the script's faults, in order", std.mem.startsWith(u8, original.faults, own.faults) },
+        .{ "each one due before its faults stopped", own.fault_count >= due and due > 0 },
         .{ "a script with faults and commands", original.faults.len > 0 and original.commands.len > 0 },
     }, "script: other seeds fail with it ({d} of 8, {d} without); its own timeline follows it ({d} commands, {d} faults)", .{
         with, without, original.command_count, original.fault_count,
     });
+}
+
+/// How far a script's fault times (from the scenario's setup) may sit from the moment a timeline's
+/// faults stopped and still count as due: the injector's start is a little past setup's end.
+const script_due_margin_ns = 100 * std.time.ns_per_ms;
+
+/// How many of a script's faults come at or before `until_ns` (from the setup's end).
+fn script_due(arena: std.mem.Allocator, text: []const u8, until_ns: u64) usize {
+    const Script = struct { faults: []const struct { at_ns: u64 = 0 } = &.{} };
+    const script = std.json.parseFromSliceLeaky(Script, arena, text, .{ .ignore_unknown_fields = true }) catch
+        return 0;
+    var count: usize = 0;
+    for (script.faults) |fault| count += @intFromBool(fault.at_ns <= until_ns);
+    return count;
+}
+
+/// A timeline's fault phase, from its setup's end (setup_complete) to its faults' stop
+/// (faults_stop), from its events.
+fn faults_window_ns(context: *Context, events_path: []const u8) ?u64 {
+    const text = std.Io.Dir.cwd().readFileAlloc(context.io, events_path, context.arena, .limited(1 << 28)) catch return null;
+    const Line = struct {
+        vtime_ns: u64 = 0,
+        event: struct { lifecycle: []const u8 = "", event: []const u8 = "" } = .{},
+    };
+    var setup_ns: ?u64 = null;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line_text| {
+        if (std.mem.indexOf(u8, line_text, "setup_complete") == null and
+            std.mem.indexOf(u8, line_text, "faults_stop") == null) continue;
+        const parsed = std.json.parseFromSliceLeaky(Line, context.arena, line_text, .{ .ignore_unknown_fields = true }) catch continue;
+        if (std.mem.eql(u8, parsed.event.lifecycle, "setup_complete")) setup_ns = parsed.vtime_ns;
+        if (std.mem.eql(u8, parsed.event.event, "faults_stop")) return parsed.vtime_ns -| (setup_ns orelse return null);
+    }
+    return null;
 }
 
 /// A script's commands (name and mode) and faults (kind and node), in order, one line each.
