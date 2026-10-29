@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Example test program: YugabyteDB 1.3.1, the release of Jepsen's analysis (2019), three nodes
+//! Example test program: YugabyteDB 1.3.1, the release of Jepsen's analysis (2019; `current`:
+//! 2026.1.2.0, the latest release), three nodes
 //! each a master and a tablet server (Jepsen's colocated nodes; replication factor 3) with its
 //! flags, and YSQL list-append transactions (examples/sql/append.zig through PostgreSQL's
 //! protocol, Jepsen's YSQL append choices: five tables, appends that update then insert, rows
@@ -51,13 +52,30 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
+/// `default`: 1.3.1, Jepsen's. `current`: 2026.1.2.0, the latest release, a master of 1 GB and a
+/// tablet server of 2 GB (--memory-mib 12288).
 fn describe(d: *System.Describe) !void {
-    const default = try d.profile("default");
-    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/yugabyte/Dockerfile" };
+    inline for (.{
+        .{ "default", "examples/yugabyte/Dockerfile", &[_][]const u8{}, true },
+        .{ "current", "examples/yugabyte/Dockerfile.2026.1", &[_][]const u8{
+            "YB_MASTER_MEMORY=1073741824",
+            "YB_TSERVER_MEMORY=2147483648",
+        }, false },
+    }) |entry| try describe_profile(try d.profile(entry[0]), entry[1], entry[2], entry[3]);
+}
+
+fn describe_profile(
+    profile: *System.Profile,
+    comptime dockerfile: []const u8,
+    comptime env: []const []const u8,
+    comptime crashing_backends: bool,
+) !void {
+    const build: sdk.schema.Build = .{ .context = ".", .dockerfile = dockerfile };
     inline for (node_names) |name| {
-        default.node(@field(System.Name, name), .{
+        profile.node(@field(System.Name, name), .{
             .build = build,
             .command = &.{name},
+            .env = env,
             .ready = .{ .tcp = master_port },
             // No power losses: YugabyteDB does not sync its write-ahead log by default
             // (durable_wal_write), so a power loss may lose what it acknowledged, and its
@@ -72,7 +90,7 @@ fn describe(d: *System.Describe) !void {
             },
             // 1.3.1's YSQL backends segfault on their way out (README: Observed), in every
             // timeline: counted, so a run's failing timelines say something again.
-            .crashes_known = &.{"postgres"},
+            .crashes_known = if (crashing_backends) &.{"postgres"} else &.{},
         });
     }
 }

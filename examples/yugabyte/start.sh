@@ -6,7 +6,8 @@
 # (as Jepsen's nemesis restarted killed ones; a kill of every master is how it found #2125). A
 # stop ends both. A tablet server gets 1 GB, a master 512 MB (Jepsen's 2 GB each: three nodes
 # share the machine; with 1 GB masters too, long timelines ended in the kernel's OOM kills of
-# postgres backends, 22 of run 18's 215 on srv3).
+# postgres backends, 22 of run 18's 215 on srv3). YB_MASTER_MEMORY, YB_TSERVER_MEMORY: other
+# limits, in bytes (the current release's profile).
 set -uo pipefail
 self=${1:?usage: start.sh <node>}
 nodes="yb1 yb2 yb3"
@@ -40,8 +41,8 @@ trap 'touch "$stopping"; pkill -TERM -x yb-master; pkill -TERM -x yb-tserver; wa
 
 supervise master "$bin/yb-master" --master_addresses "$masters" --rpc_bind_addresses "$ip:7100" \
   --fs_data_dirs /data/master --replication_factor 3 --use_initial_sys_catalog_snapshot \
-  --load_balancer_max_concurrent_adds 10 --memory_limit_hard_bytes 536870912 "${common[@]}" &
+  --load_balancer_max_concurrent_adds 10 --memory_limit_hard_bytes "${YB_MASTER_MEMORY:-536870912}" "${common[@]}" &
 supervise tserver "$bin/yb-tserver" --tserver_master_addrs "$masters" --rpc_bind_addresses "$ip:9100" \
   --fs_data_dirs /data/tserver --start_pgsql_proxy --pgsql_proxy_bind_address "$ip:5433" \
-  --rpc_slow_query_threshold_ms 1000 --memory_limit_hard_bytes 1073741824 "${common[@]}" &
+  --rpc_slow_query_threshold_ms 1000 --memory_limit_hard_bytes "${YB_TSERVER_MEMORY:-1073741824}" "${common[@]}" &
 wait

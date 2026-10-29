@@ -35,6 +35,9 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   300 s; with 64 MB segments, run 77 ended 7 of 64 timelines in OOM kills.
 - Readiness is the master's port: YSQL waits on a quorum of masters, which needs the nodes
   started after.
+- Profile `current` (2026-10-29): YugabyteDB 2026.1.2.0-b137, the latest release
+  (Dockerfile.2026.1), the same start script and flags, a 1 GB master and a 2 GB tablet server
+  (`--memory-mib 12288`); its YSQL backends' crashes are not known ones. First smoke next.
 
 ## The workload
 
