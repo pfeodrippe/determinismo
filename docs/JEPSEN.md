@@ -91,6 +91,18 @@ Blind means blind to the results, not to the test: workloads follow Jepsen's pub
 | Apache Kafka | 3.8.0 (KRaft) | KAFKA-17754 (from the Bufstream analysis): a delayed EndTxn commits the next transaction partway: aborted reads, lost writes, torn transactions under process pauses | first timelines (examples/kafka, the Java client 3.8.0 behind a line protocol); found blind on the way, confirmed from exact replays (srv2, 40 of the first 64 timelines): a power loss within ~30 s of `kafka-storage format` leaves bootstrap.checkpoint empty (written without force(), renamed in), and 3.8.0 reads it at every start: the node never starts again; not reported upstream as such (examples/kafka). KAFKA-20979 rediscovered blind (srv3, 2026-10-28, 2nd timeline of a smoke test): a power loss after a clean shutdown leaves a time index untrimmed and zero-filled, and retention deletes committed data; KAFKA-20734 (4.3.0 and 4.4.0, the latest release; a blocker, its fix merged, unreleased) met blind in the second timeline of Kafka 4.4.0's first smoke (run 89): a partition without a leader for a moment taken for deleted, its commit marker skipped, a transaction hanging for good. KAFKA-18137 (fixed in 4.0.0) met blind in hunt run 68 (timeline 125): a coordinator elected and resigned at different epochs as it restarted installed an empty load, gave a transactional id a new producer id, and left the old producer's transaction hanging for good (the partition's last stable offset stuck); KAFKA-17754 not yet (the client's links were never faulted until 2026-10-28) |
 | YugabyteDB | 1.3.1 | YSQL append G2-item when every master crashed or was paused (#2125); read skew, lost inserts (earlier versions) | not yet claimed: hunt run 77 (srv3, no outage then) had G2-item in timeline 15 after process pauses, and a lost committed insert in timeline 9; #2571's tablet-server abort (`mvcc.cc:340`) in 6 of 64 timelines; a master's abort open upstream as #30325 (its active WAL segment gone after a kill between a segment's rename and its header) in 1. Kill outages (#2125's first trigger) hunt next |
 
+## Beyond Jepsen's analyses
+
+Systems Jepsen never analyzed (or not in a decade), under the same workloads and checks:
+
+| System | Workload | Status |
+|---|---|---|
+| Apache Cassandra | 5.0.9: Jepsen's Scylla LWT list-append, final reads at SERIAL; 6.0-alpha2: Accord transactions (`accord` profile and scenario) | examples/cassandra: smokes |
+| ClickHouse Keeper | 26.9.27.3 as the ZooKeeper workload's servers (`keeper` profile) | examples/zookeeper: smoke |
+| rqlite | 10.6.6: list-append transactions through the unified endpoint, linearizable reads; `snapshots` profile | examples/rqlite: smoke |
+| MySQL Group Replication | 26.10.0, single primary: Jepsen's MySQL list-append | examples/mysql-gr: smokes passed, hunt queued |
+| Patroni | 4.1.0 with etcd, synchronous_mode | examples/patroni: run 189, 444 timelines, no loss |
+
 ## Order
 
 1. etcd: done; then its lock and lease checks (reported as by-design, not failures).
