@@ -4,10 +4,23 @@
 # same; a typo there ($SRAN_FILE) made n1 start a new cluster at every restart.
 set -e
 marker=/var/lib/mysql/.bootstrapped
-arguments=(mariadbd --wsrep-cluster-address=gcomm://n1,n2,n3)
+address=gcomm://n1,n2,n3
+arguments=(mariadbd --wsrep-cluster-address=$address)
 if [ "$GALERA_NODE" = n1 ] && [ ! -e "$marker" ]; then
   mkdir -p /var/lib/mysql
   touch "$marker"
   arguments+=(--wsrep-new-cluster)
+fi
+# With GALERA_RECOVER=1, as MariaDB's systemd unit does before every start (galera_recovery,
+# `--wsrep-recover`): the position the storage engine recovers after a crash, rather than the
+# -1 a crash leaves in grastate.dat. Jepsen's wrapper and the official image start without it.
+# A recovery that fails fails the start, as the unit's does. No arguments, as the unit's: it
+# hands them to my_print_defaults, which refuses options it does not know; the cluster's address
+# in a configuration file, as such deployments have it (the recovering server refuses to start
+# without one: "rsync SST method requires wsrep_cluster_address to be configured").
+if [ "$GALERA_RECOVER" = 1 ] && [ -d /var/lib/mysql/mysql ]; then
+  printf '[galera]\nwsrep_cluster_address = %s\n' "$address" > /etc/mysql/conf.d/98-cluster-address.cnf
+  position=$(galera_recovery)
+  if [ -n "$position" ]; then arguments+=("$position"); fi
 fi
 exec docker-entrypoint.sh "${arguments[@]}"

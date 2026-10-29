@@ -87,6 +87,7 @@ fn append_scenario(s: *System.Scenario) void {
     s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 10_000 };
     s.setup("schema", schema);
     s.parallel_driver("append", append);
+    s.finally("final reads", final_reads);
 }
 
 /// The tables, once YSQL answers (its catalog, the tablet servers registered).
@@ -98,4 +99,11 @@ fn append(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const all = addresses(context);
     try sql_append.transactions(arena, &all, options);
+}
+
+/// Every committed append still there once faults stop (examples/sql/append.zig).
+fn final_reads(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    const all = addresses(context);
+    try sql_append.final_reads(arena, &all, options);
 }

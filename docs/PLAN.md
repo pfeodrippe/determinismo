@@ -364,8 +364,14 @@ event hashing, the guest module.
   primary component of one (its donor left gracefully), saves it, and after a restart
   `pc.recovery` starts a new history from its half-copied data; nodes with newer data join it by
   SST (committed row lost, read by replay; examples/galera/README.md). Not the disk model, first
-  suspected. Next: the append workload's final reads of every key once faults stop (Elle then
-  sees lost appends; it missed this one), and a fork from timeline 265 to measure how often.
+  suspected. Done since: the SQL append workloads (Galera, MySQL, PostgreSQL, CockroachDB, TiDB,
+  YugabyteDB) end with final reads, a `finally` command: every committed append must be in its
+  key's list. Next: a Galera hunt with them (queued after next.sh) for how often.
+- `eventually` endings kill the drivers as soon as the composer reaches them (after its 4 to 63
+  starts, pauses under 20 ms): RabbitMQ's run 118 drove a median 26.6 s, under 10 s in 274 of
+  1,494 timelines. Antithesis's composer may start one any time after a driver started, killing
+  the rest, so short drives are part of the parity; a check that needs its drivers done is a
+  `finally` command (the SQL final reads: an `eventually` one cut Galera's drivers at 0.1 s).
 - RabbitMQ findings (2026-10-29, hunt run 118, flags-synced, 1,498 timelines): confirmed
   messages lost when two quorum queue members restart as new ones (Ra's names.dets registration
   not synced, kills within half a second of the declaration; timeline 1005, 23 of 34, exact

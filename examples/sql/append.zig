@@ -20,7 +20,13 @@
 //!
 //!   s.setup("schema", schema);          // sql_append.schema_create(address, options)
 //!   s.parallel_driver("append", ...);   // sql_append.transactions(arena, addresses, options)
+//!   s.finally("final reads", ...);      // sql_append.final_reads(arena, addresses, options)
 //!   .checks = .{ .elle = sdk.elle.check(.{ .consistency = ... }) }
+//!
+//! The final reads judge durability directly: Elle, below strict serializability, takes a read
+//! that misses a committed append for a read of an older snapshot, and the random reads of the
+//! transactions may never read a key again (Galera run 123: a committed row lost, Elle's 58
+//! operations none the wiser).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -52,6 +58,9 @@ pub const Options = struct {
     /// leaves the transaction to update instead. Without (YugabyteDB 1.3: "SAVEPOINT not
     /// supported yet"), a lost race fails the transaction, as Jepsen's YSQL append did.
     savepoints: bool = true,
+    /// A statement the final reads' connections run first, so that a read sees every commit the
+    /// cluster made (Galera: `SET SESSION wsrep_sync_wait = 1`); null: none.
+    final_session: ?[]const u8 = null,
 };
 
 pub const Dialect = enum { postgres, mysql };
@@ -67,6 +76,14 @@ const refused_pause_ms_max = 1000;
 const mops_max = 4;
 const window_s = 10;
 const keys_window = 4;
+/// Connections the final reads try (a pause after each that fails) before leaving the rest of
+/// the keys unjudged: a cluster may wait for an operator, as Galera does after losing every node.
+/// A `finally` command (the drivers done, faults stopped), not `eventually`, which would kill the
+/// drivers as soon as the composer reaches the ending.
+const final_attempts_max = 60;
+const final_pause_ms = 1000;
+/// Lost appends reported one by one; past these, counted.
+const lost_reported_max = 8;
 const value_size_max = 64 * 1024;
 
 /// The tables, once (any node).
@@ -160,6 +177,131 @@ pub fn transactions(arena: std.mem.Allocator, addresses: []const [4]u8, options:
         }
         sequence += 1;
     }
+}
+
+/// Once faults stop: every append the history says committed is in its key's list, read through
+/// a node that answers. A lost one fails "every committed append is in the final read"; a cluster
+/// that answers no final read is not judged, only noted. The reads go into the history, for Elle.
+pub fn final_reads(arena: std.mem.Allocator, addresses: []const [4]u8, options: Options) !void {
+    const history: sdk.elle.History = .{};
+    const committed = try appends_committed(arena, history.path);
+    if (committed.count() == 0) return;
+    var connection: Client = undefined;
+    var connected = false;
+    defer if (connected) connection.close();
+    var attempts: u32 = 0;
+    var judged: u32 = 0;
+    var lost: u32 = 0;
+    next_key: for (committed.keys(), committed.values()) |key, values| {
+        while (attempts < final_attempts_max) {
+            if (!connected) {
+                connected = final_connect(&connection, addresses, options);
+                if (!connected) {
+                    attempts += 1;
+                    pause_ms(final_pause_ms);
+                    continue;
+                }
+            }
+            const asked = [_]sdk.elle.Mop{.{ .read = .{ .key = key, .list = null } }};
+            const process = sdk.elle.process_new();
+            try history.invoke(arena, process, &asked);
+            var list: ?[]const u64 = null;
+            read(arena, &connection, .{ .append = false, .key = key, .value = 0 }, &list, options) catch {
+                try history.fail(arena, process, &asked);
+                connection.close();
+                connected = false;
+                attempts += 1;
+                pause_ms(final_pause_ms);
+                continue;
+            };
+            const seen = list orelse &.{};
+            try history.ok(arena, process, &.{.{ .read = .{ .key = key, .list = seen } }});
+            judged += 1;
+            for (values.items) |value| {
+                if (std.mem.indexOfScalar(u64, seen, value) != null) continue;
+                lost += 1;
+                if (lost > lost_reported_max) continue;
+                sdk.always(false, "every committed append is in the final read", .{
+                    .key = key,
+                    .value = value,
+                    .read = seen.len,
+                    .committed = values.items.len,
+                });
+            }
+            continue :next_key;
+        }
+        break; // Out of attempts: the rest unjudged.
+    }
+    sdk.sometimes(judged > 0, "the final reads reach a node once faults stop", .{
+        .keys = committed.count(),
+        .judged = judged,
+    });
+    if (judged > 0 and lost == 0) {
+        sdk.always(true, "every committed append is in the final read", .{ .keys = judged });
+    }
+    if (lost > lost_reported_max) sdk.event("final_reads_lost", .{ .lost = lost, .keys = judged });
+}
+
+/// A connection for the final reads, to a node drawn at random, with the final session statement.
+fn final_connect(connection: *Client, addresses: []const [4]u8, options: Options) bool {
+    const address = addresses[sdk.random_below(addresses.len)];
+    connection.open(address, options) catch return false;
+    if (options.final_session) |statement| connection.exec(statement) catch {
+        connection.close();
+        return false;
+    };
+    return true;
+}
+
+const Committed = std.AutoArrayHashMapUnmanaged(u64, std.ArrayList(u64));
+
+fn appends_committed(arena: std.mem.Allocator, path: [:0]const u8) !Committed {
+    return appends_parse(arena, try file_read(arena, path));
+}
+
+/// Each key's committed appends, from a history's `ok` lines, in the order keys first appear.
+fn appends_parse(arena: std.mem.Allocator, text: []const u8) !Committed {
+    var committed: Committed = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch
+            return error.BadHistory;
+        if (parsed != .object) return error.BadHistory;
+        const kind = parsed.object.get("type") orelse return error.BadHistory;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "ok")) continue;
+        const mops = parsed.object.get("value") orelse return error.BadHistory;
+        if (mops != .array) return error.BadHistory;
+        for (mops.array.items) |mop| {
+            if (mop != .array or mop.array.items.len != 3) continue;
+            const f = mop.array.items[0];
+            if (f != .string or !std.mem.eql(u8, f.string, "append")) continue;
+            const key = mop.array.items[1];
+            const value = mop.array.items[2];
+            if (key != .integer or value != .integer) return error.BadHistory;
+            const entry = try committed.getOrPut(arena, @intCast(key.integer));
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(arena, @intCast(value.integer));
+        }
+    }
+    return committed;
+}
+
+/// A whole file ("" when there is none).
+fn file_read(arena: std.mem.Allocator, path: [:0]const u8) ![]const u8 {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) == .NOENT) return "";
+    if (linux.errno(fd) != .SUCCESS) return error.HistoryOpen;
+    defer _ = linux.close(@intCast(fd));
+    var bytes: std.ArrayList(u8) = .empty;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = linux.read(@intCast(fd), &buffer, buffer.len);
+        if (linux.errno(count) == .INTR) continue;
+        if (linux.errno(count) != .SUCCESS) return error.HistoryRead;
+        if (count == 0) break;
+        try bytes.appendSlice(arena, buffer[0..count]);
+    }
+    return bytes.items;
 }
 
 fn draw(mops: *[mops_max]Mop, id: u64, sequence: u64) u32 {
@@ -446,6 +588,24 @@ test sqlstate_definite {
     try std.testing.expect(!sqlstate_definite("08006"));
     try std.testing.expect(!sqlstate_definite("57P01"));
     try std.testing.expect(mysql_definite(1205) and !mysql_definite(2013));
+}
+
+test appends_parse {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const history =
+        \\{"process":1,"type":"invoke","f":"txn","time":1,"value":[["append",7,70],["r",8,null]]}
+        \\{"process":1,"type":"ok","f":"txn","time":2,"value":[["append",7,70],["r",8,[1]]]}
+        \\{"process":2,"type":"info","f":"txn","time":3,"value":[["append",7,71]]}
+        \\{"process":3,"type":"fail","f":"txn","time":4,"value":[["append",9,90]]}
+        \\{"process":4,"type":"ok","f":"txn","time":5,"value":[["append",9,91],["append",7,72]]}
+        \\
+    ;
+    const committed = try appends_parse(arena.allocator(), history);
+    try std.testing.expectEqualSlices(u64, &.{ 7, 9 }, committed.keys());
+    try std.testing.expectEqualSlices(u64, &.{ 70, 72 }, committed.get(7).?.items);
+    try std.testing.expectEqualSlices(u64, &.{91}, committed.get(9).?.items);
+    try std.testing.expectError(error.BadHistory, appends_parse(arena.allocator(), "{\"type\":\"ok\"}\n"));
 }
 
 test list_parse {

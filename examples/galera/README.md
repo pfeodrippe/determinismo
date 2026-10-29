@@ -124,9 +124,32 @@ starts again (timeline 236's n2 at 42.83 s, by design). A joiner without a compl
 meant to be one: `safe_to_bootstrap: 0` is not consulted on this path, and GCS itself reports no
 node with complete state.
 
+In the code (Galera's 4.x head, as in 26.4.24): `pc::Proto::handle_view` (pc_proto.cpp) promotes a
+restored view when exactly its members are back, with `send_install(true)`, the bootstrap
+install `--wsrep-new-cluster` sends; it looks at the view's members only. GCS then takes the
+bootstrapping node as the group's first component, and with no history (`act_id_ < 0`) "starts a
+new one" (`gcs_group.cpp`, "Starting new group from scratch"). Nothing on the way asks whether
+that node ever had the group's state.
+
 Elle found no anomaly: the workload reads keys only inside its random transactions (58
-operations in timeline 265), and none read key 5 after the loss. Next: final reads of every key
-once faults stop, so a lost append is an anomaly Elle reports.
+operations in timeline 265), and none read key 5 after the loss. Since then the workload ends
+with final reads (a `finally` command, faults stopped): every committed append must be in its
+key's list.
+
+A caveat on the deployment: these nodes start as Jepsen's wrapper (`antithesis/db/bootstrap-wrapper`:
+`exec /usr/sbin/mariadbd`) and the official image start them, without position recovery, so a
+node that crashed reports seqno -1. MariaDB's systemd unit recovers the position from the storage
+engine before every start (`galera_recovery`, `--wsrep-recover`). Without it a whole cluster that
+crashed comes back through `pc.recovery` with no node holding a complete state and forms a new
+history at once, every member declared synced with whatever its storage engine kept. The first
+smoke of the final reads (run 154, timeline 1) did exactly that: n3, SIGKILLed 0.2 s after four
+commits, lost them to the once-a-second log flush (n1 and n2 held them, read by replay at 32.5 s);
+after faults stopped the three formed a group of nil history at 61.6 s (`Quorum: No node with
+complete state`, `Bootstrapped primary 00000000-… found: 3`, no state transfer), and n3 served
+without them: "every committed append is in the final read" failed. Jepsen's losses on
+coordinated crashes may come partly from this. The `jepsen-recovered` profile (12.1.2 with dirsync)
+and `default` (13.0.2) start with the systemd unit's recovery (`start`, `GALERA_RECOVER=1`):
+whether the joiner's bootstrap and its losses remain there is the next hunt.
 
 Known? Related: mariadb-corporation/galera#549 (open since 2019), "rsync crashed while syncing in
 the donor node, receiver node become safe_to_bootstrap=1", where an operator could bootstrap
@@ -166,3 +189,9 @@ primary view to gvwstate.dat while the node's state is incomplete (a joiner), or
   writes no page before its redo is durable (`log_write_up_to(lsn, true)` on both of 12.1.2's
   page write paths, buf0flu.cc and buf0dblwr.cc), and the page "in the future" was another
   node's.
+- Final reads (2026-10-29, smokes of two timelines, seed 3): `jepsen-dirsync` failed them in one
+  (run 154, timeline 1, the whole cluster crashed and came back with no position: the caveat
+  above); `jepsen-recovered` passed them in both (run 158), every restart recovering its node's
+  position (`WSREP: Recovered position d43f1730…:8`). A node that finds no primary component
+  within gcomm's wait gives up starting (`failed to reach primary view`, by design, started
+  again): a known exit.

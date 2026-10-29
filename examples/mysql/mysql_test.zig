@@ -66,6 +66,7 @@ fn Isolation(comptime level: []const u8) type {
         fn scenario(s: *System.Scenario) void {
             s.setup("schema", schema);
             s.parallel_driver("append", append);
+            s.finally("final reads", final_reads);
         }
 
         fn schema(context: *System.Context) !void {
@@ -77,6 +78,12 @@ fn Isolation(comptime level: []const u8) type {
         fn append(context: *System.Context) !void {
             const arena = context.init.arena.allocator();
             try sql_append.transactions(arena, &.{context.nodes.mysql.address}, options);
+        }
+
+        /// Every committed append still there once faults stop (examples/sql/append.zig).
+        fn final_reads(context: *System.Context) !void {
+            const arena = context.init.arena.allocator();
+            try sql_append.final_reads(arena, &.{context.nodes.mysql.address}, options);
         }
     };
 }

@@ -70,6 +70,7 @@ fn addresses(context: *System.Context) [node_names.len][4]u8 {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("cluster", cluster_ready);
     s.parallel_driver("append", append);
+    s.finally("final reads", final_reads);
 }
 
 /// The cluster initialized (once: a second init says it already is), then the table.
@@ -88,4 +89,11 @@ fn append(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const all = addresses(context);
     try sql_append.transactions(arena, &all, options);
+}
+
+/// Every committed append still there once faults stop (examples/sql/append.zig).
+fn final_reads(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    const all = addresses(context);
+    try sql_append.final_reads(arena, &all, options);
 }

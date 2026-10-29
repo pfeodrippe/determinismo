@@ -52,6 +52,12 @@ fn describe(d: *System.Describe) !void {
             .env = &.{"POSTGRES_HOST_AUTH_METHOD=trust"},
             .ready = .{ .tcp = port },
             .faults = .{ .restart = true, .crash = true, .stop = true },
+            // A host's writeback window: the image's entrypoint appends the line letting other
+            // hosts in to pg_hba.conf at initialization and never syncs it, so under the strict
+            // model the first power loss, however late, took it back and every connection was
+            // refused ("no pg_hba.conf entry", final-reads smoke, srv3 2026-10-29); a host's
+            // flusher writes it within ~30 s. PostgreSQL syncs its own data.
+            .writeback_s = 30,
         });
     }
 }
@@ -63,6 +69,7 @@ fn Isolation(comptime level: []const u8) type {
         fn scenario(s: *System.Scenario) void {
             s.setup("schema", schema);
             s.parallel_driver("append", append);
+            s.finally("final reads", final_reads);
         }
 
         fn schema(context: *System.Context) !void {
@@ -74,6 +81,12 @@ fn Isolation(comptime level: []const u8) type {
         fn append(context: *System.Context) !void {
             const arena = context.init.arena.allocator();
             try sql_append.transactions(arena, &.{context.nodes.postgres.address}, options);
+        }
+
+        /// Every committed append still there once faults stop (examples/sql/append.zig).
+        fn final_reads(context: *System.Context) !void {
+            const arena = context.init.arena.allocator();
+            try sql_append.final_reads(arena, &.{context.nodes.postgres.address}, options);
         }
     };
 }

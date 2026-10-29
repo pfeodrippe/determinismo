@@ -77,6 +77,7 @@ fn describe(d: *System.Describe) !void {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("schema", schema);
     s.parallel_driver("append", append);
+    s.finally("final reads", final_reads);
 }
 
 fn schema(context: *System.Context) !void {
@@ -89,4 +90,11 @@ fn append(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const all: [3][4]u8 = .{ context.nodes.n1.address, context.nodes.n2.address, context.nodes.n3.address };
     try sql_append.transactions(arena, &all, options);
+}
+
+/// Every committed append still there once faults stop (examples/sql/append.zig).
+fn final_reads(context: *System.Context) !void {
+    const arena = context.init.arena.allocator();
+    const all: [3][4]u8 = .{ context.nodes.n1.address, context.nodes.n2.address, context.nodes.n3.address };
+    try sql_append.final_reads(arena, &all, options);
 }
