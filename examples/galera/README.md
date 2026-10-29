@@ -156,8 +156,8 @@ appends (13, 126, 160), none through a joiner's bootstrap; each after every node
 newest commits failed within the second InnoDB's log waits to be flushed
 (`innodb_flush_log_at_trx_commit = 0`, Jepsen's setting and MariaDB's recommendation for Galera,
 durability resting on the cluster). Timeline 13, explained by causality (analysis 0: no future
-fails from 35.3 s, 6 of 15 from 40.3 s, 13 of 16 from 45.2 s): n2 stops at 35.58 s and n1 at
-37.21 s, so n3 is a primary component of one from 37.22 s (`New COMPONENT: primary = yes ...
+fails from 35.3 s nor from 37.19 s, 6 of 16 from 37.81 s, 13 of 16 from 45.2 s): n2 stops at
+35.58 s and n1 at 37.21 s, so n3 is a primary component of one from 37.22 s (`New COMPONENT: primary = yes ...
 memb_num = 1`), the newest commits on it alone until the others are synced; n3 is killed at
 43.77 s, its last second with it. Recovered positions after: n3 84, n1 38, n2 6; n3, the
 newest, resumes as the primary (111.55 s, no new history), and key 4 reads 26 of its 30
