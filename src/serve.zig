@@ -985,10 +985,15 @@ fn run_show(server: *Server, run: *const Run, out: *std.Io.Writer) !u16 {
         const path = try std.fs.path.join(server.arena, &.{ directory, time[1] });
         if (mtime_s(server.arena, path)) |seconds| try out.print(",\"{s}\":{d}", .{ time[0], seconds });
     }
-    // What its explorer says it is doing (a tree's status.json), while it runs.
+    // What its explorer says it is doing (a tree's status.json), while it runs; and how long it
+    // has not said so, past what judging a generation takes (its nodes made by replays): an
+    // explorer stalled (runs 177 and 200 sat hours in a deadlock, nothing showing it).
     if (run.status == null) if (run_file(server, run.id, "status.json")) |status| {
         const trimmed = std.mem.trim(u8, status, " \n");
         if (trimmed.len > 0 and trimmed[0] == '{') try out.print(",\"progress\":{s}", .{trimmed});
+        const status_path = try std.fs.path.join(server.arena, &.{ directory, "status.json" });
+        const silent_s = age_s(server.arena, status_path);
+        if (silent_s >= stall_after_s) try out.print(",\"stalled_s\":{d}", .{silent_s});
     } else |_| {};
     // As asked (POST /runs, its seed drawn): what a run again starts from.
     if (run_file(server, run.id, "request.json")) |request| {
@@ -2123,6 +2128,10 @@ fn mtime_s(arena: std.mem.Allocator, path: []const u8) ?i64 {
     if (linux.errno(linux.statx(linux.AT.FDCWD, path_z, 0, .{ .MTIME = true }, &stat)) != .SUCCESS) return null;
     return stat.mtime.sec;
 }
+
+/// A running explorer's status unchanged this long: it is stalled (it writes it every half minute
+/// while timelines run; judging a generation, nodes made by long replays, can take minutes).
+const stall_after_s = 30 * 60;
 
 /// Seconds since the path changed (0 if it cannot tell).
 fn age_s(arena: std.mem.Allocator, path: []const u8) u64 {

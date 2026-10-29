@@ -457,6 +457,8 @@ function statsHtml() {
   if (each) notes.push(`${duration(each)} a timeline`);
   // Running now, from the explorer's own status (a tree's).
   if (run.state === "running" && run.progress) notes.push(`<b>${run.progress.running.length} running</b>`);
+  // Its explorer has not said what it does for that long: stalled (a deadlock, or a hang).
+  if (run.state === "running" && run.stalled_s) notes.push(`<b class="fail-text">no progress for ${Math.round(run.stalled_s / 60)} min: its explorer may be stalled</b>`);
   if (run.eventsError) notes.push(`<span class="fail-text" title="${escape(run.eventsError)}">its events could not be read (hover for why)</span>`);
   return `<div class="stats" id="stats-live">
     ${stat("Timelines", done.toLocaleString(), notes.join(" · "))}
