@@ -171,6 +171,11 @@ every start aborts (`Non-negative state seqno requires non-nil history UUID:
 00000000-0000-0000-0000-000000000000:2`, `gcs init failed: Invalid argument`, `Aborting`): the node
 never starts again without an operator editing grastate.dat. Run 123 has a node that will not
 start for this in 59 of its 632 timelines; run 58 (`jepsen`) in 27 of 532; run 97 in 1 of 299.
+Such a group also declares every member synced, whatever its data: in hunt run 148 (timeline 608
+and its lineage) n3's rsync SST was cut at 75 s, the three nodes restored their component under
+the nil history at 85.82 s (`found: 3`), n3 was `SYNCED (TO: 0)` with no transfer, and its InnoDB
+refused the half-copied directory (`log sequence number 70661 is in the future`): all eight of
+that run's crashes.
 
 In the code (Galera's 4.x head): a first component of a single bootstrapping node with no
 history gets a new history UUID (`gcs_group.cpp`, "Starting new group from scratch"); a
@@ -211,6 +216,10 @@ will say whether it still happens.
   writes no page before its redo is durable (`log_write_up_to(lsn, true)` on both of 12.1.2's
   page write paths, buf0flu.cc and buf0dblwr.cc), and the page "in the future" was another
   node's.
+- Hunt run 148 (srv3, 2026-10-29, `jepsen`, seed 3, `--horizon 60s`): 954 timelines in the hour
+  (run 97: 299) but no more behaviors (52 against 53, behind all along) and the EVS abort in 5
+  timelines (run 97: 16): the horizon did not pay (docs/PLAN.md). Its 8 crash failures are one
+  lineage, the nil-history group above.
 - Final reads (2026-10-29, smokes of two timelines, seed 3): `jepsen-dirsync` failed them in one
   (run 154, timeline 1, the whole cluster crashed and came back with no position: the caveat
   above); `jepsen-recovered` passed them in both (run 158), every restart recovering its node's
