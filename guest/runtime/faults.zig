@@ -562,8 +562,10 @@ fn run_script(
         sleep_through_ns(start_ns + fault.at_ns -| monotonic_ns());
         if (stopping.load(.acquire)) break;
         // A fault of a node that is gone is skipped (clock skips and partitions into groups
-        // name no node).
-        const gone = fault.node.len > 0 and system.node(fault.node) == null;
+        // name no node). The runner is no node of the system's, and never gone: its links'
+        // faults ("degrade runner ...") were all skipped, the scripted timeline missing them.
+        const runner = std.mem.eql(u8, fault.node, "runner");
+        const gone = fault.node.len > 0 and !runner and system.node(fault.node) == null;
         if (gone) continue;
         apply(arena, system, fault);
         injections += 1;

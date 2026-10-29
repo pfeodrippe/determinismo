@@ -2738,16 +2738,53 @@ fn check_script(context: *Context) !void {
     const without = failing_count(try explore(context, &others));
     const scripted = others ++ [_][]const u8{ "--script", script_path };
     const with = failing_count(try explore(context, &scripted));
-    // Its own timeline, scripted: the same failure (the script holds what decided it). Whether
-    // other seeds fail more often with it than without is not a check: bank's bug is found in
-    // most timelines either way (6 of 8 without, 5 with, once), and 8 cannot tell them apart.
-    const own = try explore(context, &(common ++ [_][]const u8{ "--seed", "7", "--branch", index, "--script", script_path }));
-    var replayed: [1]Branch = undefined;
-    const reproduced = parse_branches(own, &replayed) == 1 and replayed[0].failing;
+    // Its own timeline, scripted, follows the script: the same commands and faults, in order.
+    // Not the same failure: a script fixes what the composer and the injector decided, the seed
+    // the rest, and the injector drawing nothing shifts every later draw of the guest's one
+    // stream (the drivers' accounts and amounts), so whether bank fails again is chance (it did
+    // at 18:45 on 2026-10-28, and did not in the full suite at 23:30). Whether other seeds fail
+    // more often with it than without is not a check either: bank's bug is found in most
+    // timelines either way (6 of 8 without, 5 with, once), and 8 cannot tell them apart.
+    const own_events = try std.fs.path.join(context.arena, &.{ context.scratch, "script-own-events.jsonl" });
+    _ = try explore(context, &(common ++ [_][]const u8{
+        "--seed", "7", "--branch", index, "--script", script_path, "--events", own_events,
+    }));
+    const followed = try run_kept(context, &.{ context.determinismo, "script", own_events });
+    const original = try script_shape(context.arena, extracted.stdout);
+    const own = try script_shape(context.arena, followed.stdout);
     expect_all(context, &.{
         .{ "other seeds fail with the script", with > 0 },
-        .{ "its own timeline, scripted, fails again", reproduced },
-    }, "script: other seeds fail with it ({d} of 8, {d} without), its own again", .{ with, without });
+        .{ "its own timeline, scripted, starts the script's commands, in order", std.mem.eql(u8, own.commands, original.commands) },
+        .{ "and applies the script's faults, in order", std.mem.eql(u8, own.faults, original.faults) },
+        .{ "a script with faults and commands", original.faults.len > 0 and original.commands.len > 0 },
+    }, "script: other seeds fail with it ({d} of 8, {d} without); its own timeline follows it ({d} commands, {d} faults)", .{
+        with, without, original.command_count, original.fault_count,
+    });
+}
+
+/// A script's commands (name and mode) and faults (kind and node), in order, one line each.
+fn script_shape(arena: std.mem.Allocator, text: []const u8) !struct {
+    commands: []const u8,
+    faults: []const u8,
+    command_count: usize,
+    fault_count: usize,
+} {
+    const Script = struct {
+        commands: []const struct { name: []const u8, mode: []const u8 } = &.{},
+        faults: []const struct { kind: []const u8, node: []const u8 = "" } = &.{},
+    };
+    const script = std.json.parseFromSliceLeaky(Script, arena, text, .{ .ignore_unknown_fields = true }) catch
+        return .{ .commands = "", .faults = "", .command_count = 0, .fault_count = 0 };
+    var commands: std.ArrayList(u8) = .empty;
+    for (script.commands) |command| try commands.print(arena, "{s} {s}\n", .{ command.name, command.mode });
+    var faults: std.ArrayList(u8) = .empty;
+    for (script.faults) |fault| try faults.print(arena, "{s} {s}\n", .{ fault.kind, fault.node });
+    return .{
+        .commands = commands.items,
+        .faults = faults.items,
+        .command_count = script.commands.len,
+        .fault_count = script.faults.len,
+    };
 }
 
 fn failing_count(report: []const u8) u32 {
