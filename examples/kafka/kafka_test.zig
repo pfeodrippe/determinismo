@@ -295,6 +295,24 @@ fn note(kind: []const u8, values: []const u64) void {
 const Outcome = enum { committed, aborted, failed, unknown };
 const Transaction = struct { outcome: Outcome, values: []const u64 };
 
+/// Whether a broker, as transaction coordinator, skipped the partition's markers taking it for
+/// deleted (KAFKA-20734's log line), from the brokers' output (the guest's node logs).
+fn markers_skipped(context: *System.Context, arena: std.mem.Allocator, partition: usize) bool {
+    var names: [2][]const u8 = undefined;
+    names[0] = std.fmt.allocPrint(arena, "{s}-{d})", .{ topic, partition }) catch return false;
+    names[1] = std.fmt.allocPrint(arena, "{s}-{d},", .{ topic, partition }) catch return false;
+    for ([_][]const u8{ "kafka-1", "kafka-2", "kafka-3" }) |broker| {
+        const path = std.fmt.allocPrint(arena, "/run/det/nodes/{s}/output.log", .{broker}) catch return false;
+        const text = std.Io.Dir.cwd().readFileAlloc(context.init.io, path, arena, .limited(1 << 28)) catch continue;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "these partitions are likely deleted already") == null) continue;
+            for (names) |name| if (std.mem.indexOf(u8, line, name) != null) return true;
+        }
+    }
+    return false;
+}
+
 fn everything_read(context: *System.Context) !void {
     const arena = context.init.arena.allocator();
     const log = std.Io.Dir.cwd().readFileAlloc(context.init.io, txns_path, arena, .limited(1 << 26)) catch |err| switch (err) {
@@ -325,10 +343,16 @@ fn everything_read(context: *System.Context) !void {
             producers = try arena.dupe(u8, client.request("producers {s} {d}", .{ topic, partition }) catch "no answer");
             break :reply offsets;
         } else |_| "no connection";
-        sdk.always(stable, "no transaction stays open once faults stop", .{
+        // A hang KAFKA-20734 explains (4.3.0, 4.4.0: a partition without a leader for a moment
+        // taken for deleted, its markers skipped; run 89) is that known bug's, counted apart, so
+        // a hunt of 4.4 sees the hangs it does not explain.
+        const explained = !stable and markers_skipped(context, arena, partition);
+        if (explained) sdk.event("kafka_known_hang", .{ .partition = partition, .issue = "KAFKA-20734" });
+        sdk.always(stable or explained, "no transaction stays open once faults stop", .{
             .partition = partition,
             .reply = reply,
             .producers = producers,
+            .known = explained,
         });
         // Hanging: aborted as Kafka's operators would (KIP-664), and the partition read past it,
         // so its writes count as aborted, not lost or torn: the rest is judged on its own (run

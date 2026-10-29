@@ -71,6 +71,9 @@ BOOTSTRAP
   # --unsafe-bypass-fsync=true: nothing synced, its durability untested (the first smoke ran so).
   # Production mode, as deployments run it.
   rpk redpanda mode production > /dev/null
+  # Redpanda refuses to start after 5 crashes in a row (crash_loop_limit) until an operator
+  # removes a file: faults kill brokers far more often (run 90: all three bricked so by 160 s).
+  rpk redpanda config set redpanda.crash_loop_limit 1000000 > /dev/null
   exec rpk redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M --check=false \
     --node-id "$id" \
     --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr "PLAINTEXT://kafka-$id:9092" \

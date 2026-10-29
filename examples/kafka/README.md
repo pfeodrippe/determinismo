@@ -53,7 +53,9 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   timeline kafka-1's controller looped from 101.9 s on "State machine for
   ntp={redpanda/controller/0} caught exception std::runtime_error (Reader cannot read before
   start of the log 0 < 19)", millions of times (4 GB of events): not a finding, its fsyncs
-  bypassed; to look for again in production mode.
+  bypassed; to look for again in production mode. start.sh also raises `crash_loop_limit`
+  (5 by default: after five unclean shutdowns in a row Redpanda refuses to start until an
+  operator removes a file): the faults killed all three brokers past it by 160 s (run 90).
 - `coverage`: the default's, on Java 25 with determinismo's coverage agent on the brokers'
   transaction path (the transaction coordinator, ReplicaManager, Partition, UnifiedLog):
   each of their source lines reports itself the first time it runs, and the tree returns to
@@ -156,7 +158,10 @@ the whole timeline (the coverage profile's slower brokers never got one).
   `kafka-dump-log.sh --transaction-log-decoder`, the same on kafka-1 and kafka-3): `t3506608`
   Empty (producer 19000, epoch 0) at offset 46, Ongoing on `jepsen-1` at 47, PrepareCommit at
   48 (the append the coordinator took for failed: written, then replicated), and PrepareAbort at
-  epoch 1 at 49 (a timeout rollback's): a load of it would have finished the abort. From 1418 s
+  epoch 1 at 49 (a timeout rollback's): a load of it would have finished the abort. kafka-2's
+  leader-epoch checkpoint then had epoch 40 begin at offset 50: what it wrote after those, as the
+  partition's leader with the empty cache, came after the abort, and the epoch-40 load knew
+  `t3506608` as producer 20000 alone. From 1418 s
   the empty cache answered `t3506608`'s InitProducerId as a new transactional id: producer id
   20000, epoch 0, Empty; at 1419.96 s, its coordinator elected
   at epoch 40, kafka-2 loaded the partition again and finished it: "Initialized transactionalId
@@ -182,7 +187,9 @@ the whole timeline (the coverage profile's slower brokers never got one).
   transaction markers", 4.3.0, 4.4.0: `metadataCache.getPartitionLeaderEndpoint` returns None
   for an offline partition since the KRaft metadata cache's rewrite), a blocker with its fix
   merged and not yet released (2026-10-28). Not new; in the latest release, and found in the
-  second timeline of a four-timeline smoke.
+  second timeline of a four-timeline smoke. Since, a hang whose partition a coordinator logged
+  as skipped this way is KAFKA-20734's: the property holds, a `kafka_known_hang` event counts
+  it, and only the hangs it does not explain fail.
 - Not a finding, a platform bug: hunt run 67 (default profile) failed "every write of a
   committed transaction is read" in timeline 111, 92 committed transactions on no broker. A
   durable crash with two of kafka-3's threads at durability points crashed it twice; the
