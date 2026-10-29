@@ -52,10 +52,10 @@ bugs are. Status: ✅ running, 🟡 next, blank later.
 | ScyllaDB | 4.2-rc3 (2020) | LWT split-brain (healthy clusters, then with membership changes), aborted LWT reads, non-isolated writes | cas-register, list-append, counter, batch | ✅ rediscovered blind (srv2, seed 3, examples/scylla: 4.2.rc3, Jepsen's configuration and LWT list-append, our own CQL client): #7258, an LWT batch answered Unavailable whose appends were read (G1a, dirty update), 1 of the first 99 timelines (and 3 of 416 in seed 5's hunt); the power-loss question was determinismo's (README) |
 | Redis (Raft, Sentinel, Valkey) | Redis-Raft (2020), 2013/2014 posts | Redis-Raft: data loss on failover, split-brain, stale and aborted reads; Sentinel/WAIT lose writes by design | append, raft, cluster | Valkey cluster, Redis 8 |
 | TigerBeetle | 0.16.11 (2025) | crashes, latencies under single faults, a query predicate bug; strong against disk corruption | transfer, idempotence, lifecycle | interesting: Zig, deterministic itself |
-| RabbitMQ | 2014 post | lost messages with mirrored queues under partitions | queue | quorum queues today |
-| ZooKeeper | 2013 post | sync+read not linearizable in edge cases | register | |
+| RabbitMQ | 2014 post | lost messages with mirrored queues under partitions | queue | 🟡 examples/rabbitmq (4.1.4, a quorum queue, Jepsen's queue checks); found blind in its first timelines: a node that never boots again after a power loss soon after its first boot (an empty feature_flags file) |
+| ZooKeeper | 2013 post | sync+read not linearizable in edge cases | register | 🟡 examples/zookeeper (3.9.6; `known`: 3.9.1, before ZOOKEEPER-4785's fix), list-append in multis, Elle |
 | Consul | 2014 post | stale reads (fixed with consistent mode) | register | BUSL |
-| Elasticsearch / OpenSearch | 1.1.0, 1.5.0 posts | lost inserts and updates on partitions, pauses, crashes | sets, dirty read | OpenSearch (Apache 2.0) |
+| Elasticsearch / OpenSearch | 1.1.0, 1.5.0 posts | lost inserts and updates on partitions, pauses, crashes | sets, dirty read | 🟡 examples/opensearch (OpenSearch 3.9.0: list-append on documents with optimistic concurrency, Elle) |
 | Aerospike | 3.99 (2018), 3.5.4 post | lost updates with more than k crashes or 27 s of pause/skew; a write reported failed that succeeded | cas-register, counter, set | Community edition |
 | Hazelcast | 3.8.3 (2017) | maps, locks, queues, atomics and ID generators unsafe under partitions | lock, queue, map, ids | |
 | Apache Ignite | (suite only) | | bank, register | |
