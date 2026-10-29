@@ -61,6 +61,35 @@ event hashing, the guest module.
 
 ## Open issues (2026-10-29)
 
+- Smokes of the new systems (2026-10-29, late): ClickHouse Keeper and Ignite pass; rqlite's
+  image failed to build (`chmod` as the image's own user: `COPY --chmod` now); SurrealDB never
+  got past "still starting up" in 750 s, every write refused by TiKV as disk full (its 5 GB
+  default reserve on a smaller disk: `reserve-space` and `reserve-raft-space` 0 now, TiDB's
+  too); both queued again. Galera's run 202 (`jepsen-recovered`) lost committed appends in 3
+  timelines, all Galera's documented trade-off (the log flushed once a second, every node holding
+  the newest commits failing within it; README): `default` and `jepsen-recovered` flush at
+  every commit now. JVMs: Ignite's C2 compiler had a third of a server's CPU 150 s in, every
+  timeline compiling again from the setup snapshot; a `c1` profile (TieredStopAtLevel=1)
+  measured against the default, side by side.
+
+- Runs hung at their budget's end (found 2026-10-29, fixed): past the time budget no generation
+  is judged, so finished timelines' summaries filled their slots, and the next one went unread;
+  its worker blocked writing it (other forked processes held the pipe's read end, so the close
+  never reached it) while the explorer waited for it to exit. Redpanda's run 177 sat so for
+  eleven hours with 107 GB of holders, Group Replication's run 200 from its budget's end,
+  stalling the hunt queue behind it. The explorer reads every summary now, dropping (and its
+  holders) one with no slot. Next: an e2e check that runs past its budget with more timelines
+  finishing than a generation holds.
+
+- Timelines past the hour (2026-10-29): the composer draws 4 to 63 driver starts and a
+  parallelism of 1 to 32, so many starts one at a time of a slow system's drivers ran on until
+  the timeline limit (1 h), and failed "the guest finishes its scenario" though every command
+  progressed: Redpanda's run 177 had a median timeline of 20 minutes and a tenth at the hour,
+  Group Replication's run 200 one (timeline 222, commands starting to the end). No driver starts
+  past half the limit now (`det.timeline_limit_ms` on the guest's command line, a
+  `drivers_stopped` event); those running finish, then the ending and the checks. Next: how
+  many timelines an hour Redpanda's next hunt runs.
+
 - Assertions guide the tree (2026-10-29, on by default, Antithesis's sometimes-assertions page):
   a `sometimes` or `reachable` made true weighs 4 times another new behavior in a timeline's
   novelty, its moment is the frontier's return point ahead of rarer output lines, and its
@@ -870,8 +899,13 @@ places, and assertions carry no location.
   (little: a busy-wait), clock reads per virtual second, and CPU time by node (det-init's
   `node_cpu` events; serve's "CPU by node"); the live status carries the first three. Cassandra's
   smoke: 0.46 virtual per wall second, x 3 nodes 1.4; 38,000 clock reads per virtual second, 98%
-  in KVM's fastpath (not what slows it). Next: the idle share and CPU by node of each system's
-  next run, and what the slow ones (Cassandra, Redpanda, YugabyteDB) spend it on.
+  in KVM's fastpath (not what slows it). First figures (smokes, 2 timelines each): ClickHouse
+  Keeper 0.76 virtual per wall second (x 4 nodes 3.0), 27% idle, 83,000 clock reads per virtual
+  second; Ignite 0.68 (x 4: 2.7), 8% idle (the three servers 30%, 30% and 28% busy, the client
+  5%), 47,000 clock reads: its JVMs hardly ever let the guest idle, being profiled. The run
+  page computes the per-node figure from a summary's nodes. Next: the idle share and CPU by
+  node of each system's next run, and what the slow ones (Cassandra, Redpanda, YugabyteDB)
+  spend it on.
 - Background work test-sized (2026-10-29): CockroachDB's ranges split at 64 KiB (512 MiB by
   default) and its time series off; YugabyteDB current's automatic tablet splitting from 128
   KiB (memtables flushed at 128 KiB); ScyllaDB current's keyspace on tablets (it was

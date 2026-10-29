@@ -57,14 +57,25 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn describe(d: *System.Describe) !void {
-    inline for (.{ .{ "default", false }, .{ "power-loss", true } }) |entry| {
+    // `c1` (an experiment): the JVMs' JIT stopped at C1, cheap to compile (C2 compiled for a third
+    // of a server's CPU time 150 s in, every timeline compiling again what it first runs).
+    // `warm` (an experiment): the default, its setup warming the JVMs up (warm_up).
+    inline for (.{
+        .{ "default", false, "" },
+        .{ "power-loss", true, "" },
+        .{ "c1", false, "-XX:TieredStopAtLevel=1" },
+        .{ "warm", false, "" },
+    }) |entry| {
         const profile = try d.profile(entry[0]);
         const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/ignite/Dockerfile" };
         inline for (.{ "n1", "n2", "n3" }, 1..) |name, id| {
             profile.node(@field(System.Name, name), .{
                 .build = build,
                 .command = &.{ "server", std.fmt.comptimePrint("{d}", .{id}) },
-                .env = &.{"IGNITE_RAFT_FSYNC=" ++ (if (entry[1]) "true" else "false")},
+                .env = if (entry[2].len == 0)
+                    &[_][]const u8{"IGNITE_RAFT_FSYNC=" ++ (if (entry[1]) "true" else "false")}
+                else
+                    &[_][]const u8{ "IGNITE_RAFT_FSYNC=" ++ (if (entry[1]) "true" else "false"), "JAVA_TOOL_OPTIONS=" ++ entry[2] },
                 // The cluster port, open at once: clients are served only once the cluster is
                 // initialized (setup), which needs all three.
                 .ready = .{ .tcp = cluster_port },
@@ -124,7 +135,28 @@ fn cluster_setup(context: *System.Context) !void {
     try client.open(context);
     defer client.connection.close();
     _ = try sdk.retry(setup_attempts_max, 500, table_create, .{&client});
+    if (std.mem.eql(u8, context.profile, "warm")) warm_up(context.init.arena.allocator(), &client);
 }
+
+/// Transactions before the setup snapshot, on keys the drivers never use and in no history: the
+/// JVMs compile the transaction paths once a run, the snapshot keeping the compiled code,
+/// instead of in every timeline (C2 had a third of a server's CPU 150 s into a timeline).
+fn warm_up(arena: std.mem.Allocator, client: *Client) void {
+    for (0..warm_transactions) |sequence| {
+        const mops = [_]Mop{
+            .{ .append = true, .key = warm_key_base + sequence % warm_keys, .value = sequence },
+            .{ .append = false, .key = warm_key_base + (sequence + 1) % warm_keys, .value = 0 },
+        };
+        var reads: [mops_max]?[]const u64 = @splat(null);
+        _ = run(arena, client, &mops, &reads);
+    }
+    sdk.event("warmed_up", .{ .transactions = warm_transactions });
+}
+
+const warm_transactions = 2000;
+const warm_keys = 64;
+/// Far above the drivers' keys (virtual seconds over the window).
+const warm_key_base = 1 << 40;
 
 fn cluster_init(address: [4]u8) !void {
     var buffer: [16 * 1024]u8 = undefined;
