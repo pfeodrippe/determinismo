@@ -16,8 +16,8 @@
 ;;
 ;; A strategy is a map in `strategies`: `:returns` gets the generation's candidates (each
 ;; timeline: its span and the behaviors it reached, with how many timelines reached them) and
-;; chooses up to `count` moments to branch from, each {:branch :vtime_ns :reason}; nil or [] leaves
-;; it to the explorer. `(use-strategy! :rarity)` switches; the control port takes "use <name>" (for
+;; chooses up to `count` moments to branch from, each {:branch :vtime_ns :reason} (fewer: the
+;; explorer fills the rest); nil or [] leaves it to the explorer. `(use-strategy! :rarity)` switches; the control port takes "use <name>" (for
 ;; scripts: bench/explore.py). Everything seen is kept for the REPL: `@generations` (candidates and
 ;; choices), `@ends` (each timeline's outcome and failing properties), and `(timeline n)` reads a
 ;; whole timeline's events from the events directory.

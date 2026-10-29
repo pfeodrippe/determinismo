@@ -3338,11 +3338,14 @@ fn tree_returns(
                 }),
             });
         }
-        if (list.items.len > 0) return list.items;
+        // Fewer moments than asked: the explorer's own choices fill the rest, so a strategy that
+        // knows only a few good moments costs the generation no depth (Tetris's deepest.py
+        // returned to one or two, and fresh games took the rest: run 161).
     }
-    for (chosen) |candidate| {
+    next: for (chosen) |candidate| {
         if (list.items.len == nodes) break;
         const summary = candidate.summary;
+        for (list.items) |taken| if (taken.branch == summary.index) continue :next;
         // Only moments before its last randomness pull lead elsewhere.
         const end_ns = @min(summary.end_ns, summary.last_pull_ns);
         const span = end_ns -| summary.start_ns;
