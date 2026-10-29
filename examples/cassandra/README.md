@@ -39,4 +39,10 @@ the write did not happen; a timeout, a write failure, a lost connection may have
 
 ## Status
 
-- 2026-10-29: written; first smoke next.
+- 2026-10-29: written. First smoke: n1 was ready only once a peer gossiped with it, and the
+  nodes start one after another (ready on the storage port since). Then (run 199, seed 1, 4
+  timelines): Elle and the final reads pass in all four, a committed append judged in every
+  one; timeline 2 lost n1 for good after a restart killed it while the image's entrypoint
+  rewrote cassandra.yaml in place (`cat` over it): truncated, "Missing required directive
+  CommitLogSync" at every start. The container's scaffolding, not Cassandra: start.sh restores
+  the shipped configuration first since.

@@ -15,6 +15,10 @@ export CASSANDRA_RPC_ADDRESS=$listen CASSANDRA_BROADCAST_RPC_ADDRESS=$listen
 export CASSANDRA_CLUSTER_NAME=jepsen CASSANDRA_ENDPOINT_SNITCH=SimpleSnitch
 export MAX_HEAP_SIZE=512M HEAP_NEWSIZE=128M
 config=/etc/cassandra/cassandra.yaml
+# From the shipped copy at every start: the image's entrypoint rewrites the configuration in
+# place (cat over it), and a node killed during that rewrite was left with a truncated one,
+# never to start again ("Missing required directive CommitLogSync", smoke run 199).
+cp /etc/cassandra/cassandra.yaml.shipped "$config"
 if [ "${CASSANDRA_COMMITLOG_SYNC:-periodic}" = batch ]; then
   sed -i -e 's/^commitlog_sync: periodic/commitlog_sync: batch/' -e 's/^commitlog_sync_period:/# commitlog_sync_period:/' "$config"
 fi
