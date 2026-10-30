@@ -136,7 +136,9 @@ use them in other repositories.
   that exited or whose filesystem went read-only starts again at the fault's end.
   `--faults +restart,+crash,+disk` adds kinds to every node (`+clock_skew`: one node's realtime
   clock ahead or behind for a while, for systems that order by clocks; any system, a Compose
-  project's too),
+  project's too), and `-interleave` takes one from every node (a run without it, to compare);
+  `interleave`, on by default, draws some of the scheduler's choices among a node's threads
+  for a while (a woken thread runs before its waker goes on, a random runnable one runs next),
   `--no-faults client,monitor` takes them all from some (an Antithesis launch's
   `exclude_faults`).
 - Efficiency (Antithesis's "virtual time per wall time"): every run reports how many virtual

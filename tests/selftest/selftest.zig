@@ -28,6 +28,9 @@
 //!   durability (profile "durable") faults at the echo node's durability points: a stall holds
 //!              its syncs; a crash at a sync loses the write when it comes before it, and keeps
 //!              it when it comes just after
+//!   interleave (profile "injectable") a race between a thread and the batch thread it wakes,
+//!              run in the echo node without and with the `interleave` fault: the kernel alone
+//!              settles it one way (the waker goes on), the fault both ways
 //!   aim        (profile "aimable") the driver aims the injector at the witness node
 //!              (sdk.fault_aim): about three of its pauses in four go there, the rest anywhere
 //!   records    a driver records numbers and their squares (sdk.record), and the host check
@@ -63,6 +66,7 @@ const quiet = sdk.schema.Faults{
     .throttle = false,
     .process_pause = false,
     .sync_stall = false,
+    .interleave = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -77,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
             .disk = disk,
             .writeback = writeback,
             .durability = durability,
+            .interleave = interleave_scenario,
             .inject = inject,
             .readdress = readdress,
             .hang = hang,
@@ -466,6 +471,43 @@ fn writeback_window(context: *System.Context) !void {
     sdk.always(status == 0 and kept, "a crash keeps what was written before a node's writeback " ++
         "window", .{ .written = status == 0, .kept = kept });
     sdk.stop_faults(0);
+}
+
+fn interleave_scenario(s: *System.Scenario) void {
+    s.singleton_driver("interleavings", interleavings);
+}
+
+const race_rounds = 400;
+
+/// The race without the `interleave` fault, then under it (every scheduling choice drawn), in a
+/// quiet period: only this fault.
+fn interleavings(context: *System.Context) !void {
+    const echo = context.nodes.echo.?;
+    sdk.stop_faults(600 * std.time.ns_per_s);
+    const plain = race_early(&echo) orelse return;
+    sdk.fault(.{ .kind = "interleave", .node = echo.name, .one_in = 1, .duration_ms = 2000 });
+    sdk.sleep_ms(100); // The injector applies it.
+    const drawn = race_early(&echo) orelse return;
+    sdk.event("races", .{ .rounds = race_rounds, .plain = plain, .interleaved = drawn });
+    sdk.always(plain < race_rounds / 50, "the kernel alone lets a waker go on before the batch thread it woke", .{
+        .early = plain,
+    });
+    sdk.always(drawn > race_rounds / 4 and drawn < race_rounds * 3 / 4, "under the interleave fault, a woken thread runs first about half the time", .{
+        .early = drawn,
+    });
+    sdk.sleep_ms(2500); // The fault ends: the module says how many choices it drew.
+    sdk.stop_faults(0);
+}
+
+/// How many of the race's rounds the woken thread ran first, from the node.
+fn race_early(echo: *const sdk.Node) ?u32 {
+    var buffer: [64]u8 = undefined;
+    var rounds_buffer: [16]u8 = undefined;
+    const rounds = std.fmt.bufPrint(&rounds_buffer, "{d}", .{race_rounds}) catch unreachable;
+    const result = echo.exec_output(&.{ "/bin/det-selftest-node", "race", rounds }, &buffer) catch return null;
+    const text = std.mem.trim(u8, result.output, " \n");
+    if (result.status != 0 or !std.mem.startsWith(u8, text, "early ")) return null;
+    return std.fmt.parseInt(u32, text["early ".len..], 10) catch null;
 }
 
 fn durability(s: *System.Scenario) void {

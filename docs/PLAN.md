@@ -179,13 +179,21 @@ event hashing, the guest module.
      returns that found a behavior new to the tree (`paid`), and ranks as one that many times
      rarer (rarity alone otherwise); each return's `why` says it. Next: measured against rarity
      alone on the Raft POC (findability), and Thompson sampling if the counts are too sparse.
-  6. Thread interleavings inside a node, from the guest's scheduler: a sched_ext (BPF)
-     scheduler drawing its choices from the platform's randomness, POS-style (partial-order
-     sampling; Fray's and Coyote's best in practice) or PCT with priority change points.
-     SECT (USENIX Security 2026) explores the kernel this way; syzkaller has the proposal
-     (#7997). The guest's 6.12 kernel has sched_ext, every node is a cgroup, and the kernel's
-     randomness already replays. Today only thread pauses reach this space (jank's output
-     capture race, Ignite's stuck intent are its kind).
+  6. Thread interleavings inside a node, from the guest's scheduler, POS-style (partial-order
+     sampling; Fray's and Coyote's best in practice). SECT (USENIX Security 2026) explores the
+     kernel this way; syzkaller has the proposal (#7997). Built (2026-10-30) as a fault,
+     `interleave`, on by default: a small patch to the fair class (guest/kernel/patches/0006,
+     no sched_ext: no BPF toolchain or loader in the guest) asks the guest module at its choices
+     within a cgroup, and for an armed node one in `one_in` is drawn (a woken thread runs first
+     or its waker goes on, a tick preempts, a random runnable thread runs next), from a
+     generator seeded from the platform at each fault. The selftest's `interleave` check: a
+     waker-wakee race the kernel alone settles one way (the woken thread a batch one) goes both
+     ways. Measured on its way: EEVDF lets a normal woken thread run before its waker goes on
+     about two times in five (164 and 158 of 400 rounds), the fault one in three. Next: the
+     membership smokes of round 3 run on it (ten systems), then findability with and without
+     it (`--faults -interleave`) on the Raft POC, seeds 4-6, queued after deploy 13 (its double
+     vote and log divergence are interleavings); PCT's priority change points if POS falls
+     short.
   7. Memory accesses where threads communicate: DataCollider (OSDI 2010; hardware data
      breakpoints on sampled accesses, then a delay: a conflicting access during it is a race,
      both threads caught at it), KCSAN's soft watchpoints, Snowboard's potential memory

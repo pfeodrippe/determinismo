@@ -36,8 +36,14 @@
 //! coming and going), {"kind": "restore"}, {"kind": "disk", "node": "db", "failure": "lost_writes"} (failures:
 //! errors, write_errors, lost_writes, corrupt_reads, slow with "delay_ms"); {"kind": "outage",
 //! "nodes": ["a", "b"]} (every node that allows crashes when none are named); restart, crash,
-//! durable_crash, wipe, stop, process_pause, thread_pause, process_kill, isolate and partition
-//! (with "peer") too.
+//! durable_crash, wipe, stop, process_pause, thread_pause, interleave (with "one_in"),
+//! process_kill, isolate and partition (with "peer") too.
+//!
+//! Interleavings (interleave): while the fault lasts, the guest kernel's scheduler leaves one in
+//! a few of its choices among the node's threads to the guest module, which draws them: a woken
+//! thread runs before its waker goes on (or not), a tick preempts the running thread, a random
+//! runnable thread runs next (guest/kernel/patches/0006). The interleavings inside a process
+//! that thread pauses reach only around one thread.
 //!
 //! Durability points (sync_stall, durable_crash): while the fault lasts, the guest module makes
 //! each of the node's fsyncs and sync writes a decision, and one in a few is picked. A stall
@@ -101,6 +107,9 @@ const Kind = enum {
     /// One thread of one of its processes stopped (ptrace), the others running: interleavings
     /// within a process, without instrumentation (Antithesis's thread pausing).
     thread_pause,
+    /// Its threads' scheduling drawn for a while (one choice in `one_in`): interleavings within
+    /// its processes, with no instrumentation (POS-style random priorities at each point).
+    interleave,
     process_kill,
     /// One pod of a Kubernetes node (Faults.pods) frozen, killed, cut off, or its network
     /// degraded, in its own network namespace.
@@ -497,7 +506,8 @@ const Applied = struct {
     why: Why = .drawn,
     disk: ?nodes.DiskFault = null,
     /// For durable_crash and sync_stall: one durability point in this many is picked; a crash
-    /// there is just after the sync or before it; a stall lasts up to stall_ms_max.
+    /// there is just after the sync or before it; a stall lasts up to stall_ms_max. For
+    /// interleave: one scheduling choice in this many is drawn.
     one_in: u32 = 0,
     after_sync: bool = false,
     stall_ms_min: u32 = 1,
@@ -603,6 +613,9 @@ fn draw(fault: *const Fault) Applied {
         .sync_stall => {
             applied.one_in = 1 + @as(u32, @intCast(sdk.random_below_named("fault.stall_one_in", 4)));
             applied.stall_ms_max = 1 + @as(u32, @intCast(sdk.random_below_named("fault.stall_ms", stall_ms_max)));
+        },
+        .interleave => {
+            applied.one_in = 1 + @as(u32, @intCast(sdk.random_below_named("fault.interleave_one_in", 4)));
         },
         .disk => {
             const failures = std.enums.values(nodes.DiskFailure);
@@ -737,6 +750,7 @@ fn faults_collect(
             faults_add(faults, &count, .{ .kind = .process_pause, .node = node.name });
             faults_add(faults, &count, .{ .kind = .thread_pause, .node = node.name });
         }
+        if (allowed.interleave) faults_add(faults, &count, .{ .kind = .interleave, .node = node.name });
         if (allowed.process_kill) {
             faults_add(faults, &count, .{ .kind = .process_kill, .node = node.name });
         }
@@ -838,6 +852,7 @@ fn apply(arena: std.mem.Allocator, system: *const schema.System, applied: *const
         .clock_skew,
         .process_pause,
         .thread_pause,
+        .interleave,
         .pod_pause,
         .pod_isolate,
         .pod_degrade,
@@ -949,6 +964,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .clock_skew => skew_begin(applied, &fault),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
+        .interleave => interleave_arm(applied.node, applied.one_in),
         else => unreachable,
     };
     started catch |err| {
@@ -1007,6 +1023,7 @@ fn node_end(system: *const schema.System, slot: *?NodeFault) void {
         .clock_skew => nodes.clock_offset(name, 0) catch {},
         .process_pause => _ = linux.kill(fault.pid, .CONT),
         .thread_pause => thread_release(fault.pid, fault.stopped),
+        .interleave => interleave_arm(name, 0) catch {},
         // The pod may be gone (killed, rescheduled), its cgroup and namespace with it: said.
         .pod_pause => fault.pod.write("cgroup.freeze", "0") catch |err| if (fault.pod.exists()) {
             sdk.event("fault_heal_failed", .{ .node = name, .pod = fault.pod.name(), .err = @errorName(err) });
@@ -1487,7 +1504,7 @@ var durable_lock: std.atomic.Mutex = .unlocked;
 var durable_active: [schema.nodes_max]bool = @splat(false);
 /// The node crashed at a durability point during its fault (it starts again at the end).
 var durable_crashed: [schema.nodes_max]bool = @splat(false);
-var durable_device: linux.fd_t = -1;
+var module_device: linux.fd_t = -1;
 var durable_listening: bool = false;
 
 fn node_index_of(system: *const schema.System, name: []const u8) ?usize {
@@ -1514,12 +1531,16 @@ fn durable_lock_take() void {
     }
 }
 
+/// The guest module's device, opened once.
+fn device_open() !void {
+    if (module_device >= 0) return;
+    const fd = linux.open(sdk.device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return error.NoDevice;
+    module_device = @intCast(fd);
+}
+
 fn durable_arm(applied: *const Applied) !void {
-    if (durable_device < 0) {
-        const fd = linux.open(sdk.device_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-        if (linux.errno(fd) != .SUCCESS) return error.NoDevice;
-        durable_device = @intCast(fd);
-    }
+    try device_open();
     if (!durable_listening) {
         const listener = try std.Thread.spawn(.{}, durable_listen, .{});
         listener.detach();
@@ -1544,12 +1565,12 @@ fn durable_arm(applied: *const Applied) !void {
         defer durable_lock.unlock();
         durable_active[index] = true;
     }
-    const armed = linux.ioctl(durable_device, ioctl_durability_arm, @intFromPtr(&arm));
+    const armed = linux.ioctl(module_device, ioctl_durability_arm, @intFromPtr(&arm));
     if (linux.errno(armed) != .SUCCESS) return error.ArmFailed;
 }
 
 fn durable_disarm(name: []const u8) void {
-    if (durable_device < 0) return;
+    if (module_device < 0) return;
     var arm: DurabilityArm = .{
         .cgroup = node_cgroup(name) catch return,
         .one_in = 0,
@@ -1558,7 +1579,27 @@ fn durable_disarm(name: []const u8) void {
         .stall_ms_max = 0,
         .node = @splat(0),
     };
-    _ = linux.ioctl(durable_device, ioctl_durability_arm, @intFromPtr(&arm));
+    _ = linux.ioctl(module_device, ioctl_durability_arm, @intFromPtr(&arm));
+}
+
+const ioctl_interleave_arm = 0xde04;
+
+const InterleaveArm = extern struct {
+    cgroup: u64 align(1),
+    one_in: u32 align(1),
+    reserved: u32 align(1) = 0,
+    node: [32]u8 align(1),
+};
+
+/// Arms the node's interleavings (one scheduling choice in `one_in` drawn), or disarms them
+/// with 0: the module then says how many it drew (an `interleaved` event).
+fn interleave_arm(name: []const u8, one_in: u32) !void {
+    try device_open();
+    var arm: InterleaveArm = .{ .cgroup = try node_cgroup(name), .one_in = one_in, .node = @splat(0) };
+    const length = @min(name.len, arm.node.len - 1);
+    @memcpy(arm.node[0..length], name[0..length]);
+    const armed = linux.ioctl(module_device, ioctl_interleave_arm, @intFromPtr(&arm));
+    if (linux.errno(armed) != .SUCCESS) return error.ArmFailed;
 }
 
 /// The listener: each ask of a durability point, its node crashed there.
@@ -1566,7 +1607,7 @@ fn durable_listen() void {
     const system = system_active orelse return;
     while (true) {
         var request: DurabilityRequest = undefined;
-        const asked = linux.ioctl(durable_device, ioctl_durability_wait, @intFromPtr(&request));
+        const asked = linux.ioctl(module_device, ioctl_durability_wait, @intFromPtr(&request));
         if (linux.errno(asked) == .INTR) continue;
         if (linux.errno(asked) != .SUCCESS) return;
         const node = for (system.nodes, 0..) |node, index| {
@@ -2305,7 +2346,8 @@ const Request = struct {
     /// `power` false are killed (none named: every node that allows restarts).
     nodes: []const []const u8 = &.{},
     power: bool = true,
-    /// durable_crash and sync_stall: one durability point in `one_in` is picked.
+    /// durable_crash and sync_stall: one durability point in `one_in` is picked; interleave: one
+    /// scheduling choice in `one_in` is drawn.
     one_in: u32 = 1,
     after_sync: bool = false,
     stall_ms_min: u32 = 1,
@@ -2407,6 +2449,7 @@ fn injected_applied(system: *const schema.System, request: *const Request) !Appl
             }
             if (std.mem.count(bool, &applied.outage, &.{true}) < 2) return error.FewerThanTwoNodes;
         },
+        .interleave => applied.one_in = @max(request.one_in, 1),
         .durable_crash, .sync_stall => {
             applied.one_in = @max(request.one_in, 1);
             applied.after_sync = request.after_sync;

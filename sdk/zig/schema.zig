@@ -231,6 +231,11 @@ pub const Faults = struct {
     clock_skew_ms_max: u32 = 10_000,
     /// Stop one of its processes (SIGSTOP) for a while.
     process_pause: bool = true,
+    /// Draw its threads' scheduling for a while: at one scheduling point in a few, a woken
+    /// thread runs before its waker goes on (or not), a tick preempts the running thread, a
+    /// random runnable thread runs next. Interleavings inside its processes (a check-then-act
+    /// between threads, a callback racing its registration), no instrumentation needed.
+    interleave: bool = true,
     /// Kill one of its processes other than its main one (SIGKILL), as a crash its supervisor
     /// must recover from (a worker, a pod's process under kubelet).
     process_kill: bool = false,

@@ -75,7 +75,10 @@ Everything below is exercised by `zig build e2e` (real VMs on the patched KVM).
   (`crash`: a node's ext4 disk keeps what was synced) and wipes; disk faults (`disk`: every I/O
   failing, writes failing, writes acknowledged and never stored, corrupted reads, or a slow
   disk, through device-mapper); faults at durability points (a node's fsyncs held for a while,
-  `sync_stall`, or a power loss right at one, `durable_crash`); graceful stops; clock skips, some
+  `sync_stall`, or a power loss right at one, `durable_crash`); interleavings (`interleave`: the
+  guest kernel's scheduler leaves some of its choices among a node's threads to the platform, so
+  a woken thread runs before its waker goes on, or a random one runs next); graceful stops; clock
+  skips, some
   permanent; per-node clock skews (`clock_skew`: one node's realtime clock ahead or behind, the
   others' as they were, as Jepsen's clock bumps: each node in its own time namespace, a guest
   kernel patch giving those a realtime offset); faults aimed at the node a scenario names

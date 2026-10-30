@@ -188,20 +188,19 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "parallel", check_parallel },             .{ "fork", check_fork },
         .{ "tree", check_tree },                     .{ "disk", check_disk },
         .{ "durability", check_durability },         .{ "mutate", check_mutate },
-        .{ "checks", check_host_checks },            .{ "inject", check_inject },
-        .{ "aim", check_aim },                       .{ "compose", check_compose },
-        .{ "shards", check_shards },                 .{ "stress", check_stress },
-        .{ "controller", check_controller },         .{ "clojure", check_clojure },
-        .{ "k3s", check_k3s },                       .{ "script", check_script },
-        .{ "modulation", check_cpu_modulation },     .{ "profile", check_profile },
-        .{ "catalog", check_catalog },               .{ "guidance", check_guidance },
-        .{ "voidstar", check_voidstar },             .{ "changed", check_changed },
-        .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
-        .{ "hang", check_hang },                     .{ "pinned", check_pinned },
-        .{ "slow", check_slow },                     .{ "sought", check_sought },
-        .{ "optimize", check_optimize },
-        .{ "states", check_states },
-        .{ "spare", check_spare },
+        .{ "interleave", check_interleave },         .{ "checks", check_host_checks },
+        .{ "inject", check_inject },                 .{ "aim", check_aim },
+        .{ "compose", check_compose },               .{ "shards", check_shards },
+        .{ "stress", check_stress },                 .{ "controller", check_controller },
+        .{ "clojure", check_clojure },               .{ "k3s", check_k3s },
+        .{ "script", check_script },                 .{ "modulation", check_cpu_modulation },
+        .{ "profile", check_profile },               .{ "catalog", check_catalog },
+        .{ "guidance", check_guidance },             .{ "voidstar", check_voidstar },
+        .{ "changed", check_changed },               .{ "readdress", check_readdress },
+        .{ "retroactive", check_retroactive },       .{ "hang", check_hang },
+        .{ "pinned", check_pinned },                 .{ "slow", check_slow },
+        .{ "sought", check_sought },                 .{ "optimize", check_optimize },
+        .{ "states", check_states },                 .{ "spare", check_spare },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -1670,7 +1669,7 @@ fn check_builtin_properties(context: *Context) !void {
     }, "mutation: the tests pass on the system and catch its mutant", .{});
     const exit_events = try std.fs.path.join(context.arena, &.{ context.scratch, "node-exit-events.jsonl" });
     const crash = try explore(context, &.{
-        "--program", program, "--scenario", "node_exit", "--seed", "1", "--branch", "0",
+        "--program", program,     "--scenario", "node_exit", "--seed", "1", "--branch", "0",
         "--events",  exit_events,
     });
     const caught = std.mem.indexOf(u8, crash, "FAIL \"no unexpected container exits\"") != null;
@@ -1712,7 +1711,7 @@ fn check_builtin_properties(context: *Context) !void {
     }, "built-in properties catch an OOM kill in a node", .{});
     const crash_events = try std.fs.path.join(context.arena, &.{ context.scratch, "crash-events.jsonl" });
     const crashed = try explore(context, &.{
-        "--program", program, "--scenario", "crash", "--seed", "1", "--branch", "0",
+        "--program", program,      "--scenario", "crash", "--seed", "1", "--branch", "0",
         "--events",  crash_events,
     });
     const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
@@ -2561,6 +2560,47 @@ fn check_durability(context: *Context) !void {
     }) catch ""});
 }
 
+/// The `interleave` fault: a race between a thread and the one it wakes, which the guest
+/// kernel alone settles one way, goes both ways under it (the scheduler's choices drawn by the
+/// guest module, guest/kernel/patches/0006), and a timeline replays exactly with them.
+fn check_interleave(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const common = [_][]const u8{
+        "--program", program, "--profile", "injectable", "--scenario", "interleave", "--seed", "1",
+    };
+    const events = try std.fmt.allocPrint(context.arena, "{s}/interleave-events", .{context.scratch});
+    const report = try explore(context, &(common ++ [_][]const u8{ "--branches", "2", "--events-dir", events }));
+    const properties = [_][]const u8{
+        "the kernel alone lets a waker go on before the batch thread it woke",
+        "under the interleave fault, a woken thread runs first about half the time",
+    };
+    var lines: [properties.len + 1][]const u8 = undefined;
+    lines[0] = "2 branches, 0 with failing properties";
+    for (properties, lines[1..]) |property, *line| {
+        line.* = try std.fmt.allocPrint(context.arena, "hit in    2/2 branches, failing in    0  {s}", .{property});
+    }
+    const passes = has_lines(report, &lines);
+    const interleaved = try query_count(context, &.{ events, "event=interleaved" });
+    const idle = try query_count(context, &.{ events, "event=interleaved details.choices=0" });
+    var branches: [2]Branch = undefined;
+    const count = parse_branches(report, &branches);
+    var same = false;
+    if (count > 0) {
+        const replay = try explore(context, &(common ++ [_][]const u8{ "--branch", "0" }));
+        var replayed: [1]Branch = undefined;
+        same = parse_branches(replay, &replayed) == 1 and
+            same_timelines(&replayed, branches[0..count]);
+    }
+    expect_all(context, &.{
+        .{ "the race goes one way alone and both ways under the fault, in both timelines", passes },
+        .{ "each fault's end says how many choices it drew, never none", interleaved > 0 and idle == 0 },
+        .{ "a timeline replays exactly", same },
+    }, "interleavings: {d} faults ended, {d} with no choice drawn", .{ interleaved, idle });
+    if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
+        "FAIL", "fault_failed", "fault_inject_refused", "races", "always",
+    }) catch ""});
+}
+
 /// An objective (sdk.optimize) leads the tree where chance does not: a streak of 24 coin flips,
 /// out of reach in 256 timelines blind, reached optimized (the archive keeps the longest streak
 /// yet and returns to it).
@@ -2570,7 +2610,7 @@ fn check_optimize(context: *Context) !void {
     for ([_][]const u8{ "streak", "streak_blind" }, &won) |scenario, *count| {
         const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
         _ = try explore(context, &.{
-            "--program", program, "--scenario", scenario, "--seed", "1", "--branches", "256",
+            "--program",    program, "--scenario", scenario, "--seed", "1", "--branches", "256",
             "--events-dir", events,
         });
         count.* = try query_count(context, &.{ events, "event=streak_won" });
@@ -2619,8 +2659,8 @@ fn check_states(context: *Context) !void {
     for ([_][]const u8{ "state", "state_int" }, &solved) |scenario, *count| {
         const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
         _ = try explore(context, &.{
-            "--compose", "tests/antithesis-compat/java/compose.yaml", "--scenario", scenario,
-            "--seed",    "1",                                         "--branches", "256",
+            "--compose",    "tests/antithesis-compat/java/compose.yaml", "--scenario", scenario,
+            "--seed",       "1",                                         "--branches", "256",
             "--events-dir", events,
         });
         count.* = try query_count(context, &.{ events, "assert.message=\"the state maze is never solved\" assert.condition=false" });
@@ -2666,7 +2706,7 @@ fn check_slow(context: *Context) !void {
     const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
     const events = try std.fs.path.join(context.arena, &.{ context.scratch, "slow-events" });
     const report = try explore(context, &.{
-        "--program",        program, "--scenario", "slow", "--seed",       "1", "--branches", "8",
+        "--program",        program, "--scenario",  "slow", "--seed",       "1",    "--branches", "8",
         "--timeline-limit", "30s",   "--branching", "flat", "--events-dir", events,
     });
     var branches: [8]Branch = undefined;

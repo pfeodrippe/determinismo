@@ -16,7 +16,9 @@
 //! `realtime` prints the node's CLOCK_REALTIME in nanoseconds; `abs-sleep <ms>` waits until
 //! that clock's now + ms twice, a nanosleep then a futex, both absolute (TIMER_ABSTIME,
 //! FUTEX_CLOCK_REALTIME), and exits 0 if each took about that long on the monotonic clock (a
-//! node's skewed clock: its deadlines are its own time).
+//! node's skewed clock: its deadlines are its own time). `race <rounds>` races a thread and the
+//! one it wakes that many times and prints "early <n>": how many times the woken one ran before
+//! its waker went on (what the `interleave` fault changes).
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -79,6 +81,13 @@ pub fn main(init: std.process.Init) !void {
         other.join();
         linux.exit_group(0);
     }
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "race")) {
+        const rounds = std.fmt.parseInt(u32, arguments[2], 10) catch linux.exit_group(2);
+        var line_buffer: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buffer, "early {d}\n", .{race(rounds)}) catch unreachable;
+        _ = linux.write(1, line.ptr, line.len);
+        linux.exit_group(0);
+    }
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "custom-fault")) {
         const stop_faults = init.environ_map.get("ANTITHESIS_STOP_FAULTS") orelse "";
         const draw = sdk.random_below(1000);
@@ -131,6 +140,54 @@ fn synced_write(path: [*:0]const u8, content: []const u8) !void {
 }
 
 var started: std.atomic.Value(bool) = .init(false);
+
+/// The race: the round the waker announced, the round the woken thread finished, and the round
+/// whose next step the waker took.
+var race_round: std.atomic.Value(u32) = .init(0);
+var race_done: std.atomic.Value(u32) = .init(0);
+var race_stepped: std.atomic.Value(u32) = .init(0);
+var race_early: u32 = 0;
+
+/// `rounds` times, the waker announces a round, wakes the other thread and takes its next step;
+/// the woken one notes whether it ran before that step. The woken one is a batch thread
+/// (SCHED_BATCH), which the kernel alone never lets preempt at its wakeup (a normal one does, two
+/// times in five here): under the `interleave` fault, it runs first whenever the draw says so.
+fn race(rounds: u32) u32 {
+    const woken = std.Thread.spawn(.{}, race_woken, .{rounds}) catch linux.exit_group(1);
+    for (1..rounds + 1) |round_index| {
+        const round: u32 = @intCast(round_index);
+        race_round.store(round, .release);
+        futex_wake(&race_round);
+        race_stepped.store(round, .release);
+        while (race_done.load(.acquire) != round) futex_wait(&race_done, round - 1);
+    }
+    woken.join();
+    return race_early;
+}
+
+fn race_woken(rounds: u32) void {
+    const sched_batch = 3;
+    const parameters: i32 = 0; // struct sched_param: its priority, 0 for batch threads.
+    _ = linux.syscall3(.sched_setscheduler, 0, sched_batch, @intFromPtr(&parameters));
+    for (1..rounds + 1) |round_index| {
+        const round: u32 = @intCast(round_index);
+        while (race_round.load(.acquire) != round) futex_wait(&race_round, round - 1);
+        if (race_stepped.load(.acquire) != round) race_early += 1;
+        race_done.store(round, .release);
+        futex_wake(&race_done);
+    }
+}
+
+const futex_private = 128;
+
+/// Sleeps while `word` holds `value` (or returns at once if it no longer does).
+fn futex_wait(word: *const std.atomic.Value(u32), value: u32) void {
+    _ = linux.syscall4(.futex, @intFromPtr(&word.raw), futex_private | 0, value, 0);
+}
+
+fn futex_wake(word: *const std.atomic.Value(u32)) void {
+    _ = linux.syscall3(.futex, @intFromPtr(&word.raw), futex_private | 1, 1);
+}
 
 fn fsync_at_start(fd: linux.fd_t) void {
     started.store(true, .release);

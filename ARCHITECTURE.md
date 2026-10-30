@@ -182,7 +182,10 @@ vCPU threads pinned; `isolcpus`/`nohz_full` for VM cores; `mitigations=` and
   announced on the command line, no ACPI/PCI, no paravirtual clocks. Later, small patches for
   *steerability only* (determinism must never depend on them):
   - kernel RNG and vDSO `getrandom` pull from the platform;
-  - scheduler hooks for thread-starvation faults;
+  - scheduler hooks (patch 0006, implemented): the fair class asks the guest module at its
+    choices within a cgroup (which runnable entity runs next, whether a woken task preempts the
+    running one, whether a tick does); the module answers for armed nodes (the `interleave`
+    fault, below) and leaves the rest to EEVDF;
   - `CLOCK_REALTIME` offsets for clock-skip faults (RDTSC is unaffected, as in Antithesis);
   - per-node realtime offsets (patch 0005, implemented): each node runs in a time namespace of
     its own, and namespaces get a `realtime` offset (CLOCK_REALTIME, its coarse form and TAI)
@@ -348,6 +351,15 @@ pulls small, and only consult plugins for decision kinds they subscribed to.
   crashes the node there (it freezes the node, then disarms it, which releases the parked task
   into the freeze, then cuts the disk and kills it). Generic: any system's act-then-persist
   windows, whatever its language or store.
+- **Interleavings** (beyond Antithesis's thread pauses): while an `interleave` fault lasts, one in
+  `one_in` of the scheduler's choices among the node's threads is drawn by the guest module
+  (patch 0006): a woken thread runs before its waker goes on, or the waker goes on; a tick
+  preempts the running thread; a random runnable thread runs next (POS-style: random priorities
+  at each scheduling point, Fray's and Coyote's best in practice). The draws come from a
+  generator the module seeds from the platform at each arm: replayed, and new with each fault,
+  so branches part. The selftest's `interleave` check: a woken batch thread, which the kernel
+  alone never lets preempt its waker, runs first about half the time under the fault (a normal
+  thread does two times in five without it).
 - **Concurrency strategy** (later): trace memory accesses in instrumented code, find
   *communication points* (overlapping accesses from different threads, at least one a write;
   SKI / Project Zero's MAccConc), and preempt exactly there. Because the VM is deterministic, every

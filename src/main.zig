@@ -165,7 +165,8 @@ const usage =
     \\  (--program <test program> | --compose <compose.yaml> | --kubernetes <manifests dir>)
     \\  [--profile <name>|<a,b,..>|all]
     \\  [--scenario <name>|all] [--cache <dir>] [--script <script.json>]
-    \\  [--faults +restart,+crash,...]   (fault kinds every node also allows)
+    \\  [--faults +restart,+crash,-interleave,...]   (fault kinds every node also allows, or none
+    \\                            does: -)
     \\  [--no-faults <node>,...]   (nodes that get no faults: a client, a monitor)
     \\
     \\machine options:

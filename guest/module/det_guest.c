@@ -20,6 +20,10 @@
  *                        the node's crash there (see "Durability points" below)
  *   ioctl(fd, DET_IOCTL_DURABILITY_WAIT, &request)
  *                        sleeps until a durability point asks for its node's crash
+ *   ioctl(fd, DET_IOCTL_INTERLEAVE_ARM, &arm)
+ *                        arms (or, with one_in 0, disarms) a node's interleavings: one in
+ *                        `one_in` of the scheduler's choices among its threads is drawn here
+ *                        (see "Interleavings" below)
  *
  * And detfs (mount -t detfs detfs <dir>): a regular file, `output`, whose writes are those
  * events too. For SDKs that need a regular file (Antithesis's Go SDK truncates its output file,
@@ -52,6 +56,7 @@
 #define DET_IOCTL_WAIT_ACTION 0xde01
 #define DET_IOCTL_DURABILITY_ARM 0xde02
 #define DET_IOCTL_DURABILITY_WAIT 0xde03
+#define DET_IOCTL_INTERLEAVE_ARM 0xde04
 #define DET_MAX_DATA (PAGE_SIZE - 16)
 
 struct det_request {
@@ -78,6 +83,7 @@ static irqreturn_t det_interrupt(int irq, void *context)
 }
 
 static long det_durability_ioctl(unsigned int cmd, unsigned long arg);
+static long det_interleave_ioctl(unsigned long arg);
 
 static long det_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -85,6 +91,8 @@ static long det_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	if (cmd == DET_IOCTL_DURABILITY_ARM || cmd == DET_IOCTL_DURABILITY_WAIT)
 		return det_durability_ioctl(cmd, arg);
+	if (cmd == DET_IOCTL_INTERLEAVE_ARM)
+		return det_interleave_ioctl(arg);
 	if (cmd != DET_IOCTL_WAIT_ACTION)
 		return -ENOTTY;
 	if (wait_event_interruptible(det_actions, atomic_xchg(&det_action_pending, 0)))
@@ -472,6 +480,122 @@ static long det_durability_ioctl(unsigned int cmd, unsigned long arg)
 	return arm.one_in && free < 0 ? -ENOSPC : 0;
 }
 
+/* Interleavings --------------------------------------------------------------------------- */
+
+/*
+ * The `interleave` fault: while a node is armed, the fair scheduler asks det_interleave_choose
+ * at its choices among the node's threads (guest/kernel/patches/0006): which runnable one runs
+ * next, whether a woken one runs before its waker goes on, whether a tick preempts the running
+ * one. One choice in `one_in` is drawn here (POS-style: random priorities at each scheduling
+ * point), the others left to EEVDF. The draws come from a generator seeded from the platform at
+ * each arm: replayed with the timeline, and new with each fault, so branches part.
+ */
+
+struct det_interleave_arm {
+	u64 cgroup;		/* The node's cgroup (its directory's inode number in cgroup2). */
+	u32 one_in;		/* A choice drawn at one scheduling point in this many; 0 disarms. */
+	u32 reserved;
+	char node[32];		/* For events. */
+} __packed;
+
+extern int (*det_sched_choose)(struct cgroup *cgroup, unsigned int choices);
+
+static DEFINE_SPINLOCK(det_interleave_lock);
+static struct det_interleave_arm det_interleaved[DET_DURABILITY_NODES];
+static u64 det_interleave_drawn[DET_DURABILITY_NODES];
+static int det_interleaved_count;
+static u64 det_interleave_state = 1;
+
+/* xorshift64*: the scheduler's draws between the platform's seeds. */
+static u64 det_interleave_next(void)
+{
+	u64 x = det_interleave_state;
+
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	det_interleave_state = x;
+	return x * 0x2545f4914f6cdd1dULL;
+}
+
+/*
+ * Called by the scheduler, its runqueue locked and interrupts off. One vCPU: nothing runs
+ * meanwhile, and the ioctl changes the table with interrupts off, so no lock is needed here.
+ */
+static int det_interleave_choose(struct cgroup *cgroup, unsigned int choices)
+{
+	u64 draw;
+	int i;
+
+	if (!READ_ONCE(det_interleaved_count))
+		return -1;
+	for (; cgroup; cgroup = cgroup_parent(cgroup)) {
+		u64 ino = cgroup_ino(cgroup);
+
+		for (i = 0; i < DET_DURABILITY_NODES; i++) {
+			if (!det_interleaved[i].one_in || det_interleaved[i].cgroup != ino)
+				continue;
+			draw = det_interleave_next();
+			if ((u32)draw % det_interleaved[i].one_in)
+				return -1;
+			det_interleave_drawn[i]++;
+			return (draw >> 32) % choices;
+		}
+	}
+	return -1;
+}
+
+static void det_emit_interleaved(const char *node, u64 drawn)
+{
+	mutex_lock(&det_lock);
+	req->op = DET_OP_EMIT;
+	req->len = scnprintf((char *)req->data, DET_MAX_DATA,
+			     "{\"event\":\"interleaved\",\"details\":{\"node\":\"%.32s\","
+			     "\"choices\":%llu}}",
+			     node, drawn);
+	req->result = 0;
+	det_call();
+	mutex_unlock(&det_lock);
+}
+
+static long det_interleave_ioctl(unsigned long arg)
+{
+	struct det_interleave_arm arm;
+	unsigned long flags;
+	u64 seed = 0, drawn = 0;
+	bool ended = false;
+	int i, free = -1, count = 0;
+
+	if (copy_from_user(&arm, (void __user *)arg, sizeof(arm)))
+		return -EFAULT;
+	arm.node[sizeof(arm.node) - 1] = 0;
+	if (arm.one_in)
+		seed = det_pull();
+	spin_lock_irqsave(&det_interleave_lock, flags);
+	for (i = 0; i < DET_DURABILITY_NODES; i++) {
+		if (det_interleaved[i].one_in && det_interleaved[i].cgroup == arm.cgroup) {
+			det_interleaved[i].one_in = 0; /* Replaced (or disarmed). */
+			drawn = det_interleave_drawn[i];
+			ended = true;
+		}
+		if (!det_interleaved[i].one_in && free < 0)
+			free = i;
+	}
+	if (arm.one_in && free >= 0) {
+		det_interleaved[free] = arm;
+		det_interleave_drawn[free] = 0;
+		det_interleave_state = seed | 1; /* Never 0: xorshift's fixed point. */
+	}
+	for (i = 0; i < DET_DURABILITY_NODES; i++)
+		count += det_interleaved[i].one_in != 0;
+	WRITE_ONCE(det_interleaved_count, count);
+	spin_unlock_irqrestore(&det_interleave_lock, flags);
+	/* How many choices it drew, for the fault's end (none: its threads never competed). */
+	if (ended && !arm.one_in)
+		det_emit_interleaved(arm.node, drawn);
+	return arm.one_in && free < 0 ? -ENOSPC : 0;
+}
+
 static const struct file_operations det_fops = {
 	.owner = THIS_MODULE,
 	.read = det_read,
@@ -565,6 +689,7 @@ static int __init det_init(void)
 	err = register_kprobe(&det_fsync_probe);
 	if (err)
 		goto filesystem;
+	WRITE_ONCE(det_sched_choose, det_interleave_choose);
 	return 0;
 filesystem:
 	unregister_filesystem(&detfs_type);
@@ -578,6 +703,8 @@ irq:
 
 static void __exit det_exit(void)
 {
+	WRITE_ONCE(det_sched_choose, NULL);
+	synchronize_rcu(); /* The scheduler's calls run with preemption off. */
 	unregister_kprobe(&det_fsync_probe);
 	unregister_filesystem(&detfs_type);
 	misc_deregister(&det_dev);

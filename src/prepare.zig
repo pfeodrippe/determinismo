@@ -719,17 +719,19 @@ fn json(arena: std.mem.Allocator, value: anytype) ![]const u8 {
 }
 
 /// Builds the image (podman reuses its layer cache) and returns its ID.
-/// Fault kinds added to every node (by field name: restart, crash, wipe, process_kill, ...),
-/// then none at all for the nodes named in `faults_none`.
+/// Fault kinds added to every node (by field name: restart, crash, wipe, process_kill, ...), or
+/// with a "-" taken from every node (-interleave: a run without it, to compare), then none at
+/// all for the nodes named in `faults_none`.
 fn faults_adjust(faults: *schema.Faults, name: []const u8, options: Options) !void {
     if (options.faults_added) |list| {
         var kinds = std.mem.tokenizeScalar(u8, list, ',');
         kinds: while (kinds.next()) |kind_text| {
-            const kind = std.mem.trimStart(u8, kind_text, "+");
+            const taken = std.mem.startsWith(u8, kind_text, "-");
+            const kind = std.mem.trimStart(u8, kind_text, "+-");
             const info = @typeInfo(schema.Faults).@"struct";
             inline for (info.field_names, info.field_types) |field, Type| {
                 if (Type == bool and std.mem.eql(u8, field, kind)) {
-                    @field(faults, field) = true;
+                    @field(faults, field) = !taken;
                     continue :kinds;
                 }
             }

@@ -1,0 +1,118 @@
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5486,6 +5486,13 @@
+ {
+ 	if (cfs_rq->next == se)
+ 		__clear_buddies_next(se);
++	if (cfs_rq->det_next == se) {
++		for_each_sched_entity(se) {
++			if (cfs_rq_of(se)->det_next != se)
++				break;
++			cfs_rq_of(se)->det_next = NULL;
++		}
++	}
+ }
+ 
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
+@@ -5656,6 +5663,43 @@
+ }
+ 
+ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags);
++
++/*
++ * determinismo: a module may steer the fair class's choices within a cgroup (det_guest.ko's
++ * `interleave` fault): which runnable entity runs next, whether a woken task preempts the
++ * running one, whether a tick preempts it. It returns an index below `choices`, or -1 to leave
++ * the choice to EEVDF. Unset, or -1, and nothing changes. Steering only: the module draws its
++ * choices from the platform's randomness, so a timeline replays with them.
++ */
++int (*det_sched_choose)(struct cgroup *cgroup, unsigned int choices) __read_mostly;
++EXPORT_SYMBOL_GPL(det_sched_choose);
++
++static int det_choose(struct cfs_rq *cfs_rq, unsigned int choices)
++{
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	int (*choose)(struct cgroup *cgroup, unsigned int choices) = READ_ONCE(det_sched_choose);
++
++	if (choose && choices >= 2)
++		return choose(cfs_rq->tg->css.cgroup, choices);
++#endif
++	return -1;
++}
++
++/* The runnable entity at `index`: the current one first (when runnable), then the tree's. */
++static struct sched_entity *det_entity_at(struct cfs_rq *cfs_rq, unsigned int index)
++{
++	struct sched_entity *curr = cfs_rq->curr;
++	struct rb_node *node;
++
++	if (curr && curr->on_rq) {
++		if (!index)
++			return curr;
++		index--;
++	}
++	for (node = rb_first_cached(&cfs_rq->tasks_timeline); node && index; node = rb_next(node))
++		index--;
++	return node ? __node_2_se(node) : NULL;
++}
+ 
+ /*
+  * Pick the next process, keeping these things in mind, in this order:
+@@ -5667,6 +5711,19 @@
+ static struct sched_entity *
+ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
+ {
++	struct sched_entity *chosen = cfs_rq->det_next;
++	int choice;
++
++	/* determinismo's choices first: a woken task to run before its waker, a random one. */
++	if (chosen && chosen->on_rq && !chosen->sched_delayed)
++		return chosen;
++	choice = det_choose(cfs_rq, cfs_rq->nr_running);
++	if (choice >= 0) {
++		chosen = det_entity_at(cfs_rq, choice);
++		if (chosen && !chosen->sched_delayed)
++			return chosen;
++	}
++
+ 	/*
+ 	 * Picking the ->next buddy will affect latency but not fairness.
+ 	 */
+@@ -8900,6 +8957,15 @@
+ 
+ 	find_matching_se(&se, &pse);
+ 	WARN_ON_ONCE(!pse);
++
++	switch (det_choose(cfs_rq_of(se), 2)) {
++	case 0:
++		return;			/* The running task goes on. */
++	case 1:			/* The woken one runs first. */
++		for (pse = &p->se; pse; pse = parent_entity(pse))
++			cfs_rq_of(pse)->det_next = pse;
++		goto preempt;
++	}
+ 
+ 	cse_is_idle = se_is_idle(se);
+ 	pse_is_idle = se_is_idle(pse);
+@@ -13220,6 +13286,10 @@
+ 		entity_tick(cfs_rq, se, queued);
+ 	}
+ 
++	/* determinismo's module may preempt the running task at a tick (and choose the next). */
++	if (det_choose(cfs_rq_of(&curr->se), 2) == 1)
++		resched_curr(rq);
++
+ 	if (static_branch_unlikely(&sched_numa_balancing))
+ 		task_tick_numa(rq, curr);
+ 
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -700,6 +700,8 @@
+ 	 */
+ 	struct sched_entity	*curr;
+ 	struct sched_entity	*next;
++	/* determinismo: a woken entity its module chose to run first (fair.c, det_choose). */
++	struct sched_entity	*det_next;
+ 
+ #ifdef CONFIG_SMP
+ 	/*
