@@ -75,7 +75,11 @@ use them in other repositories.
    for the same seed; without it the branch keeps the timeline's.
 6. **Narrow down**: `causality` measures, at moments of the failing branch, how likely the
    failure was (futures forked there that fail): the bug was decided where the probability
-   jumps; query the branch's events just before, and inside the jump the code first run there
+   jumps. A future that has not failed by the failure's moment plus its distance from the setup
+   snapshot ends there, counted as not failing (`--horizon-ms`, serve's `horizon_ms`; 0 runs every
+   future to its end): a bug decided early in a long timeline costs futures that long, not the
+   timeline's length. With `--verdict '<condition>'` (`verdict`) the bug is an event condition
+   instead of the property, and futures stop at it. Query the branch's events just before, and inside the jump the code first run there
    (`event=coverage`: each line once, the first time a process runs it; the UI lists them per
    jump) and every thread's stack at its end (`replay` with `exec` "/opt/determinismo/bin/det-profile
    <node> --stacks"; the UI's "stacks" on a jump). `replay` with `until` stops at the first event

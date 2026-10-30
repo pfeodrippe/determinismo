@@ -166,15 +166,17 @@ event hashing, the guest module.
   passed alone, the others to run alone too. `parallel`'s: its CPUs held by other runs, now
   measured (a timeline's `cpu_wait`, the run's in its workers line, status.json, summary and UI)
   and a reason to skip, as memory waits were. Next: the others' causes, from their logs.
-- Hunts: Galera's run 196 done (README); MySQL Group Replication (run 200) running, then Galera
-  jepsen-recovered, RabbitMQ Khepri ra-synced, the hyperthreads run, then srv3's
-  ~/hunts/next-list.txt (read when its turn comes): Cassandra 6's Accord, Ignite, ScyllaDB's
-  current release, SurrealDB, Kafka share groups, YugabyteDB's current release, Cassandra 5,
-  NATS batches, rqlite, ClickHouse Keeper, Redpanda and Patroni again (with clock skews),
-  ZooKeeper known, YugabyteDB outages, OpenSearch; smokes, one after another: Cassandra 5.0.9 (ready on its storage port since its first
-  smoke), its Accord scenario (6.0-alpha2), ClickHouse Keeper, rqlite (`snapshots`), Apache
-  Ignite 3.1, SurrealDB 3.3 on TiKV, Kafka 4.4's share groups: new systems and features Jepsen
-  never analyzed (docs/JEPSEN.md).
+- Hunts (2026-10-30, 01:26 on): Galera (run 202, README), MySQL Group Replication (run 200),
+  RabbitMQ Khepri ra-synced (run 210: a boot ended by a member unreachable for a moment, README)
+  done; the hyperthreads run passed (Kafka, 64 timelines on hyperthread siblings, every replay
+  the same). Now srv3's ~/hunts/next-list.txt: the Raft pair (prefer_sometimes against uniform,
+  20 min each), jank's nREPL (1 h), Redpanda (aimed, the intervention), Cassandra 6's Accord,
+  Ignite (C1), ScyllaDB's current release, SurrealDB, Kafka share groups, YugabyteDB's current
+  release, Cassandra 5, NATS batches, rqlite, ClickHouse Keeper, Patroni, ZooKeeper known,
+  YugabyteDB outages, OpenSearch. Smokes of 2026-10-30: Cassandra 5 and its Accord pass;
+  rqlite passes; SurrealDB's process panicked (README); CockroachDB's setup refused 64 KiB ranges
+  (COCKROACH_MIN_RANGE_MAX_BYTES now) and Consul refused to boot after power losses (#3489:
+  node IDs given now), both smoked again.
 
 - Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
   rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
