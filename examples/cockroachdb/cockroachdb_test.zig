@@ -120,14 +120,20 @@ fn member_step(context: *System.Context) !void {
     const lock_exclusive = 2; // LOCK_EX
     if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
     const all = [_]*const sdk.Node{ &context.nodes.@"crdb-1", &context.nodes.@"crdb-2", &context.nodes.@"crdb-3" };
-    const via = all[sdk.random_below(all.len)];
     const spare = &context.nodes.@"crdb-4";
     var buffer: [16 * 1024]u8 = undefined;
-    const status = via.exec_said(&.{
-        "/cockroach/cockroach", "node", "status", "--insecure", "--host=localhost:26257", "--decommission", "--format=csv",
-    }, &buffer) catch return;
-    // The node is down: a later step.
-    if (status.status != 0) return member_refused("node status", status.status, status.output);
+    // From the first node that answers, starting at one drawn: under faults one is often down
+    // (the first smokes' steps mostly asked a node that was), all of them seldom.
+    const first = sdk.random_below(all.len);
+    var via = all[first];
+    const status = for (0..all.len) |offset| {
+        via = all[(first + offset) % all.len];
+        const answer = via.exec_said(&.{
+            "/cockroach/cockroach", "node", "status", "--insecure", "--host=localhost:26257", "--decommission", "--format=csv",
+        }, &buffer) catch continue;
+        if (answer.status == 0) break answer;
+        if (offset == all.len - 1) return member_refused("node status", answer.status, answer.output);
+    } else return;
     const member = spare_member(status.output);
     const node = member orelse {
         if (member_started_ns()) |at| if (monotonic_ns() -| at < join_grace_ns) return; // Still joining.
