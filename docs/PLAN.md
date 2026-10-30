@@ -150,7 +150,14 @@ event hashing, the guest module.
   1. Swarm testing of faults (Groce et al., ISSTA 2012; Antithesis's Metroid post credits it):
      each timeline some of the fault kinds, half and half by named decisions. Built (det-faults'
      swarm_select, a `fault_swarm` event; `--no-swarm`, serve's `swarm: false`, to compare).
-     Next: measure on the Raft POC and a Jepsen system, several seeds.
+     Measured on the Raft POC (srv3, 2026-10-30, seeds 1-3, 20 minutes and 16 workers each,
+     runs 250/251, 252/258, 260/263, swarm then not): 13,517 timelines against 12,829; the
+     commit-progress deadlock found 59 times against 57; fsm-convergence 22 times (all in seed
+     3) against once; the log divergence (#695: log-matching and leader-completeness) once,
+     swarm's seed 3, against never; behaviors 1,276/1,420/1,407 against 1,407/1,412/1,406. Kept
+     on: as many finds of the common bug, more of the rarer ones (one seed carries most), no
+     fewer behaviors but in seed 1. (An earlier "twice the behaviors" read counted only those
+     first seen in a timeline: wrong.) Next: a Jepsen system.
   2. Optimization objectives per bucket (Antithesis, "Optimizing our way through Metroid",
      2025; PerfFuzz, ISSTA 2018, per-edge maxima): `sdk.optimize(message, bucket, value,
      goal)`, each bucket an archive cell keeping its best state, cells returned to evenly.
