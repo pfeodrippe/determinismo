@@ -47,6 +47,27 @@ started fresh when `/nodes` does not list it (it joins as a voter by itself, aft
 for its join); listed, one time in two stopped and removed (`DELETE /remove`). Elle's checks and
 the final reads hold through them.
 
+## Found: a committed write applied twice (rqlite 10.6.6, under investigation)
+
+The first membership smoke (srv3, 2026-10-30, seed 1, 4 timelines) failed Elle in branch 3:
+`duplicate-elements`, key 0's list holding value 2560125673930752 twice. The history has one
+transaction appending it (invoked at 2.49 s, acknowledged `ok` at 12.51 s); a read at 13.9 s
+saw it once. Replays read every node's own copy (`level=none`): at 20 s rq-1, rq-2 and rq-3
+all hold it twice, so the command was committed to the Raft log twice, not applied twice by
+one node. In between: rq-4 joined at 11.8 s and was removed at 13.0 s, among partitions (append
+and heartbeat RPCs failing, leaders stepping down). Our client sends each request once
+(`sdk.tcp.http_with` never resends).
+
+A candidate mechanism, in rqlite's own code: `cluster/client.go`'s `retry()` sets
+`effectiveRetries := max(1, maxRetries)`, and on the last retry writes the command again on a
+new connection ("Try a new connection if retries failed", 2026-03-28). So a request forwarded
+to the leader with no retries (`/db/request`'s default) is still written twice when the first
+attempt's answer is lost after it reached the leader. #1628 (duplicate inserts on packet loss)
+was fixed in 8.18 by retrying nothing by default; #2759 (a failed snapshot restore
+re-applying entries, found with Antithesis) is a follower's divergence, not this: here every
+node agrees. To confirm: the forwarding node's `client_force_new_conn` counter, and which node
+the request entered. Replay: `--seed 1 --branch 3 --scenario append`.
+
 ## Status
 
 - 2026-10-29: written; first smoke next.
