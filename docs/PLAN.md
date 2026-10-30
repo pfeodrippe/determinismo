@@ -170,10 +170,14 @@ event hashing, the guest module.
   4. Good-Turing discovery probability (Böhme et al., "Estimating Residual Risk in Greybox
      Fuzzing", FSE 2021; coverage-rate extrapolation, ICSE 2024): behaviors reached by one
      timeline alone over the timelines is the chance the next finds a new one. Built (serve's
-     `behaviors_once`, the UI's Behaviors note). As the hunt queue's stop rule (fewer than one
-     new behavior expected an hour: behaviors_once < hours elapsed) only once measured against
-     the plateau rule on the next hunts: a tree's returns repeat rare behaviors on purpose,
-     which deflates the singletons (the paper's adaptive bias) and could stop hunts early.
+     `behaviors_once`, the UI's Behaviors note). Not a stop rule: replayed on three hunts the
+     plateau rule ended (2026-10-30; each behavior's first two timelines from the run's events,
+     timelines in index order, stop once fewer than one new behavior is expected an hour), it
+     stopped run 210 (OpenSearch, 1,417 timelines) at timeline 80 with 6 behaviors still to
+     come, run 235 (jank's nREPL, 9,854) at 50 with 2, run 239 (Redpanda, 377) at 212 with 2.
+     The tree's returns repeat rare behaviors on purpose, which empties the singletons early
+     (the paper's adaptive bias); the plateau rule stays (scratch: gt_sim.py, kept out of the
+     repository). On cheap timelines it never fires at all (Raft, 12,900 an hour).
   5. A learning archive: seed scheduling as a bandit (EcoFuzz, USENIX Security 2020; AFL-Hier,
      NDSS 2021; T-Scheduler, Thompson sampling, 2023). Built: a cell counts the branches of its
      returns that found a behavior new to the tree (`paid`), and ranks as one that many times
