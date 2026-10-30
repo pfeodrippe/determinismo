@@ -1427,6 +1427,8 @@ function faultTip(event, decision) {
     ["groups", groups], ["permanent", d.permanent ? "yes" : undefined], ["program", d.program || undefined]];
   const why = d.injected ? `<div class="t-why"><b>Why this fault</b><br>The scenario asked for it (sdk.fault or det-faults inject), at this moment.</div>`
     : decision ? `<div class="t-why"><b>Why this fault</b><br>${escape(decision.event.details.reason)}</div>`
+    : d.why === "branch_point" ? `<div class="t-why"><b>Why this fault</b><br>The tree returned to this moment for ${escape(d.node || "a node")}: the first fault after a branch point involves the node it named.</div>`
+    : d.why === "aimed" ? `<div class="t-why"><b>Why this fault</b><br>Aimed: the scenario named the node (sdk.fault_aim: a leader or a primary its drivers found), and half the injector's faults then involve it.</div>`
     : `<div class="t-why"><b>Why this fault</b><br>Chosen at random from this timeline's seed (a replay chooses the same). A strategy (mutate, the LLM) gives its reasons here.</div>`;
   return `<div class="t-title"><span class="t-dot" style="background:var(--warn);border-radius:2px"></span>Fault: ${escape(kind || "fault")}</div>
     ${kvHtml(pairs)}${kvHtml([["timeline", `#${event.branch} at ${(event.vtime_ns / 1e9).toFixed(3)}s`]])}${why}
@@ -2250,8 +2252,18 @@ function describe(event) {
     const a = event.antithesis_assert;
     return { kind: a.display_type || "assert", text: `${a.message}${a.condition === false ? " (false)" : ""}`, css: a.condition === false ? "assert-fail" : "assert" };
   }
+  // A fault and a strategy's decision read as what they did and why, their details after.
+  if (event.event === "fault") {
+    const d = event.details || {};
+    const why = d.injected ? " · asked for by the scenario" : d.why === "aimed" ? " · aimed at the node the scenario names"
+      : d.why === "branch_point" ? " · after a branch point at its node" : "";
+    return { kind: "fault", text: `${faultName({ event })}${d.duration_ns ? " for " + ms(d.duration_ns) : ""}${why}   ${JSON.stringify(d)}`, css: "fault" };
+  }
+  if (event.event === "decision" && event.details && event.details.reason) {
+    return { kind: "decision", text: `${event.details.reason}   ${JSON.stringify(event.details)}`, css: "" };
+  }
   if (event.event) {
-    const css = event.event === "fault" ? "fault" : event.event.startsWith("command") ? "command" : "";
+    const css = event.event.startsWith("command") ? "command" : "";
     return { kind: event.event, text: JSON.stringify(event.details || {}), css };
   }
   if (event.lifecycle) return { kind: "lifecycle", text: event.lifecycle, css: "" };

@@ -79,6 +79,29 @@
    ;; The kernel's log is read when a timeline ends: its OOM kills, crashes and warnings.
    :journal "assert.message~kernel or assert.message~\"no process crashes\""})
 
+(defn why
+  "Why a timeline went as it did, in order: the tree's reason for starting it where it did, each
+  fault and why it was that one (drawn, aimed at the node the scenario names, after a branch
+  point at its node, or asked for by the scenario), and each decision a strategy explained.
+  (why 12), (why 12 {:limit 1000})."
+  ([branch] (why branch {}))
+  ([branch options]
+   (let [started (some #(when (= branch (:index %)) (:why %)) (:branches run))
+         happened (query "event=fault or event=decision" (merge {:branch branch :limit 500} options))]
+     (into (if (str/blank? started) [] [{:at 0 :what "the timeline" :why started}])
+           (keep (fn [{:keys [vtime_ns event]}]
+                   (let [details (:details event)
+                         at (/ (or vtime_ns 0) 1e9)]
+                     (if (= "fault" (:event event))
+                       {:at at
+                        :what (str/join " " (remove str/blank? [(:kind details) (:node details) (:peer details)]))
+                        :why (cond (:injected details) "asked for by the scenario"
+                                   (= "aimed" (:why details)) "aimed at the node the scenario names"
+                                   (= "branch_point" (:why details)) "after a branch point at its node"
+                                   :else "drawn")}
+                       (when (:reason details) {:at at :what "decision" :why (:reason details)})))))
+           happened))))
+
 (defn sql
   "One SELECT on the run's events database (tables events, timelines, steps; the view
   timeline_events): its rows. (sql \"SELECT kind, count(*) AS n FROM events GROUP BY kind\")."

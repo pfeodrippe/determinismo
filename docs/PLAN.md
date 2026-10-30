@@ -810,9 +810,11 @@ event hashing, the guest module.
      between), but nothing for a horizon: hunts keep none.
 3. **Why, everywhere.** Done: the tree explorer's reason for every branch point, a strategy's
    `reason` with any answer (in the timeline as a `decision` event, and in its tape), the LLM
-   strategy's reasons from the model; the UI's tooltips show them. Left: det-faults' own reasons
-   when it is guided (`fault after "leader elected": partition the leader`), the mutate
-   strategy's (which parent, which mutation), and reasons in the logs and the notebook.
+   strategy's reasons from the model, the mutate strategy's (which corpus entry, which
+   decision, at its frontier or at random), and det-faults' own for each drawn fault (`why`:
+   drawn, aimed at the node the scenario names, or after a branch point at its node); the UI's
+   tooltips show them, its logs read a fault as what it did and why and a decision as its
+   reason, and the notebook's `(why branch)` lists them for a timeline.
 4. **The UI.** Done: stat cards, discovery and failing-property charts, the multiverse tree with
    shared prefixes, branch points and forks, zoom and pan, live updates, styled tooltips, logs
    with the parents' events, Clojure notebooks (babashka) with a per-run nREPL server, fork

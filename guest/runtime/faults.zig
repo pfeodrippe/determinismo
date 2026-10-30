@@ -309,7 +309,9 @@ pub fn main(init: std.process.Init) !void {
             active_until_ns = @max(quiet_until_ns, monotonic_ns()) + stretch_ns("fault.active_ms", pacing.active_ms_max);
         }
         // Labeled decisions: a strategy sees which faults it chooses among, by name.
-        const applied = draw(&faults[fault_choose(faults[0..mixed], names)]);
+        const chosen = fault_choose(faults[0..mixed], names);
+        var applied = draw(&faults[chosen.index]);
+        applied.why = chosen.why;
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
@@ -491,6 +493,8 @@ const Applied = struct {
     process: []const u8 = "",
     /// Asked for by the scenario (`det-faults inject`, the SDK's `fault`), not drawn.
     injected: bool = false,
+    /// Why a drawn fault was this one (in its event, for the UI and queries).
+    why: Why = .drawn,
     disk: ?nodes.DiskFault = null,
     /// For durable_crash and sync_stall: one durability point in this many is picked; a crash
     /// there is just after the sync or before it; a stall lasts up to stall_ms_max.
@@ -2226,19 +2230,24 @@ fn branch_point(node: []const u8) void {
     sdk.event("faults_branch", .{ .quiet_ended = quiet, .node = node });
 }
 
+/// Why a drawn fault was this one: one involving the node a branch point named (the tree
+/// returned there for it), one involving the node the scenario aims at (`sdk.fault_aim`: a
+/// leader, a primary), or any.
+const Why = enum { branch_point, aimed, drawn };
+
 /// The next fault's index: after a branch point, one of those involving its node (a named
 /// decision: strategies see it, tapes replay it), when any does; else, while the scenario aims
 /// at a node, one involving it half the time (named decisions too); else any (`fault`).
-fn fault_choose(faults: []const Fault, names: []const []const u8) usize {
+fn fault_choose(faults: []const Fault, names: []const []const u8) struct { index: usize, why: Why } {
     defer branch_node_size = 0;
     var aimed: [faults_max]usize = undefined;
     const branched = involving(faults, branch_node[0..branch_node_size], &aimed);
-    if (branched > 0) return aimed[sdk.random_below_named("fault.branch_aim", branched)];
+    if (branched > 0) return .{ .index = aimed[sdk.random_below_named("fault.branch_aim", branched)], .why = .branch_point };
     if (aim_node_size > 0 and sdk.random_below_named("fault.aim", 2) == 0) {
         const count = involving(faults, aim_node[0..aim_node_size], &aimed);
-        if (count > 0) return aimed[sdk.random_below_named("fault.aimed", count)];
+        if (count > 0) return .{ .index = aimed[sdk.random_below_named("fault.aimed", count)], .why = .aimed };
     }
-    return sdk.decide("fault", names);
+    return .{ .index = sdk.decide("fault", names), .why = .drawn };
 }
 
 /// The indices of the faults that involve `node` (theirs, or the other end of a link), into
@@ -2537,7 +2546,7 @@ test fault_choose {
         defer aim_node_size = 0;
         var involving_b: u32 = 0;
         for (0..400) |_| {
-            const fault = faults[fault_choose(&faults, &names)];
+            const fault = faults[fault_choose(&faults, &names).index];
             if (std.mem.eql(u8, fault.node, "b") or std.mem.eql(u8, fault.peer, "b")) involving_b += 1;
         }
         try std.testing.expect(involving_b >= case[1] and involving_b <= case[2]);

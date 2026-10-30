@@ -164,7 +164,8 @@ use them in other repositories.
   line) with the same seed: each is caught (a property fails that passes without it), never ran
   (coverage shows its lines never ran), or unnoticed (a gap in the properties).
 - A run's notebook is Clojure (babashka on the server: `query`, `events`, `run`, `replay`,
-  `stacks`, ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
+  `stacks`, `why` (a timeline's faults and why each, the strategies' reasons, the tree's for the
+  timeline), ...); `POST /runs/<id>/nrepl` starts a babashka nREPL server with the same names.
 - `POST /runs/<id>/stop` stops a run (its timelines so far stay; state `stopped`). A restarted
   `serve` adopts the runs still going (each run's `pid` file).
 - Determinism checks: every run replays every 16th timeline from its tape as it goes and judges
