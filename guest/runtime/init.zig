@@ -92,6 +92,7 @@ fn run(arena: std.mem.Allocator, cmdline: []const u8) u32 {
         } else false;
         if (windowed) _ = spawn(&.{ bin ++ "det-nodes", "writeback" });
     } else |_| {}
+    if (node_names.len > 0) _ = spawn(&.{ bin ++ "det-nodes", "samples" });
     const pid_up = spawn(&.{ bin ++ "det-nodes", "up" });
     const status_up = wait_for(pid_up);
     if (status_up != 0) {
@@ -602,33 +603,15 @@ fn cpu_report() void {
         const path = std.fmt.bufPrintSentinel(&path_buffer, nodes.cgroup_root ++ "/{s}/cpu.stat", .{name}, 0) catch continue;
         var buffer: [1024]u8 = undefined;
         const text = read_text(path, &buffer);
-        const usage_usec = stat_field(text, "usage_usec") orelse continue;
+        const usage_usec = nodes.stat_field(text, "usage_usec") orelse continue;
         sdk.event("node_cpu", .{
             .node = name,
             .usage_ms = usage_usec / 1000,
-            .user_ms = (stat_field(text, "user_usec") orelse 0) / 1000,
-            .system_ms = (stat_field(text, "system_usec") orelse 0) / 1000,
+            .user_ms = (nodes.stat_field(text, "user_usec") orelse 0) / 1000,
+            .system_ms = (nodes.stat_field(text, "system_usec") orelse 0) / 1000,
             .uptime_ms = @as(u64, @intFromFloat(uptime_s * 1000)),
         });
     }
-}
-
-/// A `name value` line's value in a cgroup stat file.
-fn stat_field(text: []const u8, name: []const u8) ?u64 {
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        var words = std.mem.tokenizeScalar(u8, line, ' ');
-        if (!std.mem.eql(u8, words.next() orelse continue, name)) continue;
-        return std.fmt.parseInt(u64, words.next() orelse return null, 10) catch null;
-    }
-    return null;
-}
-
-test stat_field {
-    const text = "usage_usec 1500000\nuser_usec 1200000\nsystem_usec 300000\n";
-    try std.testing.expectEqual(@as(?u64, 1500000), stat_field(text, "usage_usec"));
-    try std.testing.expectEqual(@as(?u64, 300000), stat_field(text, "system_usec"));
-    try std.testing.expectEqual(@as(?u64, null), stat_field(text, "nr_periods"));
 }
 
 /// MemTotal from /proc/meminfo's first line, in bytes.

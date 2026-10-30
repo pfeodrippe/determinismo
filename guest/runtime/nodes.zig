@@ -1095,6 +1095,52 @@ pub const State = enum { running, paused, stopped };
 /// second of virtual time, each such node whose window passed since its last has its disk synced
 /// (syncfs), so a power loss drops what was written in the last window only. Runs as long as the
 /// guest (det-nodes writeback, from init). A node down (its disk unmounted) is skipped.
+/// Each node's resources over time (init runs it): every `sample_period_ns` of virtual time, the
+/// CPU its cgroup used meanwhile and the memory it holds, a `node_sample` event, for studies of
+/// what a system's resources say before it fails (a stuck cluster goes quiet: run 230's failing
+/// timelines ended with far less CPU and output than the others).
+pub fn samples_loop(system: *const schema.System) noreturn {
+    var used_usec: [schema.nodes_max]?u64 = @splat(null);
+    while (true) {
+        sleep_ns(sample_period_ns);
+        for (system.nodes, 0..) |node, index| {
+            var path_buffer: [path_size_max]u8 = undefined;
+            var buffer: [1024]u8 = undefined;
+            const cpu_path = print_z(&path_buffer, cgroup_root ++ "/{s}/cpu.stat", .{node.name}) catch continue;
+            const usage = stat_field(read_small(cpu_path, &buffer) orelse continue, "usage_usec") orelse continue;
+            const before = used_usec[index];
+            used_usec[index] = usage;
+            const memory_path = print_z(&path_buffer, cgroup_root ++ "/{s}/memory.current", .{node.name}) catch continue;
+            const memory_text = std.mem.trim(u8, read_small(memory_path, &buffer) orelse continue, " \n");
+            const memory = std.fmt.parseInt(u64, memory_text, 10) catch continue;
+            sdk.event("node_sample", .{
+                .node = node.name,
+                .cpu_ms = if (before) |used| (usage -| used) / std.time.us_per_ms else null,
+                .memory_mib = memory >> 20,
+            });
+        }
+    }
+}
+
+const sample_period_ns = 2 * std.time.ns_per_s;
+
+/// A `name value` line's value in a cgroup stat file.
+pub fn stat_field(text: []const u8, name: []const u8) ?u64 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, words.next() orelse continue, name)) continue;
+        return std.fmt.parseInt(u64, words.next() orelse return null, 10) catch null;
+    }
+    return null;
+}
+
+test stat_field {
+    const text = "usage_usec 1500\nuser_usec 1000\nsystem_usec 500\n";
+    try std.testing.expectEqual(@as(?u64, 500), stat_field(text, "system_usec"));
+    try std.testing.expectEqual(@as(?u64, null), stat_field(text, "nr_periods"));
+}
+
 pub fn writeback_loop(system: *const schema.System) noreturn {
     var last_s: [schema.nodes_max]u64 = @splat(0);
     var now_s: u64 = 0;

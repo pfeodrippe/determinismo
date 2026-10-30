@@ -11,6 +11,8 @@
 //!   det-nodes list                    the nodes now: name, state, pid, address, image (JSON lines)
 //!   det-nodes writeback               sync the disks of nodes with a writeback window, each
 //!                                     that often, for good (init runs it)
+//!   det-nodes samples                 each node's CPU and memory every 2 s, as events, for good
+//!                                     (init runs it)
 const std = @import("std");
 const assert = std.debug.assert;
 const nodes = @import("nodes.zig");
@@ -23,6 +25,7 @@ const usage =
     \\       det-nodes exec <node> <command>...
     \\       det-nodes list
     \\       det-nodes writeback
+    \\       det-nodes samples
     \\
 ;
 
@@ -42,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
     if (eql(u8, command, "up")) return nodes.up(arena, &system);
     if (eql(u8, command, "list")) return list(arena, &system);
     if (eql(u8, command, "writeback")) nodes.writeback_loop(&system);
+    if (eql(u8, command, "samples")) nodes.samples_loop(&system);
     if (eql(u8, command, "exec")) {
         if (arguments.len < 4) return usage_exit();
         const node = system.node(arguments[2]) orelse return error.UnknownNode;

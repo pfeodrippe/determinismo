@@ -1686,6 +1686,7 @@ fn check_builtin_properties(context: *Context) !void {
         .{ "the exit fails the property", caught },
         .{ "the failure carries the node's last words (dying as told)", said },
     }, "built-in properties catch a node that exits, saying what it said last", .{});
+    try check_samples(context, program);
     const hog = try explore(context, &.{
         "--program",  program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
         "--branches", "1",
@@ -1904,6 +1905,42 @@ fn record_timelines(context: *Context, path: []const u8) ![]const []const u8 {
 }
 
 /// The crash leaves a core dump, which `extract` takes out of the runner at a later moment.
+/// Each node's resources every 2 s (det-nodes samples): its memory, and from the second sample on
+/// the CPU it used meanwhile.
+fn check_samples(context: *Context, program: []const u8) !void {
+    const events_path = try std.fs.path.join(context.arena, &.{ context.scratch, "samples-events.jsonl" });
+    _ = try explore(context, &.{
+        "--program", program, "--scenario", "steady", "--seed",   "1",
+        "--branch",  "0",     "--timeline", "10s",    "--events", events_path,
+    });
+    const events = std.Io.Dir.cwd().readFileAlloc(context.io, events_path, context.arena, .limited(1 << 26)) catch "";
+    var samples: u32 = 0;
+    var samples_cpu: u32 = 0;
+    var last_ns: u64 = 0;
+    var first_sample_ns: ?u64 = null;
+    var lines = std.mem.tokenizeScalar(u8, events, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"vtime_ns\":")) |at| {
+            last_ns = field_u64(line[at..], "\"vtime_ns\":") orelse last_ns;
+        }
+        if (std.mem.indexOf(u8, line, "\"event\":\"node_sample\"") == null) continue;
+        if (std.mem.indexOf(u8, line, "\"node\":\"echo\"") == null) continue;
+        if (std.mem.indexOf(u8, line, "\"memory_mib\":") == null) continue;
+        samples += 1;
+        if (first_sample_ns == null) first_sample_ns = last_ns;
+        if (std.mem.indexOf(u8, line, "\"cpu_ms\":null") == null) samples_cpu += 1;
+    }
+    // One every 2 s from the first to the timeline's end, give or take one.
+    const expected = (last_ns -| (first_sample_ns orelse last_ns)) / (2 * std.time.ns_per_s) + 1;
+    expect_all(context, &.{
+        .{ "the timeline lasts two samples (4 s)", samples >= 2 },
+        .{ "the node is sampled every 2 s", samples + 1 >= expected and samples <= expected + 1 },
+        .{ "every sample after the first has the CPU used meanwhile", samples_cpu + 1 >= samples },
+    }, "each node's CPU and memory sampled every 2 s: {d} samples of the echo node in {d} s", .{
+        samples, last_ns / std.time.ns_per_s,
+    });
+}
+
 fn check_core_dump(context: *Context, program: []const u8) !void {
     const arena = context.arena;
     const events = try std.fs.path.join(arena, &.{ context.scratch, "crash.jsonl" });
