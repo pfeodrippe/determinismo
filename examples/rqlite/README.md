@@ -47,26 +47,30 @@ started fresh when `/nodes` does not list it (it joins as a voter by itself, aft
 for its join); listed, one time in two stopped and removed (`DELETE /remove`). Elle's checks and
 the final reads hold through them.
 
-## Found: a committed write applied twice (rqlite 10.6.6, under investigation)
+## Found: a forwarded write committed twice (rqlite 10.6.6)
 
 The first membership smoke (srv3, 2026-10-30, seed 1, 4 timelines) failed Elle in branch 3:
-`duplicate-elements`, key 0's list holding value 2560125673930752 twice. The history has one
-transaction appending it (invoked at 2.49 s, acknowledged `ok` at 12.51 s); a read at 13.9 s
-saw it once. Replays read every node's own copy (`level=none`): at 20 s rq-1, rq-2 and rq-3
-all hold it twice, so the command was committed to the Raft log twice, not applied twice by
-one node. In between: rq-4 joined at 11.8 s and was removed at 13.0 s, among partitions (append
-and heartbeat RPCs failing, leaders stepping down). Our client sends each request once
-(`sdk.tcp.http_with` never resends).
+`duplicate-elements`, key 0's list holding value 2560125673930752 twice.
+- The history has one transaction appending it, invoked at 2.49 s and acknowledged `ok` at
+  12.51 s (10 s later: the request's `timeout=10s`). A read at 13.9 s saw it once.
+- Replays read every node's own copy (`level=none`): at 20 s rq-1, rq-2 and rq-3 all hold it
+  twice. The command was committed to the Raft log twice; no one node applied it twice (not
+  #2759, a follower's divergence).
+- Our client sends each request once (`sdk.tcp.http_with` never resends).
+- At 20 s, rq-3's cluster client counters (`/debug/vars`): `num_client_request_retries` 1,
+  `num_client_force_new_conn` 1; the other nodes', 0. rq-3 forwarded the transaction to the
+  leader, the first attempt failed after it was sent (partitions, rq-4 joining at 11.8 s and
+  removed at 13.0 s, append and heartbeat RPCs failing), and rq-3 sent the command again.
 
-A candidate mechanism, in rqlite's own code: `cluster/client.go`'s `retry()` sets
-`effectiveRetries := max(1, maxRetries)`, and on the last retry writes the command again on a
-new connection ("Try a new connection if retries failed", 2026-03-28). So a request forwarded
-to the leader with no retries (`/db/request`'s default) is still written twice when the first
-attempt's answer is lost after it reached the leader. #1628 (duplicate inserts on packet loss)
-was fixed in 8.18 by retrying nothing by default; #2759 (a failed snapshot restore
-re-applying entries, found with Antithesis) is a follower's divergence, not this: here every
-node agrees. To confirm: the forwarding node's `client_force_new_conn` counter, and which node
-the request entered. Replay: `--seed 1 --branch 3 --scenario append`.
+The cause, in `cluster/client.go`: `retry()` sets `effectiveRetries := max(1, maxRetries)` and,
+on that last retry, writes the command again on a new connection (PR #2585, "Try a new
+connection if retries failed", 2026-03-28). `/db/request` forwards with `retries=0`
+(`qp.Retries(0)`), so every forwarded write is still written twice when the first attempt's
+answer is lost after it reached the leader, and a non-idempotent statement (here an upsert
+appending to a list) takes effect twice. #1628 (duplicate inserts on packet loss) was the same
+class, fixed in 8.18 by retrying nothing by default; #2585 brought a resend back. No issue in
+rqlite's tracker covers it (checked 2026-10-30). Not reported upstream. Replay: `--seed 1
+--branch 3 --scenario append` (default profile, the membership driver's build).
 
 ## Status
 
