@@ -32,6 +32,14 @@ What is checked:
 | Recovery | after faults, a write commits and the members reach the same revision and hash |
 | Strict serializability | list-append transactions (reads, then one txn guarded by every key's mod revision), the whole history checked by Elle at the end of each timeline |
 
+## Membership changes
+
+A fourth member, `etcd-4`, is a spare: prepared with the others, not started. The `member`
+driver takes one step at a time (a lock file in the runner), from the member list a member
+gives: the spare added (as a learner or a voter, a named decision) and started fresh; a learner
+promoted once it caught up; a voter, one time in two, stopped and then removed. Every property
+above holds through them; faults leave the spare alone while it is not running.
+
 ## Findings
 
 ### Found blind, known upstream: a member loses applied writes after a power loss that follows a snapshot install

@@ -23,6 +23,9 @@
 //!                                    every key's mod revision), every timeline's history checked
 //!                                    by Elle on the host (sdk.elle, checkers/elle) for every
 //!                                    anomaly: G0, G1, G-single, G2, real-time order
+//! Membership changes (Jepsen's member nemesis): a fourth member, a spare node, is added (as a
+//! learner or a voter), promoted, removed and added again fresh, one step at a time, while the
+//! drivers write; the properties above hold through them.
 //! Faults: the default ones, restarts, graceful stops and crashes (each member's data on its own
 //! disk), and with them stalls and crashes at the members' syncs.
 //!
@@ -36,6 +39,8 @@ const Nodes = struct {
     @"etcd-1": sdk.Node,
     @"etcd-2": sdk.Node,
     @"etcd-3": sdk.Node,
+    /// The member that joins and leaves (a spare: not started with the others).
+    @"etcd-4": sdk.Node,
 };
 const System = sdk.System(Nodes);
 const member_names = [_][]const u8{ "etcd-1", "etcd-2", "etcd-3" };
@@ -44,6 +49,13 @@ const members_count = member_names.len;
 const client_port = 2379;
 const initial_cluster = "etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380," ++
     "etcd-3=http://etcd-3:2380";
+const spare_name = "etcd-4";
+const spare_peer_url = "http://" ++ spare_name ++ ":2380";
+/// What the spare is told when it joins: the members then, itself included (etcd checks them
+/// against the cluster's).
+const spare_initial_cluster = initial_cluster ++ "," ++ spare_name ++ "=" ++ spare_peer_url;
+/// One membership step at a time, across the drivers (a lock file in the runner).
+const member_lock_path = "/tmp/etcd-member.lock";
 /// A consensus write waits out an election (etcd's default election timeout: 1 s).
 const timeout_ms = 5000;
 const acked_path = "/tmp/etcd-acked.log";
@@ -95,6 +107,24 @@ fn describe(d: *System.Describe) !void {
 }
 
 fn members(profile: *System.Profile, comptime dockerfile: []const u8) !void {
+    profile.node(.@"etcd-4", .{
+        .build = .{ .context = ".", .dockerfile = dockerfile },
+        .command = &.{
+            "--name",                        spare_name,
+            "--data-dir",                    "/var/lib/etcd",
+            "--listen-client-urls",          "http://0.0.0.0:2379",
+            "--advertise-client-urls",       "http://" ++ spare_name ++ ":2379",
+            "--listen-peer-urls",            "http://0.0.0.0:2380",
+            "--initial-advertise-peer-urls", spare_peer_url,
+            "--initial-cluster",             spare_initial_cluster,
+            "--initial-cluster-state",       "existing",
+            "--initial-cluster-token",       "determinismo",
+            "--snapshot-count",              "100",
+        },
+        .ready = .{ .tcp = client_port },
+        .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
+        .spare = true,
+    });
     inline for (member_names) |name| {
         profile.node(@field(System.Name, name), .{
             .build = .{ .context = ".", .dockerfile = dockerfile },
@@ -126,6 +156,7 @@ fn kv(s: *System.Scenario) void {
     s.parallel_driver("count", count_many);
     s.parallel_driver("append", append_many);
     s.parallel_driver("watch", watch_once);
+    s.parallel_driver("member", member_changes);
     s.anytime("agree", members_agree);
     s.eventually("recover", recovers);
     s.eventually("durable", writes_survive);
@@ -185,6 +216,94 @@ fn leader_aim(all: *const [members_count][4]u8) void {
         sdk.fault_aim(name);
         return;
     }
+}
+
+// Membership ----------------------------------------------------------------------------------
+
+const Member = struct {
+    ID: []const u8 = "0",
+    name: []const u8 = "",
+    peerURLs: []const []const u8 = &.{},
+    isLearner: bool = false,
+};
+const MemberListResponse = struct { header: Header = .{}, members: []const Member = &.{} };
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One membership step, from what the cluster says now: the spare added (a learner or a voter,
+/// a named decision) and started, fresh; a learner promoted; a voter removed, its node stopped
+/// first (a removed member stops itself, and another step must not start it meanwhile).
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open(member_lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = addresses(context);
+    const spare = &context.nodes.@"etcd-4";
+    var buffer: [16 * 1024]u8 = undefined;
+    const listed_body = member_call(all[sdk.random_below(members_count)], "/v3/cluster/member/list", "{}", &buffer) orelse return;
+    var parse_buffer: [16 * 1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&parse_buffer);
+    const listed = std.json.parseFromSliceLeaky(MemberListResponse, fixed.allocator(), listed_body, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.BadAnswer;
+    const member: ?Member = found: for (listed.members) |member| {
+        for (member.peerURLs) |url| if (std.mem.eql(u8, url, spare_peer_url)) break :found member;
+    } else null;
+    var request: [128]u8 = undefined;
+    var answer: [4096]u8 = undefined;
+    const to = all[sdk.random_below(members_count)];
+    if (member == null) {
+        const learner = sdk.random_below_named("etcd.member_learner", 2) == 0;
+        const body = try std.fmt.bufPrint(&request, "{{\"peerURLs\":[\"" ++ spare_peer_url ++ "\"],\"isLearner\":{}}}", .{learner});
+        _ = member_call(to, "/v3/cluster/member/add", body, &answer) orelse return;
+        // Fresh: a member added again is a new member, and must not bring the old one's data.
+        try spare.wipe();
+        sdk.sometimes(true, "a member joined", .{ .learner = learner });
+        return;
+    }
+    const found = member.?;
+    if (found.isLearner) {
+        const body = try std.fmt.bufPrint(&request, "{{\"ID\":\"{s}\"}}", .{found.ID});
+        // Not caught up yet, or no leader: a later step.
+        _ = member_call(to, "/v3/cluster/member/promote", body, &answer) orelse return;
+        sdk.sometimes(true, "a learner was promoted", .{});
+        return;
+    }
+    if (sdk.random_below_named("etcd.member_remove", 2) != 0) {
+        return; // A voter stays (a fault that stopped it starts it again).
+    }
+    try spare.kill();
+    const body = try std.fmt.bufPrint(&request, "{{\"ID\":\"{s}\"}}", .{found.ID});
+    // Removed or not: the next step sees which.
+    _ = member_call(to, "/v3/cluster/member/remove", body, &answer) orelse return;
+    sdk.sometimes(true, "a member was removed", .{});
+}
+
+/// A membership call through the gateway: its answer's body, or null when none came or it was
+/// refused (a `member_refused` event says how: under faults, refusals are expected).
+fn member_call(address: [4]u8, path: []const u8, body: []const u8, buffer: []u8) ?[]const u8 {
+    const response = sdk.tcp.http_with(address, client_port, "POST", path, body, buffer, .{
+        .timeout_ms = timeout_ms,
+    }) catch return null;
+    if (response.status == 200) return response.body;
+    sdk.event("member_refused", .{
+        .what = path,
+        .status = response.status,
+        .body = response.body[0..@min(response.body.len, 512)],
+    });
+    return null;
 }
 
 /// Errors that say only that no answer came: under faults, expected.
@@ -487,6 +606,7 @@ fn append_many(context: *System.Context) !void {
     id &= 0xffff_ffff;
     const history: sdk.elle.History = .{};
     var process = sdk.elle.process_new();
+    var unknown: u32 = 0;
     for (0..txns_per_driver) |sequence| {
         const txn = txn_draw(id, sequence);
         try history.invoke(arena, process, try txn_mops(arena, &txn, null));
@@ -495,6 +615,10 @@ fn append_many(context: *System.Context) !void {
             if (!no_answer(err)) return err;
             try history.info(arena, process, try txn_mops(arena, &txn, null));
             sdk.sometimes(true, "a transaction's outcome is unknown", .{ .err = @errorName(err) });
+            // An objective (sdk.optimize): states where commits went unknown, the turbulent
+            // ones where consistency bugs sit; the tree climbs toward more of them.
+            unknown += 1;
+            sdk.optimize("transactions of unknown outcome, one driver's", .{}, @floatFromInt(unknown), .maximize);
             process = sdk.elle.process_new();
             continue;
         };
