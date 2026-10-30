@@ -178,9 +178,11 @@ event hashing, the guest module.
   (COCKROACH_MIN_RANGE_MAX_BYTES now) and Consul refused to boot after power losses (#3489:
   node IDs given now), both smoked again.
 
-- Causality: planner protocol and Clojure planners (in progress); refinement deeper (up to six
-  rounds, 40 moments, jumps narrowed to 20 ms); job pid files so a serve restart keeps a running
-  analysis (built, not deployed); serve snapshotting a failure as soon as it is found.
+- Causality: the planner protocol and Clojure planners (plugins/clojure/strategies.clj,
+  docs/PLUGINS.md), refinement up to six rounds (40 moments, jumps narrowed to 20 ms), pid files
+  (a serve restart keeps a running analysis), a failure snapshotted as soon as it is found, and
+  (2026-10-30) futures ending at a horizon past the failure: deployed. Next: an analysis of
+  Ignite's run 215 (verdict `TxIdMismatch`), the horizon's first long timeline.
 - Disk snapshots (delta, `--save-snapshots`, `--from-snapshot`): the `saved` e2e check passed
   (srv3, 2026-10-29: two snapshots along a branch, the futures loaded from each the ones a replay
   forks there); long-term archive later.
