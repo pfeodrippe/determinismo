@@ -69,7 +69,24 @@ The probe: three rounds of eight clients at once, each evaluation printing its o
 Concurrent evaluations became possible when jank#1022 was fixed (2026-10-09). This race is not
 in the tracker. The workload's `print` driver checks it ("output is its own").
 
+### Non-ASCII source needs a UTF-8 locale
+
+Started without one (the C or POSIX locale: most containers' and services' default, this
+image's included), jank cannot read any source with a character outside ASCII, from a file or
+over nREPL:
+
+- `"é"` and `(count "日本語")` fail with `lex/unterminated-string`. A comment `;; é` or a symbol
+  `é` fails with "The Unicode character literal is unfinished".
+- An editor's evaluation containing such a character gets that error back.
+- With `LANG=C.UTF-8` the same source reads fine, and the replies' bencode lengths are right
+  (in bytes).
+- jank#277 ("unicode string does not work", `"你好"` unterminated) was closed in 2025. Its fix
+  holds only under a UTF-8 locale. The locale dependence is not in the tracker.
+
 ### Wrong answers
+
+- **`count` of a string counts bytes.** `(count "日本語")` is `9`; Clojure's is `3`. Not in the
+  tracker.
 
 - **Out-of-range casts answer `-9223372036854775808`.** This happens for `(long ##Inf)` and
   `(int 1e20)`: C++'s conversion is undefined. Clojure throws "Value out of range for long".
