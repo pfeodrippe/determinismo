@@ -39,4 +39,14 @@ error: the entry may still commit).
 
 ## Status
 
-New (2026-10-29): first smoke queued on srv3.
+- 2026-10-30, the first smoke (2 timelines): a server refuses every boot after a power loss.
+  - What it says: "failed to setup node ID: NodeID in /consul/data/node-id is invalid: uuid
+    string is wrong length". Timeline 1: c3 lost power at 6.06 s, 5 s after its first boot, and
+    refused to start at 7.42 s. Timeline 0: all three, ten times.
+  - Why: Consul writes `node-id` with `os.WriteFile` at its first boot (agent/nodeid.go), with
+    no sync and no atomic rename, then refuses an empty file. That is hashicorp/consul#3489,
+    open since 2017.
+  - The servers now get their node IDs on the command line (`-node-id`), so the hunts look past
+    it.
+  - The smoke also showed a platform bug, now fixed: an exit of a node that the fault injector
+    had restarted was judged only when faults stopped.

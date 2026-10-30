@@ -10,7 +10,11 @@ name=${1:?usage: start.sh <name>}
 address() { awk -v name="$1" '$2 == name && $1 ~ /^[0-9.]+$/ { print $1; exit }' /etc/hosts; }
 self=$(address "$name")
 mkdir -p /consul/data
-exec consul agent -server -bootstrap-expect 3 -node "$name" -bind "$self" -client 0.0.0.0 \
+# Its node ID given, never written: Consul writes /consul/data/node-id unsynced at its first
+# boot, so a power loss soon after leaves it empty and the server refusing every boot after
+# (hashicorp/consul#3489, open since 2017; every smoke timeline here met it).
+node_id=$(printf '00000000-0000-4000-8000-%012d' "${name#c}")
+exec consul agent -server -bootstrap-expect 3 -node "$name" -node-id "$node_id" -bind "$self" -client 0.0.0.0 \
   -retry-join "$(address c1)" -retry-join "$(address c2)" -retry-join "$(address c3)" \
   -data-dir /consul/data -log-level info \
   -hcl 'performance { raft_multiplier = 1 }' -hcl 'disable_update_check = true'

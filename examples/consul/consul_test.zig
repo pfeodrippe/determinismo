@@ -36,7 +36,8 @@ const final_attempts_max = 240;
 /// Consul's own wait for a leader to apply is shorter (Raft's apply timeout).
 const timeout_ms = 30_000;
 const response_size_max = 1 << 20;
-const request_size_max = 8192;
+/// A request with a key's whole list (base64): a window's appends, ~20 digits each.
+const request_size_max = 64 * 1024;
 const key_prefix = "lists/";
 
 pub fn main(init: std.process.Init) !void {
@@ -205,8 +206,12 @@ fn transact(
     }
     if (!writes) return .committed;
     var body_buffer: [request_size_max]u8 = undefined;
-    const body = write_body(&body_buffer, keys[0..key_count], entries[0..key_count], lists[0..key_count], mops) catch
-        unreachable; // Sized for mops_max.
+    // A list longer than a request holds (a busy window): not sent, so not committed (the first
+    // smokes' drivers panicked here, the buffer sized for a few values).
+    const body = write_body(&body_buffer, keys[0..key_count], entries[0..key_count], lists[0..key_count], mops) catch {
+        sdk.event("consul_request_too_large", .{ .keys = key_count });
+        return .not_committed;
+    };
     const response = sdk.tcp.http_with(address, http_port, "PUT", "/v1/txn", body, buffer, .{
         .timeout_ms = timeout_ms,
         .content_type = "application/json",
@@ -294,7 +299,7 @@ fn write_body(
         var appended = false;
         for (mops) |mop| appended = appended or (mop.append and mop.key == key);
         if (!appended) continue;
-        var text_buffer: [mops_max * 32 + 4096]u8 = undefined;
+        var text_buffer: [request_size_max / 2]u8 = undefined;
         var text: std.Io.Writer = .fixed(&text_buffer);
         for (list.items, 0..) |value, index| {
             if (index > 0) try text.writeByte(',');
