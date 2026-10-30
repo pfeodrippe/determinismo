@@ -23,6 +23,23 @@ error log goes to stderr, into the run's events.
 Faults: Antithesis's set, restarts, graceful stops and power losses (each node's data on its own
 disk), and stalls and power losses at the nodes' syncs.
 
+## Membership changes
+
+A fourth node, `n4`, is a spare. The `member` driver reads the cluster's members
+(`wsrep_incoming_addresses`) through a node drawn: the spare started when it is not among them
+(fresh, so a full state transfer, or with its data, an incremental one), after a grace for its
+join; among them, one time in two shut down gracefully (it leaves the cluster). Elle's checks
+hold through them. A node that joins a non-primary component aborts its start ("Wsrep startup
+was interrupted"), by design, as one that finds no primary component does; both are known
+exits. A step reads the members from the first node that answers, starting at one drawn.
+
+Smokes (srv3, 2026-10-30, seed 1, 2 timelines each): the spare was started and joined, Elle
+found every history valid. Most steps of the second smoke asked a node that was down, which is
+why a step now tries the others. Its one unexpected exit was n1's InnoDB refusing a corrupted
+data directory (the half-copied state transfer above), and its final reads reached no node:
+after the whole cluster went down, no node bootstraps it again by itself, by design. Under the
+`interleave` fault its nodes' threads competed for 11,332 drawn choices.
+
 ## Found blind: Galera 26.4.24 aborts on an uncaught std::out_of_range in EVS
 
 Hunt run 97 (srv3, 2026-10-29, `jepsen` profile: MariaDB 12.1.2, galera-4 26.4.24, seed 3,
