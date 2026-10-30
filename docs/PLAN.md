@@ -163,7 +163,9 @@ event hashing, the guest module.
   window): causality, then a future inside its jump with the tx logger up.
 - e2e under load: coverage (synced workers), parallel, script, ending and ui's causality analysis
   fail when other units share the reserved cores (2026-10-29's suite beside smokes); coverage
-  passed alone, the others to run alone too.
+  passed alone, the others to run alone too. `parallel`'s: its CPUs held by other runs, now
+  measured (a timeline's `cpu_wait`, the run's in its workers line, status.json, summary and UI)
+  and a reason to skip, as memory waits were. Next: the others' causes, from their logs.
 - Hunts: Galera's run 196 done (README); MySQL Group Replication (run 200) running, then Galera
   jepsen-recovered, RabbitMQ Khepri ra-synced, the hyperthreads run, then srv3's
   ~/hunts/next-list.txt (read when its turn comes): Cassandra 6's Accord, Ignite, ScyllaDB's
