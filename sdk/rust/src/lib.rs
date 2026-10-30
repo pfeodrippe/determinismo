@@ -451,6 +451,29 @@ fn guidance(message: &str, distance: f64) {
     emit(&json!({ "guidance": { "message": message, "distance": distance } }));
 }
 
+/// An objective's direction ([`optimize`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Goal {
+    Maximize,
+    Minimize,
+}
+
+/// An objective for exploration (Antithesis's "Optimizing our way through Metroid"): `bucket`'s
+/// strings and booleans split states into buckets (a leader, a phase), explored evenly, each
+/// keeping the state with the best `value` by `goal`; the tree returns there and goes further
+/// from it.
+pub fn optimize(message: &str, bucket: &Value, value: f64, goal: Goal) {
+    if !value.is_finite() {
+        return;
+    }
+    let bucket = if bucket.is_null() { json!({}) } else { bucket.clone() };
+    let goal = match goal {
+        Goal::Maximize => "maximize",
+        Goal::Minimize => "minimize",
+    };
+    emit(&json!({ "optimize": { "message": message, "bucket": bucket, "value": value, "goal": goal } }));
+}
+
 /// The numbers the guidance comparisons take.
 pub trait Number: Copy + PartialOrd + Into<Value> {
     fn as_f64(self) -> f64;
@@ -953,6 +976,8 @@ mod tests {
         assert_always_greater_than_or_equal_to!(3u64, 3u64, "three ties three");
         always_some!({ a: true, b: false }, "a or b");
         sometimes_all!({ a: true, b: true }, "a and b");
+        optimize("backlog", &json!({ "leader": "n1" }), 3.0, Goal::Maximize);
+        optimize("ignored", &Value::Null, f64::NAN, Goal::Minimize);
         declare("sometimes", "a declared one");
         let listed = catalog::assertions();
         assert!(listed.iter().any(|entry| entry.message == "a declared one"));

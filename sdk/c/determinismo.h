@@ -93,6 +93,12 @@ void det_always_some(const char *const *names, const int *values, size_t count,
 void det_sometimes_all(const char *const *names, const int *values, size_t count,
                        const char *message, const char *details);
 
+/* An objective for exploration (Antithesis's "Optimizing our way through Metroid"): `bucket`, a
+   JSON object or NULL, splits states by its strings and booleans (a leader, a phase); buckets
+   are explored evenly, each keeping the state with the best `value` (`maximize` 1, or 0 to
+   minimize), and the tree returns there and goes further from it. */
+void det_optimize(const char *message, const char *bucket, double value, int maximize);
+
 /* Labeled decisions, for strategies: the index of the option chosen (a platform decision),
    announced with the options' names; or a range, named. */
 size_t det_decide(const char *name, const char *const *options, size_t count);
@@ -250,6 +256,7 @@ struct prng_engine {
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +469,18 @@ static void det_guidance(const char *message, double distance) {
   used = det_json_string(line, used, sizeof line, message);
   if (used >= sizeof line) return;
   int written = snprintf(line + used, sizeof line - used, ",\"distance\":%.17g}}", distance);
+  if (written > 0 && used + (size_t)written < sizeof line) det_emit(line, used + (size_t)written);
+}
+
+void det_optimize(const char *message, const char *bucket, double value, int maximize) {
+  if (!isfinite(value)) return;
+  char line[DET_MESSAGE_SIZE_MAX];
+  size_t used = (size_t)snprintf(line, sizeof line, "{\"optimize\":{\"message\":");
+  used = det_json_string(line, used, sizeof line, message);
+  if (used >= sizeof line) return;
+  int written = snprintf(line + used, sizeof line - used,
+                         ",\"bucket\":%s,\"value\":%.17g,\"goal\":\"%s\"}}", bucket ? bucket : "{}",
+                         value, maximize ? "maximize" : "minimize");
   if (written > 0 && used + (size_t)written < sizeof line) det_emit(line, used + (size_t)written);
 }
 

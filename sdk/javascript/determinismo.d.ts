@@ -63,6 +63,13 @@ export function catalogWrite(stream?: { write(text: string): unknown }): void;
 
 export function setupComplete(details?: Details): void;
 export function event(name: string, details?: Details): void;
+/** An objective for exploration: each bucket (its strings and booleans) keeps its best state. */
+export function optimize(
+  message: string,
+  bucket: Details | null,
+  value: number | bigint,
+  goal?: "maximize" | "minimize",
+): void;
 export function output(object: { [key: string]: JSONValue }): void;
 
 export function stopFaults(seconds: number): void;

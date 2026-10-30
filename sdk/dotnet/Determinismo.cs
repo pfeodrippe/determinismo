@@ -318,6 +318,9 @@ public static class Catalog
 }
 
 /// <summary>The test's lifecycle and events of its own.</summary>
+/// <summary>An objective's direction (<see cref="Lifecycle.Optimize"/>).</summary>
+public enum Goal { Maximize, Minimize }
+
 public static class Lifecycle
 {
     /// <summary>Whether this runs inside determinismo (Antithesis's IsAntithesis).</summary>
@@ -331,6 +334,20 @@ public static class Lifecycle
 
     public static void SendEvent(string? name, JsonObject? details = null) =>
         Platform.Emit("{\"event\":" + Platform.Quote(name ?? "") + ",\"details\":" + Platform.Json(details) + "}");
+
+    /// <summary>
+    /// An objective for exploration (Antithesis's "Optimizing our way through Metroid"):
+    /// <paramref name="bucket"/>'s strings and booleans split states into buckets (a leader, a
+    /// phase), explored evenly, each keeping the state with the best <paramref name="value"/> by
+    /// <paramref name="goal"/>; the tree returns there and goes further from it.
+    /// </summary>
+    public static void Optimize(string message, JsonObject? bucket, double value, Goal goal = Goal.Maximize)
+    {
+        if (!double.IsFinite(value)) return;
+        Platform.Emit("{\"optimize\":{\"message\":" + Platform.Quote(message) + ",\"bucket\":" + Platform.Json(bucket) +
+            ",\"value\":" + value.ToString("R", CultureInfo.InvariantCulture) + ",\"goal\":\"" +
+            (goal == Goal.Maximize ? "maximize" : "minimize") + "\"}}");
+    }
 
     /// <summary>Any JSON object as an event of its own (the protocol's raw form: docs/SDKS.md).</summary>
     public static void Output(JsonObject json) => Platform.Emit(json.ToJsonString());

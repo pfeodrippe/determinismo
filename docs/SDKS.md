@@ -90,6 +90,11 @@ Inside determinismo a process opens `/dev/determinismo` read-write.
     (types: always, always_or_unreachable, sometimes, reachable, unreachable);
   - `{"assert":{"type":"...","message":"...","hit":false}}`: declared, not evaluated (the catalog);
   - `{"guidance":{"message":"...","distance":1.5}}`: how far from the interesting outcome;
+  - `{"optimize":{"message":"...","bucket":{"leader":"n1"},"value":12,"goal":"maximize"}}`: an
+    objective (goal maximize or minimize). Each bucket (its strings and booleans) is explored
+    evenly, keeping the state with its best value; the tree returns to it (`sdk.optimize` in Zig,
+    `det_optimize` in C, `optimize` in Python, Rust, JavaScript and Clojure, `Optimize` in Go,
+    `Determinismo.optimize` in Java, `Lifecycle.Optimize` in .NET);
   - `{"decision":{"name":"...","options":["a","b"]}}` or `{"decision":{"name":"...","range":10}}`
     before the read that draws it;
   - `{"lifecycle":"setup_complete","details":{...}}`;

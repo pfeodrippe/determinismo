@@ -118,7 +118,11 @@ use them in other repositories.
   fault kind, a closer guidance distance, a new kind of output line) are returned to just after
   it, and new timelines branch from there. A `sometimes` or `reachable` made true comes first
   (the frontier's moment, a heavier archive cell): put one on each rare state worth building on
-  (a failover, a retry path, a recovery), and the tree returns there. Each timeline's `why` says why it starts where it
+  (a failover, a retry path, a recovery), and the tree returns there. For progress that builds
+  up (a growing backlog, a longer partition, more uncommitted entries), `sdk.optimize(message,
+  bucket, value, .maximize)`: each bucket keeps its best state so far and the tree returns
+  there, climbing (Antithesis's Metroid exploration). Each timeline also draws its own mix of
+  fault kinds (swarm testing; `fault_swarm` says which). Each timeline's `why` says why it starts where it
   does. A generation of 16 is 4 fresh starts and 3 moments with 4 branches each:
   `--return-branches 2` makes it 6 moments with 2 (serve's `return_branches`), and `--horizon
   60s` stops each returned branch a minute past its moment unless it found something new

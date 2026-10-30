@@ -199,6 +199,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "readdress", check_readdress },           .{ "retroactive", check_retroactive },
         .{ "hang", check_hang },                     .{ "pinned", check_pinned },
         .{ "slow", check_slow },                     .{ "sought", check_sought },
+        .{ "optimize", check_optimize },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -2519,6 +2520,26 @@ fn check_durability(context: *Context) !void {
     if (!passes) std.debug.print("{s}\n", .{lines_with(context.arena, report, &.{
         "FAIL", "fault_failed", "fault_inject_refused", "det-nodes", "always",
     }) catch ""});
+}
+
+/// An objective (sdk.optimize) leads the tree where chance does not: a streak of 24 coin flips,
+/// out of reach in 256 timelines blind, reached optimized (the archive keeps the longest streak
+/// yet and returns to it).
+fn check_optimize(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    var won: [2]u64 = undefined;
+    for ([_][]const u8{ "streak", "streak_blind" }, &won) |scenario, *count| {
+        const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
+        _ = try explore(context, &.{
+            "--program", program, "--scenario", scenario, "--seed", "1", "--branches", "256",
+            "--events-dir", events,
+        });
+        count.* = try query_count(context, &.{ events, "event=streak_won" });
+    }
+    expect_all(context, &.{
+        .{ "optimized, the streak is won", won[0] > 0 },
+        .{ "blind, it is not", won[1] == 0 },
+    }, "optimize: a streak of 24 won in {d} timelines optimized, {d} blind, of 256 each", .{ won[0], won[1] });
 }
 
 /// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just

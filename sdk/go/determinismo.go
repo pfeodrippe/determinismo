@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -373,6 +374,28 @@ func guidance(message string, distance float64) {
 	best[message] = distance
 	assertionLock.Unlock()
 	emit(map[string]any{"guidance": map[string]any{"message": message, "distance": distance}})
+}
+
+// Goal is an objective's direction (Optimize).
+type Goal string
+
+const (
+	Maximize Goal = "maximize"
+	Minimize Goal = "minimize"
+)
+
+// Optimize is an objective for exploration (Antithesis's "Optimizing our way through Metroid"):
+// bucket's strings and booleans split states into buckets (a leader, a phase), explored evenly,
+// each keeping the state with the best value by goal; the tree returns there and goes further
+// from it.
+func Optimize(message string, bucket map[string]any, value float64, goal Goal) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return
+	}
+	if bucket == nil {
+		bucket = map[string]any{}
+	}
+	emit(map[string]any{"optimize": map[string]any{"message": message, "bucket": bucket, "value": value, "goal": goal}})
 }
 
 // Number is what the guidance comparisons take.

@@ -421,6 +421,25 @@ test "guidance assertions compute their distance" {
     try std.testing.expectEqual(@as(u32, 2), conditions_held(conditions));
 }
 
+/// An objective for exploration (Antithesis's, "Optimizing our way through Metroid"): `bucket`'s
+/// strings and booleans split states into buckets (a leader, a phase), explored evenly, each
+/// keeping the state that scored best on `value` (more uncommitted entries, a longer
+/// partition): returns go to it, and from it further. Numbers in the bucket are left out.
+pub fn optimize(comptime message: []const u8, bucket: anytype, value: f64, comptime goal: Goal) void {
+    comptime assert(message.len > 0);
+    if (!std.math.isFinite(value)) return; // No JSON number.
+    var buffer: [message_size_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"optimize\":{\"message\":") catch unreachable;
+    json_write(&writer, message);
+    writer.writeAll(",\"bucket\":") catch unreachable;
+    json_write(&writer, bucket);
+    writer.print(",\"value\":{d},\"goal\":\"{s}\"}}}}", .{ value, @tagName(goal) }) catch return;
+    emit_raw(writer.buffered());
+}
+
+pub const Goal = enum { maximize, minimize };
+
 pub const Kind = enum { always, always_or_unreachable, sometimes, reachable, @"unreachable" };
 
 /// An assertion whose message is computed at run time: known to the platform only once it runs

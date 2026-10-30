@@ -20,6 +20,7 @@ one no timeline reaches is judged too. A message computed at run time is known o
 """
 import ast
 import json
+import math
 import random
 import os
 import sys
@@ -221,6 +222,17 @@ def _guidance(message, distance):
         return
     _best[message] = distance
     _emit({"guidance": {"message": message, "distance": distance}})
+
+
+def optimize(message, bucket, value, goal="maximize"):
+    """An objective for exploration (Antithesis's "Optimizing our way through Metroid"):
+    `bucket`'s strings and booleans split states into buckets (a leader, a phase), explored
+    evenly, each keeping the state with the best `value` (goal "maximize" or "minimize"); the
+    tree returns there and goes further from it."""
+    assert goal in ("maximize", "minimize"), goal
+    if not math.isfinite(value):
+        return
+    _emit({"optimize": {"message": message, "bucket": bucket or {}, "value": value, "goal": goal}})
 
 
 def _compare(kind, holds, margin, left, right, message, details):

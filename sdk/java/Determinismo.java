@@ -384,6 +384,21 @@ public final class Determinismo {
     emit("{\"event\":" + quote(name) + ",\"details\":" + orEmpty(details) + "}");
   }
 
+  /** An objective's direction ({@link #optimize}). */
+  public enum Goal { MAXIMIZE, MINIMIZE }
+
+  /**
+   * An objective for exploration (Antithesis's "Optimizing our way through Metroid"): {@code
+   * bucket}'s strings and booleans (a JSON object, or null) split states into buckets (a leader, a
+   * phase), explored evenly, each keeping the state with the best {@code value} by {@code goal};
+   * the tree returns there and goes further from it.
+   */
+  public static void optimize(String message, String bucket, double value, Goal goal) {
+    if (!Double.isFinite(value)) return;
+    emit("{\"optimize\":{\"message\":" + quote(message) + ",\"bucket\":" + orEmpty(bucket)
+        + ",\"value\":" + value + ",\"goal\":\"" + goal.name().toLowerCase(java.util.Locale.ROOT) + "\"}}");
+  }
+
   /** Antithesis's name for {@link #event}. */
   public static void sendEvent(String name, String details) {
     event(name, details);

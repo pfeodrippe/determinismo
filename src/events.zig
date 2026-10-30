@@ -123,6 +123,10 @@ pub const Behavior = struct {
     /// A `sometimes` or `reachable` assertion made true: a state its programmer marked as worth
     /// reaching, where the tree returns first (Antithesis restarts tests from where one is hit).
     sought: bool = false,
+    /// An optimization's bucket (sdk.optimize): the best score this timeline reached in it
+    /// (higher is better: a minimized value negated), `vtime_ns` when. The archive keeps each
+    /// bucket's best state across timelines (Antithesis's Metroid exploration).
+    score: ?f64 = null,
 
     pub fn name(behavior: *const Behavior) []const u8 {
         return behavior.label[0..behavior.label_size];
@@ -224,13 +228,24 @@ fn retroactive_hidden(events: *const Events, data: []const u8) bool {
 }
 
 fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
+    const optimized = optimize_of(value);
     const hash = behavior_hash(value) orelse guidance_hash(value) orelse
-        output_hash(value) orelse return;
+        if (optimized) |found| found.hash else output_hash(value) orelse return;
     if (events.behavior_count == behavior_count_max) return;
     const key = hash | 1; // 0 marks an empty slot.
     var slot = key % behavior_slot_count;
     while (events.behavior_slots[slot] != 0) : (slot = (slot + 1) % behavior_slot_count) {
-        if (events.behavior_slots[slot] == key) return;
+        if (events.behavior_slots[slot] != key) continue;
+        // A bucket seen before in this timeline: its best score kept, and when.
+        if (optimized) |found| for (events.behaviors[0..events.behavior_count]) |*known| {
+            if (known.hash != key) continue;
+            if (known.score == null or found.score > known.score.?) {
+                known.score = found.score;
+                known.vtime_ns = moment.vtime_ns;
+            }
+            break;
+        };
+        return;
     }
     events.behavior_slots[slot] = key;
     const behavior = &events.behaviors[events.behavior_count];
@@ -243,7 +258,33 @@ fn behavior_note(events: *Events, moment: Moment, value: std.json.Value) void {
     @memcpy(behavior.node_name[0..size], node[0..size]);
     behavior.node_size = @intCast(size);
     behavior.sought = behavior_sought(value);
+    behavior.score = if (optimized) |found| found.score else null;
     events.behavior_count += 1;
+}
+
+const Optimized = struct { hash: u64, score: f64 };
+
+/// `{"optimize":{"message":M,"bucket":{...},"value":V,"goal":"maximize"|"minimize"}}`
+/// (sdk.optimize): its bucket as a behavior (the message and the bucket's strings and
+/// booleans), and its score, higher better.
+fn optimize_of(value: std.json.Value) ?Optimized {
+    if (value != .object) return null;
+    const optimize = value.object.get("optimize") orelse return null;
+    if (optimize != .object) return null;
+    const message = string_field(optimize.object, "message") orelse return null;
+    const measured: f64 = switch (optimize.object.get("value") orelse return null) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => return null,
+    };
+    const minimize = std.mem.eql(u8, string_field(optimize.object, "goal") orelse "", "minimize");
+    var hasher = std.hash.Wyhash.init(0x6f7074696d697a65);
+    hasher.update(message);
+    if (optimize.object.get("bucket")) |bucket| if (bucket == .object) {
+        var fields = bucket.object.iterator();
+        while (fields.next()) |field| hash_field(&hasher, bucket.object, field.key_ptr.*);
+    };
+    return .{ .hash = hasher.final(), .score = if (minimize) -measured else measured };
 }
 
 /// Whether an assertion's evaluation is a `sometimes` or `reachable` made true (determinismo's
@@ -303,6 +344,19 @@ fn behavior_label(writer: *std.Io.Writer, value: std.json.Value) void {
     if (value.object.get("guidance")) |guidance| if (guidance == .object) {
         const message = string_field(guidance.object, "message") orelse "";
         writer.print("closer to \"{s}\"", .{message}) catch {};
+        return;
+    };
+    if (value.object.get("optimize")) |optimize| if (optimize == .object) {
+        const message = string_field(optimize.object, "message") orelse "";
+        writer.print("best \"{s}\"", .{message}) catch {};
+        if (optimize.object.get("bucket")) |bucket| if (bucket == .object) {
+            var fields = bucket.object.iterator();
+            while (fields.next()) |field| switch (field.value_ptr.*) {
+                .string => |text| writer.print(" {s}={s}", .{ field.key_ptr.*, text }) catch {},
+                .bool => |flag| writer.print(" {s}={}", .{ field.key_ptr.*, flag }) catch {},
+                else => {},
+            };
+        };
         return;
     };
     if (value.object.get("output")) |output| if (output == .object) {
@@ -446,6 +500,26 @@ fn guidance_hash(value: std.json.Value) ?u64 {
     hasher.update(message);
     hasher.update(std.mem.asBytes(&bucket));
     return hasher.final();
+}
+
+test "an optimized bucket keeps its best score" {
+    var buffer: [parse_buffer_size]u8 = undefined;
+    var events: Events = undefined;
+    events.init(&buffer, .{ .log_fd = null });
+    const leader_a_3 = "{\"optimize\":{\"message\":\"lag\",\"bucket\":{\"leader\":\"a\"},\"value\":3,\"goal\":\"maximize\"}}";
+    const leader_a_7 = "{\"optimize\":{\"message\":\"lag\",\"bucket\":{\"leader\":\"a\"},\"value\":7,\"goal\":\"maximize\"}}";
+    const leader_a_5 = "{\"optimize\":{\"message\":\"lag\",\"bucket\":{\"leader\":\"a\"},\"value\":5,\"goal\":\"maximize\"}}";
+    const leader_b = "{\"optimize\":{\"message\":\"lag\",\"bucket\":{\"leader\":\"b\"},\"value\":9,\"goal\":\"minimize\"}}";
+    try events.emit(.{ .vtime_ns = 10, .branches = 1 }, leader_a_3);
+    try events.emit(.{ .vtime_ns = 20, .branches = 2 }, leader_a_7);
+    try events.emit(.{ .vtime_ns = 30, .branches = 3 }, leader_a_5);
+    try events.emit(.{ .vtime_ns = 40, .branches = 4 }, leader_b);
+    try std.testing.expectEqual(@as(u32, 2), events.behavior_count);
+    // Bucket a: its best (7), reached at 20; bucket b: minimized, 9 negated.
+    try std.testing.expectEqual(@as(?f64, 7), events.behaviors[0].score);
+    try std.testing.expectEqual(@as(u64, 20), events.behaviors[0].vtime_ns);
+    try std.testing.expectEqualStrings("best \"lag\" leader=a", events.behaviors[0].name());
+    try std.testing.expectEqual(@as(?f64, -9), events.behaviors[1].score);
 }
 
 test behavior_note {

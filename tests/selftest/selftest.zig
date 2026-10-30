@@ -91,6 +91,8 @@ pub fn main(init: std.process.Init) !void {
             .aim = aim_scenario,
             .slow = slow_scenario,
             .sought = sought_scenario,
+            .streak = streak_scenario,
+            .streak_blind = streak_blind_scenario,
         },
         .checks = .{ .squares = squares_check },
     });
@@ -791,6 +793,43 @@ fn wander(_: *System.Context) !void {
     sdk.sleep_ms(200);
     _ = sdk.random_below(2); // A draw after it: its moment leads elsewhere.
     sdk.sleep_ms(3000);
+}
+
+/// A streak of coin flips won, reset by any loss: 24 in a row is one chance in 16 million at
+/// each step, out of reach by chance. Optimized (sdk.optimize: the streak, maximized), the tree
+/// returns to the longest streak yet and goes on from it, as Antithesis's explorer kept the
+/// state with the most missiles; blind, the same flips with nothing said.
+fn streak_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("flips", flips_optimized);
+}
+
+fn streak_blind_scenario(s: *System.Scenario) void {
+    s.faults = false;
+    s.singleton_driver("flips", flips_blind);
+}
+
+fn flips_optimized(_: *System.Context) !void {
+    flips(true);
+}
+
+fn flips_blind(_: *System.Context) !void {
+    flips(false);
+}
+
+const streak_wanted = 24;
+
+fn flips(optimized: bool) void {
+    var streak: u32 = 0;
+    for (0..400) |_| {
+        sdk.sleep_ms(20);
+        streak = if (sdk.random_below_named("flip", 2) == 1) streak + 1 else 0;
+        if (optimized) sdk.optimize("streak", .{}, @floatFromInt(streak), .maximize);
+        if (streak >= streak_wanted) {
+            sdk.event("streak_won", .{ .length = streak });
+            return;
+        }
+    }
 }
 
 fn hang(s: *System.Scenario) void {

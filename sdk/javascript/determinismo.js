@@ -287,6 +287,19 @@ function guidance(message, distance) {
   emit({ guidance: { message, distance } });
 }
 
+/**
+ * An objective for exploration (Antithesis's "Optimizing our way through Metroid"): `bucket`'s
+ * strings and booleans split states into buckets (a leader, a phase), explored evenly, each
+ * keeping the state with the best `value` by `goal` ("maximize" or "minimize"); the tree returns
+ * there and goes further from it.
+ */
+function optimize(message, bucket, value, goal = "maximize") {
+  if (goal !== "maximize" && goal !== "minimize") throw new RangeError(`optimize: a goal, not ${goal}`);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return;
+  emit({ optimize: { message, bucket: bucket || {}, value: number, goal } });
+}
+
 function difference(a, b) {
   return typeof a === "bigint" || typeof b === "bigint" ? Number(BigInt(a) - BigInt(b)) : a - b;
 }
@@ -671,6 +684,7 @@ module.exports = {
   sometimesLessThanOrEqual,
   alwaysSome,
   sometimesAll,
+  optimize,
   declare,
   catalog,
   catalogAssertions,

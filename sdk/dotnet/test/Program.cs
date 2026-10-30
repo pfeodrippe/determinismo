@@ -22,6 +22,8 @@ Assert.AlwaysSome(new Dictionary<string, bool> { ["a"] = false, ["b"] = true }, 
 if (Environment.ProcessId < 0) Assert.Unreachable("never reached in this test");
 Lifecycle.SetupComplete(new JsonObject { ["nodes"] = 3 });
 Lifecycle.SendEvent("transfer", new JsonObject { ["amount"] = 10 });
+Lifecycle.Optimize("backlog", new JsonObject { ["leader"] = "n1" }, 3);
+Lifecycle.Optimize("never sent", null, double.NaN, Goal.Minimize);
 
 var below = Random.RandomBelow(7);
 Check(below < 7, "RandomBelow(7) < 7");
@@ -50,6 +52,9 @@ Check(lines.Any(line => line["guidance"]?["message"]?.ToString() == "the balance
 Check(Assertion("a replica answers", true)?["details"]?["conditions"]?["b"]?.GetValue<bool>() == true, "AlwaysSome's conditions");
 Check(lines.Any(line => line["lifecycle"]?.ToString() == "setup_complete" && (int?)line["details"]?["nodes"] == 3), "setup_complete");
 Check(lines.Any(line => line["event"]?.ToString() == "transfer" && (int?)line["details"]?["amount"] == 10), "an event");
+Check(lines.Any(line => line["optimize"] is JsonObject o && o["bucket"]?["leader"]?.ToString() == "n1"
+    && o["value"]?.GetValue<double>() == 3 && o["goal"]?.ToString() == "maximize"), "an objective");
+Check(!lines.Any(line => line["optimize"]?["message"]?.ToString() == "never sent"), "no objective for NaN");
 var catalog = Catalog.Assertions();
 Check(catalog.Contains(("unreachable", "never reached in this test")), "the generated catalog has an assertion never run");
 Check(catalog.Contains(("always", "the balance stays positive")), "the catalog has a comparison as an always");

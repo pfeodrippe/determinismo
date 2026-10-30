@@ -1239,8 +1239,8 @@ const SummaryHeader = extern struct {
     reserved: [6]u8 = @splat(0),
 };
 
-/// Bumped whenever Events.Behavior changes. 1: `sought`.
-const summary_format = 1;
+/// Bumped whenever Events.Behavior changes. 1: `sought`. 2: `score`.
+const summary_format = 2;
 
 fn summary_write(fd: linux.fd_t, summary: *const Summary) void {
     const header: SummaryHeader = .{
@@ -2967,6 +2967,8 @@ const Cell = struct {
     label: []const u8,
     visits: u32 = 0,
     sought: bool = false,
+    /// An optimization's bucket (sdk.optimize): the best score reached in it, at its one place.
+    best: ?f64 = null,
 
     const Place = struct { branch: u32, vtime_ns: u64 };
 
@@ -3356,6 +3358,17 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
         const open = summary.cut or at < summary.last_pull_ns;
         if (!open or at + std.time.ns_per_ms >= summary.end_ns) continue;
         const entry = try state.cells.getOrPut(arena, behavior.hash);
+        if (entry.found_existing) if (behavior.score) |score| {
+            // An optimization's bucket: its place is its best state (Antithesis's representative
+            // replaced by a better one, "Optimizing our way through Metroid"), returned to anew.
+            const cell = entry.value_ptr;
+            if (cell.best != null and score <= cell.best.?) continue;
+            cell.places[0] = .{ .branch = summary.index, .vtime_ns = at };
+            cell.place_count = 1;
+            cell.best = score;
+            cell.visits = 0;
+            continue;
+        };
         if (entry.found_existing) {
             // A sought behavior reached by another timeline: one more place to return to.
             const cell = entry.value_ptr;
@@ -3372,6 +3385,7 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
             .places = undefined,
             .label = try arena.dupe(u8, behavior.name()),
             .sought = behavior.sought,
+            .best = behavior.score,
         };
         entry.value_ptr.places[0] = .{ .branch = summary.index, .vtime_ns = at };
     }
@@ -3401,11 +3415,13 @@ fn archive_returns(
         const timelines: u64 = state.visits.get(entry.key_ptr.*) orelse 0;
         // A sought cell ranks as one a few times rarer (lower scores go first).
         const weight: u64 = if (state.prefer_sometimes and !entry.value_ptr.sought) sought_weight else 1;
-        ranked[index] = .{
-            .hash = entry.key_ptr.*,
-            .score = (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)) * weight,
-            .tie = random.random().int(u64),
-        };
+        // An objective's bucket by its returns alone (since its best last improved): buckets
+        // explored evenly however many timelines reach them, as Antithesis's are.
+        const score = if (entry.value_ptr.best != null)
+            1 + @as(u64, entry.value_ptr.visits)
+        else
+            (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)) * weight;
+        ranked[index] = .{ .hash = entry.key_ptr.*, .score = score, .tie = random.random().int(u64) };
     }
     std.sort.pdq(Ranked, ranked, {}, struct {
         fn before(_: void, a: Ranked, b: Ranked) bool {

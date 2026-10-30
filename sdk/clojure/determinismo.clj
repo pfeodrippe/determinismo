@@ -177,6 +177,18 @@
   ([name] (event name nil))
   ([name data] (Determinismo/event name (details-json data))))
 
+(defn optimize
+  "An objective for exploration (Antithesis's \"Optimizing our way through Metroid\"): `bucket`'s
+  strings and booleans split states into buckets (a leader, a phase), explored evenly, each
+  keeping the state with the best `value` by `goal` (:maximize, the default, or :minimize); the
+  tree returns there and goes further from it."
+  ([message bucket value] (optimize message bucket value :maximize))
+  ([message bucket value goal]
+   (Determinismo/optimize message (details-json bucket) (double value)
+                          (case goal
+                            :maximize Determinismo$Goal/MAXIMIZE
+                            :minimize Determinismo$Goal/MINIMIZE))))
+
 (defn output
   "Any map as an event of its own (the protocol's raw form: docs/SDKS.md)."
   [data]

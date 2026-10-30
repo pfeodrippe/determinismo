@@ -17,6 +17,7 @@ func TestOutsideDeterminismo(t *testing.T) {
 	AlwaysGreaterThanOrEqualTo(3, 3, "three ties three", nil)
 	SometimesAll([]NamedBool{{"a", true}, {"b", false}}, "a and b", nil)
 	Event("started", nil)
+	Optimize("backlog", map[string]any{"leader": "n1"}, 3, Maximize)
 	Output(map[string]any{"custom": 1})
 	BuggifyPause("anywhere")
 	if Buggify("anywhere") {
@@ -35,7 +36,8 @@ func TestOutsideDeterminismo(t *testing.T) {
 		t.Fatalf("catalog: %q %v", listed.String(), err)
 	}
 	events, _ := os.ReadFile(file)
-	for _, want := range []string{`"message":"the draw is zero"`, `"line":`, `"guidance"`, `"custom":1`, `"event":"started"`} {
+	for _, want := range []string{`"message":"the draw is zero"`, `"line":`, `"guidance"`, `"custom":1`, `"event":"started"`,
+		`"optimize":{"bucket":{"leader":"n1"},"goal":"maximize","message":"backlog","value":3}`} {
 		if !strings.Contains(string(events), want) {
 			t.Fatalf("local output lacks %s:\n%s", want, events)
 		}
