@@ -99,7 +99,13 @@ import sys, json, urllib.request
 run = json.load(sys.stdin)
 stats = run.get("stats") or {}
 properties = json.load(urllib.request.urlopen("http://localhost:7878/runs/%d/properties" % run["id"], timeout=60))
-failing = ["%s (%d)" % (p["message"], p.get("timelines_failing") or 0) for p in properties if p.get("status") == "failing"]
+# Each failing property with its findability (serve: independent finds, mean CPU time to find).
+def failure(p):
+    found = ""
+    if p.get("independent_finds"):
+        found = ", found %d times, every %.1f CPU-min" % (p["independent_finds"], (p.get("mean_cpu_ns_to_find") or 0) / 6e10)
+    return "%s (%d%s)" % (p["message"], p.get("timelines_failing") or 0, found)
+failing = [failure(p) for p in properties if p.get("status") == "failing"]
 summary = run.get("summary") or {}
 busy = ", %.1f of %d workers busy" % (summary["at_once"], summary["workers"]) if summary.get("workers") else ""
 # Its timelines replayed as it ran: a parted one is a determinism bug of the platform.
