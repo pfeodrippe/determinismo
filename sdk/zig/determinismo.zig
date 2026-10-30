@@ -797,11 +797,30 @@ fn location_write(writer: *std.Io.Writer, address: usize) void {
 
 fn json_write(writer: *std.Io.Writer, value: anytype) void {
     const start = writer.end;
-    std.json.Stringify.value(value, .{}, writer) catch {
-        // Details that don't fit are replaced: the assertion itself must never be lost.
-        writer.end = start;
-        writer.writeAll("\"<details too large>\"") catch unreachable;
-    };
+    const fits = if (std.json.Stringify.value(value, .{}, writer)) |_|
+        writer.buffer.len - writer.end >= json_closing_max
+    else |_|
+        false;
+    if (fits) return;
+    // Details that don't fit, with room for what closes the message after them, are
+    // replaced: the assertion itself must never be lost (Consul's driver panicked on an
+    // event whose details fit but left no room for its closing brace).
+    writer.end = start;
+    writer.writeAll("\"<details too large>\"") catch unreachable;
+}
+
+/// What a message may still write after a value: its closing braces.
+const json_closing_max = 16;
+
+test "json_write leaves room for what closes the message" {
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.writeAll("{\"event\":") catch unreachable;
+    // A string that fits the buffer but leaves no room for "}".
+    const filler: [50]u8 = @splat('x');
+    json_write(&writer, @as([]const u8, &filler));
+    writer.writeAll("}") catch unreachable;
+    try std.testing.expectEqualStrings("{\"event\":\"<details too large>\"}", writer.buffered());
 }
 
 fn emit_raw(message: []const u8) void {
