@@ -39,8 +39,9 @@ ssh "$host" 'sudo -n systemctl start determinismo-serve; sleep 5; curl -s --max-
 import json, sys
 runs = json.load(sys.stdin)
 print(\"serve lists %d runs\" % len(runs))"; head -3 ~/park-manifest.txt'
-echo "== Back. The hunts left to run are ~/hunts/next-list2.txt's (the queue's log: ~/hunts/queue-run.log)."
-echo "To run them: ssh $host 'cd ~/determinismo && sudo -n systemd-run --uid=$user --unit hunts \\"
-echo "  -p AllowedCPUs=<your reserved cores> infra/host/hunt-queue.sh 0 \$(grep -v \"^#\" ~/hunts/next-list2.txt)'"
+echo "== Back. The hunts left to run are in ~/hunts/next-list*.txt, in order (the queue's log:"
+echo "~/hunts/queue-run.log says which ran). To run a list: ssh $host 'cd ~/determinismo && \\"
+echo "  sudo -n systemd-run --uid=$user --unit hunts -p AllowedCPUs=<your reserved cores> \\"
+echo "  infra/host/hunt-queue.sh 0 \$(grep -v \"^#\" ~/hunts/<list>)'"
 echo "Runs parked from the old host keep their records and events; their tapes replay only on the"
 echo "build that made them, and every new hunt starts on this one."
