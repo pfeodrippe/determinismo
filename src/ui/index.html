@@ -746,11 +746,20 @@ const builtin = new Set(["test commands exit successfully", "no unexpected conta
 // Also determinismo's: a crash named by its process, a language runtime's panic (Go, Rust, Java).
 const isBuiltin = (message) => builtin.has(message) || message.startsWith("no process crashes")
   || /^no (panics|fatal errors|data races|uncaught exceptions) \((Go|Rust|Java)\)$/.test(message);
+// Antithesis's findability: the failure counted once a subtree (siblings' failures are one
+// find), and the run's CPU time over those finds, the mean time to find it again.
+function findability(property) {
+  if (!property.finds) return "";
+  const s = property.find_ns / 1e9;
+  const every = s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${(s / 60).toFixed(1)} min` : `${s.toFixed(1)} s`;
+  return ` · found ${property.finds} ${property.finds === 1 ? "time" : "times"} independently, every ${every} of CPU on average`;
+}
 function properties() {
   return (state.run.properties || []).map((p) => ({
     kind: p.type, message: p.message, location: p.location, status: p.status,
     failing: p.status === "failing", branches_hit: p.timelines_hit, branches_true: p.timelines_true,
     branches_failing: p.timelines_failing, example_branch: p.first_failing_timeline,
+    finds: p.independent_finds, find_ns: p.mean_cpu_ns_to_find,
   }));
 }
 // Failing across the multiverse (a sometimes never true too); an assertion that must be reached
@@ -800,7 +809,7 @@ function propertyHtml(property) {
   return `<div class="property" data-message="${escape(property.message)}" data-kind="${escape(property.kind)}">
     <div class="row">${badge}
       <span class="name">${escape(property.message)}${property.location ? ` <span class="muted mono" style="font-size:11px">${escape(property.location)}</span>` : ""}</span>
-      <span class="counts">${escape(property.kind)} · hit in ${property.branches_hit}${property.kind === "sometimes" ? ` · true in ${property.branches_true ?? "?"}` : ""} · failing in ${property.branches_failing}</span></div>
+      <span class="counts">${escape(property.kind)} · hit in ${property.branches_hit}${property.kind === "sometimes" ? ` · true in ${property.branches_true ?? "?"}` : ""} · failing in ${property.branches_failing}${findability(property)}</span></div>
     <div class="examples" hidden></div></div>`;
 }
 function propertiesWire() {

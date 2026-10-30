@@ -488,7 +488,7 @@ fn sql_string(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// them, a `sometimes` that no timeline made true; one that must be reached and was not
 /// (`always`, `sometimes`, `reachable`) is "unreached" (judged across scenarios).
 pub const properties_sql =
-    \\WITH per AS (
+    \\WITH RECURSIVE per AS (
     \\    SELECT timeline, type, name AS message,
     \\        count(condition) AS hits,
     \\        count(*) FILTER (WHERE condition) AS trues,
@@ -511,6 +511,24 @@ pub const properties_sql =
     \\        min(timeline) FILTER (WHERE hits > 0) AS first_hit_timeline,
     \\        sum(hits) AS hits, sum(trues) AS trues, any_value(place) AS place
     \\    FROM per GROUP BY ALL
+    \\), failing_timelines AS (
+    \\    SELECT DISTINCT type, message, timeline FROM per WHERE failed_ns IS NOT NULL
+    \\), ancestry(timeline, ancestor) AS (
+    \\    -- A tree's timeline and every timeline it branched from.
+    \\    SELECT branch, parent FROM timelines WHERE parent IS NOT NULL
+    \\    UNION ALL
+    \\    SELECT a.timeline, t.parent FROM ancestry a JOIN timelines t ON t.branch = a.ancestor
+    \\    WHERE t.parent IS NOT NULL
+    \\), independent AS (
+    \\    -- Antithesis's findability: a failure counted once a subtree, where no timeline it
+    \\    -- branched from failed the property too (siblings' failures are not independent).
+    \\    SELECT type, message, count(*) AS finds FROM failing_timelines f
+    \\    WHERE NOT EXISTS (SELECT 1 FROM ancestry a JOIN failing_timelines g
+    \\        ON g.timeline = a.ancestor AND g.type = f.type AND g.message = f.message
+    \\        WHERE a.timeline = f.timeline)
+    \\    GROUP BY ALL
+    \\), cpu AS (
+    \\    SELECT sum(wall_ns) AS cpu_ns FROM timelines
     \\), listed AS (
     \\SELECT type, message,
     \\    CASE
@@ -526,15 +544,18 @@ pub const properties_sql =
     \\    regexp_extract(coalesce(place ->> '$.file', place ->> '$.file_name'), '[^/]*$') || ':'
     \\        || coalesce(place ->> '$.line', place ->> '$.begin_line', '0')
     \\        || coalesce(' ' || coalesce(place ->> '$.function', place ->> '$.function_name'), '')
-    \\        AS location
-    \\FROM judged
+    \\        AS location,
+    \\    finds AS independent_finds,
+    \\    -- Mean CPU time to find it: the timelines' time over its independent finds.
+    \\    (SELECT cpu_ns FROM cpu) // finds AS mean_cpu_ns_to_find
+    \\FROM judged LEFT JOIN independent USING (type, message)
     \\UNION ALL
     \\-- The run's timelines replayed as it ran (replays.zig): determinismo's own property.
     \\SELECT 'always', 'timelines replay to their recorded history', -- report.replays_property
     \\    CASE WHEN bool_and(same) THEN 'passing' ELSE 'failing' END,
     \\    count(*), count(*) FILTER (WHERE same), count(*) FILTER (WHERE NOT same),
     \\    min(timeline) FILTER (WHERE NOT same), NULL, min(timeline), count(*),
-    \\    count(*) FILTER (WHERE same), 'replays.zig'
+    \\    count(*) FILTER (WHERE same), 'replays.zig', NULL, NULL
     \\FROM replays HAVING count(*) > 0
     \\UNION ALL
     \\-- Logging volume over all the timelines (report.logging_judge: 200 MB an hour of virtual
@@ -542,7 +563,7 @@ pub const properties_sql =
     \\SELECT 'always', 'logging output stays under 200 MB per hour of virtual time',
     \\    CASE WHEN sum(output_bytes) * 3600000000000 >= 200000000 * sum(output_span_ns)
     \\        AND sum(output_span_ns) >= 1000000000 THEN 'failing' ELSE 'passing' END,
-    \\    count(*), count(*), 0, NULL, NULL, min(branch), count(*), count(*), 'report.zig'
+    \\    count(*), count(*), 0, NULL, NULL, min(branch), count(*), count(*), 'report.zig', NULL, NULL
     \\FROM timelines HAVING count(output_span_ns) > 0
     \\)
     \\SELECT * FROM listed
