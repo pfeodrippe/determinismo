@@ -176,8 +176,8 @@ event hashing, the guest module.
      stopped run 210 (OpenSearch, 1,417 timelines) at timeline 80 with 6 behaviors still to
      come, run 235 (jank's nREPL, 9,854) at 50 with 2, run 239 (Redpanda, 377) at 212 with 2.
      The tree's returns repeat rare behaviors on purpose, which empties the singletons early
-     (the paper's adaptive bias); the plateau rule stays (scratch: gt_sim.py, kept out of the
-     repository). On cheap timelines it never fires at all (Raft, 12,900 an hour).
+     (the paper's adaptive bias); the plateau rule stays. On cheap timelines it never fires at
+     all (Raft, 12,900 an hour).
   5. A learning archive: seed scheduling as a bandit (EcoFuzz, USENIX Security 2020; AFL-Hier,
      NDSS 2021; T-Scheduler, Thompson sampling, 2023). Built: a cell counts the branches of its
      returns that found a behavior new to the tree (`paid`), and ranks as one that many times
