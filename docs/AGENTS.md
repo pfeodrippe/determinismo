@@ -94,7 +94,9 @@ use them in other repositories.
    **Try a change**: `replay` with `exec` and `continue` makes a change at a moment (data, a
    setting, a function redefined through a REPL) and lets the branch play out; `fork` with
    `exec` explores many futures of the changed system. `determinismo extract` takes a node's
-   file out at a moment (a data file, a core dump); `determinismo inject` puts a local file in
+   file out at a moment (a data file, a core dump; from a node that exited, through its
+   writable layer: `--file runner:/run/det/nodes/<node>/layer/upper/<path>`, for the last lines
+   of a log written just before an exit); `determinismo inject` puts a local file in
    (a patched binary, a config), then `--then` and `--continue`. `determinismo profile --node
    <node> --ms <duration>` samples where the node spends its CPU from the moment on (`--all`
    for waiting threads too, `--svg` for a flame graph); `determinismo stacks --node <node>`
