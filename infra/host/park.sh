@@ -68,7 +68,7 @@ kept='.determinismo hunts guest raft-poc park-manifest.txt'
 excluded='--exclude=.determinismo/runs/*/snapshots --exclude=.determinismo/runs/*/holders'
 
 echo "== On $host: what runs now"
-ssh "$host" 'systemctl list-units --type=service --state=active --plain --no-legend "after-*" "hunt*" "pass*" "unit*" | cut -d" " -f1
+ssh "$host" 'systemctl list-units --type=service --state=active --plain --no-legend "after-*" "hunt*" "pass*" "unit*" "members*" | cut -d" " -f1
 curl -s --max-time 30 localhost:7878/runs | python3 -c "
 import json, sys
 print(\"running runs:\", [r[\"id\"] for r in json.load(sys.stdin) if r.get(\"state\") == \"running\"] or \"none\")"'
@@ -81,7 +81,7 @@ fi
 
 echo "== Stopping the hunt queue, then every running run (through serve), then serve"
 ssh "$host" 'set -e
-for unit in $(systemctl list-units --type=service --state=active --plain --no-legend "after-*" "hunt*" "pass*" "unit*" | cut -d" " -f1); do
+for unit in $(systemctl list-units --type=service --state=active --plain --no-legend "after-*" "hunt*" "pass*" "unit*" "members*" | cut -d" " -f1); do
   sudo -n systemctl stop "$unit"; echo "stopped $unit"
 done
 for id in $(curl -s --max-time 30 localhost:7878/runs | python3 -c "
