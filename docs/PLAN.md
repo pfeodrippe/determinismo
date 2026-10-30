@@ -189,11 +189,14 @@ event hashing, the guest module.
      generator seeded from the platform at each fault. The selftest's `interleave` check: a
      waker-wakee race the kernel alone settles one way (the woken thread a batch one) goes both
      ways. Measured on its way: EEVDF lets a normal woken thread run before its waker goes on
-     about two times in five (164 and 158 of 400 rounds), the fault one in three. Next: the
-     membership smokes of round 3 run on it (ten systems), then findability with and without
-     it (`--faults -interleave`) on the Raft POC, seeds 4-6, queued after deploy 13 (its double
-     vote and log divergence are interleavings); PCT's priority change points if POS falls
-     short.
+     about two times in five (164 and 158 of 400 rounds), the fault one in three. On real
+     systems (round 3 of the membership smokes, 2 timelines each): the module drew 11,332
+     choices among Galera's threads, 9,655 among ZooKeeper's, 9,190 among Redpanda's (MongoDB's
+     timelines did not draw the fault), and no timeline's kernel warned. Short faults on idle
+     nodes draw few (none in some): on one mostly idle vCPU a node's threads seldom compete.
+     Next: findability with and without it (`--faults -interleave`) on the Raft POC, seeds
+     4-6, queued after deploy 12 (its double vote and log divergence are interleavings); PCT's
+     priority change points if POS falls short.
   7. Memory accesses where threads communicate: DataCollider (OSDI 2010; hardware data
      breakpoints on sampled accesses, then a delay: a conflicting access during it is a race,
      both threads caught at it), KCSAN's soft watchpoints, Snowboard's potential memory
