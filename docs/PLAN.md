@@ -118,6 +118,12 @@ event hashing, the guest module.
   (serve: `prefer_sometimes: false`) for the benchmark: queued first in the hunt list, the Raft
   POC (its Antithesis SDK assertions now behaviors) 20 minutes each way, seed 1, timelines to
   each of its known bugs. A horizon stays off: measured, it hurt (Galera, below).
+  Measured (srv3, 2026-10-30, runs 230 and 231, 20 minutes each, seed 1): no gain on this
+  benchmark. Both runs found only the commit-progress deadlock, neither the POC's other three
+  bugs. Preferring sometimes: 4351 timelines, the first failing at completion 62, 53 failing.
+  Uniform: 4340 timelines, the first at 75, 71 failing. It stays on (guidance on by default),
+  but one seed of one bug says nothing for it yet; the next measure is several seeds, and a
+  system whose bugs sit behind a rare state.
 
 - Redpanda's second finding (run 177's timeline 56): a partition leader restarted from a local
   snapshot never arms `rm_stm`'s auto-abort timer for the open transactions the snapshot holds
@@ -178,6 +184,13 @@ event hashing, the guest module.
   (COCKROACH_MIN_RANGE_MAX_BYTES now) and Consul refused to boot after power losses (#3489:
   node IDs given now), both smoked again.
 
+- Failures at their moment, with their cause (2026-10-30). An exit of a node the injector
+  restarted was judged only when faults stopped: it was the injector's unreaped child. Nodes are
+  det-init's children now, judged as they exit. A failing exit carries the node's last lines
+  (`said`), and so does a crash's core_dump event; the UI shows them by each failing example.
+  Next: crashes judged at their moment. det-init reads the kernel's log once, at the end, so
+  SurrealDB's panic at 49.3 s failed its property at 63.4 s. det-core, run at the crash, can
+  judge it then.
 - Causality: the planner protocol and Clojure planners (plugins/clojure/strategies.clj,
   docs/PLUGINS.md), refinement up to six rounds (40 moments, jumps narrowed to 20 ms), pid files
   (a serve restart keeps a running analysis), a failure snapshotted as soon as it is found, and
