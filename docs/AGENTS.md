@@ -118,7 +118,8 @@ use them in other repositories.
   fault kind, a closer guidance distance, a new kind of output line) are returned to just after
   it, and new timelines branch from there. A `sometimes` or `reachable` made true comes first
   (the frontier's moment, a heavier archive cell): put one on each rare state worth building on
-  (a failover, a retry path, a recovery), and the tree returns there. For progress that builds
+  (a failover, a retry path, a recovery), and the tree returns there. An archive cell whose
+  returns found something new ranks higher (returns go where they pay). For progress that builds
   up (a growing backlog, a longer partition, more uncommitted entries), `sdk.optimize(message,
   bucket, value, .maximize)`: each bucket keeps its best state so far and the tree returns
   there, climbing (Antithesis's Metroid exploration). Each timeline also draws its own mix of
