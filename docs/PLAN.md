@@ -105,6 +105,119 @@ event hashing, the guest module.
   `drivers_stopped` event); those running finish, then the ending and the checks. Next: how
   many timelines an hour Redpanda's next hunt runs.
 
+- Membership changes, the gap against Jepsen's nemeses (2026-10-30). Jepsen finds so much
+  without controlling determinism through its oracles (Knossos and Elle against the vendor's
+  own claims), workloads that make anomalies visible, and faults that reach shallow bugs (most
+  need few nodes and few events: Yuan et al., OSDI 2014). Our faults cover its nemeses and more
+  (power loss at fsync points, sync stalls, lying disks, duplicated and corrupted packets,
+  clock skew), but no workload adds or removes a member, Jepsen's `member` nemesis (behind
+  much of Redis-Raft's and etcd's analyses). Built: spare nodes (schema `spare`: prepared with
+  the others, started by a driver; det-faults leaves a node alone while it is not running), and
+  a `member` driver that takes one membership step at a time (a lock file in the runner) from
+  what the cluster lists: etcd (the spare added as a learner or a voter, promoted, removed after
+  it is stopped, added again fresh), rqlite (joins as a voter by itself, `DELETE /remove`),
+  Consul (joins by retry-join, autopilot makes it a voter; force-leave with prune), RabbitMQ
+  (the quorum queue's members: delete_member at three, add_member back), NATS (a stream peer
+  removed; with three servers its replacement is the server removed, catching up anew), Kafka
+  (a spare broker-only node 4: one replica of the topic or of `__transaction_state` moved onto
+  it or back, kafka-reassign-partitions), Redpanda (the spare joins with an ID the cluster
+  assigns, is decommissioned through the admin API, and joins again fresh as a new node once
+  gone), CockroachDB (the spare joins with a fresh store, a new node ID; `node decommission`;
+  joins again fresh once decommissioned), Cassandra (the spare bootstraps from the seeds,
+  `nodetool decommission` from itself, then stopped; bootstraps again fresh). Smokes queued.
+  YugabyteDB (a spare tablet server registers, is blacklisted until its tablets moved off, then
+  stopped and unblacklisted; registers again fresh), Kafka's dynamic quorum (KIP-853, profile
+  `kafka-4.4-dynamic`: the three bootstrap it from fixed directory IDs, the spare starts as an
+  observer and is added to the voters with add-controller and removed with remove-controller).
+  Every one in its smoke next; then hunts with them (as the hunt queue's next systems).
+- Exploration ideas from reading (2026-10-30: the user's list, and exploration research since
+  2020, deterministic or not), best first. Each is measured with findability before it is
+  called a gain:
+  1. Swarm testing of faults (Groce et al., ISSTA 2012; Antithesis's Metroid post credits it):
+     each timeline some of the fault kinds, half and half by named decisions. Built (det-faults'
+     swarm_select, a `fault_swarm` event; `--no-swarm`, serve's `swarm: false`, to compare).
+     Next: measure on the Raft POC and a Jepsen system, several seeds.
+  2. Optimization objectives per bucket (Antithesis, "Optimizing our way through Metroid",
+     2025; PerfFuzz, ISSTA 2018, per-edge maxima): `sdk.optimize(message, bucket, value,
+     goal)`, each bucket an archive cell keeping its best state, cells returned to evenly.
+     Built in every SDK (events.zig, the archive; selftest `streak`: 11 of 256 optimized
+     timelines win, 0 blind). Workload objectives: etcd, rqlite and Consul maximize a driver's
+     transactions of unknown outcome (the turbulent states where consistency bugs sit). Next:
+     measured on a hunt against the same without.
+  3. Findability (Antithesis, "Did you get lucky or unlucky?", 2025): independent finds and
+     mean CPU time to find per property. Built (serve's properties, the UI).
+  4. Good-Turing discovery probability (Böhme et al., "Estimating Residual Risk in Greybox
+     Fuzzing", FSE 2021; coverage-rate extrapolation, ICSE 2024): behaviors reached by one
+     timeline alone over the timelines is the chance the next finds a new one. Built (serve's
+     `behaviors_once`, the UI's Behaviors note). As the hunt queue's stop rule (fewer than one
+     new behavior expected an hour: behaviors_once < hours elapsed) only once measured against
+     the plateau rule on the next hunts: a tree's returns repeat rare behaviors on purpose,
+     which deflates the singletons (the paper's adaptive bias) and could stop hunts early.
+  5. A learning archive: seed scheduling as a bandit (EcoFuzz, USENIX Security 2020; AFL-Hier,
+     NDSS 2021; T-Scheduler, Thompson sampling, 2023). Built: a cell counts the branches of its
+     returns that found a behavior new to the tree (`paid`), and ranks as one that many times
+     rarer (rarity alone otherwise); each return's `why` says it. Next: measured against rarity
+     alone on the Raft POC (findability), and Thompson sampling if the counts are too sparse.
+  6. Thread interleavings inside a node, from the guest's scheduler: a sched_ext (BPF)
+     scheduler drawing its choices from the platform's randomness, POS-style (partial-order
+     sampling; Fray's and Coyote's best in practice) or PCT with priority change points.
+     SECT (USENIX Security 2026) explores the kernel this way; syzkaller has the proposal
+     (#7997). The guest's 6.12 kernel has sched_ext, every node is a cgroup, and the kernel's
+     randomness already replays. Today only thread pauses reach this space (jank's output
+     capture race, Ignite's stuck intent are its kind).
+  7. Memory accesses where threads communicate: DataCollider (OSDI 2010; hardware data
+     breakpoints on sampled accesses, then a delay: a conflicting access during it is a race,
+     both threads caught at it), KCSAN's soft watchpoints, Snowboard's potential memory
+     communications from a hypervisor's trace (SOSP 2021), KRACE's alias coverage (S&P 2020),
+     SegFuzz (S&P 2023), MAccConc (Project Zero, 2026: delays at communication points,
+     count-augmented stack IDs). Ours: the VMM sets a debug register on a sampled address of a
+     node's process, and a hit by another thread is a race event (a behavior) and a branch
+     point: preempt there. Needs 6 first (the preemption), then the VMM's debug registers.
+  8. Guest code coverage from the VMM, with no instrumentation: Intel PT for the whole guest
+     (kAFL, USENIX Security 2017; Nyx, USENIX Security 2021; HyperFuzzer, CCS 2021), every
+     process's edges as behaviors, binaries without an SDK included (JIT code aside); cheaper
+     tracing per "coverage-preserving coverage-guided tracing" (2022). srv3's W-2295 has PT;
+     KVM must pass it to the guest (pt_mode). RedQueen/CmpLog's comparison operands by VM
+     introspection solve input magic, less ours (decisions, not bytes). Past edges, from the
+     compiled code: data dependencies (DDFuzz, EuroS&P 2022: def-use edges as feedback, 26 bugs
+     edge coverage missed, ~10% overhead; FuzzRDUCC rebuilds def-use chains from binaries) and
+     variable relationships (InvsCov, 2023), as edge kinds of the C SDK's LLVM coverage.
+  9. Resource objectives from det-init, as optimize values per node: a cgroup's memory peak
+     (MemLock, 2020: memory exhaustion, unbounded recursion and leaks), instructions retired or
+     branches (honggfuzz's hardware counters, OmniFuzz; the PMU the VMM already reads).
+     Measured first on what hunts record (2026-10-30; AUC of each signal at a timeline's end,
+     within fresh starts and within branches of similar length, runs 230, 231, 210, 235):
+     failing timelines end with far less node CPU and output (AUC 0.00 on the Raft POC's
+     commit-progress deadlock and RabbitMQ's boot failure: a stuck system goes quiet), more
+     memory on the Raft POC and jank (0.76 to 0.99; none on RabbitMQ); timelines finding a new
+     behavior cost more wall time per virtual second and have more faults (0.7 to 1.0), which
+     behaviors already capture. Symptoms at the end, so not yet guidance: `det-nodes samples`
+     now records each node's CPU and memory every 2 s (node_sample events), and the next Raft
+     hunts say whether going quiet comes early enough before the failure to return there (then
+     a built-in objective: a node's longest quiet stretch while drivers run). Assembly-level
+     signals (PT, PMU) wait for this cheaper one.
+  10. Messages reordered with guarantees: PCTCP (OOPSLA 2018: bug depth d found with known
+     probability), ByzzFuzz's small-scope message mutations (2023), Mallory's Lamport-timeline
+     feedback and learned fault policy (CCS 2023: 54% more states than Jepsen, 1.87x faster).
+  11. State variables as states, surfaced from instrumented code with no workload change
+     (SGFuzz, USENIX Security 2022: enum-typed variables are the state; NSFuzz 2023, RSAFL 2026;
+     all beat response codes as states). Built for the JVM: the coverage agent reports each
+     transition of a field holding one of the program's enum constants (a `state` event, "state
+     <class>.<field>: OLD -> NEW", first time per process), behaviors the tree returns to; the
+     e2e `states` check is a maze whose progress runs no new line, solved through its enum and
+     never through the same progress in an int. Next: measured on Kafka 4.4's transaction
+     coordinator (its TransactionState, queued after the Raft runs); Go through a source
+     rewriter of our own (go/types: stores of a named integer type's constants, etcd's
+     raft.StateType; Go coverage is Antithesis's instrumentor today), worth less on the Raft POC:
+     hashicorp/raft sets its four roles through setState (an atomic store), states every
+     timeline reaches; C, C++ and Rust through
+     SGFuzz's LLVM pass. Raw memory as state (StateAFL, 2022: fuzzy hashes of long-lived
+     allocations) after those: noisier, and the heap layout is the runtime's.
+  12. Later: Q-learning policies (QL, OOPSLA 2020; reward augmentation, OOPSLA 2024); a model
+     breaking plateaus as a strategy plugin (ChatAFL, NDSS 2024; Intelligent Go-Explore, ICLR
+     2025, a foundation model judging which states are interesting); a TLA+ model's state
+     coverage as guidance (model-guided fuzzing, 2024). Read, little for us: "Debug
+     Determinism" (HotOS 2011, the failure's cause over full fidelity: replay already gives it).
 - Assertions guide the tree (2026-10-29, on by default, Antithesis's sometimes-assertions page):
   a `sometimes` or `reachable` made true weighs 4 times another new behavior in a timeline's
   novelty, its moment is the frontier's return point ahead of rarer output lines, and its
