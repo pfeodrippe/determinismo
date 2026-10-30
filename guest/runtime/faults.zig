@@ -287,7 +287,8 @@ pub fn main(init: std.process.Init) !void {
     baseline_start(&system);
     disk_baseline_start(&system);
     if (script_faults(arena)) |scripted| return run_script(arena, &system, scripted);
-    const names = try fault_names(arena, faults[0..count]);
+    const mixed = swarm_select(&faults, count);
+    const names = try fault_names(arena, faults[0..mixed]);
     const pacing = scenario.pacing;
     // With bursts: when the stretch of faults under way ends (CLOCK_MONOTONIC).
     var active_until_ns: u64 = if (pacing.active_ms_max > 0) monotonic_ns() + stretch_ns("fault.active_ms", pacing.active_ms_max) else std.math.maxInt(u64);
@@ -308,7 +309,7 @@ pub fn main(init: std.process.Init) !void {
             active_until_ns = @max(quiet_until_ns, monotonic_ns()) + stretch_ns("fault.active_ms", pacing.active_ms_max);
         }
         // Labeled decisions: a strategy sees which faults it chooses among, by name.
-        const applied = draw(&faults[fault_choose(faults[0..count], names)]);
+        const applied = draw(&faults[fault_choose(faults[0..mixed], names)]);
         if (monotonic_ns() < quiet_until_ns and applied.kind != .clock_skip) continue;
         apply(arena, &system, &applied);
     }
@@ -372,6 +373,72 @@ fn network_stop(system: *const schema.System) void {
 
 /// Each fault's name, as a strategy reads it: its kind and whom it hits ("pause raft-2",
 /// "partition raft-1 raft-3", "degrade raft-1 runner").
+/// Swarm testing (Groce et al., "Swarm Testing", ISSTA 2012; Antithesis's exploration credits it
+/// too): this timeline's faults are some of the kinds allowed, each kind in or out half and half
+/// by a named decision ("fault.swarm <kind>", for strategies to steer), one at least. A mix
+/// without some kinds reaches what the full mix makes improbable (partitions on and on with no
+/// restart healing them); a branch from a moment keeps its timeline's mix, subtrees differ.
+/// The kinds kept go first in `faults`: how many.
+fn swarm_select(faults: *[faults_max]Fault, count: u32) u32 {
+    if (count == 0) return 0;
+    if (swarm_off()) return count; // explore --no-swarm: every kind, for comparisons.
+    var allowed: std.EnumSet(Kind) = .empty;
+    for (faults[0..count]) |fault| allowed.insert(fault.kind);
+    var kept: std.EnumSet(Kind) = .empty;
+    var kinds = allowed.iterator();
+    while (kinds.next()) |kind| {
+        var label_buffer: [64]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buffer, "fault.swarm {s}", .{@tagName(kind)}) catch "fault.swarm";
+        if (sdk.random_below_named(label, 2) == 0) kept.insert(kind);
+    }
+    if (kept.count() == 0) {
+        var pick = sdk.random_below_named("fault.swarm_one", allowed.count());
+        var any = allowed.iterator();
+        while (any.next()) |kind| {
+            if (pick == 0) kept.insert(kind);
+            pick -|= 1;
+        }
+    }
+    var front: u32 = 0;
+    for (0..count) |index| {
+        if (!kept.contains(faults[index].kind)) continue;
+        std.mem.swap(Fault, &faults[front], &faults[index]);
+        front += 1;
+    }
+    var names_buffer: [512]u8 = undefined;
+    var names: std.Io.Writer = .fixed(&names_buffer);
+    var listed = kept.iterator();
+    while (listed.next()) |kind| names.print("{s}{s}", .{ if (names.end == 0) "" else " ", @tagName(kind) }) catch break;
+    sdk.event("fault_swarm", .{ .kinds = names.buffered(), .faults = front, .of = count });
+    return front;
+}
+
+/// `det.swarm=0` among the kernel's command line's words (explore's --no-swarm).
+fn swarm_off() bool {
+    const fd = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [4096]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return false;
+    var words = std.mem.tokenizeAny(u8, buffer[0..size], " \n");
+    while (words.next()) |word| if (std.mem.eql(u8, word, "det.swarm=0")) return true;
+    return false;
+}
+
+test swarm_select {
+    // Outside the guest the decisions are the local random source: whatever is kept goes first,
+    // one kind at least, and nothing is lost.
+    var faults: [faults_max]Fault = undefined;
+    const kinds = [_]Kind{ .pause, .restart, .pause, .isolate, .restart };
+    for (kinds, 0..) |kind, index| faults[index] = .{ .kind = kind, .node = "n" };
+    const kept = swarm_select(&faults, kinds.len);
+    try std.testing.expect(kept >= 1 and kept <= kinds.len);
+    for (faults[0..kept]) |kept_fault| for (faults[kept..kinds.len]) |left| {
+        try std.testing.expect(kept_fault.kind != left.kind);
+    };
+}
+
 fn fault_names(arena: std.mem.Allocator, faults: []const Fault) ![]const []const u8 {
     const names = try arena.alloc([]const u8, faults.len);
     for (faults, names) |fault, *name| {

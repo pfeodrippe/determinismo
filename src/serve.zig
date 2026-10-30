@@ -850,6 +850,8 @@ pub const RunRequest = struct {
     /// A tree's returns go first to a `sometimes` or `reachable` made true (explore's default);
     /// false: every new behavior alike (--no-prefer-sometimes, for comparisons).
     prefer_sometimes: bool = true,
+    /// Each timeline some of the fault kinds (explore's default); false: --no-swarm.
+    swarm: bool = true,
     pipeline: ?u32 = null,
     jobs: ?u32 = null,
     strategy: ?[]const u8 = null,
@@ -956,6 +958,7 @@ fn explore_arguments(
         try argv.appendSlice(server.arena, &.{ "--return-branches", try print(server, "{d}", .{count}) });
     }
     if (!asked.prefer_sometimes) try argv.append(server.arena, "--no-prefer-sometimes");
+    if (!asked.swarm) try argv.append(server.arena, "--no-swarm");
     if (asked.pipeline) |depth| {
         try argv.appendSlice(server.arena, &.{ "--pipeline", try print(server, "{d}", .{depth}) });
     }

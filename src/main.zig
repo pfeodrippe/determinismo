@@ -74,6 +74,8 @@ const usage =
     \\                            returns go first to just after a `sometimes` or `reachable`
     \\                            assertion made true, the states the program marks worth
     \\                            reaching; without it, every new behavior weighs the same)
+    \\                            [--no-swarm]   (each timeline some of the fault kinds, half and
+    \\                            half, by default: swarm testing; without it, every kind)
     \\                            [--pipeline <n>]   (a tree's generations of timelines planned
     \\                            from the setup snapshot before its first returns, 1 to 4, and
     \\                            queued ahead after: default 2 up to 16 workers, else 3)
@@ -263,6 +265,9 @@ const Arguments = struct {
     /// sometimes`: every new behavior alike): Antithesis restarts tests from where one is hit.
     prefer_sometimes: bool = true,
     prefer_sometimes_given: bool = false,
+    /// Each timeline some of the fault kinds (det-faults' swarm testing; `--no-swarm`: every kind
+    /// in every timeline, for comparisons: `det.swarm=0` on the guest's command line).
+    swarm: bool = true,
     timeline_text: ?[]const u8 = null,
     /// A targeted run: a diff file or git range whose changed lines the tree explores first.
     changed: ?[]const u8 = null,
@@ -938,7 +943,7 @@ fn cmdline_build(
     arguments: *const Arguments,
     scenario: ?[]const u8,
 ) ![]const u8 {
-    var parts: [5][]const u8 = undefined;
+    var parts: [6][]const u8 = undefined;
     var count: u32 = 0;
     parts[count] = base;
     count += 1;
@@ -956,6 +961,10 @@ fn cmdline_build(
     }
     if (arguments.timeline_limit_ns) |ns| { // det-composer's: no driver starts past its half.
         parts[count] = try std.fmt.allocPrint(arena, "det.timeline_limit_ms={d}", .{ns / std.time.ns_per_ms});
+        count += 1;
+    }
+    if (!arguments.swarm) { // det-faults': every fault kind in every timeline.
+        parts[count] = "det.swarm=0";
         count += 1;
     }
     return std.mem.join(arena, " ", parts[0..count]);
@@ -4309,6 +4318,10 @@ fn parse_arguments(arena: std.mem.Allocator, argv: []const [:0]const u8) !Argume
         if (std.mem.eql(u8, argv[index], "--prefer-sometimes") or std.mem.eql(u8, argv[index], "--no-prefer-sometimes")) {
             arguments.prefer_sometimes = std.mem.eql(u8, argv[index], "--prefer-sometimes");
             arguments.prefer_sometimes_given = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argv[index], "--swarm") or std.mem.eql(u8, argv[index], "--no-swarm")) {
+            arguments.swarm = std.mem.eql(u8, argv[index], "--swarm");
             continue;
         }
         if (std.mem.eql(u8, argv[index], "--resume")) {
