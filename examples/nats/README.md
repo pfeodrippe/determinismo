@@ -48,6 +48,21 @@ stream is read whole:
 | an acknowledged batch is read back whole, at its sequence | an acknowledged batch's messages are missing (in `sync`; `default` may lose them by design), or its last is not at the acknowledged sequence |
 | every stored message is of a batch begun | a message no producer began |
 
+## Membership changes
+
+The `member` driver scales the stream's replica group from three peers to two and back
+(`$JS.API.STREAM.UPDATE`) while producers publish: a peer leaves the group, and one joins it and
+catches up anew. (Removing a peer is refused with three servers and three replicas, "no
+replacement available": the first smoke's every try.) The copies must still converge (as many
+as the group has peers) and lose no acknowledged message.
+
 ## Findings
 
-None yet: 8 of 8 timelines pass with `sync`.
+- Found blind, matching nats-server#7545 (open, Jepsen's, "Data loss with membership changes
+  and partitions", 2.12.1), still in 2.15.2: in the first membership smoke (2026-10-30, profile
+  `sync`, seed 1, branch 3), every one of 227 acknowledged messages was missing once faults
+  stopped. The stream was readable (a stream leader was elected at 281.5 s) and read back empty.
+  The `member` driver's peer removals were all refused there ("peer remap failed", "no
+  replacement available": three servers, three replicas), amid partitions, kills and stalls.
+  Before membership changes, 8 of 8 timelines passed with `sync`. Replay: `--seed 1 --branch 3
+  --profile sync --scenario queue`.

@@ -20,6 +20,11 @@
 //! graceful stops and power losses (each server's data on its own disk), and stalls and power
 //! losses at the servers' syncs.
 //!
+//! Membership changes (Jepsen's member nemesis): the stream's replica group scaled down to two
+//! peers and back up to three (`$JS.API.STREAM.UPDATE`), one step at a time, while producers
+//! publish: a peer leaves the group and one joins it, catching up anew. (A peer removal is
+//! refused here: with three servers no replacement is available, the first smoke's every try.)
+//!
 //!   determinismo explore ... --program zig-out/bin/nats-test --profile sync --scenario queue
 const std = @import("std");
 const assert = std.debug.assert;
@@ -88,6 +93,7 @@ fn describe(d: *System.Describe) !void {
 fn queue(s: *System.Scenario) void {
     s.setup("stream", stream_created);
     s.parallel_driver("publish", publish_many);
+    s.parallel_driver("member", member_changes);
     s.eventually("read", messages_survive);
     s.eventually("converge", replicas_converge);
 }
@@ -115,14 +121,18 @@ fn stream_created(context: *System.Context) !void {
     _ = try sdk.retry(setup_attempts_max, 200, stream_create, .{&all});
 }
 
+/// The stream's configuration, with `replicas` (its creation's 3; the member driver's 2 and 3).
+fn stream_config(comptime replicas: u32) []const u8 {
+    return std.fmt.comptimePrint("{{\"name\":\"" ++ stream ++ "\",\"subjects\":[\"" ++ subject ++ "\"]," ++
+        "\"num_replicas\":{d},\"storage\":\"file\",\"allow_direct\":true}}", .{replicas});
+}
+
 fn stream_create(all: *const [servers_count][4]u8) !void {
     var client: Client = undefined;
     try client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms });
     defer client.close();
-    const config = "{\"name\":\"" ++ stream ++ "\",\"subjects\":[\"" ++ subject ++ "\"]," ++
-        "\"num_replicas\":3,\"storage\":\"file\",\"allow_direct\":true}";
     var buffer: [4096]u8 = undefined;
-    const reply = try client.request("$JS.API.STREAM.CREATE." ++ stream, config, &buffer);
+    const reply = try client.request("$JS.API.STREAM.CREATE." ++ stream, stream_config(3), &buffer);
     if (reply.status != 0) return error.NoResponders;
     if (std.mem.indexOf(u8, reply.payload, "\"error\"") != null) {
         // Created already by an earlier attempt whose answer was lost: fine.
@@ -196,6 +206,58 @@ fn leader_aim(all: *const [servers_count][4]u8, comptime name: []const u8) void 
         .ignore_unknown_fields = true,
     }) catch return;
     if (info.cluster.leader.len > 0) sdk.fault_aim(info.cluster.leader);
+}
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One membership step, one at a time (a lock file in the runner): the stream's group, as its
+/// info lists it (its leader and replicas), scaled from three peers to two, or back to three.
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open("/tmp/nats-member.lock", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = addresses(context);
+    var client: Client = undefined;
+    client.open(all[sdk.random_below(servers_count)], client_port, .{ .timeout_ms = timeout_ms }) catch return;
+    defer client.close();
+    var buffer: [reply_size_max]u8 = undefined;
+    const reply = client.request("$JS.API.STREAM.INFO." ++ stream, "", &buffer) catch return;
+    if (reply.status != 0) return member_refused("stream info", reply.status, reply.payload);
+    const Info = struct { config: struct { num_replicas: u32 = 0 } = .{} };
+    var parse_buffer: [reply_size_max]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&parse_buffer);
+    const info = std.json.parseFromSliceLeaky(Info, fixed.allocator(), reply.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return member_refused("stream info: unreadable", reply.status, reply.payload);
+    const down = info.config.num_replicas == 3;
+    var answer: [reply_size_max]u8 = undefined;
+    const updated = client.request("$JS.API.STREAM.UPDATE." ++ stream, if (down) stream_config(2) else stream_config(3), &answer) catch return;
+    if (updated.status != 0 or std.mem.indexOf(u8, updated.payload, "\"error\"") != null) {
+        return member_refused(if (down) "scale to 2" else "scale to 3", updated.status, updated.payload);
+    }
+    if (down) {
+        sdk.sometimes(true, "a peer left the stream's group", .{});
+    } else {
+        sdk.sometimes(true, "a peer joined the stream's group", .{});
+    }
+}
+
+/// A membership call refused or unanswered, said (an event): under faults, refusals are expected,
+/// and a step that never succeeds says why.
+fn member_refused(what: []const u8, status: u32, body: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = status, .body = body[0..@min(body.len, 512)] });
 }
 
 /// "<message> <sequence>", appended in one write.
@@ -579,26 +641,36 @@ fn replicas_converge(context: *System.Context) !void {
     };
 }
 
-const Copy = struct { messages: u64, last_seq: u64 };
+const Copy = struct { messages: u64, last_seq: u64, replicas: u32 };
 
+/// Every server holding a copy holds the same one, and as many hold one as the stream's group
+/// has peers (two or three: the member driver scales it).
 fn converged(all: *const [servers_count][4]u8) !void {
     var first: ?Copy = null;
+    var copies: u32 = 0;
     for (all) |address| {
-        const copy = try copy_of(address);
+        const copy = copy_of(address) catch |err| switch (err) {
+            error.NoCopy => continue, // Not in the stream's group.
+            else => return err,
+        };
+        copies += 1;
         if (first) |known| {
             if (known.messages != copy.messages or known.last_seq != copy.last_seq) {
                 return error.NotConverged;
             }
         } else first = copy;
     }
+    const replicas = if (first) |copy| copy.replicas else return error.NoCopy;
+    if (copies < replicas) return error.NotConverged;
 }
 
 fn copy_of(address: [4]u8) !Copy {
     var buffer: [reply_size_max]u8 = undefined;
-    const response = try sdk.tcp.http_with(address, monitor_port, "GET", "/jsz?streams=true", "", &buffer, .{ .timeout_ms = timeout_ms });
+    const response = try sdk.tcp.http_with(address, monitor_port, "GET", "/jsz?streams=true&config=true", "", &buffer, .{ .timeout_ms = timeout_ms });
     if (response.status != 200) return error.NoAnswer;
     const State = struct { messages: u64 = 0, last_seq: u64 = 0 };
-    const Detail = struct { name: []const u8 = "", state: State = .{} };
+    const Config = struct { num_replicas: u32 = 3 };
+    const Detail = struct { name: []const u8 = "", state: State = .{}, config: Config = .{} };
     const Account = struct { stream_detail: []const Detail = &.{} };
     const Jsz = struct { account_details: []const Account = &.{} };
     var parse_buffer: [reply_size_max]u8 = undefined;
@@ -608,7 +680,7 @@ fn copy_of(address: [4]u8) !Copy {
     }) catch return error.BadReply;
     for (jsz.account_details) |account| for (account.stream_detail) |detail| {
         if (std.mem.eql(u8, detail.name, stream)) {
-            return .{ .messages = detail.state.messages, .last_seq = detail.state.last_seq };
+            return .{ .messages = detail.state.messages, .last_seq = detail.state.last_seq, .replicas = detail.config.num_replicas };
         }
     };
     return error.NoCopy;
