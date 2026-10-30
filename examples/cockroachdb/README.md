@@ -20,6 +20,18 @@ test's data never reaches) and merge under 16 KiB, so splits, merges and the lea
 moves after them happen within a timeline, as Jepsen's split nemesis made them happen. Internal
 time series are off (a write every 10 s per node that nothing here reads).
 
+## Membership changes
+
+A fourth node, `crdb-4`, is a spare. The `member` driver reads `node status --decommission`
+through a node drawn: the spare started fresh (a new store, a new node ID) when it has no active
+or decommissioning node, after a 30 s grace; active, one time in two decommissioned
+(`node decommission --wait=none`, its replicas moved off). Elle's checks hold through them.
+
+The first smoke (srv3, 2026-10-30, seed 1, 2 timelines of ~15 minutes): the spare was started
+and joined 15 times, decommissioned 3 times; Elle found both histories valid. In timeline 1,
+crdb-3 exited with status 7 (a fatal error) at 921 s, while the spare was joining under
+partitions: under investigation (its log is taken out of a replay).
+
 ## Findings
 
 None yet: 4 of 4 timelines pass Elle on srv1 (seed 1, 6 GB guests: `--memory-mib 6144`).

@@ -371,6 +371,7 @@ pub fn build(b: *std.Build) void {
         "examples/opensearch/opensearch_test.zig",
         "examples/rqlite/rqlite_test.zig",
         "examples/consul/consul_test.zig",
+        "examples/cockroachdb/cockroachdb_test.zig",
         "examples/ignite/ignite_test.zig",
         "examples/surrealdb/surrealdb_test.zig",
         "examples/tetris/tetris_test.zig",
@@ -411,6 +412,7 @@ pub fn build(b: *std.Build) void {
             unit_tests.root_module.addImport("mysql", mysql);
         }
         if (std.mem.eql(u8, root, "examples/scylla/scylla_test.zig")) unit_tests.root_module.addImport("cql", cql);
+        if (std.mem.eql(u8, root, "examples/cockroachdb/cockroachdb_test.zig")) unit_tests.root_module.addImport("sql_append", sql_append);
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
     const tidy_tests = b.addTest(.{ .root_module = b.createModule(.{
