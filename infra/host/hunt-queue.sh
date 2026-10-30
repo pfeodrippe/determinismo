@@ -116,8 +116,8 @@ try:
     replays = ", replays %d of %d the same" % (row["same"], row["n"])
 except Exception:
     pass
-# Good-Turing beside the plateau rule (behaviors one timeline alone reached): which would have
-# stopped it, measured before either replaces the other.
+# Its behaviors, and how many one timeline alone reached (Good-Turing: over the timelines, the
+# chance the next finds a new one; measured as a stop rule, it stops trees far too early).
 timelines = stats.get("timelines") or 0
 once = stats.get("behaviors_once")
 behaviors = ", %d behaviors, %d by one timeline alone" % (stats.get("behaviors") or 0, once) if once is not None else ""
