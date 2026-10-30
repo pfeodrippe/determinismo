@@ -225,7 +225,8 @@ pub fn http_with(
 
 /// "HTTP/1.x NNN reason", headers, an empty line, then the body: Content-Length bytes when the
 /// server says how many (it may keep the connection open after them, as Java's HttpServer
-/// does), else everything until it closes. A reply cut short (nothing, or part of its head)
+/// does), chunks when it sends them (some do even to an HTTP/1.0 request: Redpanda's admin
+/// API), else everything until it closes. A reply cut short (nothing, or part of its head)
 /// means the server went away (a stop, a crash): ConnectionClosed, not another protocol.
 fn response_read(connection: *Connection, buffer: []u8) !Response {
     const status_line = try connection.read_line();
@@ -234,20 +235,49 @@ fn response_read(connection: *Connection, buffer: []u8) !Response {
     }
     const status = std.fmt.parseInt(u16, status_line[9..12], 10) catch return error.BadReply;
     var length: ?u32 = null;
+    var chunked = false;
     while (true) {
         const line = try connection.read_line();
         if (line.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " ");
-        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            chunked = std.ascii.findIgnoreCase(value, "chunked") != null;
+        }
+        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
         length = std.fmt.parseInt(u32, value, 10) catch return error.BadReply;
     }
+    if (chunked) return .{ .status = status, .body = try chunks_read(connection, buffer) };
     const body = if (length) |size| try connection.read_exact(size) else try connection.read_all();
     if (body.len > buffer.len) return error.ReplyTooLarge;
     @memcpy(buffer[0..body.len], body);
     return .{ .status = status, .body = buffer[0..body.len] };
 }
+
+/// A chunked body into `buffer`: each chunk's size in hex on a line, its bytes and a line end,
+/// until a chunk of size 0 and the trailer's lines (to an empty one, or the server closing).
+fn chunks_read(connection: *Connection, buffer: []u8) ![]const u8 {
+    var size_total: usize = 0;
+    while (true) {
+        const size_line = try connection.read_line();
+        const extension = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+        const digits = std.mem.trim(u8, size_line[0..extension], " \t");
+        const size = std.fmt.parseInt(u32, digits, 16) catch return error.BadReply;
+        if (size == 0) break;
+        if (size_total + size > buffer.len) return error.ReplyTooLarge;
+        @memcpy(buffer[size_total..][0..size], try connection.read_exact(size));
+        size_total += size;
+        if ((try connection.read_line()).len != 0) return error.BadReply;
+    }
+    for (0..trailer_lines_max) |_| {
+        const line = connection.read_line() catch break;
+        if (line.len == 0) break;
+    }
+    return buffer[0..size_total];
+}
+
+const trailer_lines_max = 64;
 
 test response_read {
     const Case = struct { sent: []const u8, close: bool };
@@ -256,10 +286,13 @@ test response_read {
         .{ .sent = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", .close = false },
         // No length: the body runs until the server closes.
         .{ .sent = "HTTP/1.0 409 Conflict\r\nA: b\r\n\r\nleader raft-2\n", .close = true },
+        // Chunks, one with an extension, then the last chunk and the trailer's end.
+        .{ .sent = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;x=y\r\n world\r\n0\r\n\r\n", .close = false },
     };
     const expected = [_]Response{
         .{ .status = 200, .body = "hello" },
         .{ .status = 409, .body = "leader raft-2\n" },
+        .{ .status = 200, .body = "hello world" },
     };
     for (cases, expected) |case, want| {
         var fds: [2]i32 = undefined;

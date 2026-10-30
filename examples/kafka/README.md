@@ -128,9 +128,11 @@ assigns, is decommissioned through the admin API, and joins again fresh as a new
 First smokes (srv3, 2026-10-30, seed 1): Apache Kafka 4.4 moved 150 replicas, transactions
 atomic and durable through them. The dynamic quorum added the spare to the voters and never
 removed it (the driver passed a directory ID the spare's format never had: fixed). Redpanda's
-spare never started: the step never got past listing the brokers, and did not say why (it now
-does); one timeline hung on a fault injector bug (a thread pause seizing a thread of a process
-in an exec: fixed in det-faults). Both again in the next smokes.
+spare never started: the step never got past listing the brokers. Said, the second smoke
+showed why: its admin API answers in chunks even to an HTTP/1.0 request, which `sdk.tcp` did
+not decode (it does now). One timeline of the first hung on a fault injector bug (a thread
+pause seizing a thread of a process in an exec: fixed in det-faults). Both again in the next
+smokes.
 
 ## Share groups (queues for Kafka)
 
