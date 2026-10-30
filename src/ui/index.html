@@ -467,8 +467,17 @@ function statsHtml() {
     ${stat("Failing", failing.toLocaleString(), "timelines with a failing property", failing ? "var(--fail)" : "var(--pass)")}
     ${stat("Properties", `${failed} / ${list.length}`, run.state === "running" ? "failing so far" : "failing", failed ? "var(--fail)" : "var(--pass)")}
     ${stat("Virtual time", duration(vtime), speed)}
-    ${stat("Behaviors", `<span id="behaviors">${(stats.behaviors ?? 0).toLocaleString()}</span>`, `<span id="behaviors-note">distinct, by timelines</span>`, "var(--accent)")}
+    ${stat("Behaviors", `<span id="behaviors">${(stats.behaviors ?? 0).toLocaleString()}</span>`, discoveryChance(done, stats.behaviors_once ?? 0), "var(--accent)")}
   </div>`;
+}
+// Good-Turing's chance that the next timeline finds a behavior never seen: the behaviors only one
+// timeline reached, over the timelines (Böhme et al., FSE 2021). Near 0: exploring more this way
+// stops paying.
+function discoveryChance(timelines, once) {
+  if (timelines < 2) return "distinct, by timelines";
+  const chance = once / timelines;
+  const percent = chance === 0 ? "~0%" : chance < 0.001 ? "<0.1%" : `${(chance * 100).toFixed(chance < 0.1 ? 1 : 0)}%`;
+  return `<span title="Good-Turing: ${once.toLocaleString()} behaviors reached by one timeline alone, of ${timelines.toLocaleString()} timelines">${percent} chance the next timeline finds a new one</span>`;
 }
 function chartsHtml() {
   const list = properties().filter(isFailing).sort((a, b) => b.branches_failing - a.branches_failing);
@@ -725,11 +734,7 @@ async function discoveryDraw() {
     <path d="${line}" fill="none" stroke="#8f7cf7" stroke-width="2.2"/>${ticksX}</svg>`;
   box.classList.remove("muted");
   state.discovery = { runId: id, html: box.innerHTML };
-  // Still rising: the last fifth of the timelines found new behaviors.
-  const recent = points.filter(([b]) => b >= maxX * 0.8);
-  const rising = recent.length > 1 && recent[recent.length - 1][1] > recent[0][1];
   if ($("#behaviors")) $("#behaviors").textContent = maxY.toLocaleString();
-  if ($("#behaviors-note")) $("#behaviors-note").textContent = rising ? "still rising: run longer" : "flat lately";
 }
 
 // Properties: each assertion with its verdict across the timelines so far (the run's events

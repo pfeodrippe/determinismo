@@ -635,6 +635,14 @@ pub const stats_sql =
     \\    (SELECT coalesce(sum(vtime_ns), 0) FROM timelines) AS vtime_ns,
     \\    (SELECT coalesce(sum(wall_ns), 0) FROM timelines) AS wall_ns,
     \\    (SELECT count(DISTINCT behavior) FROM events) AS behaviors,
+    \\    -- Behaviors only one timeline reached (none in setup): over the timelines, Good-Turing's
+    \\    -- chance that the next timeline finds one never seen (Böhme et al., "Estimating
+    \\    -- Residual Risk in Greybox Fuzzing", FSE 2021): when exploring more stops paying.
+    \\    (SELECT count(*) FROM (
+    \\        SELECT behavior FROM events
+    \\        WHERE branch IS NOT NULL AND behavior IS NOT NULL
+    \\            AND behavior NOT IN (SELECT behavior FROM events WHERE branch IS NULL AND behavior IS NOT NULL)
+    \\        GROUP BY behavior HAVING count(DISTINCT branch) = 1)) AS behaviors_once,
     \\    (SELECT count(*) FROM events) AS events,
     \\    -- Each node's CPU time over the guest's uptime, averaged over the timelines (det-init's
     \\    -- node_cpu events at a timeline's end): where a slow simulation spends its time.
@@ -831,6 +839,10 @@ test "ingest brings whole timelines; properties, timelines and discovery read th
     try testing.expectEqual(Point{ .timelines = 1, .behaviors = 4 }, points[0]);
     try testing.expectEqual(Point{ .timelines = 2, .behaviors = 5 }, points[1]);
     try testing.expectEqual(Point{ .timelines = 3, .behaviors = 6 }, points[2]);
+    // Good-Turing's singletons: each timeline's 4 behaviors its own, the setup's left out.
+    const Once = struct { behaviors_once: u64 };
+    const once = (try connection.row(Once, arena, "SELECT behaviors_once FROM (" ++ stats_sql ++ ")", .{})).?;
+    try testing.expectEqual(4, once.behaviors_once);
 
     // Logging volume, a run's property: the timelines' output over their output span. These
     // timelines had no such fields (older lines): no row. Timeline 4 logs 2 GB in an hour:

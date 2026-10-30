@@ -17,7 +17,9 @@
 //!   GET  /runs               every run: {id, state, scenario, system, from_branch}
 //!   GET  /runs/<id>          its state, its request (as asked, its seed drawn), its record (run,
 //!                             snapshot, summary, changed) and stats (timelines,
-//!                             failing_timelines, vtime_ns, wall_ns, behaviors, events)
+//!                             failing_timelines, vtime_ns, wall_ns, behaviors, behaviors_once
+//!                             (reached by one timeline alone: Good-Turing's chance that the next
+//!                             finds a new one is behaviors_once / timelines), events)
 //!   GET  /runs/<id>/timelines  every finished timeline, with the properties it violates
 //!   GET  /runs/<id>/properties every property with its verdict across the timelines so far
 //!   GET  /runs/<id>/discovery  {points: [[timelines, behaviors], ...]}: new behavior discovery
