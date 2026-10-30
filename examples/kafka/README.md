@@ -43,6 +43,10 @@ determinismo explore --kernel ~/guest/vmlinuz --initrd ~/guest/base.cpio --memor
   hanging transaction below, in 4.0.0); new ones are found in a current release.
   `kafka-4.4-coverage`: the same with the coverage agent (Dockerfile.4.4.coverage), as
   `coverage` below: run 68, with it, found the hanging transaction; run 67, without, did not.
+  Its agent also reports the transitions of the coordinators' enum fields (TransactionState:
+  JVM states, sdk/java/DeterminismoCoverage). `kafka-4.4-dynamic`: the same release with a
+  dynamic KRaft quorum (KIP-853: controller.quorum.bootstrap.servers, the three formatted with
+  `--initial-controllers`), whose voters the `member` driver changes (below).
 - `redpanda`: Redpanda v26.2.6 (Dockerfile.redpanda) as the brokers, under the same client and
   checks: it speaks Kafka's protocol, transactions included. One shard and a gigabyte each, a
   cluster formed from its three seeds, its log synced as Redpanda syncs it. Jepsen's Redpanda
@@ -109,6 +113,24 @@ the faults then involve the broker where transaction bugs live (Redpanda's run 1
 the coordinator's crash). The brokers' clocks are skewed too (`clock_skew`, one broker's realtime clock
 ahead or behind by up to 10 s for a while, sometimes strobing): transaction coordinators expire
 transactions by their wall clocks, and the logs' safety must not depend on clocks agreeing.
+
+## Membership changes
+
+A spare `kafka-4` in every profile. Apache Kafka: a broker only, onto which the `member` driver
+moves one replica at a time of the topic or of `__transaction_state` (the coordinators' log),
+and back to the broker it lacks, with `kafka-reassign-partitions.sh`; transactions must stay
+atomic and durable through the moves. `kafka-4.4-dynamic`: a dynamic KRaft quorum (KIP-853)
+bootstrapped by the three from fixed directory IDs; the spare starts as an observer, is added to
+the voters (`add-controller`, run on it) and removed (`remove-controller`, by the directory ID its
+own format drew, read from `describe --status`). Redpanda: the spare joins with an ID the cluster
+assigns, is decommissioned through the admin API, and joins again fresh as a new node once gone.
+
+First smokes (srv3, 2026-10-30, seed 1): Apache Kafka 4.4 moved 150 replicas, transactions
+atomic and durable through them. The dynamic quorum added the spare to the voters and never
+removed it (the driver passed a directory ID the spare's format never had: fixed). Redpanda's
+spare never started: the step never got past listing the brokers, and did not say why (it now
+does); one timeline hung on a fault injector bug (a thread pause seizing a thread of a process
+in an exec: fixed in det-faults). Both again in the next smokes.
 
 ## Share groups (queues for Kafka)
 

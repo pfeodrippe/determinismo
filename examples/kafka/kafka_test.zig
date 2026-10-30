@@ -28,6 +28,9 @@ const Nodes = struct {
     @"kafka-1": sdk.Node,
     @"kafka-2": sdk.Node,
     @"kafka-3": sdk.Node,
+    /// The spare broker (started by the `member` driver): Apache Kafka's partitions' replicas
+    /// move onto it and back; Redpanda's joins and is decommissioned.
+    @"kafka-4": sdk.Node,
     kclient: sdk.Node,
 };
 const System = sdk.System(Nodes);
@@ -111,7 +114,7 @@ pub fn main(init: std.process.Init) !void {
 /// `coverage` (Dockerfile.4.4.coverage): run 68, with it, found what run 67, without, did not.
 /// `redpanda`: Redpanda's brokers in Kafka's place (Dockerfile.redpanda).
 fn describe(d: *System.Describe) !void {
-    inline for (.{ "default", "format-unsynced", "unflushed", "coverage", "kafka-4.4", "kafka-4.4-coverage", "redpanda" }) |profile_name| {
+    inline for (.{ "default", "format-unsynced", "unflushed", "coverage", "kafka-4.4", "kafka-4.4-coverage", "kafka-4.4-dynamic", "redpanda" }) |profile_name| {
         try describe_profile(try d.profile(profile_name), profile_name);
     }
 }
@@ -132,7 +135,7 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
             "examples/kafka/Dockerfile.4.4.coverage"
         else if (coverage)
             "examples/kafka/Dockerfile.coverage"
-        else if (comptime std.mem.eql(u8, profile_name, "kafka-4.4"))
+        else if (comptime std.mem.eql(u8, profile_name, "kafka-4.4") or std.mem.eql(u8, profile_name, "kafka-4.4-dynamic"))
             "examples/kafka/Dockerfile.4.4"
         else
             "examples/kafka/Dockerfile",
@@ -142,11 +145,16 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
     else
         build;
     const format = if (comptime std.mem.eql(u8, profile_name, "format-unsynced")) profile_name else "synced";
+    // A dynamic KRaft quorum (KIP-853): the spare is a controller added to the voters and
+    // removed, not a broker partitions move onto.
+    const dynamic = comptime std.mem.eql(u8, profile_name, "kafka-4.4-dynamic");
+    const quorum_env: []const []const u8 = if (dynamic) &.{"KAFKA_QUORUM=dynamic"} else &.{};
     const flush = if (comptime std.mem.eql(u8, profile_name, "unflushed")) profile_name else "flushed";
     inline for (.{ "kafka-1", "kafka-2", "kafka-3" }, 1..) |name, id| {
         const number = std.fmt.comptimePrint("{d}", .{id});
         profile.node(@field(System.Name, name), .{
             .build = brokers_build,
+            .env = quorum_env,
             .command = if (redpanda)
                 &.{ "redpanda", number }
             else if (coverage)
@@ -161,6 +169,19 @@ fn describe_profile(profile: anytype, comptime profile_name: []const u8) !void {
             .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
         });
     }
+    profile.node(.@"kafka-4", .{
+        .build = brokers_build,
+        .env = quorum_env,
+        .command = if (redpanda)
+            &.{ "redpanda", "4" }
+        else if (coverage)
+            &.{ "broker", "4", format, flush, "coverage" }
+        else
+            &.{ "broker", "4", format, flush },
+        .ready = .{ .tcp = if (redpanda) redpanda_rpc_port else if (dynamic) controller_port else 9092 },
+        .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
+        .spare = true,
+    });
     profile.node(.kclient, .{
         .build = build,
         .command = &.{"client"},
@@ -187,7 +208,270 @@ fn txn_scenario(s: *System.Scenario) void {
     s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
     s.setup("topic", topic_created);
     s.parallel_driver("txn", transactions);
+    s.parallel_driver("member", member_changes);
     s.eventually("read", everything_read);
+}
+
+// Membership ------------------------------------------------------------------------------------
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// A partition's replicas moved (Jepsen's member nemesis, as Kafka changes membership): one at a
+/// time (a lock file in the runner), of the workload's topic or of `__transaction_state` (the
+/// coordinators' log), one replica onto the spare broker, or back from it to the broker it
+/// lacks, through `kafka-reassign-partitions.sh` run in a broker drawn. The spare starts at the
+/// first step; transactions must stay atomic and durable through the moves.
+fn member_step(context: *System.Context) !void {
+    const spare = &context.nodes.@"kafka-4";
+    const lock = linux.open("/tmp/kafka-member.lock", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    if (std.mem.eql(u8, context.profile, "redpanda")) return redpanda_member_step(context, spare);
+    if (std.mem.eql(u8, context.profile, "kafka-4.4-dynamic")) return controller_member_step(context, spare);
+    spare.start() catch {}; // Running already, or started now (it joins as broker 4).
+    const brokers = [_]*const sdk.Node{ &context.nodes.@"kafka-1", &context.nodes.@"kafka-2", &context.nodes.@"kafka-3" };
+    const via = brokers[sdk.random_below(brokers.len)];
+    const transactions_log = sdk.random_below_named("kafka.member_topic", 2) == 0;
+    const moved_topic = if (transactions_log) "__transaction_state" else topic;
+    // Kafka's default transaction.state.log.num.partitions; the topic's from num.partitions.
+    const partition = sdk.random_below(if (transactions_log) 50 else 4);
+    var described: [64 * 1024]u8 = undefined;
+    const description = via.exec_said(&.{
+        "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--describe", "--topic", moved_topic,
+    }, &described) catch return;
+    // Its broker is down: a later step.
+    if (description.status != 0) return member_refused("describe", description.status, description.output);
+    var assigned: [replicas]u32 = undefined;
+    const count = replicas_of(description.output, partition, &assigned) orelse return;
+    if (count != replicas) return;
+    // Onto the spare, or back from it to the broker it lacks.
+    const onto_spare = std.mem.indexOfScalar(u32, &assigned, 4) == null;
+    if (onto_spare) {
+        assigned[sdk.random_below_named("kafka.member_replica", replicas)] = 4;
+    } else {
+        const missing: u32 = for ([_]u32{ 1, 2, 3 }) |broker| {
+            if (std.mem.indexOfScalar(u32, &assigned, broker) == null) break broker;
+        } else return;
+        assigned[std.mem.indexOfScalar(u32, &assigned, 4).?] = missing;
+    }
+    var plan_buffer: [256]u8 = undefined;
+    const plan = try std.fmt.bufPrint(&plan_buffer, "{{\"version\":1,\"partitions\":[{{\"topic\":\"{s}\",\"partition\":{d},\"replicas\":[{d},{d},{d}]}}]}}", .{
+        moved_topic, partition, assigned[0], assigned[1], assigned[2],
+    });
+    var output: [8 * 1024]u8 = undefined;
+    const result = via.exec_said(&.{
+        "sh", "-c",
+        "printf %s \"$0\" > /tmp/reassign.json && /opt/kafka/bin/kafka-reassign-partitions.sh " ++
+            "--bootstrap-server localhost:9092 --reassignment-json-file /tmp/reassign.json --execute",
+        plan,
+    }, &output) catch return;
+    // A move under way, or no controller: a later step.
+    if (result.status != 0) return member_refused("reassign", result.status, result.output);
+    sdk.sometimes(true, "a partition replica was moved", .{ .topic = moved_topic, .onto_spare = onto_spare });
+}
+
+/// The dynamic quorum's membership step (KIP-853), from `kafka-metadata-quorum describe
+/// --status` through a controller drawn: the spare, an observer once started, added to the
+/// voters (`add-controller`, run on it: its own configuration and directory); a voter, removed
+/// one time in two (`remove-controller` with its directory ID). It runs throughout.
+fn controller_member_step(context: *System.Context, spare: *const sdk.Node) !void {
+    spare.start() catch {}; // Running already, or started now (an observer).
+    const controllers = [_]*const sdk.Node{ &context.nodes.@"kafka-1", &context.nodes.@"kafka-2", &context.nodes.@"kafka-3" };
+    const via = controllers[sdk.random_below(controllers.len)];
+    const quorum_tool = "/opt/kafka/bin/kafka-metadata-quorum.sh";
+    var buffer: [16 * 1024]u8 = undefined;
+    const status = via.exec_said(&.{ quorum_tool, "--bootstrap-controller", "localhost:9093", "describe", "--status" }, &buffer) catch return;
+    // No controller there: a later step.
+    if (status.status != 0) return member_refused("quorum status", status.status, status.output);
+    var output: [8 * 1024]u8 = undefined;
+    if (!voter_listed(status.output, 4)) {
+        const added = spare.exec_said(&.{
+            quorum_tool, "--command-config", "/tmp/server.properties", "--bootstrap-controller", "localhost:9093", "add-controller",
+        }, &output) catch return;
+        if (added.status != 0) return member_refused("add-controller", added.status, added.output);
+        sdk.sometimes(true, "a controller was added to the voters", .{});
+        return;
+    }
+    sdk.sometimes(true, "a controller joined the voters", .{});
+    if (sdk.random_below_named("kafka.controller_remove", 2) != 0) return;
+    // Its directory ID is the one its format drew (it is not among the initial controllers).
+    const directory = voter_directory(status.output, 4) orelse {
+        return member_refused("quorum status unread", status.status, status.output);
+    };
+    const removed = via.exec_said(&.{
+        quorum_tool,       "--bootstrap-controller", "localhost:9093",            "remove-controller",
+        "--controller-id", "4",                      "--controller-directory-id", directory,
+    }, &output) catch return;
+    if (removed.status != 0) return member_refused("remove-controller", removed.status, removed.output);
+    sdk.sometimes(true, "a controller was removed from the voters", .{});
+}
+
+/// Whether `describe --status` lists node `id` among its CurrentVoters (`"id": 4` in the line's
+/// JSON).
+fn voter_listed(text: []const u8, id: u32) bool {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "CurrentVoters:")) continue;
+        var spaced_buffer: [24]u8 = undefined;
+        var tight_buffer: [24]u8 = undefined;
+        const spaced = std.fmt.bufPrint(&spaced_buffer, "\"id\": {d},", .{id}) catch return false;
+        const tight = std.fmt.bufPrint(&tight_buffer, "\"id\":{d},", .{id}) catch return false;
+        return std.mem.indexOf(u8, line, spaced) != null or std.mem.indexOf(u8, line, tight) != null;
+    }
+    return false;
+}
+
+/// The directory ID `describe --status` gives voter `id` (`{"id": 4, "directoryId": "..."`).
+fn voter_directory(text: []const u8, id: u32) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "CurrentVoters:")) continue;
+        var spaced_buffer: [24]u8 = undefined;
+        var tight_buffer: [24]u8 = undefined;
+        const spaced = std.fmt.bufPrint(&spaced_buffer, "\"id\": {d},", .{id}) catch return null;
+        const tight = std.fmt.bufPrint(&tight_buffer, "\"id\":{d},", .{id}) catch return null;
+        const at = std.mem.indexOf(u8, line, spaced) orelse std.mem.indexOf(u8, line, tight) orelse return null;
+        const key = "\"directoryId\":";
+        const field = std.mem.indexOfPos(u8, line, at, key) orelse return null;
+        const open = std.mem.indexOfScalarPos(u8, line, field + key.len, '"') orelse return null;
+        const close = std.mem.indexOfScalarPos(u8, line, open + 1, '"') orelse return null;
+        return line[open + 1 .. close];
+    }
+    return null;
+}
+
+test voter_directory {
+    const text = "ClusterId: MkU3\nLeaderId: 1\n" ++
+        "CurrentVoters:          [{\"id\": 1, \"directoryId\": \"x\"}, {\"id\": 4, \"directoryId\": \"Hy0_aa\", \"endpoints\": []}]\n";
+    try std.testing.expectEqualStrings("Hy0_aa", voter_directory(text, 4).?);
+    try std.testing.expectEqualStrings("x", voter_directory(text, 1).?);
+    try std.testing.expect(voter_directory(text, 2) == null);
+}
+
+test voter_listed {
+    const text = "ClusterId: MkU3\nLeaderId: 1\n" ++
+        "CurrentVoters:          [{\"id\": 1, \"directoryId\": \"x\"}, {\"id\": 4, \"directoryId\": \"y\"}]\n" ++
+        "CurrentObservers:       [{\"id\": 2, \"directoryId\": \"z\"}]\n";
+    try std.testing.expect(voter_listed(text, 4));
+    try std.testing.expect(voter_listed(text, 1));
+    try std.testing.expect(!voter_listed(text, 2));
+}
+
+/// Redpanda's membership step, from its admin API's brokers (`GET /v1/brokers`): the spare (any
+/// node but 1 to 3) decommissioned one time in two while active; once it is gone, started again
+/// fresh (a new node, a new ID), unless its last start was within the join grace.
+fn redpanda_member_step(context: *System.Context, spare: *const sdk.Node) !void {
+    const brokers = [_][4]u8{ context.nodes.@"kafka-1".address, context.nodes.@"kafka-2".address, context.nodes.@"kafka-3".address };
+    const via = brokers[sdk.random_below(brokers.len)];
+    const arena = context.init.arena.allocator();
+    const buffer = try arena.alloc(u8, 64 * 1024);
+    const listed = tcp.http_with(via, redpanda_admin_port, "GET", "/v1/brokers", "", buffer, .{ .timeout_ms = 5_000 }) catch |err| {
+        return member_refused("brokers", 0, @errorName(err));
+    };
+    if (listed.status != 200) return member_refused("brokers", listed.status, listed.body);
+    const Broker = struct { node_id: u32 = 0, membership_status: []const u8 = "" };
+    const all = std.json.parseFromSliceLeaky([]const Broker, arena, listed.body, .{ .ignore_unknown_fields = true }) catch {
+        return member_refused("brokers unread", listed.status, listed.body);
+    };
+    const found: ?Broker = for (all) |broker| {
+        if (broker.node_id > 3) break broker;
+    } else null;
+    const broker = found orelse {
+        if (member_started_ns()) |at| if (monotonic_ns() -| at < join_grace_ns) return; // Still joining.
+        try spare.wipe(); // Fresh: a new node, which the cluster gives a new ID.
+        member_started_note();
+        sdk.sometimes(true, "a broker was started to join", .{});
+        return;
+    };
+    if (!std.mem.eql(u8, broker.membership_status, "active")) return; // Draining: later.
+    sdk.sometimes(true, "a broker joined", .{});
+    if (sdk.random_below_named("redpanda.member_remove", 2) != 0) {
+        return; // A member stays (a fault that stopped it starts it again).
+    }
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/v1/brokers/{d}/decommission", .{broker.node_id});
+    const response = tcp.http_with(via, redpanda_admin_port, "PUT", path, "", buffer, .{ .timeout_ms = 10_000 }) catch |err| {
+        return member_refused("decommission", 0, @errorName(err));
+    };
+    if (response.status != 200) return member_refused("decommission", response.status, response.body);
+    sdk.sometimes(true, "a broker was decommissioned", .{});
+}
+
+/// A membership call refused or unanswered (status 0, the error), said (an event): under faults,
+/// refusals are expected, and a step that never succeeds says why.
+fn member_refused(what: []const u8, status: u32, body: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = status, .body = body[0..@min(body.len, 512)] });
+}
+
+const redpanda_admin_port = 9644;
+/// The spare's last fresh start (monotonic, virtual), and how long its join may take before the
+/// cluster lists it: until then, not started again.
+const member_started_path = "/tmp/kafka-member.started";
+const join_grace_ns = 30 * std.time.ns_per_s;
+
+fn member_started_ns() ?u64 {
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var text: [32]u8 = undefined;
+    const size = linux.read(@intCast(fd), &text, text.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text[0..size], " \n"), 10) catch null;
+}
+
+fn member_started_note() void {
+    var text: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&text, "{d}\n", .{monotonic_ns()}) catch return;
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), line.ptr, line.len);
+}
+
+/// The replicas `kafka-topics.sh --describe` lists for `partition` ("Partition: 2 ... Replicas:
+/// 1,3,2 ..."), into `assigned`; how many, or null when the partition is not listed.
+fn replicas_of(text: []const u8, partition: u64, assigned: *[replicas]u32) ?usize {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var marker_buffer: [32]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buffer, "Partition: {d}\t", .{partition}) catch return null;
+        if (std.mem.indexOf(u8, line, marker) == null) continue;
+        const at = (std.mem.indexOf(u8, line, "Replicas: ") orelse return null) + "Replicas: ".len;
+        const end = std.mem.indexOfAnyPos(u8, line, at, "\t ") orelse line.len;
+        var count: usize = 0;
+        var ids = std.mem.tokenizeScalar(u8, line[at..end], ',');
+        while (ids.next()) |id| {
+            if (count == assigned.len) return null;
+            assigned[count] = std.fmt.parseInt(u32, id, 10) catch return null;
+            count += 1;
+        }
+        return count;
+    }
+    return null;
+}
+
+test replicas_of {
+    const text = "Topic: jepsen\tTopicId: x\tPartitionCount: 4\n" ++
+        "\tTopic: jepsen\tPartition: 1\tLeader: 2\tReplicas: 2,4,1\tIsr: 2,1\n" ++
+        "\tTopic: jepsen\tPartition: 10\tLeader: 3\tReplicas: 3,1,2\tIsr: 3,1,2\n";
+    var assigned: [replicas]u32 = undefined;
+    try std.testing.expectEqual(@as(?usize, 3), replicas_of(text, 1, &assigned));
+    try std.testing.expectEqualSlices(u32, &.{ 2, 4, 1 }, &assigned);
+    try std.testing.expectEqual(@as(?usize, 3), replicas_of(text, 10, &assigned));
+    try std.testing.expectEqualSlices(u32, &.{ 3, 1, 2 }, &assigned);
+    try std.testing.expectEqual(@as(?usize, null), replicas_of(text, 2, &assigned));
 }
 
 const Client = struct {
