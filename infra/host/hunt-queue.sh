@@ -110,7 +110,12 @@ try:
     replays = ", replays %d of %d the same" % (row["same"], row["n"])
 except Exception:
     pass
-print("%d timelines%s%s, failing: %s" % (stats.get("timelines") or 0, busy, replays, "; ".join(failing) or "nothing"))
+# Good-Turing beside the plateau rule (behaviors one timeline alone reached): which would have
+# stopped it, measured before either replaces the other.
+timelines = stats.get("timelines") or 0
+once = stats.get("behaviors_once")
+behaviors = ", %d behaviors, %d by one timeline alone" % (stats.get("behaviors") or 0, once) if once is not None else ""
+print("%d timelines%s%s%s, failing: %s" % (timelines, behaviors, busy, replays, "; ".join(failing) or "nothing"))
 ' 2>/dev/null
 }
 for request in "$@"; do
