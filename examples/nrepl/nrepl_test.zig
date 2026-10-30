@@ -13,7 +13,8 @@
 //!   errors are answered              an evaluation that throws answers its error, and its
 //!                                    session evaluates on
 //!   definitions are shared           a var defined in one session is that value in another,
-//!                                    and completes and looks up there
+//!                                    and completes and looks up there; a file loaded in one
+//!                                    (`load-file`, as editors send a buffer) is called in another
 //!   a session keeps its namespace    after `(in-ns 'x)`, the session's next evaluation is in x
 //!   output is its own                what an evaluation prints comes back to it, nothing else
 //!   interrupts land                  an interrupted long evaluation ends interrupted (or done)
@@ -61,6 +62,7 @@ fn jank(s: *System.Scenario) void {
     s.parallel_driver("evaluate", evaluate_many);
     s.parallel_driver("fail", fail_one);
     s.parallel_driver("define", define_one);
+    s.parallel_driver("load", load_one);
     s.parallel_driver("namespace", namespace_one);
     s.parallel_driver("print", print_one);
     s.eventually("recovers", recovers);
@@ -174,6 +176,38 @@ fn define_one(context: *System.Context) !void {
     sdk.always(lookup.done and info != null and info.?.string("name") != null, "a definition looks up in another session", .{
         .name = name,
     });
+}
+
+/// A file loaded in one session (`load-file`: its namespace and a function), the function called
+/// in another.
+fn load_one(context: *System.Context) !void {
+    var loader = Client.init();
+    loader.open(context.nodes.nrepl.address, port) catch |err| return unavailable(err);
+    defer loader.close();
+    var caller = Client.init();
+    caller.open(context.nodes.nrepl.address, port) catch |err| return unavailable(err);
+    defer caller.close();
+    const k = sdk.random_below(64);
+    const n = sdk.random_below(1_000_000);
+    var file_buffer: [96]u8 = undefined;
+    const file = try std.fmt.bufPrint(&file_buffer, "(ns loaded-{d}) (defn f [] {d})", .{ k, n });
+    var path_buffer: [32]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "loaded_{d}.clj", .{k});
+    const loaded = loader.call(&.{
+        .{ "op", "load-file" }, .{ "file", file }, .{ "file-path", path }, .{ "file-name", path },
+    }) catch |err| return unavailable(err);
+    sdk.always(loaded.done, "requests finish", .{});
+    if (loaded.value == null) return; // Loaded concurrently with another of its name: either.
+    var call_buffer: [32]u8 = undefined;
+    const called = caller.eval(try std.fmt.bufPrint(&call_buffer, "(loaded-{d}/f)", .{k})) catch |err|
+        return unavailable(err);
+    const value = std.fmt.parseInt(u64, called.value orelse "", 10) catch std.math.maxInt(u64);
+    // Another driver may load the same namespace between the two: then a number all the same.
+    sdk.always(value != std.math.maxInt(u64), "definitions are shared", .{
+        .file = file,
+        .read = called.value orelse "",
+    });
+    sdk.sometimes(value == n, "a loaded file's function was called in another session", .{});
 }
 
 /// A session that moved to another namespace evaluates there next (nREPL's sessions keep their
