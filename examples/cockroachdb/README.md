@@ -29,8 +29,12 @@ or decommissioning node, after a 30 s grace; active, one time in two decommissio
 
 The first smoke (srv3, 2026-10-30, seed 1, 2 timelines of ~15 minutes): the spare was started
 and joined 15 times, decommissioned 3 times; Elle found both histories valid. In timeline 1,
-crdb-3 exited with status 7 (a fatal error) at 921 s, while the spare was joining under
-partitions: under investigation (its log is taken out of a replay).
+crdb-3 exited with status 7 (a fatal error) at 921 s: "clock synchronization error: this node
+is more than 400ms away from at least half of the known nodes (1 of 2 are within the
+offset)", by design. Its log, taken out of a replay from its writable layer once it had exited,
+said so; det-faults had skewed crdb-3 +275 ms and then crdb-2 -223 ms, 498 ms apart, each
+within its 300 ms. Drawn skews now stay within a node's largest of every other node's, as a
+maximum offset is meant (det-faults), so a node that stops itself so is a bug.
 
 ## Findings
 
