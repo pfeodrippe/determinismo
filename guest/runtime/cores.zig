@@ -15,6 +15,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
+const last_output = @import("tail.zig");
+const crash_names = @import("crash_names.zig");
 
 const cores_directory = "/run/det/cores";
 /// "<thread id> <process name>" per crash: the kernel's crash line names the thread
@@ -51,7 +53,8 @@ pub fn main(init: std.process.Init) !u8 {
     const process = process_name(pid, &process_buffer) orelse command;
     var node_buffer: [name_size_max]u8 = undefined;
     const node = node_of(pid, &node_buffer);
-    crash_record(tid, process, known_of(init.arena.allocator(), node));
+    const known = known_of(init.arena.allocator(), node);
+    crash_record(tid, process, known);
     var path_buffer: [256]u8 = undefined;
     const format = cores_directory ++ "/{s}-{s}-{d}.core";
     const path = try std.fmt.bufPrintSentinel(&path_buffer, format, .{ node, command, pid }, 0);
@@ -66,8 +69,14 @@ pub fn main(init: std.process.Init) !u8 {
     while (input.fill()) input.start = input.end;
     const size = kept.size;
     const dropped = input.position - kept.read_kept;
+    var said_buffer: [last_output.said_size_max]u8 = undefined;
+    // What the node said last (a panic's message, an assertion's): read once the dump is in,
+    // its forwarder caught up.
+    const said = last_output.said(node, &said_buffer);
+    judge(init.arena.allocator(), process, known, .{ .node = node, .signal = signal, .path = path, .said = said });
     sdk.event("core_dump", .{
         .node = node,
+        .said = said,
         .pid = pid,
         .tid = tid,
         .process = process,
@@ -78,6 +87,37 @@ pub fn main(init: std.process.Init) !u8 {
         .dropped = dropped,
     });
     return 0;
+}
+
+/// The crash judged at its moment, as det-init would at the timeline's end (it judges only
+/// crashes no dump recorded): a known exit (by what its node said last) or a crash its node
+/// declares known counted, any other failing "no process crashes: <process>".
+fn judge(arena: std.mem.Allocator, process: []const u8, known: ?[]const u8, details: anytype) void {
+    var property_buffer: [crash_names.known_crash_prefix.len + 128]u8 = undefined;
+    if (known) |text| {
+        const shown = text[0..@min(text.len, 128 - 1)];
+        const property = std.fmt.bufPrint(&property_buffer, crash_names.known_exit_prefix ++ "{s}", .{shown}) catch return;
+        return sdk.assert_computed(.sometimes, true, property, details);
+    }
+    if (crash_known(arena, process)) {
+        const property = std.fmt.bufPrint(&property_buffer, crash_names.known_crash_prefix ++ "{s}", .{process}) catch return;
+        return sdk.assert_computed(.sometimes, true, property, details);
+    }
+    const property = std.fmt.bufPrint(&property_buffer, crash_names.crash_prefix ++ "{s}", .{process}) catch return;
+    sdk.assert_computed(.always, false, property, details);
+}
+
+/// Whether a node declares the process's crashes known (schema.Node.crashes_known, any node's
+/// as det-init has them; by name or its start: a command name is 15 characters at most).
+fn crash_known(arena: std.mem.Allocator, process: []const u8) bool {
+    const source = file_read(arena, system_path, system_size_max) orelse return false;
+    const system = sdk.schema.parse(sdk.schema.System, arena, source) catch return false;
+    for (system.nodes) |spec| {
+        for (spec.crashes_known) |name| {
+            if (std.mem.startsWith(u8, process, name)) return true;
+        }
+    }
+    return false;
 }
 
 /// What this core may take: cores_size_max, less what the other cores took of
@@ -340,9 +380,22 @@ fn node_from_cgroup(text: []const u8, buffer: *[name_size_max]u8) []const u8 {
 }
 
 /// Letters, digits, '.', '_' and '-' kept, anything else '_': a file name piece.
-/// /proc/<pid>/comm: the process's first thread's name.
+/// The process's name as the kernel's crash line has it ("surreal: surrealdb-worke: potentially
+/// unexpected fatal signal 6.": its executable's file name, whole), so a crash's property and a
+/// node's crashes_known name it the same way; else /proc/<pid>/comm, its first thread's name
+/// (15 characters at most).
 fn process_name(pid: linux.pid_t, buffer: *[name_size_max]u8) ?[]const u8 {
     var path_buffer: [64]u8 = undefined;
+    const exe = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/exe", .{pid}, 0) catch return null;
+    var target: [std.fs.max_path_bytes]u8 = undefined;
+    const linked = linux.readlink(exe, &target, target.len);
+    if (linux.errno(linked) == .SUCCESS and linked > 0) {
+        const deleted = " (deleted)";
+        var link = target[0..linked];
+        if (std.mem.endsWith(u8, link, deleted)) link = link[0 .. link.len - deleted.len];
+        const file = std.fs.path.basename(link);
+        if (file.len > 0) return sanitized(buffer, file);
+    }
     const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/comm", .{pid}, 0) catch return null;
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return null;

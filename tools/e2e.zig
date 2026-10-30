@@ -1665,11 +1665,26 @@ fn check_builtin_properties(context: *Context) !void {
         .{ "the tests pass on the system (PASS default)", std.mem.indexOf(u8, both, "PASS default") != null },
         .{ "they catch its mutant (FAIL mutant)", std.mem.indexOf(u8, both, "FAIL mutant") != null },
     }, "mutation: the tests pass on the system and catch its mutant", .{});
+    const exit_events = try std.fs.path.join(context.arena, &.{ context.scratch, "node-exit-events.jsonl" });
     const crash = try explore(context, &.{
-        "--program", program, "--scenario", "node_exit", "--seed", "1", "--branches", "1",
+        "--program", program, "--scenario", "node_exit", "--seed", "1", "--branch", "0",
+        "--events",  exit_events,
     });
     const caught = std.mem.indexOf(u8, crash, "FAIL \"no unexpected container exits\"") != null;
-    expect(context, caught, "built-in properties catch a node that exits", .{});
+    // The failure carries what the node said last (tail.zig).
+    const exit_said = std.Io.Dir.cwd().readFileAlloc(context.io, exit_events, context.arena, .limited(1 << 26)) catch "";
+    const said = said: {
+        var lines = std.mem.tokenizeScalar(u8, exit_said, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "\"no unexpected container exits\",\"condition\":false") == null) continue;
+            break :said std.mem.indexOf(u8, line, "dying as told") != null;
+        }
+        break :said false;
+    };
+    expect_all(context, &.{
+        .{ "the exit fails the property", caught },
+        .{ "the failure carries the node's last words (dying as told)", said },
+    }, "built-in properties catch a node that exits, saying what it said last", .{});
     const hog = try explore(context, &.{
         "--program",  program, "--profile", "memory", "--scenario", "oom", "--seed", "1",
         "--branches", "1",
@@ -1691,11 +1706,31 @@ fn check_builtin_properties(context: *Context) !void {
         .{ "the OOM kill fails its property", std.mem.indexOf(u8, hog, oom) != null },
         .{ "the hog was killed", std.mem.indexOf(u8, hog, "FAIL \"the hog is killed\"") == null },
     }, "built-in properties catch an OOM kill in a node", .{});
+    const crash_events = try std.fs.path.join(context.arena, &.{ context.scratch, "crash-events.jsonl" });
     const crashed = try explore(context, &.{
-        "--program", program, "--scenario", "crash", "--seed", "1", "--branches", "1",
+        "--program", program, "--scenario", "crash", "--seed", "1", "--branch", "0",
+        "--events",  crash_events,
     });
     const crash_caught = std.mem.indexOf(u8, crashed, "FAIL \"no process crashes") != null;
-    expect(context, crash_caught, "built-in properties catch a crash (SIGSEGV) in a node", .{});
+    // Judged by det-core as it happened: the failure's moment the core dump's, not the end's.
+    const crash_log = std.Io.Dir.cwd().readFileAlloc(context.io, crash_events, context.arena, .limited(1 << 26)) catch "";
+    var crash_failed_ns: ?u64 = null;
+    var dumped_ns: ?u64 = null;
+    var crash_lines = std.mem.tokenizeScalar(u8, crash_log, '\n');
+    while (crash_lines.next()) |line| {
+        const at = field_u64(line, "\"vtime_ns\":") orelse continue;
+        if (dumped_ns == null and std.mem.indexOf(u8, line, "\"event\":\"core_dump\"") != null) dumped_ns = at;
+        if (crash_failed_ns == null and std.mem.indexOf(u8, line, "\"message\":\"no process crashes: ") != null and
+            std.mem.indexOf(u8, line, "\"condition\":false") != null) crash_failed_ns = at;
+    }
+    const at_its_moment = if (crash_failed_ns) |failed| if (dumped_ns) |dumped|
+        failed <= dumped + std.time.ns_per_s
+    else
+        false else false;
+    expect_all(context, &.{
+        .{ "the crash fails its property", crash_caught },
+        .{ "at its moment (within 1 s of its core dump)", at_its_moment },
+    }, "built-in properties catch a crash (SIGSEGV) in a node, as it happens", .{});
     // Declared known (schema.Node.crashes_known): counted as a sometimes, not failed.
     const known = try explore(context, &.{
         "--program", program, "--profile", "known-crash", "--scenario", "crash", "--seed", "1", "--branches", "1",
@@ -3508,6 +3543,19 @@ fn field(line: []const u8, comptime key: []const u8) ?[]const u8 {
     const start = (std.mem.indexOf(u8, line, key) orelse return null) + key.len;
     const end = std.mem.indexOfScalarPos(u8, line, start, ' ') orelse line.len;
     return line[start..end];
+}
+
+/// A JSON line's number after `key` (`"vtime_ns":123,`).
+fn field_u64(line: []const u8, comptime key: []const u8) ?u64 {
+    const start = (std.mem.indexOf(u8, line, key) orelse return null) + key.len;
+    var end = start;
+    while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
+    return std.fmt.parseInt(u64, line[start..end], 10) catch null;
+}
+
+test field_u64 {
+    try std.testing.expectEqual(@as(?u64, 123), field_u64("{\"seq\":1,\"vtime_ns\":123,\"x\":2}", "\"vtime_ns\":"));
+    try std.testing.expectEqual(@as(?u64, null), field_u64("{}", "\"vtime_ns\":"));
 }
 
 fn expect(context: *Context, ok: bool, comptime format: []const u8, arguments: anytype) void {

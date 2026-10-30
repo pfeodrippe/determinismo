@@ -12,6 +12,8 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const sdk = @import("determinismo");
 const nodes = @import("nodes.zig");
+const last_output = @import("tail.zig");
+const crash_names = @import("crash_names.zig");
 
 const bin = "/opt/determinismo/bin/";
 const modules_directory = "/opt/determinismo/modules/";
@@ -305,7 +307,7 @@ fn wait_for(pid: linux.pid_t) u32 {
 /// remove its pidfile first, so an exit of the process a pidfile names is unexpected.
 const node_exit_property = "no unexpected container exits";
 var node_names: []const []const u8 = &.{};
-const known_exit_prefix = "an exit the system is known to make: ";
+const known_exit_prefix = crash_names.known_exit_prefix;
 /// Each node's known exits (schema.Node.exits_known), in node_names' order.
 var exits_known: []const []const []const u8 = &.{};
 const output_tail_max = 64 * 1024;
@@ -350,15 +352,21 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
         // pods' containers are judged by det-podlogs, under the same property.
         const signaled = code == 128 + 9 or code == 128 + 15;
         const expected = code == 0 or signaled or nodes.disk_failing(name);
-        const details = .{ .node = name, .status = code };
         if (!expected) if (exit_known(index, name)) |text| {
             var property_buffer: [known_exit_prefix.len + 128]u8 = undefined;
             const shown = text[0..@min(text.len, 128)];
             const property = std.fmt.bufPrint(&property_buffer, known_exit_prefix ++ "{s}", .{shown}) catch return;
-            sdk.assert_computed(.sometimes, true, property, details);
+            sdk.assert_computed(.sometimes, true, property, .{ .node = name, .status = code });
             return;
         };
-        sdk.assert_computed(.always, expected, node_exit_property, details);
+        // What it said last, its cause most often: its forwarder's last lines given a moment.
+        var said_buffer: [last_output.said_size_max]u8 = undefined;
+        const said = if (expected) "" else said: {
+            const settle: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&settle, null);
+            break :said last_output.said(name, &said_buffer);
+        };
+        sdk.assert_computed(.always, expected, node_exit_property, .{ .node = name, .status = code, .said = said });
         return;
     }
 }
@@ -374,11 +382,11 @@ fn orphan_reaped(pid: linux.pid_t, status: u32) void {
 /// client's rpc_tp_Transact thread is postgres's). A timeline without any crash passes
 /// `crash_property`.
 const oom_property = "the kernel kills no process for lack of memory";
-const known_crash_prefix = "a process crash the system is known to have: ";
+const known_crash_prefix = crash_names.known_crash_prefix;
 /// The processes whose crashes the system's nodes declare known (schema.Node.crashes_known).
 var crashes_known: []const []const u8 = &.{};
 const crash_property = "no process crashes (segfault, illegal instruction, ...)";
-const crash_property_prefix = "no process crashes: ";
+const crash_property_prefix = crash_names.crash_prefix;
 const kernel_property = "the kernel reports no warnings, BUGs or hung tasks";
 const kmsg_records_max = 1 << 16;
 
@@ -404,13 +412,10 @@ fn kernel_check() void {
             const problem = kernel_problem(record.text) orelse continue;
             if (problem == .crash) {
                 const crash = crash_of(crashes, record.text);
-                // A crash on a known way down, by what its node printed last (det-core matched
-                // it then): the known exit's property, as its exit would have been.
-                if (crash.known) |text| {
-                    var known_exit_buffer: [known_exit_prefix.len + 128]u8 = undefined;
-                    const property = std.fmt.bufPrint(&known_exit_buffer, known_exit_prefix ++ "{s}", .{text}) catch
-                        continue;
-                    sdk.assert_computed(.sometimes, true, property, .{ .kernel_us = record.time_us, .line = record.text });
+                // A core dump's: det-core judged it as it happened (with what its node said
+                // last). Here only crashes no dump recorded (a process that may not dump).
+                if (crash.recorded) {
+                    seen.set(.crash, true);
                     continue;
                 }
                 const process = crash.process;
@@ -464,6 +469,8 @@ const Crash = struct {
     process: []const u8,
     /// The known exit its node's last output named (cores.zig), if one.
     known: ?[]const u8 = null,
+    /// det-core recorded it, and judged it then (cores.zig): at its moment, not here.
+    recorded: bool = false,
 };
 
 /// The process of a crash line: the one det-core recorded for its thread ("<tid> <process>"
@@ -479,8 +486,8 @@ fn crash_of(crashes: []const u8, text: []const u8) Crash {
         const recorded = std.fmt.parseInt(u32, line[0..space], 10) catch continue;
         if (recorded != tid or space + 1 >= line.len) continue;
         const rest = line[space + 1 ..];
-        const tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return .{ .process = rest };
-        return .{ .process = rest[0..tab], .known = rest[tab + 1 ..] };
+        const tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return .{ .process = rest, .recorded = true };
+        return .{ .process = rest[0..tab], .known = rest[tab + 1 ..], .recorded = true };
     }
     return .{ .process = crash_process(text) };
 }
@@ -504,6 +511,7 @@ fn crash_by_process(crashes: []const u8, process: []const u8) Crash {
         // the program's ("det-selftest-node" for "det-selftest-no").
         if (recorded.len == 0 or !std.mem.startsWith(u8, process, recorded)) continue;
         found.known = if (tab) |at| rest[at + 1 ..] else null;
+        found.recorded = true;
     }
     return found;
 }

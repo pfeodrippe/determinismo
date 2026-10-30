@@ -70,6 +70,7 @@ td { padding: 4px 8px; border-bottom: 1px solid #262830; vertical-align: top; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: var(--panel-2); }
 .mono { font-family: var(--mono); font-size: 12.5px; }
+.cause { white-space: pre-wrap; word-break: break-word; font-size: 11.5px; max-width: 70ch; max-height: 6.5em; overflow: hidden; color: var(--muted, inherit); }
 .fail-text { color: var(--fail); }
 .pass-text { color: var(--pass); }
 .muted { color: var(--muted); }
@@ -256,6 +257,7 @@ function efficiencyOf(run, key, format) {
   return source ? format(source[key]) : "–";
 }
 const quote = (text) => '"' + String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+const sqlString = (text) => "'" + String(text).replace(/'/g, "''") + "'";
 
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
@@ -847,7 +849,8 @@ async function examplesToggle(element) {
   try {
     const failing = conditions.failing ? await query({ condition: conditions.failing, output: "branches", limit: 1000000 }) : [];
     const passing = conditions.passing ? await query({ condition: conditions.passing, output: "branches", limit: 1000000 }) : [];
-    state.examples.set(message, { failing, passing, note: conditions.note });
+    const causes = failing.length ? await failureCauses(message) : new Map();
+    state.examples.set(message, { failing, passing, causes, note: conditions.note });
   } catch (error) { state.examples.set(message, { error: error.message }); }
   // Drawn where the property is now (the list may have been drawn again meanwhile).
   const now = [...document.querySelectorAll(".property")].find((other) => other.dataset.message === message);
@@ -870,6 +873,34 @@ function exampleConditions(message, kind) {
         note: "A sometimes or reachable property fails only if no timeline makes it true: these timelines did." };
   }
 }
+// What each failing example said, by branch: its first failure's details (an exit's `said`,
+// what its node wrote last), or for a crash the same timeline's core dump's `said`.
+async function failureCauses(message) {
+  const causes = new Map();
+  const firsts = await apiJson(`/runs/${state.runId}/sql`, { sql:
+    `SELECT branch, CAST(event -> '$.assert.details' AS VARCHAR) AS details FROM events
+     WHERE path_assert_message = ${sqlString(message)} AND condition = false
+     QUALIFY row_number() OVER (PARTITION BY branch ORDER BY seq) = 1 ORDER BY branch LIMIT 10` });
+  for (const row of firsts) {
+    let details = {};
+    try { details = JSON.parse(row.details || "{}") || {}; } catch { /* Shown as it is. */ }
+    causes.set(row.branch, details.said || (row.details && row.details !== "{}" ? row.details : ""));
+  }
+  if (message.startsWith("no process crashes")) {
+    const dumps = await apiJson(`/runs/${state.runId}/sql`, { sql:
+      `SELECT branch, json_extract_string(event, '$.details.said') AS said FROM events
+       WHERE name = 'core_dump' QUALIFY row_number() OVER (PARTITION BY branch ORDER BY seq) = 1` });
+    for (const row of dumps) if (row.said && causes.has(row.branch)) causes.set(row.branch, row.said);
+  }
+  return causes;
+}
+// The last lines of what a node said, or a compact excerpt.
+function causeHtml(text) {
+  if (!text) return "";
+  const lines = String(text).split("\n").filter((line) => line.trim() !== "");
+  const shown = lines.slice(-4).join("\n");
+  return `<div class="mono cause" title="${escape(text)}">${escape(shown.length > 600 ? "…" + shown.slice(-600) : shown)}</div>`;
+}
 function examplesDraw(element) {
   const message = element.dataset.message;
   const box = $(".examples", element);
@@ -883,10 +914,12 @@ function examplesDraw(element) {
     ...failing.slice(0, 10).map((example) => ({ ...example, failing: true })),
     ...passing.filter((example) => !failingBranches.has(example.branch)).slice(0, 5).map((example) => ({ ...example, failing: false })),
   ];
-  box.innerHTML = rows.length ? `<table><tr><th>Example</th><th>Branch</th><th>Time</th><th>Hits</th><th></th></tr>
+  const causes = loaded.causes || new Map();
+  box.innerHTML = rows.length ? `<table><tr><th>Example</th><th>Branch</th><th>Time</th><th>Hits</th><th>What it said</th><th></th></tr>
     ${rows.map((row) => `<tr class="clickable" data-branch="${row.branch}" data-vtime="${row.first_vtime_ns}">
       <td class="${row.failing ? "fail-text" : "pass-text"}">${row.failing ? "Failing" : "Passing"}</td>
       <td class="mono">${row.branch}</td><td class="mono">${seconds(row.first_vtime_ns)}</td><td class="mono">${row.matches}</td>
+      <td>${row.failing ? causeHtml(causes.get(row.branch)) : ""}</td>
       <td>${row.failing ? `<button class="causality" data-branch="${row.branch}" title="How likely the failure was at each moment of this timeline">Causality</button>` : ""}</td></tr>`).join("")}
     </table><div class="muted" style="margin-top:4px">${failing.length} failing timelines, ${passing.filter((example) => !failingBranches.has(example.branch)).length} passing. Click an example for its logs.${loaded.note ? ` ${escape(loaded.note)}` : ""}</div>
     ${failing.length ? causalityOptionsHtml() : ""}
