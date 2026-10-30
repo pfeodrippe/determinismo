@@ -1,7 +1,9 @@
 - [x] test TLC ( https://github.com/tlaplus/tlaplus )
 - [x] speed and exploration quality
 - [x] test quint
-- [ ] test jank nrepl
+- [x] test jank nrepl
+- [ ] learn over time
+- [ ] use service logs to guide strategies as well (besides the normal determinismo sdk logs for properties, assertions, sometimes, lifecycle etc)
 - [ ] test determinismo itself (nested kvm)
 - [ ] can we do load/perf test with it ?
 - [ ] writing tests in clojure (using zig or some abstraction that communicates using something else?)
