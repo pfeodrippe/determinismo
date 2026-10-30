@@ -117,8 +117,9 @@ event hashing, the guest module.
   what the cluster lists: etcd (the spare added as a learner or a voter, promoted, removed after
   it is stopped, added again fresh), rqlite (joins as a voter by itself, `DELETE /remove`),
   Consul (joins by retry-join, autopilot makes it a voter; force-leave with prune), RabbitMQ
-  (the quorum queue's members: delete_member at three, add_member back), NATS (a stream peer
-  removed; with three servers its replacement is the server removed, catching up anew), Kafka
+  (the quorum queue's members: delete_member at three, add_member back), NATS (the stream's
+  group scaled from three peers to two and back; a peer removal is refused with three servers),
+  Kafka
   (a spare broker-only node 4: one replica of the topic or of `__transaction_state` moved onto
   it or back, kafka-reassign-partitions), Redpanda (the spare joins with an ID the cluster
   assigns, is decommissioned through the admin API, and joins again fresh as a new node once
@@ -128,7 +129,11 @@ event hashing, the guest module.
   YugabyteDB (a spare tablet server registers, is blacklisted until its tablets moved off, then
   stopped and unblacklisted; registers again fresh), Kafka's dynamic quorum (KIP-853, profile
   `kafka-4.4-dynamic`: the three bootstrap it from fixed directory IDs, the spare starts as an
-  observer and is added to the voters with add-controller and removed with remove-controller).
+  observer and is added to the voters with add-controller and removed with remove-controller),
+  MongoDB (replSetReconfig through the primary: the spare added fresh as a voter, removed after
+  it is stopped), ZooKeeper (profile `reconfig`: dynamic reconfiguration, a spare server added
+  and removed), ScyllaDB (the spare bootstraps, `nodetool decommission` from itself; Raft-based
+  topology in `current`). Every driver says each refused call (`member_refused`).
   Every one in its smoke next; then hunts with them (as the hunt queue's next systems).
 - Exploration ideas from reading (2026-10-30: the user's list, and exploration research since
   2020, deterministic or not), best first. Each is measured with findability before it is
@@ -192,10 +197,13 @@ event hashing, the guest module.
      memory on the Raft POC and jank (0.76 to 0.99; none on RabbitMQ); timelines finding a new
      behavior cost more wall time per virtual second and have more faults (0.7 to 1.0), which
      behaviors already capture. Symptoms at the end, so not yet guidance: `det-nodes samples`
-     now records each node's CPU and memory every 2 s (node_sample events), and the next Raft
-     hunts say whether going quiet comes early enough before the failure to return there (then
-     a built-in objective: a node's longest quiet stretch while drivers run). Assembly-level
-     signals (PT, PMU) wait for this cheaper one.
+     records each node's CPU and memory every 2 s (node_sample events). Measured over time on
+     the Raft POC (run 250, 4,102 timelines with samples): 9 of 23 failing timelines went quiet
+     (the cluster's CPU under a fifth of its own median for 6 s) about 2 min before failing,
+     but so did 1,321 of 4,079 passing ones; a quiet timeline failed 0.68% of the time against
+     0.56% overall, a lift of 1.2. Not worth an objective. Resource signals stay data (the
+     samples, the end-of-timeline study), and assembly-level ones (PT, PMU) are not pursued for
+     guidance on this evidence; structured state from instrumented code (11) is the lead.
   10. Messages reordered with guarantees: PCTCP (OOPSLA 2018: bug depth d found with known
      probability), ByzzFuzz's small-scope message mutations (2023), Mallory's Lamport-timeline
      feedback and learned fault policy (CCS 2023: 54% more states than Jepsen, 1.87x faster).
