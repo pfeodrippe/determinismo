@@ -134,6 +134,15 @@ event hashing, the guest module.
   it is stopped), ZooKeeper (profile `reconfig`: dynamic reconfiguration, a spare server added
   and removed), ScyllaDB (the spare bootstraps, `nodetool decommission` from itself; Raft-based
   topology in `current`). Every driver says each refused call (`member_refused`).
+  First smokes (srv3, 2026-10-30, seed 1, 2 to 4 timelines each): rqlite 10.6.6 commits a
+  forwarded write twice (new: its cluster client resends on a new connection even with no
+  retries, PR #2585; confirmed by the forwarding node's counters); etcd 3.7.3's #22498 again,
+  a member silently losing 7 acknowledged increments and serving linearizable reads from that
+  state; NATS 2.15.2 losing all 227 acknowledged messages with `sync` (#7545, open); RabbitMQ's
+  known feature-flags boot failure; Consul clean; Kafka 150 replica moves, no failure. Fixed
+  in the drivers on the way: one step per run never completed a join (now up to 20 steps); a
+  join grace counted from boot; a stale member list starting a removed spare; NATS's peer
+  removal always refused (now scaling the group); Galera's CLI errors unsaid.
   Every one in its smoke next; then hunts with them (as the hunt queue's next systems).
 - Exploration ideas from reading (2026-10-30: the user's list, and exploration research since
   2020, deterministic or not), best first. Each is measured with findability before it is
