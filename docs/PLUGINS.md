@@ -93,6 +93,11 @@ For code coverage:
   `sdk/java/DeterminismoCoverage.java`, `-javaagent:determinismo-coverage.jar=<class prefixes>`;
   each source line of those classes reports itself the first time it runs (`"line
   <class>:<n>"`), classes defined at run time included (see `tests/antithesis-compat/java`).
+  States too, as SGFuzz finds them (enum-typed variables are a program's state): each store
+  outside initializers of one of the program's enum constants to a field reports the
+  transition the first time it happens (a `state` event, `"state <class>.<field>: OLD ->
+  NEW"`), so the tree returns to timelines that reach a new state even where no new line runs
+  (template `state`, against `state_int`: the same maze, its progress an int).
 
 Coverage can also be semantic: any `{"event":"coverage","details":{"name":"..."}}` is a
 feature, so a system can report an abstraction of its own state (a spec's abstract state, a

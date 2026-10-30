@@ -200,6 +200,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "hang", check_hang },                     .{ "pinned", check_pinned },
         .{ "slow", check_slow },                     .{ "sought", check_sought },
         .{ "optimize", check_optimize },
+        .{ "states", check_states },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -2577,6 +2578,31 @@ fn check_optimize(context: *Context) !void {
         .{ "optimized, the streak is won", won[0] > 0 },
         .{ "blind, it is not", won[1] == 0 },
     }, "optimize: a streak of 24 won in {d} timelines optimized, {d} blind, of 256 each", .{ won[0], won[1] });
+}
+
+/// States from instrumented code (the JVM agent's enum transitions, SGFuzz's state variables)
+/// guide the tree where line coverage cannot: the state maze's progress runs no new line, and is
+/// solved when its stage is an enum field, never when the same progress is an int.
+fn check_states(context: *Context) !void {
+    var solved: [2]u64 = undefined;
+    var transitions: u64 = 0;
+    for ([_][]const u8{ "state", "state_int" }, &solved) |scenario, *count| {
+        const events = try std.fmt.allocPrint(context.arena, "{s}/{s}-events", .{ context.scratch, scenario });
+        _ = try explore(context, &.{
+            "--compose", "tests/antithesis-compat/java/compose.yaml", "--scenario", scenario,
+            "--seed",    "1",                                         "--branches", "256",
+            "--events-dir", events,
+        });
+        count.* = try query_count(context, &.{ events, "assert.message=\"the state maze is never solved\" assert.condition=false" });
+        if (std.mem.eql(u8, scenario, "state")) transitions = try query_count(context, &.{ events, "event=state" });
+    }
+    expect_all(context, &.{
+        .{ "the agent reports the stage's transitions", transitions > 0 },
+        .{ "with its stage an enum, the maze is solved", solved[0] > 0 },
+        .{ "with its progress an int, it is not", solved[1] == 0 },
+    }, "states: the state maze solved in {d} timelines by its enum's transitions ({d} reported), {d} with an int, of 256 each", .{
+        solved[0], transitions, solved[1],
+    });
 }
 
 /// A `sometimes` made true comes first among a timeline's new behaviors: the tree returns just
