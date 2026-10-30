@@ -43,3 +43,32 @@ the commit).
 
 - 2026-10-29: written; the transaction's shape tried on a 3.3.5 server in memory (a `RETURN`
   inside a transaction ends it, committing what ran: reads are expressions). First smoke next.
+- 2026-10-29: the first smoke never got past setup: TiKV refused every write as its disk was
+  full by its own reserve (5 GB by default). `reserve-space` and `reserve-raft-space` are 0 now.
+- 2026-10-30: the second smoke (2 timelines) found the panic below.
+
+## Found blind: an async commit that TiKV declines aborts the SurrealDB process
+
+Smoke run 226 (srv3, 2026-10-30), timeline 1. TiKV was in elections, and the client logged
+"check leader failed ... failed to connect to all addresses". At 49.27 s, SurrealDB on n3
+panicked:
+
+```
+thread 'surrealdb-worker' (221) panicked at .../surrealdb-tikv-client-0.5.0/src/transaction/transaction.rs:1289:27:
+called `Option::unwrap()` on a `None` value
+```
+
+The process aborted (SIGABRT, a core dump of 127 MB), and every request in flight on that node
+went with it. The node's start script started it again.
+
+Why:
+
+- SurrealDB uses TiKV's async commit by default (`async_commit: true`, `tikv_async_commit`).
+- Its client, `Committer::commit`, takes the prewrite's `min_commit_ts` with `unwrap()`, beside
+  its authors' note: `// FIXME: min_commit_ts == 0 => fallback to normal 2PC`.
+- A prewrite that TiKV does not do as async commit leaves it unset, so the client panics instead
+  of committing in two phases.
+
+Upstream `tikv/client-rust` has the same line (src/transaction/transaction.rs:1388 on master,
+2026-10-30). Neither tracker has it (surrealdb/tikv-client has issues turned off). A deployment
+that sets `tikv_async_commit` false does not go through this path.
