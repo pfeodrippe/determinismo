@@ -354,7 +354,10 @@ event hashing, the guest module.
     1.4x. But twice the VMs outgrew memory: admission claims each VM's guest, not its in-run
     snapshots and holders, and from 40 minutes in the host ran out (53 Dgraph timelines
     killed). Off by default again (`--siblings on`, DETERMINISMO_SMT=1) until admission
-    counts snapshots and holders. Next: that accounting.
+    counts snapshots and holders. Decided (2026-10-30, with the user): siblings stay off. Their
+    1.4x is not worth the memory and a determinism risk that only sampled replays (16 a run)
+    would catch; Antithesis pins one VM per physical core too (its hypervisor post). The night's
+    sibling run (Kafka, 64 timelines, 16 replays the same) only measured that it is safe.
   - Fault injector deadlock (2026-10-28, Kafka run 24, 1 timeline of 68): no fault for the
     last 69 s of timeline 63, a crashed node never started again, an isolation never ended.
     Found by replaying the timeline to 60 s and dumping det-faults' threads and /proc/locks:
