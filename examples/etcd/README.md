@@ -42,21 +42,22 @@ above holds through them; faults leave the spare alone while it is not running.
 
 ## Findings
 
-### Under investigation: a member's keyspace ~90 revisions behind its applied index, no snapshot install
+### Found again: #22498 losing acknowledged increments, served by linearizable reads
 
-The second membership smoke (srv3, 2026-10-30, `--scenario kv --seed 1`, branch 2, the default
-profile, etcd v3.7.3) failed "the counter counts every acknowledged increment and no more": the
-final linearizable read, through etcd-1, gave 0 after 7 acknowledged increments. A replay at
-32.5 s, each member's own copy (serializable reads, `endpoint status`):
-- etcd-1: counter "0" (mod revision 2, its setup value), raft index 119, applied 119;
-- etcd-2 (the leader) and etcd-3: counter "7" (mod revision 93), raft index 119, applied 119.
-etcd-1 claims to have applied everything and its keyspace is far behind: it answers
-linearizable reads from that state. Unlike #22498 (below), etcd-1 never installed a snapshot
-(every start logs `snapshot-index 0`, `Skipping snapshot backend`); its restored consistent
-index went 22, 39, 80 across power losses at sync points (`durable_crash` at 11.34 s and 15.32
-s) and crashes. Next: etcd-1's bbolt file and WAL extracted at moments around 15.3 s, as for
-#22498, to tell an etcd durability path from an artifact of how `durable_crash` crashes at an
-fsync. A learner was promoted and the spare joined in that run.
+The second membership smoke (srv3, 2026-10-30, `--scenario kv --seed 1`, branch 2, etcd
+v3.7.3) failed "the counter counts every acknowledged increment and no more": the final
+linearizable read, through etcd-1, gave 0 after 7 acknowledged increments. Replays read each
+member's own copy (serializable reads): etcd-1 and the leader both held 7 at 16.3 s and 17.5 s;
+at 32.5 s etcd-1 held "0" (mod revision 2, its setup value) and etcd-2 and etcd-3 held "7"
+(mod revision 93), all three at applied index 119. etcd-1's log shows #22498's sequence (below):
+- 17.86 s: it receives the leader's snapshot (index 107), saves `000000000000006b.snap.db`,
+  installs it (`applySnapshot: opened snapshot backend`), and restores consistent index 107;
+- 18.47 s: a power loss, 0.6 s later;
+- 22.58 s: `restore consistentIndex 107`, `Skipping snapshot backend` (consistent index 107,
+  snapshot index 107): it keeps the old file, which claims index 107 with data from before.
+The same bug, reached blind again; here a member silently loses acknowledged writes and answers
+linearizable reads from that state (it takes the leader's read index, then reads its own).
+Replay: `--scenario kv --seed 1 --branch 2` (the membership driver's build).
 
 ### Found blind, known upstream: a member loses applied writes after a power loss that follows a snapshot install
 
