@@ -57,6 +57,9 @@ fn describe(d: *System.Describe) !void {
                 "--cache=64MiB",
                 "--max-sql-memory=64MiB",
             },
+            // Test-sized ranges allowed (zone_sql): 64 MiB is the smallest range_max_bytes
+            // otherwise, as CockroachDB's own roachtests lower it.
+            .env = &.{"COCKROACH_MIN_RANGE_MAX_BYTES=65536"},
             .ready = .{ .tcp = port },
             // A wipe is left out: a node that lost its store cannot rejoin as itself. Clocks
             // skewed within its maximum offset (500 ms; a node past 80% of it stops on purpose).
@@ -79,12 +82,15 @@ fn append_scenario(s: *System.Scenario) void {
     s.finally("final reads", final_reads);
 }
 
-/// Ranges split at 64 KiB (CockroachDB's smallest; 512 MiB by default, which a test's data never
-/// reaches) and merge under 16 KiB: splits, merges and the lease and replica moves after them
+/// Ranges split at 64 KiB (512 MiB by default, which a test's data never reaches; below 64 MiB
+/// only with COCKROACH_MIN_RANGE_MAX_BYTES lowered: the first smoke's setup was refused) and
+/// merge under 16 KiB: splits, merges and the lease and replica moves after them
 /// happen within a timeline, as Jepsen's split nemesis made them. No internal time series (a
 /// write every 10 s on every node that nothing reads here).
-const settings_sql = "ALTER RANGE default CONFIGURE ZONE USING range_min_bytes = 16384, " ++
-    "range_max_bytes = 65536; SET CLUSTER SETTING timeseries.storage.enabled = false";
+const zone_sql = "ALTER RANGE default CONFIGURE ZONE USING range_min_bytes = 16384, range_max_bytes = 65536";
+/// Its own statement: a cluster setting is refused inside a transaction, and one `-e` with both
+/// is one (the second smoke's setup).
+const timeseries_sql = "SET CLUSTER SETTING timeseries.storage.enabled = false";
 
 /// The cluster initialized (once: a second init says it already is), its ranges test-sized, then
 /// the table.
@@ -103,7 +109,7 @@ fn cluster_ready(context: *System.Context) !void {
 fn settings_apply(context: *System.Context) !void {
     var buffer: [4096]u8 = undefined;
     const result = try context.nodes.@"crdb-1".exec_output(&.{
-        "/cockroach/cockroach", "sql", "--insecure", "--host=crdb-1:26257", "-e", settings_sql,
+        "/cockroach/cockroach", "sql", "--insecure", "--host=crdb-1:26257", "-e", zone_sql, "-e", timeseries_sql,
     }, &buffer);
     if (result.status != 0) {
         sdk.event("cluster_settings_refused", .{ .status = result.status, .output = result.output });
