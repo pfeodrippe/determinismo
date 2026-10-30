@@ -130,36 +130,12 @@ pub fn start(
     // and a command run in the node (through /proc/<pid>/root) would not find its files.
     var running: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&running, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
-    const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
-        linux.CLONE.NEWNET | linux.CLONE.NEWPID | @backingInt(linux.SIG.CHLD);
-    const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
-    if (linux.errno(result) != .SUCCESS) return error.Clone;
-    if (result == 0) {
-        _ = linux.close(sync[1]);
-        _ = linux.close(running[0]);
-        // Other nodes' mounts go first, before it is in the node's cgroup within reach of its
-        // faults: a copy held here keeps another node's disk alive after its crash (its remount
-        // gets the old, shut down filesystem back, or the disk is busy), and a fault may stop
-        // or freeze it for seconds before it runs the node's program.
-        launch.mounts_detach_other_nodes() catch |err| die("detach", err);
-        // The parent has set up cgroup and network: its "g", nothing else (it failed, and
-        // closed the pipe: a node running outside its cgroup, without a pidfile, would be out
-        // of reach of every fault).
-        var byte: [1]u8 = undefined;
-        if (linux.read(sync[0], &byte, 1) != 1 or byte[0] != 'g') linux.exit_group(1);
-        // Its own cgroup namespace, rooted at its cgroup (as containers have): what it creates
-        // there (kubelet's pods) stays under the node, within reach of its faults.
-        if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
-            die("unshare", error.Unshare);
-        }
-        // Its own time namespace, entered at the exec: its realtime clock can be skewed apart
-        // from the other nodes' (clock_offset, the clock_skew fault).
-        if (linux.errno(linux.unshare(linux.CLONE.NEWTIME)) != .SUCCESS) {
-            die("unshare", error.Unshare);
-        }
-        launch.exec(output_pipes.stdout[1], output_pipes.stderr[1]); // Never returns.
-    }
-    const pid: linux.pid_t = @intCast(result);
+    const child: Child = .{ .launch = &launch, .sync = sync, .running = running, .output = output_pipes };
+    // det-init's child, whoever starts it: det-init reaps it as it exits and judges the exit
+    // then. Started by det-faults (after a fault) it was det-faults' child, unreaped until the
+    // faults stopped: its exit judged only then (Consul's smoke, srv3, 2026-10-30: a restart
+    // that refused to boot at 7.4 s judged at 10.9 s), and the zombie taken for running.
+    const pid = if (linux.getpid() == 1) try child.clone() else try child.clone_orphaned();
     // A start that fails from here on leaves nothing running: the child is the first process
     // of its PID namespace, so the namespace goes with it. (A pidfile that could not be
     // written, with /run full, once left a node running that no fault could reach: a crash
@@ -181,6 +157,80 @@ pub fn start(
     try file_write(paths.pid, try std.fmt.allocPrint(arena, "{d}\n", .{pid}));
     sdk.event("node_start", .{ .node = node.name, .pid = pid });
 }
+
+/// The node's first process, cloned into its namespaces, and what it needs to become the node's
+/// program.
+const Child = struct {
+    launch: *const Launch,
+    sync: [2]linux.fd_t,
+    running: [2]linux.fd_t,
+    output: output.Pipes,
+
+    const flags = linux.CLONE.NEWNS | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC |
+        linux.CLONE.NEWNET | linux.CLONE.NEWPID | @backingInt(linux.SIG.CHLD);
+
+    /// Cloned as this process's child.
+    fn clone(child: *const Child) !linux.pid_t {
+        const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
+        if (linux.errno(result) != .SUCCESS) return error.Clone;
+        if (result == 0) child.run();
+        return @intCast(result);
+    }
+
+    /// Cloned by an intermediate process that exits at once: an orphan, det-init's (PID 1) to
+    /// reap. Its PID comes back through a pipe (0: the clone failed).
+    fn clone_orphaned(child: *const Child) !linux.pid_t {
+        var said: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&said, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        defer _ = linux.close(said[0]);
+        const middle = linux.fork();
+        if (linux.errno(middle) != .SUCCESS) {
+            _ = linux.close(said[1]);
+            return error.Fork;
+        }
+        if (middle == 0) {
+            const result = linux.syscall5(.clone, flags, 0, 0, 0, 0);
+            if (result == 0) child.run();
+            const pid: linux.pid_t = if (linux.errno(result) == .SUCCESS) @intCast(result) else 0;
+            _ = linux.write(said[1], std.mem.asBytes(&pid), @sizeOf(linux.pid_t));
+            linux.exit_group(0);
+        }
+        _ = linux.close(said[1]);
+        var status: i32 = 0;
+        while (linux.errno(linux.wait4(@intCast(middle), &status, 0, null)) == .INTR) {}
+        var pid: linux.pid_t = 0;
+        if (linux.read(said[0], std.mem.asBytes(&pid), @sizeOf(linux.pid_t)) != @sizeOf(linux.pid_t) or pid == 0) {
+            return error.Clone;
+        }
+        return pid;
+    }
+
+    fn run(child: *const Child) noreturn {
+        _ = linux.close(child.sync[1]);
+        _ = linux.close(child.running[0]);
+        // Other nodes' mounts go first, before it is in the node's cgroup within reach of its
+        // faults: a copy held here keeps another node's disk alive after its crash (its remount
+        // gets the old, shut down filesystem back, or the disk is busy), and a fault may stop
+        // or freeze it for seconds before it runs the node's program.
+        child.launch.mounts_detach_other_nodes() catch |err| die("detach", err);
+        // The parent has set up cgroup and network: its "g", nothing else (it failed, and
+        // closed the pipe: a node running outside its cgroup, without a pidfile, would be out
+        // of reach of every fault).
+        var byte: [1]u8 = undefined;
+        if (linux.read(child.sync[0], &byte, 1) != 1 or byte[0] != 'g') linux.exit_group(1);
+        // Its own cgroup namespace, rooted at its cgroup (as containers have): what it creates
+        // there (kubelet's pods) stays under the node, within reach of its faults.
+        if (linux.errno(linux.unshare(linux.CLONE.NEWCGROUP)) != .SUCCESS) {
+            die("unshare", error.Unshare);
+        }
+        // Its own time namespace, entered at the exec: its realtime clock can be skewed apart
+        // from the other nodes' (clock_offset, the clock_skew fault).
+        if (linux.errno(linux.unshare(linux.CLONE.NEWTIME)) != .SUCCESS) {
+            die("unshare", error.Unshare);
+        }
+        child.launch.exec(child.output.stdout[1], child.output.stderr[1]); // Never returns.
+    }
+};
 
 /// Runs `argv` inside a running node (its namespaces, root, environment and user), like
 /// `docker exec`, with this process's standard streams. Returns the command's exit status.
