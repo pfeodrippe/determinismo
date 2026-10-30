@@ -205,6 +205,37 @@ and dies on what rabbit-1's Mnesia sends it.
 Also: `with_running_or_clean_mnesia` restores `dir` with no `try ... after`, so any exit from
 its fun leaves the node's Mnesia settings at the throwaway ones.
 
+### Found blind: a member unreachable for a moment during a node's boot ends the boot for good
+
+Hunt run 210 (srv3, 2026-10-30, Khepri, `ra-synced`, 1417 timelines). In 31 timelines a broker
+leaves the cluster ("no unexpected container exits"): its boot stops with
+`Error during startup: {error,{incompatible_feature_flags,{erpc,noconnection}}}`, then "Kernel
+pid terminated" and a crash dump. Nothing restarts it.
+
+Timeline 613, rabbit-2:
+
+- **42.8 s:** restarted by a fault.
+- **50-52 s:** rabbit-1 and rabbit-3 are crashed and restarted.
+- **53.12 s:** while rabbit-2 is still booting, it is isolated for 2 s.
+- **53.69 s:** its boot fails with the error above.
+- **About 57 s:** it exits.
+
+The code, the same in 4.1.4 and on main (2026-10-30):
+
+- At boot, `rabbit_db:pre_init/1` syncs the node's feature flags with the other cluster members,
+  once.
+- `rabbit_feature_flags:sync_feature_flags_with_cluster/2` keeps the members that are running at
+  that instant (`rabbit:is_running/1`), then `rabbit_ff_controller:sync_cluster/1` calls each of
+  them.
+- A member that passed the check but cannot be reached a moment later fails the call
+  (`{erpc,noconnection}`).
+- `rabbit_db_cluster:ensure_feature_flags_are_in_sync/2` throws any error, tagged
+  `incompatible_feature_flags`, and nothing retries. So a network blip at that moment ends the
+  boot; an unreachable member is not an incompatible one.
+
+The closest report, rabbitmq-server#8114 (the same error after a partition healed), was closed
+as a test setup mistake. A maintainer there notes the tag hides whatever the sync failed on.
+
 ## Status
 
 - 2026-10-28: first timelines (srv3): the finding above, in both. Run 76 (enqueues noted
