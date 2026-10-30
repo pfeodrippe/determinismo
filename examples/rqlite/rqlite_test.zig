@@ -15,6 +15,10 @@
 //! timeout: the entry may still commit). Once faults stop, every committed append must be in
 //! its key's list, read at `level=linearizable` through any node (sdk.elle.final_reads).
 //!
+//! Membership changes (Jepsen's member nemesis): a fourth node, a spare, joins the cluster as a
+//! voter and is removed (stopped first, then `DELETE /remove`), then joins again fresh, one
+//! step at a time, while the drivers append.
+//!
 //! Profiles: `default`, rqlite's own settings; `snapshots`, Raft snapshots every 64 entries (and
 //! at 64 KiB of SQLite WAL), checked every second: a timeline's few thousand writes snapshot and
 //! truncate the log many times (the default waits for 8,192 entries or a 4 MiB WAL).
@@ -28,6 +32,8 @@ const Nodes = struct {
     @"rq-1": sdk.Node,
     @"rq-2": sdk.Node,
     @"rq-3": sdk.Node,
+    /// The node that joins and leaves (a spare: not started with the others).
+    @"rq-4": sdk.Node,
 };
 const System = sdk.System(Nodes);
 
@@ -47,6 +53,13 @@ const timeout_ms = 30_000;
 const response_size_max = 1 << 20;
 const request_size_max = 4096;
 const table = "lists";
+const spare_id = "4";
+/// One membership step at a time, across the drivers (a lock file in the runner).
+const member_lock_path = "/tmp/rqlite-member.lock";
+/// The spare's last fresh start (monotonic, virtual), and how long its join may take before it
+/// is listed: until then, not started again.
+const member_started_path = "/tmp/rqlite-member.started";
+const join_grace_ns = 30 * std.time.ns_per_s;
 
 pub fn main(init: std.process.Init) !void {
     return System.main(init, .{
@@ -63,7 +76,7 @@ fn describe(d: *System.Describe) !void {
     }) |entry| {
         const profile = try d.profile(entry[0]);
         const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/rqlite/Dockerfile" };
-        inline for (.{ "rq-1", "rq-2", "rq-3" }, 1..) |name, id| {
+        inline for (.{ "rq-1", "rq-2", "rq-3", "rq-4" }, 1..) |name, id| {
             profile.node(@field(System.Name, name), .{
                 .build = build,
                 .command = &.{std.fmt.comptimePrint("{d}", .{id})},
@@ -74,6 +87,7 @@ fn describe(d: *System.Describe) !void {
                 // rqlite syncs its Raft log before acknowledging an entry: power losses too.
                 // Raft's safety must not depend on clocks.
                 .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
+                .spare = id == 4,
             });
         }
     }
@@ -84,6 +98,7 @@ fn append_scenario(s: *System.Scenario) void {
     s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
     s.setup("table", table_created);
     s.parallel_driver("append", appends);
+    s.parallel_driver("member", member_changes);
     s.finally("final reads", final_reads);
 }
 
@@ -124,6 +139,90 @@ fn table_create(arena: std.mem.Allocator, all: *const [nodes_count][4]u8, buffer
     }
 }
 
+// Membership ------------------------------------------------------------------------------------
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One membership step, from the nodes the cluster lists now: the spare started fresh when it
+/// is not among them (it joins as a voter); else, one time in two, stopped and removed (stopped
+/// first: a removed node that runs on keeps its old view, and another step must not start it).
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open(member_lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = addresses(context);
+    const spare = &context.nodes.@"rq-4";
+    const arena = context.init.arena.allocator();
+    const buffer = try arena.alloc(u8, response_size_max);
+    const listed = sdk.tcp.http_with(all[sdk.random_below(nodes_count)], http_port, "GET", "/nodes?nonvoters&ver=2", "", buffer, .{
+        .timeout_ms = 5_000,
+    }) catch return; // No answer: a later step.
+    if (listed.status != 200) return member_refused("nodes", listed.status, listed.body);
+    const Listed = struct { nodes: []const struct { id: []const u8 = "" } = &.{} };
+    const nodes = std.json.parseFromSliceLeaky(Listed, arena, listed.body, .{ .ignore_unknown_fields = true }) catch
+        return member_refused("nodes: unreadable", listed.status, listed.body);
+    const member = for (nodes.nodes) |node| {
+        if (std.mem.eql(u8, node.id, spare_id)) break true;
+    } else false;
+    if (!member) {
+        if (member_started_ns()) |at| if (monotonic_ns() -| at < join_grace_ns) return; // Still joining.
+        // Fresh: a node removed must not rejoin with the old cluster's state.
+        try spare.wipe();
+        member_started_note();
+        sdk.sometimes(true, "a node was started to join", .{});
+        return;
+    }
+    sdk.sometimes(true, "a node joined", .{});
+    if (sdk.random_below_named("rqlite.member_remove", 2) != 0) {
+        return; // A member stays (a fault that stopped it starts it again).
+    }
+    try spare.kill();
+    const response = sdk.tcp.http_with(all[sdk.random_below(nodes_count)], http_port, "DELETE", "/remove", "{\"id\":\"" ++ spare_id ++ "\"}", buffer, .{
+        .timeout_ms = timeout_ms,
+        .content_type = "application/json",
+    }) catch return; // Removed or not: the next step sees which.
+    if (response.status != 200) return member_refused("remove", response.status, response.body);
+    sdk.sometimes(true, "a node was removed", .{});
+}
+
+/// A membership call refused or unanswered, said (an event): under faults, refusals are expected,
+/// and a step that never succeeds says why.
+fn member_refused(what: []const u8, status: u32, body: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = status, .body = body[0..@min(body.len, 512)] });
+}
+
+fn member_started_ns() ?u64 {
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [32]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, buffer[0..size], " \n"), 10) catch null;
+}
+
+fn member_started_note() void {
+    var buffer: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{d}\n", .{monotonic_ns()}) catch return;
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), text.ptr, text.len);
+}
+
+
 // The workload ----------------------------------------------------------------------------------
 
 const Mop = struct { append: bool, key: u64, value: u64 };
@@ -139,6 +238,7 @@ fn appends(context: *System.Context) !void {
     var process = sdk.elle.process_new();
     const buffer = try arena.alloc(u8, response_size_max);
     leader_aim(arena, all[sdk.random_below(nodes_count)], buffer);
+    var unknown: u32 = 0;
     for (0..transactions_per_driver) |sequence| {
         var mops: [mops_max]Mop = undefined;
         const count = draw(&mops, id, sequence);
@@ -157,6 +257,10 @@ fn appends(context: *System.Context) !void {
             .unknown => {
                 try history.info(arena, process, try elle_mops(arena, mops[0..count], null));
                 sdk.sometimes(true, "a transaction's outcome is unknown", .{});
+                // An objective (sdk.optimize): states where commits went unknown, the turbulent
+                // ones where consistency bugs sit; the tree climbs toward more of them.
+                unknown += 1;
+                sdk.optimize("transactions of unknown outcome, one driver's", .{}, @floatFromInt(unknown), .maximize);
                 process = sdk.elle.process_new(); // Elle's rule: one operation at a time.
             },
         }

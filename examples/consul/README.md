@@ -37,6 +37,13 @@ error: the entry may still commit).
 - Final reads: once faults stop, every committed append is in its key's list.
 - The faults aim at the leader a server names (`/v1/status/leader`).
 
+## Membership changes
+
+A fourth server, `c4`, is a spare: it joins by retry-join (no bootstrap-expect), and autopilot
+makes it a voter once stable. The `member` driver takes one step at a time from the Raft
+configuration: the spare started fresh when it is not in it (after a 30 s grace for its join);
+in it, one time in two stopped and force-left with `prune`.
+
 ## Status
 
 - 2026-10-30, the first smoke (2 timelines): a server refuses every boot after a power loss.

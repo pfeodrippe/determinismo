@@ -40,6 +40,13 @@ unknown otherwise (a leadership lost while committing, a timeout).
 | every committed append is in the final read | an acknowledged write gone once faults stop (final reads at `level=linearizable`) |
 | the final reads reach a node once faults stop | the cluster never serves again |
 
+## Membership changes
+
+A fourth node, `rq-4`, is a spare. The `member` driver takes one step at a time: the spare
+started fresh when `/nodes` does not list it (it joins as a voter by itself, after a 30 s grace
+for its join); listed, one time in two stopped and removed (`DELETE /remove`). Elle's checks and
+the final reads hold through them.
+
 ## Status
 
 - 2026-10-29: written; first smoke next.

@@ -14,17 +14,34 @@
 //! request got no answer or another error (the entry may still commit). Once faults stop,
 //! every committed append must be in its key's list (sdk.elle.final_reads).
 //!
+//! Membership changes (Jepsen's member nemesis): a fourth server, a spare, joins the cluster
+//! (autopilot makes it a voter once stable) and is removed (stopped first, then force-left with
+//! `prune`), then joins again fresh, one step at a time, while the drivers append.
+//!
 //!   determinismo explore ... --memory-mib 3072 --program zig-out/bin/consul-test --scenario append
 const std = @import("std");
 const linux = std.os.linux;
 const sdk = @import("determinismo");
 
-const Nodes = struct { c1: sdk.Node, c2: sdk.Node, c3: sdk.Node };
+const Nodes = struct {
+    c1: sdk.Node,
+    c2: sdk.Node,
+    c3: sdk.Node,
+    /// The server that joins and leaves (a spare: not started with the others).
+    c4: sdk.Node,
+};
 const System = sdk.System(Nodes);
 
 const http_port = 8500;
 const nodes_count = 3;
 const node_names = [nodes_count][]const u8{ "c1", "c2", "c3" };
+const spare_name = "c4";
+/// One membership step at a time, across the drivers (a lock file in the runner).
+const member_lock_path = "/tmp/consul-member.lock";
+/// The spare's last fresh start (monotonic, virtual), and how long its join may take before it
+/// is in the Raft configuration: until then, not started again.
+const member_started_path = "/tmp/consul-member.started";
+const join_grace_ns = 30 * std.time.ns_per_s;
 const transactions_per_driver = 20;
 const mops_max = 4;
 /// Keys move with virtual time, a few at once, so lists stay short.
@@ -51,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
 fn describe(d: *System.Describe) !void {
     const profile = try d.profile("default");
     const build: sdk.schema.Build = .{ .context = ".", .dockerfile = "examples/consul/Dockerfile" };
-    inline for (node_names) |name| {
+    inline for (node_names ++ .{spare_name}) |name| {
         profile.node(@field(System.Name, name), .{
             .build = build,
             .command = &.{name},
@@ -61,6 +78,7 @@ fn describe(d: *System.Describe) !void {
             // Consul syncs its Raft log before an entry is committed: power losses too. Its
             // default reads lean on a leader lease (clocks); `?consistent` ones must not.
             .faults = .{ .restart = true, .crash = true, .stop = true, .clock_skew = true },
+            .spare = comptime std.mem.eql(u8, name, spare_name),
         });
     }
 }
@@ -70,11 +88,94 @@ fn append_scenario(s: *System.Scenario) void {
     s.pacing = .{ .active_ms_max = 10_000, .quiet_ms_max = 30_000 };
     s.setup("leader", leader_elected);
     s.parallel_driver("append", appends);
+    s.parallel_driver("member", member_changes);
     s.finally("final reads", final_reads);
 }
 
 fn addresses(context: *System.Context) [nodes_count][4]u8 {
     return .{ context.nodes.c1.address, context.nodes.c2.address, context.nodes.c3.address };
+}
+
+// Membership ------------------------------------------------------------------------------------
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One membership step, from the Raft configuration now: the spare started fresh when it is not
+/// in it (and was not started within the join grace); else, one time in two, stopped and
+/// force-left with `prune` (stopped first: another step must not start it meanwhile).
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open(member_lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = addresses(context);
+    const spare = &context.nodes.c4;
+    const arena = context.init.arena.allocator();
+    const buffer = try arena.alloc(u8, 64 * 1024);
+    const listed = sdk.tcp.http_with(all[sdk.random_below(nodes_count)], http_port, "GET", "/v1/operator/raft/configuration", "", buffer, .{
+        .timeout_ms = 5_000,
+    }) catch return; // No answer: a later step.
+    if (listed.status != 200) return member_refused("raft configuration", listed.status, listed.body);
+    const Configuration = struct { Servers: []const struct { Node: []const u8 = "" } = &.{} };
+    const configuration = std.json.parseFromSliceLeaky(Configuration, arena, listed.body, .{ .ignore_unknown_fields = true }) catch
+        return member_refused("raft configuration: unreadable", listed.status, listed.body);
+    const member = for (configuration.Servers) |server| {
+        if (std.mem.eql(u8, server.Node, spare_name)) break true;
+    } else false;
+    if (!member) {
+        if (member_started_ns()) |at| if (monotonic_ns() -| at < join_grace_ns) return; // Still joining.
+        // Fresh: a server removed must not rejoin with the old cluster's state.
+        try spare.wipe();
+        member_started_note();
+        sdk.sometimes(true, "a server was started to join", .{});
+        return;
+    }
+    sdk.sometimes(true, "a server joined", .{});
+    if (sdk.random_below_named("consul.member_remove", 2) != 0) {
+        return; // A member stays (a fault that stopped it starts it again).
+    }
+    try spare.kill();
+    const response = sdk.tcp.http_with(all[sdk.random_below(nodes_count)], http_port, "PUT", "/v1/agent/force-leave/" ++ spare_name ++ "?prune", "", buffer, .{
+        .timeout_ms = 10_000,
+    }) catch return; // Removed or not: the next step sees which.
+    if (response.status != 200) return member_refused("force-leave", response.status, response.body);
+    sdk.sometimes(true, "a server was removed", .{});
+}
+
+/// A membership call refused or unanswered, said (an event): under faults, refusals are expected,
+/// and a step that never succeeds says why.
+fn member_refused(what: []const u8, status: u32, body: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = status, .body = body[0..@min(body.len, 512)] });
+}
+
+fn member_started_ns() ?u64 {
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var buffer: [32]u8 = undefined;
+    const size = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, buffer[0..size], " \n"), 10) catch null;
+}
+
+fn member_started_note() void {
+    var buffer: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{d}\n", .{monotonic_ns()}) catch return;
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), text.ptr, text.len);
 }
 
 // Setup -----------------------------------------------------------------------------------------
@@ -113,6 +214,7 @@ fn appends(context: *System.Context) !void {
     var process = sdk.elle.process_new();
     const buffer = try arena.alloc(u8, response_size_max);
     leader_aim(arena, &all, buffer);
+    var unknown: u32 = 0;
     for (0..transactions_per_driver) |sequence| {
         var mops: [mops_max]Mop = undefined;
         const count = draw(&mops, id, sequence);
@@ -131,6 +233,10 @@ fn appends(context: *System.Context) !void {
             .unknown => {
                 try history.info(arena, process, try elle_mops(arena, mops[0..count], null));
                 sdk.sometimes(true, "a transaction's outcome is unknown", .{});
+                // An objective (sdk.optimize): states where commits went unknown, the turbulent
+                // ones where consistency bugs sit; the tree climbs toward more of them.
+                unknown += 1;
+                sdk.optimize("transactions of unknown outcome, one driver's", .{}, @floatFromInt(unknown), .maximize);
                 process = sdk.elle.process_new(); // Elle's rule: one operation at a time.
             },
         }
