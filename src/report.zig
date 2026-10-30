@@ -458,6 +458,8 @@ pub const Multiverse = struct {
         multiverse.idle_ns += other.idle_ns;
         multiverse.nodes = @max(multiverse.nodes, other.nodes);
         multiverse.wall_ns += other.wall_ns;
+        multiverse.memory_wait_ns += other.memory_wait_ns;
+        multiverse.cpu_wait_ns += other.cpu_wait_ns;
         multiverse.output_bytes += other.output_bytes;
         multiverse.output_span_ns += other.output_span_ns;
         for (other.aggregates[0..other.aggregate_count]) |*incoming| {
@@ -688,6 +690,21 @@ test "Multiverse.efficiency" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), measured.idle_share, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 100), measured.clock_reads_per_s, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), measured.per_node, 1e-9);
+}
+
+test "Multiverse.absorb carries a worker's waits" {
+    const whole = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(whole);
+    const worker = try std.testing.allocator.create(Multiverse);
+    defer std.testing.allocator.destroy(worker);
+    whole.* = .{};
+    worker.* = .{};
+    worker.memory_wait_ns = 3 * std.time.ns_per_s;
+    worker.cpu_wait_ns = 2 * std.time.ns_per_s;
+    try whole.absorb(worker);
+    try whole.absorb(worker);
+    try std.testing.expectEqual(6 * std.time.ns_per_s, whole.memory_wait_ns);
+    try std.testing.expectEqual(4 * std.time.ns_per_s, whole.cpu_wait_ns);
 }
 
 /// An overshoot means a timer or moment landed later than its branch count: such a timeline
