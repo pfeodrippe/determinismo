@@ -17,6 +17,7 @@ The properties:
 - An evaluation that throws gets its error back, and its session evaluates on.
 - A var defined in one session has its value in another, and completes and looks up there.
 - After `(in-ns 'x)`, the session's next evaluation is in `x`.
+- What an evaluation prints comes back to it, and nothing another evaluation printed.
 - An interrupted evaluation ends interrupted or done.
 - After faults, a new session evaluates again.
 
@@ -49,6 +50,24 @@ When one of these runs over nREPL, every connected editor loses the server.
 
 The workload's jank timelines leave these two forms out. Otherwise every timeline would end at
 them.
+
+### Concurrent evaluations swap each other's output
+
+The probe: three rounds of eight clients at once, each evaluation printing its own mark twice.
+
+- **Most evaluations got the wrong output.** Only 4 of 24 got exactly their two marks. The rest
+  got none (client 2 of round 1), one, or other evaluations' marks: client 1 of round 1 got
+  marks 12 and 17 beside one of its own.
+- **The server's stdout ends up in a deleted file.** After the rounds, its fd 1 pointed at
+  `/tmp/jank-nrepl-WVmQWk (deleted)`, so whatever it prints from then on is lost.
+- **The cause** is `capture.jank`. To capture an evaluation's output, it points the process's
+  own stdout and stderr at a temp file of the evaluation's own (`dup` the fd, then `dup2` the
+  temp file over it), and restores the saved fd when the evaluation ends. Two evaluations
+  interleave those swaps. One saves the other's temp file as "the original" and restores it
+  last.
+
+Concurrent evaluations became possible when jank#1022 was fixed (2026-10-09). This race is not
+in the tracker. The workload's `print` driver checks it ("output is its own").
 
 ### Wrong answers
 

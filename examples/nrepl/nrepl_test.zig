@@ -15,6 +15,7 @@
 //!   definitions are shared           a var defined in one session is that value in another,
 //!                                    and completes and looks up there
 //!   a session keeps its namespace    after `(in-ns 'x)`, the session's next evaluation is in x
+//!   output is its own                what an evaluation prints comes back to it, nothing else
 //!   interrupts land                  an interrupted long evaluation ends interrupted (or done)
 //!   the server recovers              after faults, a new session evaluates again
 const std = @import("std");
@@ -61,6 +62,7 @@ fn jank(s: *System.Scenario) void {
     s.parallel_driver("fail", fail_one);
     s.parallel_driver("define", define_one);
     s.parallel_driver("namespace", namespace_one);
+    s.parallel_driver("print", print_one);
     s.eventually("recovers", recovers);
 }
 
@@ -190,6 +192,27 @@ fn namespace_one(context: *System.Context) !void {
     sdk.always(std.mem.eql(u8, next.ns orelse "", name), "a session keeps its namespace", .{
         .name = name,
         .ns = next.ns orelse "",
+    });
+}
+
+/// An evaluation's output comes back to it, all of it and no other's, while others print too
+/// (jank's server captures it by pointing the process's stdout at a file of the evaluation's
+/// own while it runs).
+fn print_one(context: *System.Context) !void {
+    var client = Client.init();
+    client.open(context.nodes.nrepl.address, port) catch |err| return unavailable(err);
+    defer client.close();
+    const mark = sdk.random_below(1 << 40);
+    var code_buffer: [128]u8 = undefined;
+    const code = try std.fmt.bufPrint(&code_buffer, "(do (println \"mark-{d}\") (reduce + (range 20000)) " ++
+        "(println \"mark-{d}\") nil)", .{ mark, mark });
+    const printed = client.eval(code) catch |err| return unavailable(err);
+    sdk.always(printed.done, "requests finish", .{});
+    var own_buffer: [32]u8 = undefined;
+    const own = try std.fmt.bufPrint(&own_buffer, "mark-{d}\n", .{mark});
+    sdk.always(std.mem.count(u8, printed.out, own) == 2 and std.mem.count(u8, printed.out, "mark-") == 2, "an evaluation's output is its own", .{
+        .mark = mark,
+        .out = printed.out[0..@min(printed.out.len, 160)],
     });
 }
 
