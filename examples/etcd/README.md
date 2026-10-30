@@ -42,6 +42,22 @@ above holds through them; faults leave the spare alone while it is not running.
 
 ## Findings
 
+### Under investigation: a member's keyspace ~90 revisions behind its applied index, no snapshot install
+
+The second membership smoke (srv3, 2026-10-30, `--scenario kv --seed 1`, branch 2, the default
+profile, etcd v3.7.3) failed "the counter counts every acknowledged increment and no more": the
+final linearizable read, through etcd-1, gave 0 after 7 acknowledged increments. A replay at
+32.5 s, each member's own copy (serializable reads, `endpoint status`):
+- etcd-1: counter "0" (mod revision 2, its setup value), raft index 119, applied 119;
+- etcd-2 (the leader) and etcd-3: counter "7" (mod revision 93), raft index 119, applied 119.
+etcd-1 claims to have applied everything and its keyspace is far behind: it answers
+linearizable reads from that state. Unlike #22498 (below), etcd-1 never installed a snapshot
+(every start logs `snapshot-index 0`, `Skipping snapshot backend`); its restored consistent
+index went 22, 39, 80 across power losses at sync points (`durable_crash` at 11.34 s and 15.32
+s) and crashes. Next: etcd-1's bbolt file and WAL extracted at moments around 15.3 s, as for
+#22498, to tell an etcd durability path from an artifact of how `durable_crash` crashes at an
+fsync. A learner was promoted and the spare joined in that run.
+
 ### Found blind, known upstream: a member loses applied writes after a power loss that follows a snapshot install
 
 Not new: reported on 2026-09-29 as etcd-io/etcd#22498 (against 3.7.2, reproduced by simulating
