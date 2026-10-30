@@ -14,6 +14,11 @@
 //! bursts, restarts, power losses and graceful stops of the brokers; the client node's links to
 //! the brokers faulted, the drivers' calls into it not.
 //!
+//! Membership changes (Jepsen's member nemesis): the quorum queue's members change while the
+//! drivers enqueue and dequeue, one step at a time: a member removed (`delete_member`) when it
+//! has three, a missing one added back (`add_member`) otherwise. Ra's membership changes
+//! under faults must lose no confirmed message.
+//!
 //!   determinismo explore ... --memory-mib 4096 --program zig-out/bin/rabbitmq-test --scenario queue
 const std = @import("std");
 const linux = std.os.linux;
@@ -32,6 +37,9 @@ const client_port = 7000;
 const amqp_port = 5672;
 const queue = "jepsen";
 const brokers = 3;
+const broker_nodes = [brokers][]const u8{ "rabbit@rabbit-1", "rabbit@rabbit-2", "rabbit@rabbit-3" };
+/// One membership step at a time, across the drivers (a lock file in the runner).
+const member_lock_path = "/tmp/rabbitmq-member.lock";
 const ops_path = "/tmp/rabbitmq-ops.log";
 /// The client node's dequeues (rclient.py's DEQUEUED_PATH), and how much of it the judge reads.
 const dequeued_path = "/var/lib/rclient/dequeued.log";
@@ -115,6 +123,7 @@ fn queue_scenario(s: *System.Scenario) void {
     s.setup("queue", queue_declared);
     s.parallel_driver("enqueue", enqueues);
     s.parallel_driver("dequeue", dequeues);
+    s.parallel_driver("member", member_changes);
     s.eventually("drain", drained);
 }
 
@@ -126,6 +135,7 @@ fn queue_khepri_scenario(s: *System.Scenario) void {
     s.setup("queue", queue_declared_khepri);
     s.parallel_driver("enqueue", enqueues);
     s.parallel_driver("dequeue", dequeues);
+    s.parallel_driver("member", member_changes);
     s.eventually("drain", drained);
 }
 
@@ -187,6 +197,74 @@ fn queue_declare(context: *System.Context) !void {
     if (std.mem.eql(u8, reply, "ok")) return;
     sdk.event("rabbitmq_error", .{ .command = "declare", .reply = reply });
     return error.NotDeclared;
+}
+
+// Membership ------------------------------------------------------------------------------------
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart, so a join, a removal and a join again fit in one
+/// driver's run.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One membership step of the quorum queue, from its members now (`quorum_status`, through a
+/// broker drawn): one removed when it has all three, one missing added back otherwise.
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open(member_lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = [brokers]*const sdk.Node{ &context.nodes.@"rabbit-1", &context.nodes.@"rabbit-2", &context.nodes.@"rabbit-3" };
+    var buffer: [16 * 1024]u8 = undefined;
+    // From the first broker that answers, starting at one drawn: under faults one is often down,
+    // all of them seldom (no answer from any: the queue has no leader, a later step).
+    const first = sdk.random_below(brokers);
+    var via = all[first];
+    const status = for (0..brokers) |offset| {
+        via = all[(first + offset) % brokers];
+        const answer = via.exec_said(&.{ "rabbitmq-queues", "-q", "quorum_status", queue, "--formatter", "json" }, &buffer) catch continue;
+        if (answer.status == 0) break answer;
+        if (offset == brokers - 1) return member_refused("quorum_status", answer.status, answer.output);
+    } else return;
+    var members: [brokers]bool = undefined;
+    var count: u32 = 0;
+    for (broker_nodes, &members) |name, *member| {
+        var quoted: [64]u8 = undefined;
+        member.* = std.mem.indexOf(u8, status.output, try std.fmt.bufPrint(&quoted, "\"{s}\"", .{name})) != null;
+        count += @intFromBool(member.*);
+    }
+    var candidates: [brokers]usize = undefined;
+    var candidates_count: usize = 0;
+    const removing = count == brokers;
+    for (members, 0..) |member, index| if (member == removing) {
+        candidates[candidates_count] = index;
+        candidates_count += 1;
+    };
+    if (candidates_count == 0) return;
+    const target = broker_nodes[candidates[sdk.random_below_named("rabbitmq.member", candidates_count)]];
+    var output: [4096]u8 = undefined;
+    const command = if (removing) "delete_member" else "add_member";
+    const result = via.exec_said(&.{ "rabbitmq-queues", "-q", command, queue, target }, &output) catch return;
+    // Refused (a change under way, no quorum): a later step.
+    if (result.status != 0) return member_refused(command, result.status, result.output);
+    if (removing) {
+        sdk.sometimes(true, "a queue member was removed", .{ .member = target });
+    } else {
+        sdk.sometimes(true, "a queue member was added", .{ .member = target });
+    }
+}
+
+/// A membership call refused or unanswered, said (an event): under faults, refusals are expected,
+/// and a step that never succeeds says why.
+fn member_refused(what: []const u8, status: u32, body: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = status, .body = body[0..@min(body.len, 512)] });
 }
 
 // The workload ----------------------------------------------------------------------------------

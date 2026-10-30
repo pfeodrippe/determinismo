@@ -67,6 +67,18 @@ bursts with quiet stretches, plus restarts, power losses and graceful stops of t
 client node stands for Jepsen's clients: its links to the brokers are faulted, the drivers'
 calls into it are not (`runner_links = false`).
 
+## Membership changes
+
+The quorum queue's members change while the drivers enqueue and dequeue: the `member` driver
+reads `rabbitmq-queues quorum_status` through a broker drawn, removes a member
+(`delete_member`) when the queue has all three, and adds a missing one back (`add_member`)
+otherwise, from the first broker that answers. No confirmed message may be lost through Ra's
+membership changes.
+
+Smokes (srv3, 2026-10-30, seed 1): the first removed a member in 2 of 4 timelines and added one
+back in 1. In the second, both timelines lost brokers to the boot failures below within 30 s
+(`{case_clause,{ok,[]}}`, `mnesia_not_running`), and no step found a broker running the queue.
+
 ## Findings
 
 ### Found blind: a power loss soon after a node's first boot leaves it unable to boot again
