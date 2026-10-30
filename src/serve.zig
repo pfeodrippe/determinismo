@@ -79,9 +79,11 @@ pub const Options = struct {
     /// A run's snapshots on disk (causality analysis saves its timelines' moments there) go
     /// when none was saved for this long.
     snapshots_keep_ns: u64 = 24 * std.time.ns_per_hour,
-    /// Each failing property's first failing timeline is saved to disk as soon as it is found,
-    /// unless the explorer's ladder did (`--no-failure-snapshots`: not).
-    failure_snapshots: bool = true,
+    /// Each failing property's first failing timeline saved to disk as soon as it is found,
+    /// unless the explorer's ladder did (`--failure-snapshots`). Off by default (2026-10-30): a
+    /// replay and disk for every failing property of every run, for analyses that are rare and
+    /// replay the timeline themselves when nothing is saved.
+    failure_snapshots: bool = false,
     /// Each failing property's first failing timeline analyzed as soon as it is found, in the
     /// background (`--failure-analysis`; off by default: see failures_analyze).
     failure_analysis: bool = false,

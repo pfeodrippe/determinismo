@@ -43,9 +43,9 @@ const usage =
     \\                            [--archive "<cmd>"]
     \\                            [--snapshots-keep-hours <h>]   (runs' snapshots on disk, from
     \\                            causality analyses: removed when none was saved for that long;
-    \\                            24 by default) [--no-failure-snapshots]   (by default each
-    \\                            failing property's first failing timeline is saved to disk as
-    \\                            soon as it is found, unless the explorer's ladder did)
+    \\                            24 by default) [--failure-snapshots]   (each failing
+    \\                            property's first failing timeline saved to disk as soon as it
+    \\                            is found, for analyses to start at once; off: a replay each)
     \\                            [--failure-analysis]   (each analyzed at once, in the background,
     \\                            on 4 CPUs beside the runs) <machine options>
     \\       determinismo mcp     <machine options>   (an MCP server on stdio, for agents)
@@ -781,7 +781,7 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
     var explorer: ?[]const u8 = null;
     var archive: ?[]const u8 = null;
     var snapshots_keep_hours: u64 = 24;
-    var failure_snapshots = true;
+    var failure_snapshots = false;
     var failure_analysis = false;
     var bb: []const u8 = "bb";
     var machine: std.ArrayList([]const u8) = .empty;
@@ -801,8 +801,8 @@ fn command_serve(init: std.process.Init, argv: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, flag, "--snapshots-keep-hours")) {
             snapshots_keep_hours = try std.fmt.parseInt(u64, value, 10);
             index += 1;
-        } else if (std.mem.eql(u8, flag, "--no-failure-snapshots")) {
-            failure_snapshots = false;
+        } else if (std.mem.eql(u8, flag, "--failure-snapshots")) {
+            failure_snapshots = true;
         } else if (std.mem.eql(u8, flag, "--failure-analysis")) {
             failure_analysis = true;
         } else if (std.mem.eql(u8, flag, "--explorer")) {
