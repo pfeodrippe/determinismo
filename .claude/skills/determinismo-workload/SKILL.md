@@ -38,6 +38,13 @@ fn transfers(s: *System.Scenario) void {
   (`explore --compose compose.yaml`, see `tests/antithesis-compat`).
 - Draw every choice from the SDK (`sdk.random_below`, `sdk.decide("name", options)`), never from
   the clock or `std.crypto.random`: strategies steer these, and replays repeat them.
+- Membership changes are where clustered systems break (Jepsen's member nemesis): give the
+  system a spare node (`.spare = true`: prepared, not started) and a `member` parallel driver
+  that takes one step at a time under a lock file: join the spare, remove it through the
+  system's API (stopped first when it would otherwise rejoin), join it again fresh (`wipe`).
+  See `examples/etcd/etcd_test.zig` (`member_step`) or `examples/cockroachdb`.
+- Progress that builds up (a backlog, outcomes left unknown) can be an objective:
+  `sdk.optimize(message, bucket, value, .maximize)`; the tree climbs from each bucket's best.
 - Clients: `sdk.tcp` (`Connection`, `request_line`, `http`), `node.exec_output` to run a command
   in a node. Protocol clients stay in the example (see `examples/bank/resp.zig`).
 - A driver that loses its server to a fault is not a failure: `sdk.tcp.unavailable(err)` tells
