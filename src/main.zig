@@ -2170,6 +2170,8 @@ const Planned = struct {
     horizon_ns: ?u64 = null,
     /// The disk holder its node was made from: its own first disk holder saves against it.
     disk_origin: ?holders.Origin = null,
+    /// The archive cell its return went to (TreeReturn.cell).
+    cell: ?u64 = null,
 };
 
 /// How a branch went, for planning the next generation: the behaviors it reached first, when.
@@ -2966,6 +2968,10 @@ const Cell = struct {
     place_count: u8 = 1,
     label: []const u8,
     visits: u32 = 0,
+    /// Branches of its returns that found a behavior new to the tree: a return that pays ranks
+    /// it higher (seed scheduling as a bandit: EcoFuzz, USENIX Security 2020; AFL-Hier, NDSS
+    /// 2021), rarity alone otherwise.
+    paid: u32 = 0,
     sought: bool = false,
     /// An optimization's bucket (sdk.optimize): the best score reached in it, at its one place.
     best: ?f64 = null,
@@ -2979,6 +2985,44 @@ const Cell = struct {
 };
 
 const cell_places_max = 4;
+
+/// Fixed-point resolution of a cell's rank divided by its paying returns.
+const paid_scale = 16;
+
+test "the archive returns first to a cell whose returns paid, among equally rare ones" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: TreeState = .{
+        .base = 1,
+        .total = 64,
+        .size = 16,
+        .children = 4,
+        .pipeline = 1,
+        .jobs = 1,
+        .holding = false,
+        .registry = undefined,
+        .change = null,
+        .hunks_reached = &.{},
+        .candidates = &.{},
+        .tape_buffer = undefined,
+        .io = undefined,
+        .archive = true,
+        .prefer_sometimes = true,
+        .setup = undefined,
+    };
+    for ([_]u64{ 11, 22 }, [_]u32{ 0, 3 }) |hash, paid| {
+        var cell: Cell = .{ .places = undefined, .label = "a behavior", .visits = 3, .paid = paid };
+        cell.places[0] = .{ .branch = @intCast(hash), .vtime_ns = 5 };
+        try state.cells.put(arena, hash, cell);
+        try state.visits.put(arena, hash, 2);
+    }
+    var random: std.Random.DefaultPrng = .init(7);
+    const returns = try archive_returns(arena, &state, &.{}, &random);
+    try std.testing.expect(returns.len >= 2);
+    try std.testing.expectEqual(@as(?u64, 22), returns[0].cell);
+    try std.testing.expectEqual(@as(?u64, 11), returns[1].cell);
+}
 
 /// How much more a sought behavior (a `sometimes` or `reachable` made true) weighs than another
 /// new one, in a timeline's novelty and as an archive cell (`--prefer-sometimes`): a few output
@@ -3115,6 +3159,10 @@ fn tree_judge(
                 label = behavior.name();
             }
         }
+        // A return that paid: its cell ranks higher from now on.
+        if (novel > 0) if (state.planned.get(summary.index)) |planned| if (planned.cell) |hash| {
+            if (state.cells.getPtr(hash)) |cell| cell.paid += 1;
+        };
         state.candidates[candidate_count] = .{
             .summary = summary,
             .novel = novel,
@@ -3280,6 +3328,7 @@ fn tree_judge(
                 .path = path,
                 .generation = generation + 1,
                 .why = back.why,
+                .cell = back.cell,
                 .horizon_ns = if (back.horizon_ns orelse branches.arguments.horizon_ns) |horizon| at + horizon else null,
                 .disk_origin = if (making.disk) |on_disk| .{ .branch = on_disk.branch, .vtime_ns = on_disk.held.vtime_ns } else null,
             });
@@ -3338,6 +3387,9 @@ const TreeReturn = struct {
     branch: u32,
     vtime_ns: u64,
     why: []const u8,
+    /// The archive cell it returns to (archive_returns), credited when its branches find
+    /// something new.
+    cell: ?u64 = null,
     /// A strategy's horizon for this return (null: `--horizon`, or to the end).
     horizon_ns: ?u64 = null,
 };
@@ -3367,6 +3419,9 @@ fn archive_add(arena: std.mem.Allocator, state: *TreeState, plan: []const Planne
             cell.place_count = 1;
             cell.best = score;
             cell.visits = 0;
+            // A better state is an objective's payoff (its bucket is no new behavior): its cell
+            // ranks as one whose returns paid.
+            cell.paid += 1;
             continue;
         };
         if (entry.found_existing) {
@@ -3416,11 +3471,13 @@ fn archive_returns(
         // A sought cell ranks as one a few times rarer (lower scores go first).
         const weight: u64 = if (state.prefer_sometimes and !entry.value_ptr.sought) sought_weight else 1;
         // An objective's bucket by its returns alone (since its best last improved): buckets
-        // explored evenly however many timelines reach them, as Antithesis's are.
-        const score = if (entry.value_ptr.best != null)
+        // explored evenly however many timelines reach them, as Antithesis's are. A cell whose
+        // returns paid ranks as one that many times rarer.
+        const rarity = if (entry.value_ptr.best != null)
             1 + @as(u64, entry.value_ptr.visits)
         else
             (1 + timelines) * (1 + @as(u64, entry.value_ptr.visits)) * weight;
+        const score = rarity * paid_scale / (1 + @as(u64, entry.value_ptr.paid));
         ranked[index] = .{ .hash = entry.key_ptr.*, .score = score, .tie = random.random().int(u64) };
     }
     std.sort.pdq(Ranked, ranked, {}, struct {
@@ -3438,10 +3495,11 @@ fn archive_returns(
             .vtime_ns = place.vtime_ns,
             .why = try std.fmt.allocPrint(arena, "Go-Explore's archive: back to just after {s}, " ++
                 "as #{d} reached it ({d} timelines reached it, from {d} places kept); returned " ++
-                "there {d} times.", .{
+                "there {d} times, {d} of its branches finding something new.", .{
                 cell.label,  place.branch, state.visits.get(cell_ranked.hash) orelse 0, cell.place_count,
-                cell.visits,
+                cell.visits, cell.paid,
             }),
+            .cell = cell_ranked.hash,
         });
     }
     return list.items;
