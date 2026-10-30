@@ -68,7 +68,7 @@ pub const Node = struct {
         arguments[0] = "exec";
         arguments[1] = node.name;
         for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
-        return (try nodes_run(arguments[0 .. argv.len + 2], null)).status;
+        return (try nodes_run(arguments[0 .. argv.len + 2], null, .stdout)).status;
     }
 
     /// Like `exec`, with the command's standard output captured into `buffer` (what fits; the
@@ -80,7 +80,19 @@ pub const Node = struct {
         arguments[0] = "exec";
         arguments[1] = node.name;
         for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
-        return nodes_run(arguments[0 .. argv.len + 2], buffer);
+        return nodes_run(arguments[0 .. argv.len + 2], buffer, .stdout);
+    }
+
+    /// Like `exec_output`, with the command's standard error in `buffer` too: for tools whose
+    /// refusal is a message (a membership command refused: its reason, said in an event).
+    pub fn exec_said(node: *const Node, argv: []const []const u8, buffer: []u8) !Output {
+        assert(argv.len > 0);
+        assert(argv.len + 3 <= exec_arguments_max);
+        var arguments: [exec_arguments_max][]const u8 = undefined;
+        arguments[0] = "exec";
+        arguments[1] = node.name;
+        for (argv, arguments[2..][0..argv.len]) |argument, *target| target.* = argument;
+        return nodes_run(arguments[0 .. argv.len + 2], buffer, .both);
     }
 
     /// Cuts (or restores) the link between this node and `peer` (a node name or "runner").
@@ -474,12 +486,15 @@ const exec_arguments_max = 32;
 const argument_size_max = 1024;
 
 fn nodes_command(arguments: []const []const u8) !void {
-    if ((try nodes_run(arguments, null)).status != 0) return error.NodeCommandFailed;
+    if ((try nodes_run(arguments, null, .stdout)).status != 0) return error.NodeCommandFailed;
 }
 
-/// Runs det-nodes with `arguments`; returns its exit status, and its standard output when
-/// `capture` is given.
-fn nodes_run(arguments: []const []const u8, capture: ?[]u8) !Output {
+/// What a command's capture takes: its standard output, or its standard error with it.
+const Captured = enum { stdout, both };
+
+/// Runs det-nodes with `arguments`; returns its exit status, and what `captured` names into
+/// `capture` when given.
+fn nodes_run(arguments: []const []const u8, capture: ?[]u8, captured: Captured) !Output {
     assert(arguments.len + 1 <= exec_arguments_max);
     var storage: [exec_arguments_max][argument_size_max]u8 = undefined;
     var argv: [exec_arguments_max:null]?[*:0]const u8 = @splat(null);
@@ -496,6 +511,7 @@ fn nodes_run(arguments: []const []const u8, capture: ?[]u8) !Output {
     if (linux.errno(pid) != .SUCCESS) return error.Fork;
     if (pid == 0) {
         if (capture != null) _ = linux.dup2(pipe[1], 1);
+        if (capture != null and captured == .both) _ = linux.dup2(pipe[1], 2);
         _ = linux.execve(nodes_binary, &argv, &environment);
         linux.exit_group(127);
     }
