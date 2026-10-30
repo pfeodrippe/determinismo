@@ -29,6 +29,21 @@ machine: a 256 MB WiredTiger cache each.
 Faults: Antithesis's set, restarts, graceful stops and power losses (each node's data on its own
 disk), and stalls and power losses at the nodes' syncs.
 
+## Membership changes
+
+A fourth member, `n4`, is a spare. The `member` driver reconfigures the replica set one step at
+a time through the primary (`replSetGetConfig`, then `replSetReconfig` with the version plus
+one and the same settings): the spare started fresh (an initial sync) and added as a voter
+(priority 0: never elected, as the drivers follow a primary among the first three) when the
+configuration lacks it, after a 30 s grace; a member, one time in two stopped and removed.
+Every refusal is a `member_refused` event (a reconfiguration still committing, a primary
+stepping down).
+
+Smokes (srv3, 2026-10-30, seed 1, 2 timelines): the first crashed its driver (a connection
+closed twice when no primary answered); the second added the spare in both timelines and
+removed it in one, Elle valid in both, every refusal MongoDB's own ("replSetReconfig should
+only be run on a writable PRIMARY", "Stepped down when persisting new config").
+
 ## Sharded, as Jepsen tested 4.2.6
 
 Jepsen's anomalies in 4.2.6 came from a sharded cluster, which MongoDB traced to SERVER-48307

@@ -13,6 +13,11 @@
 //! commit has no clear answer (UnknownTransactionCommitResult, a write concern error, a lost
 //! connection) may have happened.
 //!
+//! Membership changes (Jepsen's member nemesis): a fourth member, a spare node, is added to the
+//! replica set (fresh: an initial sync) and removed (stopped first), one reconfiguration at a
+//! time through the primary (`replSetReconfig`, the configuration's version plus one), while the
+//! drivers append.
+//!
 //!   determinismo explore ... --program zig-out/bin/mongodb-test --scenario append
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,7 +26,13 @@ const sdk = @import("determinismo");
 const Mongo = @import("client.zig");
 const bson = Mongo.bson;
 
-const Nodes = struct { n1: sdk.Node, n2: sdk.Node, n3: sdk.Node };
+const Nodes = struct {
+    n1: sdk.Node,
+    n2: sdk.Node,
+    n3: sdk.Node,
+    /// The member that is added and removed (a spare: not started with the others).
+    n4: sdk.Node,
+};
 const System = sdk.System(Nodes);
 
 const node_names = [_][]const u8{ "n1", "n2", "n3" };
@@ -60,8 +71,9 @@ pub fn main(init: std.process.Init) !void {
 fn describe(d: *System.Describe) !void {
     inline for (.{ .{ "default", image }, .{ "jepsen", image_jepsen } }) |entry| {
         const profile = try d.profile(entry[0]);
-        inline for (node_names) |name| {
+        inline for (node_names ++ .{"n4"}) |name| {
             profile.node(@field(System.Name, name), .{
+                .spare = comptime std.mem.eql(u8, name, "n4"),
                 .image = entry[1],
                 .command = &.{
                     "mongod",                  "--replSet", replica_set, "--bind_ip_all", "--port", "27017",
@@ -80,6 +92,7 @@ fn describe(d: *System.Describe) !void {
 fn append_scenario(s: *System.Scenario) void {
     s.setup("replica_set", replica_set_setup);
     s.parallel_driver("append", append);
+    s.parallel_driver("member", member_changes);
     s.finally("final reads", final_reads);
 }
 
@@ -101,15 +114,9 @@ fn replica_set_setup(context: *System.Context) !void {
     _ = try sdk.retry(setup_attempts_max, 200, collection_create, .{&all});
 }
 
-/// Jepsen's replica set: fast heartbeats and elections, priorities 3, 2, 1.
-fn initiate(address: [4]u8) !void {
-    var connection: Mongo = undefined;
-    try connection.open(address, port, .{ .timeout_ms = timeout_ms });
-    defer connection.close();
-    var buffer: [command_size_max]u8 = undefined;
-    var builder: bson.Builder = .init(&buffer);
-    builder.document("replSetInitiate");
-    builder.string("_id", replica_set);
+/// The replica set's settings (Jepsen's: fast heartbeats and elections), at its initiation and at
+/// every reconfiguration.
+fn settings_write(builder: *bson.Builder) void {
     builder.document("settings");
     // Below the election timeout: newer versions refuse Jepsen's 1 s elections with the default
     // 2 s heartbeat interval (4.2 did not check).
@@ -119,17 +126,133 @@ fn initiate(address: [4]u8) !void {
     builder.int32("catchUpTimeoutMillis", 1000);
     builder.int32("catchUpTakeoverDelayMillis", 3000);
     builder.close();
+}
+
+/// The members, the spare last when `spare`: a voter at priority 0, never elected (the drivers
+/// follow a primary among the first three).
+fn members_write(builder: *bson.Builder, spare: bool) void {
     builder.array("members");
-    for (node_names, 0..) |name, position| {
+    for (node_names ++ .{"n4"}, 0..) |name, position| {
+        if (position == node_names.len and !spare) break;
         var index: [10]u8 = undefined;
         var host: [32]u8 = undefined;
         builder.document(bson.index(&index, position));
         builder.int32("_id", @intCast(position));
         builder.string("host", std.fmt.bufPrint(&host, "{s}:{d}", .{ name, port }) catch unreachable);
-        builder.int32("priority", @intCast(node_names.len - position));
+        builder.int32("priority", if (position == node_names.len) 0 else @intCast(node_names.len - position));
         builder.close();
     }
     builder.close();
+}
+
+// Membership ------------------------------------------------------------------------------------
+
+/// Membership steps for a while (Jepsen's member nemesis acts every few seconds): up to
+/// `member_steps_max`, a drawn 1 to 5 s apart.
+fn member_changes(context: *System.Context) !void {
+    for (0..member_steps_max) |_| {
+        try member_step(context);
+        sdk.sleep_ms(1000 + sdk.random_below_named("member.pause_ms", 4000));
+    }
+}
+
+const member_steps_max = 20;
+
+/// One reconfiguration, one at a time (a lock file in the runner), through the primary: the spare
+/// added (started fresh first, unless its last start was within the join grace) when the
+/// configuration lacks it; else, one time in two, stopped and removed.
+fn member_step(context: *System.Context) !void {
+    const lock = linux.open("/tmp/mongodb-member.lock", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(lock) != .SUCCESS) return error.MemberLock;
+    defer _ = linux.close(@intCast(lock));
+    const lock_exclusive = 2; // LOCK_EX
+    if (linux.errno(linux.flock(@intCast(lock), lock_exclusive)) != .SUCCESS) return error.MemberLock;
+    const all = members(context);
+    const spare = &context.nodes.n4;
+    var connection: Mongo = undefined;
+    const primary = primary_connect(&connection, &all, all[sdk.random_below(all.len)].address) catch return;
+    if (!primary) return; // No primary now (and the connection closed): a later step.
+    defer connection.close();
+    var buffer: [command_size_max]u8 = undefined;
+    var builder: bson.Builder = .init(&buffer);
+    builder.int32("replSetGetConfig", 1);
+    builder.string("$db", "admin");
+    const reply = connection.command(try builder.finish()) catch return;
+    if (!Mongo.ok(reply)) return member_refused("replSetGetConfig", Mongo.code(reply), Mongo.message(reply));
+    const config_element = (bson.get(reply, "config") catch return) orelse return;
+    const config = config_element.nested() orelse return;
+    const version_element = (bson.get(config, "version") catch return) orelse return;
+    const version = version_element.integer() orelse return;
+    const member = std.mem.indexOf(u8, config, "n4:27017") != null;
+    if (!member) {
+        if (member_started_ns()) |at| if (monotonic_ns() -| at < join_grace_ns) return; // Starting.
+        try spare.wipe(); // Fresh: an initial sync, as a member added anew does.
+        member_started_note();
+    } else if (sdk.random_below_named("mongodb.member_remove", 2) != 0) {
+        return; // A member stays (a fault that stopped it starts it again).
+    } else {
+        try spare.kill();
+    }
+    var reconfig_buffer: [command_size_max]u8 = undefined;
+    var reconfig: bson.Builder = .init(&reconfig_buffer);
+    reconfig.document("replSetReconfig");
+    reconfig.string("_id", replica_set);
+    reconfig.int64("version", version + 1);
+    settings_write(&reconfig);
+    members_write(&reconfig, !member);
+    reconfig.close();
+    reconfig.string("$db", "admin");
+    const reconfigured = connection.command(try reconfig.finish()) catch return;
+    if (!Mongo.ok(reconfigured)) return member_refused("replSetReconfig", Mongo.code(reconfigured), Mongo.message(reconfigured));
+    if (member) {
+        sdk.sometimes(true, "a member was removed", .{});
+    } else {
+        sdk.sometimes(true, "a member was added", .{});
+    }
+}
+
+/// A membership call refused, said (an event): under faults, refusals are expected (a
+/// reconfiguration still committing, a primary stepping down), and a step that never succeeds
+/// says why.
+fn member_refused(what: []const u8, code: i64, message: []const u8) void {
+    sdk.event("member_refused", .{ .what = what, .status = code, .body = message[0..@min(message.len, 512)] });
+}
+
+/// The spare's last fresh start (monotonic, virtual), and how long its start may take before it
+/// is added again: until then, not started again.
+const member_started_path = "/tmp/mongodb-member.started";
+const join_grace_ns = 30 * std.time.ns_per_s;
+
+fn member_started_ns() ?u64 {
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(fd));
+    var text: [32]u8 = undefined;
+    const size = linux.read(@intCast(fd), &text, text.len);
+    if (linux.errno(size) != .SUCCESS) return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text[0..size], " \n"), 10) catch null;
+}
+
+fn member_started_note() void {
+    var text: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&text, "{d}\n", .{monotonic_ns()}) catch return;
+    const fd = linux.open(member_started_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    _ = linux.write(@intCast(fd), line.ptr, line.len);
+}
+
+/// Jepsen's replica set: fast heartbeats and elections, priorities 3, 2, 1.
+fn initiate(address: [4]u8) !void {
+    var connection: Mongo = undefined;
+    try connection.open(address, port, .{ .timeout_ms = timeout_ms });
+    defer connection.close();
+    var buffer: [command_size_max]u8 = undefined;
+    var builder: bson.Builder = .init(&buffer);
+    builder.document("replSetInitiate");
+    builder.string("_id", replica_set);
+    settings_write(&builder);
+    members_write(&builder, false);
     builder.close();
     builder.string("$db", "admin");
     const reply = try connection.command(try builder.finish());
