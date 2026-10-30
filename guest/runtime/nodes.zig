@@ -118,6 +118,18 @@ pub fn start(
     node: *const schema.Resolved,
 ) !void {
     assert(schema.name_valid(node.name));
+    // One start of a node at a time, across processes: det-faults starting it again after a
+    // fault and a driver starting it (a spare) both found it not running and both started it,
+    // two of its programs on one disk (Kafka's dynamic quorum's smoke, srv3, 2026-10-30: the
+    // other's rename took quorum-state.tmp away, and the broker exited). Unlocked, not only
+    // closed: the node's first process holds a copy of the file until it execs.
+    var lock_path_buffer: [path_size_max]u8 = undefined;
+    const lock_path = try print_z(&lock_path_buffer, state_root ++ "/{s}.start", .{node.name});
+    const lock = linux.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(lock) != .SUCCESS) return error.StartLock;
+    defer _ = linux.close(@intCast(lock));
+    while (linux.errno(linux.flock(@intCast(lock), std.posix.LOCK.EX)) == .INTR) {}
+    defer _ = linux.flock(@intCast(lock), std.posix.LOCK.UN);
     if (pid_read(node.name) != null) return error.AlreadyRunning;
     var paths: Paths = undefined;
     try paths.init(node.name);
