@@ -29,7 +29,16 @@ determinismo explore ... --program zig-out/bin/nrepl-test --profile jank --scena
 
 Profile `jank`, 2 timelines of 37 s and 19 s. Every property held except "a session keeps its
 namespace" (below), with no crash. jank's server idles most of the time: 91% of virtual time
-was skipped, at 10 virtual seconds per wall second. The first hunt (1 h) is queued.
+was skipped, at 10 virtual seconds per wall second.
+
+## The first hunt (srv3, run 235, 2026-10-30)
+
+A tree, 1 h budget, seed 1. The plateau rule stopped it at the hour: 9,854 timelines, 77
+behaviors, none reached by one timeline alone (Good-Turing's chance that the next finds a new
+one: about 0). Two properties failed, both known from writing the workload: "a session keeps
+its namespace" (7,150 timelines) and "an evaluation's output is its own" (3,875, the output
+capture race below). No crash and no other failure: under these faults, sessions and
+definitions held. The two forms that kill the server stay left out (below).
 
 ## jank 0.1, met while writing the workload (2026-10-30)
 
