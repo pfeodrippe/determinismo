@@ -270,6 +270,7 @@ fn node_resolve(
         .crashes_known = node.crashes_known,
         .writeback_s = node.writeback_s,
         .exits_known = node.exits_known,
+        .spare = node.spare,
     };
     var image: ImageConfig = .{};
     const disk = if (node.source.image) |reference|

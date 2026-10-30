@@ -103,6 +103,10 @@ pub const Node = struct {
     /// timeline (ZooKeeper's servers that lost power before their first snapshot reached the
     /// disk refuse to start: ZOOKEEPER-3220). Another exit still fails.
     exits_known: []const []const u8 = &.{},
+    /// Not started with the others (its root, address and disk ready all the same): a driver
+    /// starts it, as a member that joins later (Jepsen's membership changes). Faults leave it
+    /// alone while it is not running.
+    spare: bool = false,
 };
 
 /// Where a node's root filesystem comes from: exactly one field is set.
@@ -340,6 +344,7 @@ pub const Resolved = struct {
     crashes_known: []const []const u8 = &.{},
     writeback_s: ?u32 = null,
     exits_known: []const []const u8 = &.{},
+    spare: bool = false,
 };
 
 pub fn node_address(index: u32) [4]u8 {

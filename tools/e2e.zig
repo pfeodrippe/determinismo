@@ -201,6 +201,7 @@ fn checks_run(context: *Context, only: []const u8, jar: []const u8) !u32 {
         .{ "slow", check_slow },                     .{ "sought", check_sought },
         .{ "optimize", check_optimize },
         .{ "states", check_states },
+        .{ "spare", check_spare },
         .{ "saved", check_saved },                   .{ "concurrent", check_concurrent },
         .{ "resume", check_resume },                 .{ "ui", check_ui },
         .{ "runs", check_runs },                     .{ "kubernetes", check_kubernetes },
@@ -2578,6 +2579,35 @@ fn check_optimize(context: *Context) !void {
         .{ "optimized, the streak is won", won[0] > 0 },
         .{ "blind, it is not", won[1] == 0 },
     }, "optimize: a streak of 24 won in {d} timelines optimized, {d} blind, of 256 each", .{ won[0], won[1] });
+}
+
+/// A spare node (schema `spare`): not started with the others; until a driver starts it, faults
+/// find it not running and skip it (none applied to it), then it answers and faults reach it.
+fn check_spare(context: *Context) !void {
+    const program = try std.fs.path.join(context.arena, &.{ context.bin, "det-selftest" });
+    const events = try std.fmt.allocPrint(context.arena, "{s}/spare-events", .{context.scratch});
+    const report = try explore(context, &.{
+        "--program",  program, "--profile",    "spare", "--scenario", "spare", "--seed", "1",
+        "--branches", "2",     "--events-dir", events,
+    });
+    const started = try query_count(context, &.{ events, "event=node_start details.node=witness" });
+    const answered = try query_count(context, &.{ events, "assert.message=\"the spare node started and answered\"" });
+    const skipped = try query_count(context, &.{ events, "event=fault_skipped details.node=witness details.err=NotRunning" });
+    const before = try query_count(context, &.{
+        events, "event=fault details.node=witness", "--not-preceded-by", "event=node_start details.node=witness",
+    });
+    const after = try query_count(context, &.{ events, "event=fault details.node=witness" });
+    const passed = std.mem.indexOf(u8, report, "2 branches, 0 with failing properties") != null;
+    expect_all(context, &.{
+        .{ "the spare starts only when the driver starts it", started > 0 },
+        .{ "it answers once started", answered > 0 },
+        .{ "faults skip it while it is not running", skipped > 0 },
+        .{ "no fault is applied to it before it starts", before == 0 },
+        .{ "faults reach it once it runs", after > 0 },
+        .{ "every property passes (no exit or fault failure)", passed },
+    }, "spare: started by its driver in {d} timelines; {d} faults skipped before, {d} after", .{
+        started, skipped, after,
+    });
 }
 
 /// States from instrumented code (the JVM agent's enum transitions, SGFuzz's state variables)

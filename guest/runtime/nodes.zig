@@ -83,6 +83,7 @@ pub fn up(arena: std.mem.Allocator, system: *const schema.System) !void {
     try hosts_write("/etc/hosts", system);
     host_settings();
     for (system.nodes, 0..) |*node, index| {
+        if (node.spare) continue; // A driver starts it.
         try start(arena, system, node);
         ready_wait(node) catch |err| {
             // Said, with the nodes it waited before: a readiness that needs them never comes

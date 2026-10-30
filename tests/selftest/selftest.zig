@@ -93,6 +93,7 @@ pub fn main(init: std.process.Init) !void {
             .sought = sought_scenario,
             .streak = streak_scenario,
             .streak_blind = streak_blind_scenario,
+            .spare = spare_scenario,
         },
         .checks = .{ .squares = squares_check },
     });
@@ -216,6 +217,23 @@ fn describe_faulted(d: *System.Describe) !void {
             .faults = pauses,
         });
     }
+    // A spare witness (not started with the echo node: a driver starts it), restarts and pauses
+    // allowed, for the "spare" scenario: faults must leave it alone until it runs.
+    const spared = try d.profile("spare");
+    spared.node(.echo, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = quiet,
+    });
+    var spare_faults = quiet;
+    spare_faults.pause = true;
+    spare_faults.restart = true;
+    spared.node(.witness, .{
+        .binary = "zig-out/bin/det-selftest-node",
+        .ready = .{ .tcp = port },
+        .faults = spare_faults,
+        .spare = true,
+    });
     // Restarts that may give it a new address, for the "readdress" scenario.
     const movable = try d.profile("movable");
     var moves = quiet;
@@ -752,6 +770,29 @@ fn realtime_ns() i128 {
     var now: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &now);
     return @as(i128, now.sec) * std.time.ns_per_s + now.nsec;
+}
+
+/// A spare node started late: for 20 s faults find it not running (and skip it), then the driver
+/// starts it and it answers; faults reach it from then on.
+fn spare_scenario(s: *System.Scenario) void {
+    s.singleton_driver("spare_start", spare_start);
+}
+
+fn spare_start(context: *System.Context) !void {
+    const spare = &context.nodes.witness.?;
+    sdk.sleep_ms(20 * std.time.ms_per_s);
+    try spare.start();
+    var reply: [16]u8 = undefined;
+    for (0..200) |_| {
+        const answer = request(spare.address, "ping\n", &reply) catch {
+            sdk.sleep_ms(100);
+            continue;
+        };
+        sdk.always(std.mem.eql(u8, answer, "ping\n"), "the spare echoes once started", .{});
+        sdk.reachable("the spare node started and answered", .{});
+        break;
+    }
+    sdk.sleep_ms(20 * std.time.ms_per_s); // Faults reach it now.
 }
 
 fn aim_scenario(s: *System.Scenario) void {

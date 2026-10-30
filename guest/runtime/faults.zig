@@ -924,6 +924,12 @@ fn skew_begin(applied: *const Applied, fault: *NodeFault) !void {
 fn node_start(system: *const schema.System, applied: *const Applied) void {
     const slot = node_slot(system, applied.node) orelse return;
     if (slot.* != null) return;
+    // Not running: a spare not started yet, a member a driver took out, or a node that exited on
+    // its own. A restart would start it behind the scenario's back.
+    if (nodes.state_of(applied.node) == .stopped) {
+        sdk.event("fault_skipped", .{ .node = applied.node, .err = "NotRunning" });
+        return;
+    }
     var fault = NodeFault{ .applied = applied.*, .end_ns = monotonic_ns() + applied.duration_ns };
     const started: anyerror!void = switch (applied.kind) {
         .pod_pause, .pod_isolate, .pod_degrade => pod_begin(&fault),
@@ -1869,6 +1875,12 @@ fn network_node_new(system: *const schema.System, name: []const u8) void {
 }
 
 /// Brings every link to what the active faults (or the baseline) make it.
+/// A node (never the runner) that is not running.
+fn not_running(endpoint: []const u8) bool {
+    if (std.mem.eql(u8, endpoint, schema.runner_name)) return false;
+    return nodes.state_of(endpoint) == .stopped;
+}
+
 fn network_refresh(system: *const schema.System) void {
     const endpoints = system.nodes.len + 1;
     for (0..endpoints) |a| for (a + 1..endpoints) |b| {
@@ -1887,7 +1899,10 @@ fn network_refresh(system: *const schema.System) void {
         // their faults with a link marked down that no longer existed).
         nodes.link_set(system, from, to, state) catch |err| {
             const gone = err == error.NoSuchInterface or err == error.NoSuchNamespace;
-            if (!(gone and state == .up)) {
+            // A node not running (a spare not started yet) has no links to cut: its start makes
+            // them anew.
+            const absent = gone and (not_running(from) or not_running(to));
+            if (!(gone and state == .up) and !absent) {
                 sdk.event("link_set_failed", .{ .from = from, .to = to, .state = @tagName(state), .err = @errorName(err) });
                 continue;
             }

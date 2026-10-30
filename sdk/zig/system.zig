@@ -117,6 +117,9 @@ pub fn NodeSpec(comptime Name: type) type {
         /// Exits the system is known to make, by what the node wrote last: counted, not failed
         /// (schema.Node.exits_known).
         exits_known: []const []const u8 = &.{},
+        /// Not started with the others: a driver starts it (`Node.start`), a member joining
+        /// later (schema.Node.spare).
+        spare: bool = false,
     };
 }
 
@@ -429,6 +432,7 @@ pub fn System(comptime Nodes: type) type {
                         .crashes_known = spec.crashes_known,
                         .writeback_s = spec.writeback_s,
                         .exits_known = spec.exits_known,
+                        .spare = spec.spare,
                     });
                 } else if (Field == Node) {
                     const message = "profile {s}: node {s} is not optional\n";
