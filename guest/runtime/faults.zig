@@ -935,9 +935,35 @@ fn skew_ns(applied: *const Applied) i64 {
     return if (applied.forward) size else -size;
 }
 
-fn skew_begin(applied: *const Applied, fault: *NodeFault) !void {
-    try nodes.clock_offset(applied.node, skew_ns(applied));
-    if (applied.strobe_ns > 0) fault.flip_ns = monotonic_ns() + applied.strobe_ns;
+/// A drawn skew kept within the node's largest skew of every other node's skew now: a system's
+/// maximum clock offset holds between any two nodes, and two nodes skewed opposite ways would
+/// otherwise be twice that apart (srv3, 2026-10-30: crdb-3 at +275 ms and crdb-2 at -223 ms,
+/// 498 ms apart with CockroachDB's maximum at 500). A skew asked for by the scenario is as
+/// asked. Null when no offset fits (another node's skew is past this one's largest).
+fn skew_clamped(system: *const schema.System, applied: *const Applied) ?i64 {
+    const offset_ns = skew_ns(applied);
+    if (applied.injected) return offset_ns;
+    const node = system.node(applied.node) orelse return offset_ns;
+    const max_ns: i64 = @as(i64, @max(10, node.faults.clock_skew_ms_max)) * std.time.ns_per_ms;
+    var low: i64 = -max_ns;
+    var high: i64 = max_ns;
+    for (nodes_faulted) |slot| {
+        const other = slot orelse continue;
+        if (other.applied.kind != .clock_skew or std.mem.eql(u8, other.applied.node, applied.node)) continue;
+        const theirs = skew_ns(&other.applied);
+        low = @max(low, theirs - max_ns);
+        high = @min(high, theirs + max_ns);
+    }
+    if (low > high) return null;
+    return std.math.clamp(offset_ns, low, high);
+}
+
+fn skew_begin(system: *const schema.System, fault: *NodeFault) !void {
+    const offset_ns = skew_clamped(system, &fault.applied) orelse return error.SkewApart;
+    fault.applied.forward = offset_ns >= 0;
+    fault.applied.skip_ns = @abs(offset_ns);
+    try nodes.clock_offset(fault.applied.node, offset_ns);
+    if (fault.applied.strobe_ns > 0) fault.flip_ns = monotonic_ns() + fault.applied.strobe_ns;
 }
 
 fn node_start(system: *const schema.System, applied: *const Applied) void {
@@ -961,7 +987,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
         .stop => stop_begin(applied.node, &fault),
         .disk => nodes.disk_fail(applied.node, applied.disk.?),
         .throttle => nodes.cpu_limit(applied.node, applied.cpu_percent),
-        .clock_skew => skew_begin(applied, &fault),
+        .clock_skew => skew_begin(system, &fault),
         .process_pause => process_stop(applied, &fault),
         .thread_pause => thread_stop(applied, &fault),
         .interleave => interleave_arm(applied.node, applied.one_in),
@@ -969,7 +995,8 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     };
     started catch |err| {
         // Nothing to fault (no pod to pick right now): not a failure.
-        const skipped = err == error.NoPods or err == error.OnePod or err == error.ThreadPending;
+        const skipped = err == error.NoPods or err == error.OnePod or err == error.ThreadPending or
+            err == error.SkewApart;
         sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
@@ -2555,10 +2582,10 @@ test faults_collect {
     // a: pause, restart, throttle, process pause; with the runner and with b: partition and
     // degrade both ways (6). b: pause, isolate, throttle, clock skew, process pause; with the
     // runner: partition and degrade both ways (3). Thread pauses where process pauses are (2).
-    // Sync stalls (on by default) on both (2). A clog of b (it allows isolation), groups across
-    // the runner, a and b. Clock skip. A restore.
-    try std.testing.expectEqual(@as(u32, 26), faults_collect(&system, &scenario, &faults));
-    const groups = faults[0..26];
+    // Sync stalls and interleavings (on by default) on both (4). A clog of b (it allows
+    // isolation), groups across the runner, a and b. Clock skip. A restore.
+    try std.testing.expectEqual(@as(u32, 28), faults_collect(&system, &scenario, &faults));
+    const groups = faults[0..28];
     const has_groups = for (groups) |fault| {
         if (fault.kind == .partition_groups) break true;
     } else false;
@@ -2569,7 +2596,28 @@ test faults_collect {
     } else unreachable;
     try std.testing.expectEqualStrings("b", skew.node);
     try std.testing.expectEqual(10 * std.time.ns_per_s, skew.skew_ns_max);
-    try std.testing.expectEqual(Kind.restore, faults[25].kind); // The last one.
+    try std.testing.expectEqual(Kind.restore, faults[27].kind); // The last one.
+}
+
+test skew_clamped {
+    var resolved = [2]schema.Resolved{
+        .{ .name = "a", .address = "10.0.0.2", .disk = "vdb", .digest = "", .command = &.{"x"}, .env = &.{} },
+        .{ .name = "b", .address = "10.0.0.3", .disk = "vdc", .digest = "", .command = &.{"x"}, .env = &.{} },
+    };
+    for (&resolved) |*node| node.faults = .{ .clock_skew = true, .clock_skew_ms_max = 300 };
+    const system = schema.System{ .profile = "p", .nodes = &resolved, .scenarios = &.{} };
+    const ms = std.time.ns_per_ms;
+    // b is 250 ms ahead: a may go back at most 50 ms, and ahead up to its largest, 300.
+    nodes_faulted[1] = .{ .applied = .{ .kind = .clock_skew, .node = "b", .duration_ns = 0, .skip_ns = 250 * ms, .forward = true }, .end_ns = 0 };
+    defer nodes_faulted[1] = null;
+    const back: Applied = .{ .kind = .clock_skew, .node = "a", .duration_ns = 0, .skip_ns = 300 * ms, .forward = false };
+    try std.testing.expectEqual(@as(?i64, -50 * ms), skew_clamped(&system, &back));
+    const ahead: Applied = .{ .kind = .clock_skew, .node = "a", .duration_ns = 0, .skip_ns = 200 * ms, .forward = true };
+    try std.testing.expectEqual(@as(?i64, 200 * ms), skew_clamped(&system, &ahead));
+    // Asked for by the scenario: as asked.
+    var asked = back;
+    asked.injected = true;
+    try std.testing.expectEqual(@as(?i64, -300 * ms), skew_clamped(&system, &asked));
 }
 
 test fault_choose {
