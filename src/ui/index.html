@@ -654,7 +654,7 @@ function environmentBody() {
 }
 
 // How busy a tree's workers were: timelines running at once on average, of how many, and how
-// long their VMs waited for the host's memory and for CPUs other runs held (the explorer's
+// long their VMs waited for the host's memory and for a CPU (the explorer's
 // status while it runs, its summary after). A hunt whose CPUs sit idle says so here.
 function atOnce(run) {
   const live = run.state === "running" ? run.progress : null;
@@ -665,7 +665,7 @@ function atOnce(run) {
   const share = Math.round(100 * known.at_once / known.workers);
   return `${known.at_once.toFixed(1)} of ${known.workers} workers (${share}%)`
     + (known.memory_s >= 1 ? ` · VMs waited ${Math.round(known.memory_s)} s for memory` : "")
-    + (known.cpu_s >= 1 ? ` · ${Math.round(known.cpu_s)} s for CPUs other runs held` : "");
+    + (known.cpu_s >= 1 ? ` · ${Math.round(known.cpu_s)} s for a CPU` : "");
 }
 function utilizationSummary() {
   const vtime = state.run.branches.reduce((sum, branch) => sum + branch.vtime_ns, 0);

@@ -362,7 +362,7 @@ pub const Multiverse = struct {
             vm.events.hash.final(),          failing,
         }) catch {};
         if (branch.memory_wait_ns > 0) line.print(" memory_wait={d:.3}s", .{seconds(branch.memory_wait_ns)}) catch {};
-        // A take's pauses alone are tens of milliseconds: from a tenth of a second, other runs.
+        // A take's pauses alone are tens of milliseconds: from a tenth of a second, CPUs held.
         if (branch.cpu_wait_ns >= cpu_wait_said_ns) line.print(" cpu_wait={d:.3}s", .{seconds(branch.cpu_wait_ns)}) catch {};
         // Where exact stops went less than exactly in this timeline: beside a replay that parts
         // from it, what to suspect first.

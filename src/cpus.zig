@@ -323,8 +323,8 @@ pub const Held = struct {
     /// How long the take waited for the host's memory (other runs' VMs and holders claim it):
     /// a run whose VMs mostly wait for memory runs fewer timelines at once than it has CPUs.
     memory_wait_ns: u64 = 0,
-    /// And for a CPU, the rest of the take: its CPUs held by other runs' VMs (or a priority
-    /// process's), each attempt a pause of 10 to 30 ms.
+    /// And for a CPU, the rest of the take: every CPU held (by other runs' VMs, a priority
+    /// process, or this run's own replays and workers), each attempt a pause of 10 to 30 ms.
     cpu_wait_ns: u64 = 0,
 };
 

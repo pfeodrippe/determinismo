@@ -2622,7 +2622,7 @@ const Busy = struct {
         multiverse.workers = busy.jobs;
         multiverse.at_once = busy.at_once();
         std.debug.print("[determinismo] workers: {d:.1} timelines at once of {d} on average " ++
-            "({d:.0}%); their VMs waited {d:.0}s for memory, {d:.0}s for CPUs other runs held\n", .{
+            "({d:.0}%); their VMs waited {d:.0}s for memory, {d:.0}s for a CPU\n", .{
             busy.at_once(),
             busy.jobs,
             100 * busy.at_once() / @as(f64, @floatFromInt(@max(busy.jobs, 1))),

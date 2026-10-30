@@ -2957,7 +2957,7 @@ fn workers_said(output: []const u8) u32 {
 }
 
 /// The timelines' wall times over the run's (its multiverse line's).
-/// How long a report's timelines waited for the host's memory and for CPUs other runs held
+/// How long a report's timelines waited for the host's memory and for a CPU
 /// (their `memory_wait=` and `cpu_wait=`), and the run's wall time.
 fn waits_of(output: []const u8) struct { memory_s: f64, cpu_s: f64, run_s: f64 } {
     var memory_s: f64 = 0;
