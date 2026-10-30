@@ -949,7 +949,7 @@ fn node_start(system: *const schema.System, applied: *const Applied) void {
     };
     started catch |err| {
         // Nothing to fault (no pod to pick right now): not a failure.
-        const skipped = err == error.NoPods or err == error.OnePod;
+        const skipped = err == error.NoPods or err == error.OnePod or err == error.ThreadPending;
         sdk.event(if (skipped) "fault_skipped" else "fault_failed", .{ .node = applied.node, .err = @errorName(err) });
         return;
     };
@@ -1612,6 +1612,14 @@ fn thread_stop(applied: *const Applied, fault: *NodeFault) !void {
     const count = try nodes.processes(applied.node, &pids);
     if (count == 0) return error.NoProcess;
     const pid = pids[applied.process_index % count];
+    // A thread of it still seized from an earlier pause (not stopped when that pause ended) may
+    // have exited unreaped: an exec of the process then holds its cred_guard_mutex waiting for
+    // that zombie, and seizing another of its threads would wait on the mutex for good (srv3,
+    // 2026-10-30, Redpanda's membership smoke: the injector stalled 3,500 s in `apply
+    // thread_pause` on a broker restarted a second earlier, its start exec'ing). Reaped first;
+    // left alone if one is still there.
+    threads_release_pending(0);
+    if (thread_pending_in(pid)) return error.ThreadPending;
     fault.command_size = @intCast(command_of(pid, &fault.command).len);
     var tids: [threads_max]linux.pid_t = undefined;
     const threads = nodes.threads(pid, &tids);
@@ -1629,6 +1637,16 @@ fn thread_stop(applied: *const Applied, fault: *NodeFault) !void {
     // meanwhile): the pause begins when the thread stops.
     fault.pid = tid;
     fault.stopped = thread_stopped(tid);
+}
+
+/// Whether a thread of process `pid` is still seized from an earlier pause.
+fn thread_pending_in(pid: linux.pid_t) bool {
+    for (threads_pending[0..threads_pending_count]) |tid| {
+        var path_buffer: [48]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/task/{d}", .{ pid, tid }, 0) catch continue;
+        if (linux.errno(linux.access(path, linux.F_OK)) == .SUCCESS) return true;
+    }
+    return false;
 }
 
 /// Whether the tracee `tid` reported its stop, or exited (polled, never waited for).
