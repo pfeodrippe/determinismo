@@ -153,6 +153,9 @@ const Shared = struct {
     /// By run id: attached yet, and the lock its attach, ingest and answers hold.
     attached: [runs_max]bool = @splat(false),
     store_locks: [runs_max]std.Io.Mutex = @splat(.init),
+    /// By run id: the newer run that took its events directory (an exploration given the same
+    /// --events-dir again, emptied: a smoke script's), 0 for none. Its events went with it.
+    taken: [runs_max]u32 = @splat(0),
     /// By run id: how many ingests brought timelines in, and the answers that change only
     /// then (a running run's page asks for them every few seconds).
     generations: [runs_max]u64 = @splat(0),
@@ -352,6 +355,10 @@ fn run_update(server: *Server, id: u32) !void {
     defer lock.unlock(server.io);
     const events = try run_store(server, id);
     var failure: duckdb.Failure = .{};
+    if (shared.taken[id] != 0) {
+        server.detail = try print(server, "its events directory holds run {d}'s events now", .{shared.taken[id]});
+        return error.EventsTaken;
+    }
     if (!shared.attached[id]) {
         // An exploration given --events-dir links its run's events there: a symlink to a
         // directory, which createDirPath takes for NotDir (runs 65 to 71 on srv3 never opened).
@@ -360,9 +367,23 @@ fn run_update(server: *Server, id: u32) !void {
         const database = &shared.database;
         const arena = server.arena;
         const name = events.name;
-        _ = store.Store.attach(database, arena, events.directory, name, &failure) catch |err| {
-            server.detail = try server.arena.dupe(u8, failure.text());
-            return err;
+        _ = store.Store.attach(database, arena, events.directory, name, &failure) catch |err| retry: {
+            // An older run named the same directory: this one, newer, holds it now (DuckDB
+            // attaches a file once, and says to which database).
+            const older = attached_by(failure.text()) orelse 0;
+            if (older == 0 or older >= id) {
+                server.detail = try server.arena.dupe(u8, failure.text());
+                return err;
+            }
+            events_take(server, older, id) catch |take_err| {
+                server.detail = try server.arena.dupe(u8, failure.text());
+                return take_err;
+            };
+            failure = .{};
+            break :retry store.Store.attach(database, arena, events.directory, name, &failure) catch |again| {
+                server.detail = try server.arena.dupe(u8, failure.text());
+                return again;
+            };
         };
         shared.attached[id] = true;
     }
@@ -396,6 +417,39 @@ fn run_update(server: *Server, id: u32) !void {
         shared.replays_ingested[id] = replays_size;
         shared.generations[id] += 1;
     }
+}
+
+/// The run whose database (`run_<id>`) holds a file, by DuckDB's "already attached by database
+/// \"run_<id>\"" failure; null if it says nothing of the kind.
+fn attached_by(text: []const u8) ?u32 {
+    const marker = "already attached by database \"run_";
+    const start = (std.mem.indexOf(u8, text, marker) orelse return null) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return null;
+    return std.fmt.parseInt(u32, text[start..end], 10) catch null;
+}
+
+test attached_by {
+    try std.testing.expectEqual(@as(?u32, 206), attached_by("Resource In Use Error: Unique file handle conflict: " ++
+        "Cannot attach \"run_226\" - the database file \"/x/events.duckdb\" is already attached by database \"run_206\""));
+    try std.testing.expectEqual(@as(?u32, null), attached_by("Catalog Error: something else"));
+}
+
+/// Run `newer` takes run `older`'s events directory: older's database detached, its answers
+/// forgotten, and its queries told whose events the directory holds now.
+fn events_take(server: *Server, older: u32, newer: u32) !void {
+    const shared = server.shared;
+    assert(older < newer);
+    const lock = &shared.store_locks[older];
+    lock.lockUncancelable(server.io);
+    defer lock.unlock(server.io);
+    var failure: duckdb.Failure = .{};
+    try shared.database.detach(try print(server, "run_{d}", .{older}), &failure);
+    shared.attached[older] = false;
+    shared.taken[older] = newer;
+    shared.ingested[older] = 0;
+    shared.replays_ingested[older] = 0;
+    shared.generations[older] += 1;
+    std.debug.print("[determinismo] run {d} took run {d}'s events directory\n", .{ newer, older });
 }
 
 fn run_store(server: *Server, id: u32) !store.Store {
