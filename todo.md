@@ -2,8 +2,13 @@
 - [x] speed and exploration quality
 - [x] test quint
 - [x] test jank nrepl
-- [ ] learn over time
+- [ ] automatic fault-schedule shrinking
+- [ ] persistent learning across campaigns
 - [ ] use service logs to guide strategies as well (besides the normal determinismo sdk logs for properties, assertions, sometimes, lifecycle etc)
+- [ ] playground so people can play with their services (and it's a good way to learn about determinism)
+- [ ] richer modulation of individual instruction speeds (like antithesis)
+- [ ] uncertainty-aware estimates across multiple runs (like antithesis)
+- [ ] do we do https://antithesis.com/blog/2025/metroid/ ?
 - [ ] test determinismo itself (nested kvm)
 - [ ] can we do load/perf test with it ?
 - [ ] writing tests in clojure (using zig or some abstraction that communicates using something else?)
@@ -18,3 +23,11 @@
   - [ ] for all cases above, how to make it so that the timelike "likely" follows the path that it was following? maybe we could have some way to define which points we want to be called and that (because the service is instrumented), then we are able to confirm it, backtracking again a little bit and restarting with another seed if not the case ?
 - [ ] does the elle append_many needs to be this complex or it's because the API for a custom check is not yet good enough ?
 - [ ] modified clojure compiler so properties are automatic for clojure projects
+
+## Determinismo Lang
+
+- [ ] on top of zig
+- [ ] every part of the lang is property-based/deterministic driven
+- [ ] the agent should be able to run anything and then replay, inspect, fault etc
+- [ ] or maybe it's just better for it to be determinismo, but for jank ?
+- [ ] the main point here is to have fast feedback WHILE developing
